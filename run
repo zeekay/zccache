@@ -1,43 +1,4 @@
 #!/usr/bin/env bash
-# run — Execute a command using this project's Rust toolchain.
-#
-# Usage:
-#   ./run cargo check --workspace
-#   ./run cargo test -p zccache-hash
-#   ./run rustc --version
-#   ./run rustfmt --check crates/zccache-core/src/lib.rs
-#
-# This is the Rust equivalent of `uv run` — it ensures the rustup-managed
-# toolchain is used regardless of what else is on your system PATH.
-
-set -eo pipefail
-
-# Resolve the rustup cargo/bin directory
-if [ -n "${CARGO_HOME:-}" ] && [ -d "$CARGO_HOME/bin" ]; then
-    RUSTUP_BIN="$CARGO_HOME/bin"
-elif [ -d "$HOME/.cargo/bin" ]; then
-    RUSTUP_BIN="$HOME/.cargo/bin"
-elif command -v cygpath >/dev/null 2>&1 && [ -d "$(cygpath -u "${USERPROFILE:-.}")/.cargo/bin" ]; then
-    RUSTUP_BIN="$(cygpath -u "$USERPROFILE")/.cargo/bin"
-else
-    echo "error: Cannot find .cargo/bin. Run ./install first." >&2
-    exit 1
-fi
-
-# Prepend it so rustup's binaries win over any system Rust
-export PATH="${RUSTUP_BIN}:${PATH}"
-
-# Verify we're using rustup's toolchain
-if ! command -v rustup >/dev/null 2>&1; then
-    echo "error: rustup not found at ${RUSTUP_BIN}. Run ./install first." >&2
-    exit 1
-fi
-
-# Execute the command
-if [ $# -eq 0 ]; then
-    echo "usage: ./run <command> [args...]" >&2
-    echo "  e.g. ./run cargo check --workspace" >&2
-    exit 1
-fi
-
-exec "$@"
+set -e
+cd "$(dirname "$0")"
+exec uv run python run.py "$@"

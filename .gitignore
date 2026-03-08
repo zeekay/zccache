@@ -15,3 +15,13 @@ Thumbs.db
 
 # Cargo lock is checked in for binaries
 # (workspace contains binary crates)
+.loop
+
+# Python / uv
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
