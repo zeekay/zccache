@@ -1,0 +1,20 @@
+[package]
+name = "zccache"
+version = "0.1.0"
+edition = "2024"
+description = "sccache but designed for speed"
+license = "MIT"
+
+[dependencies]
+blake3 = "1.5"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "zccache"
+path = "src/main.rs"
