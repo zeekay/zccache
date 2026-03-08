@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zccache-core",
+    "crates/zccache-hash",
+    "crates/zccache-protocol",
+    "crates/zccache-fscache",
+    "crates/zccache-artifact",
+    "crates/zccache-watcher",
+    "crates/zccache-compiler",
+    "crates/zccache-ipc",
+    "crates/zccache-daemon",
+    "crates/zccache-cli",
+    "crates/zccache-test-support",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/user/zccache"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+blake3 = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+redb = "2"
+notify = "7"
+tempfile = "3"
+bytes = "1"
+
+# Note: workspace.lints requires Rust 1.74+. If your toolchain is older,
+# these are ignored. Lint configuration is also enforced via CI clippy flags.
+#
+# [workspace.lints.rust]
+# unsafe_code = "deny"
+# missing_debug_implementations = "warn"
+#
+# [workspace.lints.clippy]
+# all = { level = "warn", priority = -1 }
+# pedantic = { level = "warn", priority = -1 }
+# nursery = { level = "warn", priority = -1 }
+# unwrap_used = "warn"

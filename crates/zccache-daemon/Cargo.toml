@@ -1,0 +1,23 @@
+[package]
+name = "zccache-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+zccache-core = { path = "../zccache-core" }
+zccache-protocol = { path = "../zccache-protocol" }
+zccache-ipc = { path = "../zccache-ipc" }
+zccache-fscache = { path = "../zccache-fscache" }
+zccache-artifact = { path = "../zccache-artifact" }
+zccache-watcher = { path = "../zccache-watcher" }
+zccache-hash = { path = "../zccache-hash" }
+zccache-compiler = { path = "../zccache-compiler" }

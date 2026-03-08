@@ -1,0 +1,16 @@
+[package]
+name = "zccache-fscache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+
+[dependencies]
+dashmap = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+zccache-core = { path = "../zccache-core" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
