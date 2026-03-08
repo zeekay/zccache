@@ -17,6 +17,12 @@ pub fn compiler_identity(compiler: &str) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         let _ = reader.read_to_end(&mut buf);
         hasher.update(&buf);
+    } else if std::env::var("ZCCACHE_DEBUG").is_ok() {
+        eprintln!(
+            "zccache: warning: could not hash compiler binary for '{}'; \
+             falling back to version string only",
+            compiler
+        );
     }
 
     // Also hash the version string so cross-version rebuilds are detected even

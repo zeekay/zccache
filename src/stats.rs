@@ -100,6 +100,8 @@ fn dir_size(path: &Path) -> Result<u64> {
         if meta.is_file() {
             total += meta.len();
         } else if meta.is_dir() {
+            // Errors from sub-directories are ignored so that a permissions
+            // issue on one sub-dir doesn't prevent showing the rest of the stats.
             total += dir_size(&entry.path()).unwrap_or(0);
         }
     }
