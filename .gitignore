@@ -13,6 +13,9 @@
 .DS_Store
 Thumbs.db
 
+# Session cache (hook fingerprints)
+.cache/
+
 # Cargo lock is checked in for binaries
 # (workspace contains binary crates)
 .loop

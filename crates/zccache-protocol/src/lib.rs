@@ -57,8 +57,8 @@ pub fn decode_message<T: serde::de::DeserializeOwned>(
 
     buf.advance(4);
     let payload = buf.split_to(len);
-    let msg =
-        bincode::deserialize(&payload).map_err(|e| ProtocolError::Deserialization(e.to_string()))?;
+    let msg = bincode::deserialize(&payload)
+        .map_err(|e| ProtocolError::Deserialization(e.to_string()))?;
     Ok(Some(msg))
 }
 

@@ -2,4 +2,4 @@
 
 Python scripts invoked by Claude Code hooks (configured in `.claude/settings.json`).
 
-All hooks are executed via `uv run python` to ensure consistent Python environment.
+All hooks are executed via `uv run` to ensure consistent Python environment.

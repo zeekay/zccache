@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse hook: blocks bare Rust commands and bare python/pip.
 
-All cargo/rustc must go through ./run (ensures correct toolchain).
+All cargo/rustc/rustfmt must go through uv run (trampoline ensures correct toolchain).
 All python must go through uv (ensures correct environment).
 
 Exit codes:
@@ -16,7 +16,7 @@ import sys
 RUST_TOOLS = {"cargo", "rustc", "rustfmt", "clippy-driver", "cargo-clippy", "cargo-fmt"}
 PYTHON_TOOLS = {"python", "python3", "pip", "pip3"}
 
-WRAPPED_PREFIXES = ("./run ", "uv run ", "uv pip ")
+ALLOWED_PREFIXES = ("uv run ", "uv pip ")
 
 
 def check_command(command):
@@ -31,8 +31,8 @@ def check_command(command):
         if not seg:
             continue
 
-        # Skip if properly wrapped
-        if any(seg.startswith(p) for p in WRAPPED_PREFIXES):
+        # Skip if properly wrapped with uv
+        if any(seg.startswith(p) for p in ALLOWED_PREFIXES):
             continue
 
         first_word = seg.split()[0] if seg.split() else ""
@@ -40,8 +40,8 @@ def check_command(command):
         if first_word in RUST_TOOLS:
             return (
                 first_word,
-                f"Use `./run {first_word} ...` instead of bare `{first_word}`. "
-                f"The ./run wrapper ensures the correct Rust toolchain is used.",
+                f"Use `uv run {first_word} ...` instead of bare `{first_word}`. "
+                f"The uv trampoline ensures the correct Rust toolchain is used.",
             )
 
         if first_word in PYTHON_TOOLS:
@@ -54,7 +54,7 @@ def check_command(command):
                 )
             return (
                 first_word,
-                f"Use `uv run python ...` instead of bare `{first_word}`. "
+                f"Use `uv run ...` instead of bare `{first_word}`. "
                 f"All Python must be executed through uv.",
             )
 
@@ -76,6 +76,11 @@ def main():
     try:
         data = json.load(sys.stdin)
     except json.JSONDecodeError:
+        sys.exit(0)
+
+    # Only check Bash commands
+    tool_name = data.get("tool_name", "")
+    if tool_name != "Bash":
         sys.exit(0)
 
     command = data.get("tool_input", {}).get("command", "")

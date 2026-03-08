@@ -1,0 +1,40 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# ///
+"""Run workspace tests.
+
+Usage:
+    ./test                          # all tests
+    ./test -p zccache-hash          # single crate
+    ./test -p zccache-hash -- name  # single test by name
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+
+
+def main():
+    cmd = ["uv", "run", "cargo", "test"]
+
+    args = sys.argv[1:]
+    if not args:
+        cmd += ["--workspace"]
+
+    cmd += args
+
+    result = subprocess.run(
+        cmd,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(SCRIPT_DIR),
+    )
+    return result.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

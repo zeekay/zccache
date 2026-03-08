@@ -12,9 +12,7 @@
 ///
 /// Returns an error if the temp directory cannot be created.
 pub fn temp_cache_dir() -> std::io::Result<tempfile::TempDir> {
-    tempfile::Builder::new()
-        .prefix("zccache-test-")
-        .tempdir()
+    tempfile::Builder::new().prefix("zccache-test-").tempdir()
 }
 
 /// Initialize tracing for tests (only installs once).

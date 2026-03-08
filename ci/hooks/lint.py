@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: runs rustfmt + clippy on edited Rust files.
+"""PostToolUse hook: runs per-file lint on edited Rust files.
 
-Runs after every Edit/Write. For .rs files: auto-formats with rustfmt,
-then runs clippy on the affected crate. Feeds errors back to Claude.
+Delegates to ./lint in single-file mode for speed.
+Runs after every Edit/Write on .rs files.
 
 Exit codes:
   0 - Success or non-Rust file
-  2 - Clippy violations found (stderr fed back to Claude)
+  2 - Lint violations found (stderr fed back to Claude)
 """
 
 import json
@@ -32,6 +32,10 @@ def main():
     # Normalize path
     file_path = file_path.replace("\\", "/")
 
+    # Resolve relative paths against project root
+    if not os.path.isabs(file_path):
+        file_path = os.path.join(str(PROJECT_ROOT), file_path).replace("\\", "/")
+
     # Only lint Rust files
     if not file_path.endswith(".rs"):
         return 0
@@ -40,39 +44,24 @@ def main():
     if not os.path.isfile(file_path):
         return 0
 
-    os.chdir(str(PROJECT_ROOT))
-    run_py = str(PROJECT_ROOT / "run.py")
-
-    # Auto-format
-    subprocess.run(
-        ["uv", "run", "python", run_py, "cargo", "fmt", "--all"],
+    # Delegate to ./lint in single-file mode
+    lint_script = str(PROJECT_ROOT / "lint")
+    result = subprocess.run(
+        ["uv", "run", "--script", lint_script, file_path],
         capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(PROJECT_ROOT),
     )
 
-    # Determine which crate was edited
-    crate_arg = []
-    if "crates/" in file_path:
-        parts = file_path.split("crates/")
-        if len(parts) > 1:
-            crate_dir = parts[1].split("/")[0]
-            if crate_dir:
-                crate_arg = ["-p", crate_dir]
-
-    # Run clippy
-    cmd = ["uv", "run", "python", run_py, "cargo", "clippy"]
-    if crate_arg:
-        cmd += crate_arg
-    else:
-        cmd += ["--workspace"]
-    cmd += ["--all-targets", "--", "-D", "warnings"]
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        crate_name = crate_arg[1] if crate_arg else "workspace"
-        print(f"clippy warnings in {crate_name} after editing {file_path}:", file=sys.stderr)
-        output = result.stderr or result.stdout
-        for line in output.strip().splitlines()[-40:]:
-            print(line, file=sys.stderr)
+        rel_path = os.path.relpath(file_path, str(PROJECT_ROOT))
+        print(f"Lint violations in {rel_path}:", file=sys.stderr)
+        if result.stdout.strip():
+            print(result.stdout.strip(), file=sys.stderr)
+        if result.stderr.strip():
+            print(result.stderr.strip(), file=sys.stderr)
         return 2
 
     return 0

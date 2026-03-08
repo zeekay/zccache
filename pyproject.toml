@@ -5,9 +5,15 @@ description = "A high-performance local compiler cache daemon"
 requires-python = ">=3.9"
 dependencies = []
 
+[project.scripts]
+cargo = "ci.trampoline:cargo"
+rustc = "ci.trampoline:rustc"
+rustfmt = "ci.trampoline:rustfmt"
+clippy-driver = "ci.trampoline:clippy_driver"
+
 [build-system]
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = []
+packages = ["ci"]

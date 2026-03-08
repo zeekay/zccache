@@ -4,8 +4,8 @@ zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md 
 
 ## Essential Rules
 
-- **Always use `./run` to execute Rust commands.** Bare cargo/rustc are blocked by hook.
-- **Always use `uv` for Python.** Bare `python`/`pip` are blocked by hook. Use `uv run python ...` or `uv pip ...`.
+- **Always use `uv run` to execute Rust commands.** Bare cargo/rustc are blocked by hook. Trampolines in `pyproject.toml` ensure the correct toolchain.
+- **Always use `uv` for Python.** Bare `python`/`pip` are blocked by hook. Use `uv run ...` or `uv pip ...`.
 - MSRV: 1.75 | Edition: 2021 | Toolchain: stable (clippy + rustfmt)
 - CI: Linux, macOS, Windows. All warnings denied (`RUSTFLAGS="-D warnings"`)
 - Every directory with files must have a README.md (enforced by hook)
@@ -13,22 +13,24 @@ zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md 
 ## Commands
 
 ```bash
-./run cargo check --workspace --all-targets
-./run cargo test --workspace
-./run cargo test -p <crate> -- <test_name>
-./run cargo clippy --workspace --all-targets -- -D warnings
-./run cargo fmt --all
-RUSTDOCFLAGS="-D warnings" ./run cargo doc --workspace --no-deps
-./run cargo bench -p zccache-hash
+uv run cargo check --workspace --all-targets
+uv run cargo test --workspace
+uv run cargo test -p <crate> -- <test_name>
+uv run cargo clippy --workspace --all-targets -- -D warnings
+uv run cargo fmt --all
+RUSTDOCFLAGS="-D warnings" uv run cargo doc --workspace --no-deps
+uv run cargo bench -p zccache-hash
 ```
 
 ## Hooks (enforced automatically)
 
-All hooks are Python scripts in `ci/hooks/`, invoked via `uv run python`:
+All hooks are Python scripts in `ci/hooks/`, invoked via `uv run`:
 
-- **PreToolUse**: `ci/hooks/tool_guard.py` blocks bare Rust commands (must use `./run`) and bare `python`/`pip` (must use `uv`)
+- **PreToolUse**: `ci/hooks/tool_guard.py` blocks bare Rust commands (must use `uv run`) and bare `python`/`pip` (must use `uv`)
 - **PostToolUse**: `ci/hooks/lint.py` auto-formats + runs clippy on edited .rs files
 - **PostToolUse**: `ci/hooks/readme_guard.py` errors if directory lacks README.md
+- **SessionStart**: `ci/hooks/check-on-start.py` captures git fingerprint
+- **Stop**: `ci/hooks/check-on-stop.py` runs full workspace lint + tests (skips if no changes)
 
 ## Core Principles
 
