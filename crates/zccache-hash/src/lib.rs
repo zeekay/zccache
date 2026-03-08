@@ -76,15 +76,33 @@ pub fn hash_reader<R: Read>(mut reader: R) -> std::io::Result<ContentHash> {
     Ok(ContentHash(*hasher.finalize().as_bytes()))
 }
 
-/// Hash the contents of a file.
+/// Hash the contents of a file using memory mapping.
+///
+/// Uses `memmap2` for zero-copy file access. The OS page cache ensures
+/// files recently read (e.g., during compilation) are hashed from memory,
+/// not disk. Falls back to buffered reading for empty files.
 ///
 /// # Errors
 ///
 /// Returns an error if the file cannot be read.
+///
+/// # Safety
+///
+/// Memory mapping is technically unsafe if another process modifies the file
+/// concurrently. The TOCTOU check in `MetadataCache::hash_and_insert` detects
+/// this by comparing stat before and after hashing.
 pub fn hash_file(path: &Path) -> std::io::Result<ContentHash> {
     let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
-    hash_reader(reader)
+    let meta = file.metadata()?;
+
+    if meta.len() == 0 {
+        return Ok(hash_bytes(b""));
+    }
+
+    // SAFETY: The caller (MetadataCache::hash_and_insert) stats before and
+    // after hashing to detect concurrent modification.
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    Ok(hash_bytes(&mmap))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

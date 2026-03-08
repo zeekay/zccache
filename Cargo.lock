@@ -622,6 +622,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memmap2"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "mio"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1583,6 +1592,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "zccache-core",
+ "zccache-hash",
 ]
 
 [[package]]
@@ -1591,7 +1601,9 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "criterion",
+ "memmap2",
  "serde",
+ "tempfile",
  "zccache-core",
 ]
 
@@ -1634,9 +1646,11 @@ dependencies = [
  "notify",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
  "zccache-core",
  "zccache-fscache",
+ "zccache-hash",
 ]
 
 [[package]]

@@ -1,11 +1,25 @@
-//! File watcher abstraction for zccache.
+//! File watcher for zccache.
 //!
-//! Provides a platform-abstracted file watching interface that
-//! integrates with the metadata cache's confidence model.
+//! Provides cross-platform file watching with settle/coalesce buffering,
+//! directory ignore filtering, and integration with the metadata cache's
+//! clock-based change tracking.
+//!
+//! Architecture:
+//! ```text
+//! notify (OS thread) → mpsc → SettleBuffer (tokio task) → CacheSystem
+//! ```
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::path::{Path, PathBuf};
+pub mod ignore;
+pub mod notify_watcher;
+pub mod settle;
+
+use std::path::PathBuf;
+
+pub use ignore::IgnoreFilter;
+pub use notify_watcher::NotifyWatcher;
+pub use settle::{SettleBuffer, SettledEvent};
 
 /// Events produced by the file watcher.
 #[derive(Debug, Clone)]
@@ -25,36 +39,20 @@ pub enum WatchEvent {
     Error(String),
 }
 
-/// Trait for file watcher implementations.
-///
-/// Abstracts over platform-specific file watching backends.
-pub trait FileWatcher: Send + Sync {
-    /// Start watching a directory (recursively).
-    fn watch(&mut self, path: &Path) -> zccache_core::Result<()>;
-
-    /// Stop watching a directory.
-    fn unwatch(&mut self, path: &Path) -> zccache_core::Result<()>;
-
-    /// Receive the next batch of events.
-    ///
-    /// Returns an empty vec if no events are pending.
-    fn poll_events(&mut self) -> zccache_core::Result<Vec<WatchEvent>>;
-}
-
 /// Configuration for the file watcher.
 #[derive(Debug, Clone)]
 pub struct WatcherConfig {
-    /// Whether to use polling fallback instead of native events.
-    pub use_polling: bool,
-    /// Polling interval in milliseconds (only used in polling mode).
-    pub poll_interval_ms: u64,
+    /// Settle window in milliseconds.
+    pub settle_window_ms: u64,
+    /// Directory patterns to ignore.
+    pub ignore_patterns: Vec<String>,
 }
 
 impl Default for WatcherConfig {
     fn default() -> Self {
         Self {
-            use_polling: false,
-            poll_interval_ms: 1000,
+            settle_window_ms: 50,
+            ignore_patterns: IgnoreFilter::default_patterns(),
         }
     }
 }

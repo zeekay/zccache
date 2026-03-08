@@ -5,9 +5,10 @@
 """Run workspace tests.
 
 Usage:
-    ./test                          # all tests
-    ./test -p zccache-hash          # single crate
-    ./test -p zccache-hash -- name  # single test by name
+    uv run test                          # unit tests only
+    uv run test --full                   # unit + stress + integration tests
+    uv run test -p zccache-hash          # single crate
+    uv run test -p zccache-hash -- name  # single test by name
 """
 
 import subprocess
@@ -21,10 +22,27 @@ def main():
     cmd = ["uv", "run", "cargo", "test"]
 
     args = sys.argv[1:]
-    if not args:
+    full = "--full" in args
+    if full:
+        args.remove("--full")
+
+    # Split on "--" to separate cargo args from test-binary args.
+    if "--" in args:
+        sep = args.index("--")
+        cargo_args = args[:sep]
+        test_args = args[sep + 1:]
+    else:
+        cargo_args = args
+        test_args = []
+
+    if not cargo_args:
         cmd += ["--workspace"]
 
-    cmd += args
+    cmd += cargo_args
+    cmd += ["--"]
+    if full:
+        cmd += ["--include-ignored"]
+    cmd += test_args
 
     result = subprocess.run(
         cmd,

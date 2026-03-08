@@ -15,26 +15,17 @@ pub enum Confidence {
     High,
 }
 
-/// Platform-specific file identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum FileId {
-    /// Unix inode (device, inode).
-    Unix { dev: u64, ino: u64 },
-    /// Windows file index.
-    Windows { volume_serial: u32, file_index: u64 },
-    /// Fallback when file identity is unavailable.
-    Unknown,
-}
-
 /// Cached metadata for a single file.
+///
+/// Change detection uses `(mtime, size)`. File replacement detection
+/// (same path, new inode) is handled by the file watcher (`notify`),
+/// not by platform-specific file identity checks.
 #[derive(Debug, Clone)]
 pub struct FileMetadata {
     /// File modification time.
     pub mtime: SystemTime,
     /// File size in bytes.
     pub size: u64,
-    /// File identity (inode/file index).
-    pub file_id: FileId,
     /// Confidence level of this entry.
     pub confidence: Confidence,
     /// When this entry was last verified via stat.
@@ -115,6 +106,24 @@ impl MetadataCache {
         self.entries.is_empty()
     }
 
+    /// Return a cached content hash if the entry has High or Medium confidence.
+    ///
+    /// This is the clock-aware fast path: the caller has journal-based
+    /// assurance that the file hasn't changed, so time-based decay is
+    /// not applied. Returns `None` if the entry is missing, Low confidence,
+    /// or has no cached hash.
+    #[must_use]
+    pub fn get_cached_hash(&self, path: &Path) -> Option<zccache_hash::ContentHash> {
+        self.entries
+            .get(path)
+            .and_then(|entry| match entry.confidence {
+                Confidence::High | Confidence::Medium => entry
+                    .content_hash
+                    .map(zccache_hash::ContentHash::from_bytes),
+                Confidence::Low => None,
+            })
+    }
+
     fn decayed_confidence(&self, meta: &FileMetadata) -> Confidence {
         let elapsed = meta.last_verified.elapsed();
         match meta.confidence {
@@ -142,13 +151,217 @@ mod tests {
         let meta = FileMetadata {
             mtime: SystemTime::now(),
             size: 100,
-            file_id: FileId::Unknown,
             confidence: Confidence::High,
             last_verified: Instant::now(),
             content_hash: None,
         };
         cache.insert(path.clone(), meta);
         assert!(cache.get(&path).is_some());
+    }
+
+    #[test]
+    fn get_returns_none_for_missing_path() {
+        let cache = MetadataCache::new();
+        assert!(cache.get(Path::new("/no/such/path")).is_none());
+    }
+
+    #[test]
+    fn insert_overwrites_existing() {
+        let cache = MetadataCache::new();
+        let path = PathBuf::from("/tmp/overwrite.c");
+
+        let meta1 = FileMetadata {
+            mtime: SystemTime::now(),
+            size: 100,
+            confidence: Confidence::High,
+            last_verified: Instant::now(),
+            content_hash: None,
+        };
+        cache.insert(path.clone(), meta1);
+        assert_eq!(cache.get(&path).unwrap().size, 100);
+
+        let meta2 = FileMetadata {
+            mtime: SystemTime::now(),
+            size: 999,
+            confidence: Confidence::Medium,
+            last_verified: Instant::now(),
+            content_hash: None,
+        };
+        cache.insert(path.clone(), meta2);
+        assert_eq!(cache.get(&path).unwrap().size, 999);
+    }
+
+    #[test]
+    fn downgrade_single_path() {
+        let cache = MetadataCache::new();
+        let path_a = PathBuf::from("/tmp/a.c");
+        let path_b = PathBuf::from("/tmp/b.c");
+
+        for path in [&path_a, &path_b] {
+            cache.insert(
+                path.clone(),
+                FileMetadata {
+                    mtime: SystemTime::now(),
+                    size: 10,
+                    confidence: Confidence::High,
+                    last_verified: Instant::now(),
+                    content_hash: None,
+                },
+            );
+        }
+
+        cache.downgrade(&path_a);
+        assert_eq!(cache.get(&path_a).unwrap().confidence, Confidence::Low);
+        assert_eq!(cache.get(&path_b).unwrap().confidence, Confidence::High);
+    }
+
+    #[test]
+    fn downgrade_nonexistent_is_noop() {
+        let cache = MetadataCache::new();
+        cache.downgrade(Path::new("/no/such/path")); // should not panic
+    }
+
+    #[test]
+    fn remove_entry() {
+        let cache = MetadataCache::new();
+        let path = PathBuf::from("/tmp/removable.c");
+        cache.insert(
+            path.clone(),
+            FileMetadata {
+                mtime: SystemTime::now(),
+                size: 10,
+                confidence: Confidence::High,
+                last_verified: Instant::now(),
+                content_hash: None,
+            },
+        );
+        assert_eq!(cache.len(), 1);
+
+        cache.remove(&path);
+        assert!(cache.get(&path).is_none());
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn remove_nonexistent_is_noop() {
+        let cache = MetadataCache::new();
+        cache.remove(Path::new("/no/such/path")); // should not panic
+    }
+
+    #[test]
+    fn is_empty_and_len() {
+        let cache = MetadataCache::new();
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+
+        cache.insert(
+            PathBuf::from("/tmp/x.c"),
+            FileMetadata {
+                mtime: SystemTime::now(),
+                size: 1,
+                confidence: Confidence::High,
+                last_verified: Instant::now(),
+                content_hash: None,
+            },
+        );
+        assert!(!cache.is_empty());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn get_cached_hash_high_confidence() {
+        let cache = MetadataCache::new();
+        let path = PathBuf::from("/tmp/hashed.c");
+        let hash_bytes = [42u8; 32];
+        cache.insert(
+            path.clone(),
+            FileMetadata {
+                mtime: SystemTime::now(),
+                size: 10,
+                confidence: Confidence::High,
+                last_verified: Instant::now(),
+                content_hash: Some(hash_bytes),
+            },
+        );
+
+        let result = cache.get_cached_hash(&path);
+        assert!(result.is_some());
+        assert_eq!(*result.unwrap().as_bytes(), hash_bytes);
+    }
+
+    #[test]
+    fn get_cached_hash_medium_confidence() {
+        let cache = MetadataCache::new();
+        let path = PathBuf::from("/tmp/med.c");
+        let hash_bytes = [7u8; 32];
+        cache.insert(
+            path.clone(),
+            FileMetadata {
+                mtime: SystemTime::now(),
+                size: 10,
+                confidence: Confidence::Medium,
+                last_verified: Instant::now(),
+                content_hash: Some(hash_bytes),
+            },
+        );
+
+        let result = cache.get_cached_hash(&path);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn get_cached_hash_low_confidence_returns_none() {
+        let cache = MetadataCache::new();
+        let path = PathBuf::from("/tmp/low.c");
+        cache.insert(
+            path.clone(),
+            FileMetadata {
+                mtime: SystemTime::now(),
+                size: 10,
+                confidence: Confidence::Low,
+                last_verified: Instant::now(),
+                content_hash: Some([1u8; 32]),
+            },
+        );
+
+        assert!(cache.get_cached_hash(&path).is_none());
+    }
+
+    #[test]
+    fn get_cached_hash_no_hash_returns_none() {
+        let cache = MetadataCache::new();
+        let path = PathBuf::from("/tmp/nohash.c");
+        cache.insert(
+            path.clone(),
+            FileMetadata {
+                mtime: SystemTime::now(),
+                size: 10,
+                confidence: Confidence::High,
+                last_verified: Instant::now(),
+                content_hash: None,
+            },
+        );
+
+        assert!(cache.get_cached_hash(&path).is_none());
+    }
+
+    #[test]
+    fn get_cached_hash_missing_path_returns_none() {
+        let cache = MetadataCache::new();
+        assert!(cache.get_cached_hash(Path::new("/no/such")).is_none());
+    }
+
+    #[test]
+    fn confidence_ordering() {
+        assert!(Confidence::Low < Confidence::Medium);
+        assert!(Confidence::Medium < Confidence::High);
+        assert!(Confidence::Low < Confidence::High);
+    }
+
+    #[test]
+    fn default_creates_new_cache() {
+        let cache = MetadataCache::default();
+        assert!(cache.is_empty());
     }
 
     #[test]
@@ -159,7 +372,6 @@ mod tests {
             let meta = FileMetadata {
                 mtime: SystemTime::now(),
                 size: 100,
-                file_id: FileId::Unknown,
                 confidence: Confidence::High,
                 last_verified: Instant::now(),
                 content_hash: None,

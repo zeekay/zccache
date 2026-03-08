@@ -8,11 +8,13 @@ license.workspace = true
 
 [dependencies]
 blake3 = { workspace = true }
+memmap2 = { workspace = true }
 serde = { workspace = true }
 zccache-core = { path = "../zccache-core" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "hashing"

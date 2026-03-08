@@ -3,6 +3,12 @@
 //! Provides a fast, concurrent, in-memory cache of filesystem metadata
 //! to reduce redundant stat calls during compilation.
 
+pub mod cache_system;
+pub mod clock;
 pub mod metadata;
+pub mod verify;
 
-pub use metadata::{Confidence, FileId, FileMetadata, MetadataCache};
+pub use cache_system::CacheSystem;
+pub use clock::{ChangeJournal, Clock};
+pub use metadata::{Confidence, FileMetadata, MetadataCache};
+pub use verify::VerifyResult;

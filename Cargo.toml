@@ -33,6 +33,7 @@ clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 redb = "2"
 notify = "7"
+memmap2 = "0.9"
 tempfile = "3"
 bytes = "1"
 

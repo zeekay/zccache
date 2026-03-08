@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 notify = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 zccache-core = { path = "../zccache-core" }
@@ -15,3 +16,4 @@ zccache-fscache = { path = "../zccache-fscache" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+zccache-hash = { path = "../zccache-hash" }

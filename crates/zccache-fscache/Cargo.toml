@@ -11,6 +11,7 @@ dashmap = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 zccache-core = { path = "../zccache-core" }
+zccache-hash = { path = "../zccache-hash" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

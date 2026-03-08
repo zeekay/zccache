@@ -13,9 +13,10 @@ zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md 
 ## Commands
 
 ```bash
+uv run test                 # unit tests only
+uv run test --full          # unit + stress + integration tests
+uv run test -p <crate> -- <test_name>
 uv run cargo check --workspace --all-targets
-uv run cargo test --workspace
-uv run cargo test -p <crate> -- <test_name>
 uv run cargo clippy --workspace --all-targets -- -D warnings
 uv run cargo fmt --all
 RUSTDOCFLAGS="-D warnings" uv run cargo doc --workspace --no-deps
@@ -62,6 +63,13 @@ All hooks are Python scripts in `ci/hooks/`, invoked via `uv run`:
 - **PostToolUse**: `ci/hooks/readme_guard.py` errors if directory lacks README.md
 - **SessionStart**: `ci/hooks/check-on-start.py` captures git fingerprint
 - **Stop**: `ci/hooks/check-on-stop.py` runs full workspace lint + tests (skips if no changes)
+
+## Development Philosophy: TDD
+
+- **Red → Green → Refactor.** Write failing tests first, then implement the minimum code to make them pass, then refactor.
+- Tests are the spec. If the test suite passes, the feature works. If behavior isn't tested, it doesn't exist.
+- Comprehensive tests over comprehensive docs. Tests are executable documentation.
+- Test real behavior: use `tempfile` for filesystem tests, not mocks. Test the contract, not the implementation.
 
 ## Core Principles
 

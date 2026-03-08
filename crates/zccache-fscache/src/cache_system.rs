@@ -1,0 +1,386 @@
+//! Unified cache system: metadata cache + change journal.
+//!
+//! This is the primary API that the daemon uses. It composes
+//! `MetadataCache` (per-file metadata + hashing) with `ChangeJournal`
+//! (monotonic clock + batched change tracking) to provide clock-aware
+//! lookups that eliminate redundant stat calls across concurrent clients.
+
+use crate::clock::{ChangeJournal, Clock};
+use crate::metadata::MetadataCache;
+use std::path::{Path, PathBuf};
+use zccache_core::Result;
+use zccache_hash::ContentHash;
+
+/// Result of a clock-aware lookup.
+#[derive(Debug, Clone)]
+pub struct ClockLookup {
+    /// The content hash of the file.
+    pub hash: ContentHash,
+    /// The clock at the time of lookup.
+    pub clock: Clock,
+}
+
+/// Unified cache system: metadata cache + change journal.
+///
+/// During `make -j16`, 16 concurrent compilation requests all ask about
+/// the same headers. Without the clock, each one would stat-verify
+/// independently. With the clock, the daemon verifies once per batch
+/// and all concurrent clients share that answer.
+#[derive(Debug)]
+pub struct CacheSystem {
+    metadata: MetadataCache,
+    journal: ChangeJournal,
+}
+
+impl CacheSystem {
+    /// Create a new cache system with default settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            metadata: MetadataCache::new(),
+            journal: ChangeJournal::new(),
+        }
+    }
+
+    /// Returns the current clock value.
+    #[must_use]
+    pub fn current_clock(&self) -> Clock {
+        self.journal.current_clock()
+    }
+
+    /// Access the underlying metadata cache.
+    #[must_use]
+    pub fn metadata(&self) -> &MetadataCache {
+        &self.metadata
+    }
+
+    /// Access the underlying change journal.
+    #[must_use]
+    pub fn journal(&self) -> &ChangeJournal {
+        &self.journal
+    }
+
+    /// Clock-aware lookup. The critical fast path for concurrent clients.
+    ///
+    /// If the journal says the file hasn't changed since `since_clock` AND
+    /// the cache has a usable hash at High/Medium confidence, returns the
+    /// hash immediately — **zero syscalls**.
+    ///
+    /// Otherwise falls through to the full stat-verify + hash path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read.
+    pub fn lookup_since(&self, path: &Path, since_clock: Clock) -> Result<ClockLookup> {
+        let clock = self.journal.current_clock();
+
+        // Fast path: journal says no changes AND we have a cached hash.
+        if !self.journal.changed_since(path, since_clock) {
+            if let Some(hash) = self.metadata.get_cached_hash(path) {
+                return Ok(ClockLookup { hash, clock });
+            }
+        }
+
+        // Slow path: stat-verify and hash via MetadataCache.
+        let hash = self.metadata.lookup(path)?;
+        Ok(ClockLookup {
+            hash,
+            clock: self.journal.current_clock(),
+        })
+    }
+
+    /// Apply a settled batch of file changes from the watcher.
+    ///
+    /// Advances the journal clock and downgrades MetadataCache confidence
+    /// for each affected path. Called by the settle buffer after coalescing.
+    ///
+    /// Returns the new clock value.
+    pub fn apply_changes(&self, changed_paths: Vec<PathBuf>) -> Clock {
+        // Downgrade confidence for each changed path.
+        for path in &changed_paths {
+            self.metadata.downgrade(path);
+        }
+
+        // Record in journal and advance the clock.
+        self.journal.advance(changed_paths)
+    }
+
+    /// Apply a batch where some files were removed.
+    ///
+    /// Removed files are evicted from the metadata cache entirely.
+    /// Modified files are downgraded. Advances the clock.
+    pub fn apply_changes_with_removals(
+        &self,
+        changed: Vec<PathBuf>,
+        removed: Vec<PathBuf>,
+    ) -> Clock {
+        for path in &changed {
+            self.metadata.downgrade(path);
+        }
+        for path in &removed {
+            self.metadata.remove(path);
+        }
+
+        let mut all_paths = changed;
+        all_paths.extend(removed);
+        self.journal.advance(all_paths)
+    }
+
+    /// Handle a watcher overflow event.
+    ///
+    /// Downgrades ALL metadata cache entries to Low confidence and marks
+    /// the overflow in the journal so all subsequent clock queries return
+    /// "changed" for clocks before the overflow.
+    pub fn apply_overflow(&self) -> Clock {
+        self.metadata.downgrade_all();
+        self.journal.mark_overflow()
+    }
+}
+
+impl Default for CacheSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::Confidence;
+    use std::fs;
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    fn create_file(dir: &TempDir, name: &str, content: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, content).expect("failed to create test file");
+        path
+    }
+
+    fn sleep_for_mtime() {
+        thread::sleep(Duration::from_millis(1100));
+    }
+
+    #[test]
+    fn new_cache_is_at_clock_zero() {
+        let cache = CacheSystem::new();
+        assert_eq!(cache.current_clock(), Clock::ZERO);
+    }
+
+    #[test]
+    fn default_creates_new_cache() {
+        let cache = CacheSystem::default();
+        assert_eq!(cache.current_clock(), Clock::ZERO);
+        assert!(cache.metadata().is_empty());
+    }
+
+    #[test]
+    fn lookup_since_nonexistent_file_returns_error() {
+        let cache = CacheSystem::new();
+        let result = cache.lookup_since(Path::new("/no/such/file.c"), Clock::ZERO);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn lookup_since_journal_no_change_but_no_cached_hash() {
+        // Journal says "no change" but cache entry has no hash → slow path.
+        let dir = TempDir::new().unwrap();
+        let path = create_file(&dir, "nohash.h", "data");
+
+        let cache = CacheSystem::new();
+
+        // Manually put the path in the journal without populating the metadata cache hash.
+        let c1 = cache.apply_changes(vec![path.clone()]);
+
+        // lookup_since with c1 → journal says no change, but no cached hash → slow path.
+        let result = cache.lookup_since(&path, c1).unwrap();
+        let expected = zccache_hash::hash_bytes(b"data");
+        assert_eq!(result.hash, expected);
+    }
+
+    #[test]
+    fn clock_advances_on_apply() {
+        let cache = CacheSystem::new();
+        assert_eq!(cache.current_clock(), Clock::ZERO);
+
+        let c1 = cache.apply_changes(vec![]);
+        assert_eq!(c1.tick(), 1);
+
+        let c2 = cache.apply_changes(vec![]);
+        assert_eq!(c2.tick(), 2);
+    }
+
+    #[test]
+    fn apply_overflow_advances_clock() {
+        let cache = CacheSystem::new();
+        let c1 = cache.apply_changes(vec![]);
+        let overflow = cache.apply_overflow();
+        assert!(overflow > c1);
+    }
+
+    #[test]
+    fn lookup_since_returns_current_clock() {
+        let dir = TempDir::new().unwrap();
+        let path = create_file(&dir, "clocked.h", "tick");
+
+        let cache = CacheSystem::new();
+        let result = cache.lookup_since(&path, Clock::ZERO).unwrap();
+        // Clock should be at or after the current clock at time of lookup.
+        assert!(result.clock >= Clock::ZERO);
+    }
+
+    #[test]
+    fn lookup_since_zero_always_stats() {
+        let dir = TempDir::new().unwrap();
+        let path = create_file(&dir, "a.c", "hello");
+
+        let cache = CacheSystem::new();
+        let result = cache.lookup_since(&path, Clock::ZERO).unwrap();
+
+        // Should have computed the hash.
+        let expected = zccache_hash::hash_bytes(b"hello");
+        assert_eq!(result.hash, expected);
+    }
+
+    #[test]
+    fn lookup_since_skips_stat_when_no_changes() {
+        let dir = TempDir::new().unwrap();
+        let path = create_file(&dir, "stable.h", "#pragma once");
+
+        let cache = CacheSystem::new();
+
+        // First lookup populates the cache.
+        let r1 = cache.lookup_since(&path, Clock::ZERO).unwrap();
+
+        // Record the file in the journal so it's "tracked" (not untracked → conservative true).
+        let c1 = cache.apply_changes(vec![path.clone()]);
+
+        // File hasn't changed since c1. Second lookup should use fast path.
+        let r2 = cache.lookup_since(&path, c1).unwrap();
+        assert_eq!(r1.hash, r2.hash);
+    }
+
+    #[test]
+    fn lookup_since_stats_when_changed() {
+        let dir = TempDir::new().unwrap();
+        let path = create_file(&dir, "evolving.c", "v1");
+
+        let cache = CacheSystem::new();
+        let r1 = cache.lookup_since(&path, Clock::ZERO).unwrap();
+
+        // Simulate file change: edit + watcher event.
+        sleep_for_mtime();
+        fs::write(&path, "v2").unwrap();
+        let c2 = cache.apply_changes(vec![path.clone()]);
+
+        // Lookup with old clock → journal says "changed" → full stat path.
+        let r2 = cache.lookup_since(&path, Clock::ZERO).unwrap();
+        assert_ne!(r1.hash, r2.hash);
+        assert_eq!(r2.hash, zccache_hash::hash_bytes(b"v2"));
+
+        // Lookup with new clock → journal says "not changed" → fast path.
+        let r3 = cache.lookup_since(&path, c2).unwrap();
+        assert_eq!(r2.hash, r3.hash);
+    }
+
+    #[test]
+    fn apply_changes_downgrades_confidence() {
+        let dir = TempDir::new().unwrap();
+        let path = create_file(&dir, "watched.h", "content");
+
+        let cache = CacheSystem::new();
+        cache.lookup_since(&path, Clock::ZERO).unwrap();
+
+        // Entry should be High.
+        let entry = cache.metadata().get(&path).unwrap();
+        assert_eq!(entry.confidence, Confidence::High);
+
+        // Apply changes → confidence should drop.
+        cache.apply_changes(vec![path.clone()]);
+        let entry = cache.metadata().get(&path).unwrap();
+        assert_eq!(entry.confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn apply_overflow_downgrades_all() {
+        let dir = TempDir::new().unwrap();
+        let path_a = create_file(&dir, "a.h", "aaa");
+        let path_b = create_file(&dir, "b.h", "bbb");
+
+        let cache = CacheSystem::new();
+        cache.lookup_since(&path_a, Clock::ZERO).unwrap();
+        cache.lookup_since(&path_b, Clock::ZERO).unwrap();
+
+        let c_before = cache.current_clock();
+        cache.apply_overflow();
+
+        // All entries should be Low.
+        let a = cache.metadata().get(&path_a).unwrap();
+        let b = cache.metadata().get(&path_b).unwrap();
+        assert_eq!(a.confidence, Confidence::Low);
+        assert_eq!(b.confidence, Confidence::Low);
+
+        // Journal: queries before overflow return "changed".
+        assert!(cache.journal().changed_since(&path_a, c_before));
+    }
+
+    #[test]
+    fn concurrent_lookups_shared_cache() {
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let mut paths = Vec::new();
+        for i in 0..10 {
+            paths.push(create_file(
+                &dir,
+                &format!("header_{i}.h"),
+                &format!("content {i}"),
+            ));
+        }
+
+        let cache = Arc::new(CacheSystem::new());
+
+        // Populate cache.
+        for path in &paths {
+            cache.lookup_since(path, Clock::ZERO).unwrap();
+        }
+        let c1 = cache.apply_changes(paths.clone());
+
+        // Simulate make -j8: 8 threads all looking up the same 10 headers.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            let paths = paths.clone();
+            handles.push(std::thread::spawn(move || {
+                for path in &paths {
+                    let result = cache.lookup_since(path, c1).unwrap();
+                    assert_eq!(result.hash, zccache_hash::hash_file(path).unwrap(),);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn apply_changes_with_removals() {
+        let dir = TempDir::new().unwrap();
+        let path_mod = create_file(&dir, "mod.c", "modified");
+        let path_del = create_file(&dir, "del.c", "deleted");
+
+        let cache = CacheSystem::new();
+        cache.lookup_since(&path_mod, Clock::ZERO).unwrap();
+        cache.lookup_since(&path_del, Clock::ZERO).unwrap();
+        assert_eq!(cache.metadata().len(), 2);
+
+        fs::remove_file(&path_del).unwrap();
+        cache.apply_changes_with_removals(vec![path_mod], vec![path_del.clone()]);
+
+        // Deleted file should be gone from metadata cache.
+        assert!(cache.metadata().get(&path_del).is_none());
+        assert_eq!(cache.metadata().len(), 1);
+    }
+}
