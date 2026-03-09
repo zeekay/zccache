@@ -10,6 +10,8 @@ cargo = "ci.trampoline:cargo"
 rustc = "ci.trampoline:rustc"
 rustfmt = "ci.trampoline:rustfmt"
 clippy-driver = "ci.trampoline:clippy_driver"
+run_zccache = "ci.trampoline:run_zccache"
+run_zccache_daemon = "ci.trampoline:run_zccache_daemon"
 
 [build-system]
 requires = ["setuptools>=64"]

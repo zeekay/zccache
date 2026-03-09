@@ -56,3 +56,32 @@ def rustfmt():
 
 def clippy_driver():
     _run_tool("clippy-driver")
+
+
+def _run_cargo_bin(package):
+    """Run a cargo binary with the correct toolchain on PATH."""
+    cargo_bin = _find_cargo_bin()
+    if not cargo_bin:
+        print("error: Cannot find .cargo/bin. Run ./install first.", file=sys.stderr)
+        sys.exit(1)
+
+    os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
+
+    extra = sys.argv[1:]
+    # Strip leading '--' that uv inserts
+    if extra and extra[0] == "--":
+        extra = extra[1:]
+    cmd = ["cargo", "run", "-p", package]
+    if extra:
+        cmd.append("--")
+        cmd.extend(extra)
+    result = subprocess.run(cmd)
+    sys.exit(result.returncode)
+
+
+def run_zccache():
+    _run_cargo_bin("zccache-cli")
+
+
+def run_zccache_daemon():
+    _run_cargo_bin("zccache-daemon")
