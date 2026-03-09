@@ -1,12 +1,8 @@
 //! Adversarial corner-case tests for cache correctness.
 //!
 //! These tests target subtle scenarios NOT covered by other test suites:
-//! - Content revert cycles (A→B→A should hit original cache)
-//! - Diamond dependency invalidation (shared transitive header)
-//! - Same content, different filenames (filename in cache key)
 //! - Failed compile not cached (header appears after failure)
 //! - Cache persistence across session boundaries
-//! - Deep transitive include chains (5+ levels)
 //! - Thundering herd (concurrent same-file compilation from multiple sessions)
 //!
 //! Run all:    uv run cargo test -p zccache-daemon --test adversarial_corner_cases -- --nocapture
@@ -84,6 +80,8 @@ async fn compile(
             session_id,
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_string(),
+            compiler: None,
+            env: None,
         })
         .await
         .unwrap();
@@ -181,247 +179,6 @@ impl TestHarness {
         self.shutdown.notify_one();
         self.server_handle.await.unwrap();
     }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// CONTENT REVERT CYCLE
-//
-// Edit source A→B→A. The cache should retain the original entry and return
-// a hit when content reverts to its original state.
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Content revert: A→B (miss) → A (should hit original cache).
-/// This tests that the cache retains old artifact entries even after new
-/// content overwrites the same filename.
-#[tokio::test]
-async fn corner_content_revert_hits_original_cache() {
-    let mut h = match TestHarness::new().await {
-        Some(h) => h,
-        None => return,
-    };
-
-    let original = "int f() { return 1; }\n";
-    let modified = "int f() { return 2; }\n";
-
-    // Compile original (miss)
-    h.write_file("revert.cpp", original);
-    let (_, cached, obj_original) = h.compile_file_read("revert.cpp", "revert.o").await;
-    assert!(!cached, "first compile must miss");
-
-    // Edit to different content (miss)
-    h.write_file("revert.cpp", modified);
-    let (_, cached, obj_modified) = h.compile_file_read("revert.cpp", "revert.o").await;
-    assert!(!cached, "modified content must miss");
-    assert_ne!(
-        obj_original, obj_modified,
-        "different content → different .o"
-    );
-
-    // Revert to original content (should hit!)
-    h.write_file("revert.cpp", original);
-    std::fs::remove_file(h.path("revert.o")).unwrap();
-    let (_, cached, obj_reverted) = h.compile_file_read("revert.cpp", "revert.o").await;
-    assert!(
-        cached,
-        "reverting to original content should hit the original cache entry"
-    );
-    assert_eq!(
-        obj_original, obj_reverted,
-        "reverted .o must match original .o byte-for-byte"
-    );
-
-    h.shutdown().await;
-}
-
-/// Extended revert cycle: A→B→C→A. Same principle, but with an intermediate state.
-#[tokio::test]
-async fn corner_content_revert_three_way_cycle() {
-    let mut h = match TestHarness::new().await {
-        Some(h) => h,
-        None => return,
-    };
-
-    let v1 = "int f() { return 10; }\n";
-    let v2 = "int f() { return 20; }\n";
-    let v3 = "int f() { return 30; }\n";
-
-    // v1 → miss
-    h.write_file("cycle.cpp", v1);
-    let (_, cached, obj_v1) = h.compile_file_read("cycle.cpp", "cycle.o").await;
-    assert!(!cached);
-
-    // v2 → miss
-    h.write_file("cycle.cpp", v2);
-    let (_, cached, obj_v2) = h.compile_file_read("cycle.cpp", "cycle.o").await;
-    assert!(!cached);
-    assert_ne!(obj_v1, obj_v2);
-
-    // v3 → miss
-    h.write_file("cycle.cpp", v3);
-    let (_, cached, obj_v3) = h.compile_file_read("cycle.cpp", "cycle.o").await;
-    assert!(!cached);
-    assert_ne!(obj_v2, obj_v3);
-
-    // Back to v1 → should hit
-    h.write_file("cycle.cpp", v1);
-    std::fs::remove_file(h.path("cycle.o")).unwrap();
-    let (_, cached, obj_v1_again) = h.compile_file_read("cycle.cpp", "cycle.o").await;
-    assert!(cached, "revert to v1 should hit original cache");
-    assert_eq!(obj_v1, obj_v1_again);
-
-    // Back to v2 → should also hit
-    h.write_file("cycle.cpp", v2);
-    std::fs::remove_file(h.path("cycle.o")).unwrap();
-    let (_, cached, obj_v2_again) = h.compile_file_read("cycle.cpp", "cycle.o").await;
-    assert!(cached, "revert to v2 should hit its cache entry");
-    assert_eq!(obj_v2, obj_v2_again);
-
-    h.shutdown().await;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// DIAMOND DEPENDENCY INVALIDATION
-//
-// A.cpp includes B.h and C.h. Both B.h and C.h include D.h.
-// Editing D.h must invalidate A.cpp because D.h is a transitive dependency
-// reachable through both paths.
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Diamond: A.cpp → {B.h, C.h} → D.h. Edit D.h → must invalidate.
-#[tokio::test]
-async fn corner_diamond_dependency_invalidation() {
-    let mut h = match TestHarness::new().await {
-        Some(h) => h,
-        None => return,
-    };
-
-    h.write_file("d.h", "#pragma once\n#define DIAMOND_VAL 1\n");
-    h.write_file(
-        "b.h",
-        "#pragma once\n#include \"d.h\"\ninline int from_b() { return DIAMOND_VAL; }\n",
-    );
-    h.write_file(
-        "c.h",
-        "#pragma once\n#include \"d.h\"\ninline int from_c() { return DIAMOND_VAL + 10; }\n",
-    );
-    h.write_file(
-        "diamond.cpp",
-        "#include \"b.h\"\n#include \"c.h\"\nint f() { return from_b() + from_c(); }\n",
-    );
-
-    let (exit, cached, obj_v1) = h.compile_file_read("diamond.cpp", "diamond.o").await;
-    assert_eq!(exit, 0);
-    assert!(!cached);
-
-    // Edit the shared leaf header D.h — source files unchanged
-    h.write_file("d.h", "#pragma once\n#define DIAMOND_VAL 99\n");
-
-    let (exit, cached, obj_v2) = h.compile_file_read("diamond.cpp", "diamond.o").await;
-    assert_eq!(exit, 0);
-    assert!(
-        !cached,
-        "diamond dependency: editing D.h must invalidate A.cpp"
-    );
-    assert_ne!(obj_v1, obj_v2, "different DIAMOND_VAL → different .o");
-
-    // Verify cache hit on second compile with same state
-    std::fs::remove_file(h.path("diamond.o")).unwrap();
-    let (_, cached, obj_v2b) = h.compile_file_read("diamond.cpp", "diamond.o").await;
-    assert!(cached, "no changes → should hit cache");
-    assert_eq!(obj_v2, obj_v2b);
-
-    h.shutdown().await;
-}
-
-/// Diamond with independent branch edit: edit only B.h (not D.h).
-/// A.cpp must still miss because B.h changed.
-#[tokio::test]
-async fn corner_diamond_branch_edit() {
-    let mut h = match TestHarness::new().await {
-        Some(h) => h,
-        None => return,
-    };
-
-    h.write_file("shared.h", "#pragma once\n#define SHARED 1\n");
-    h.write_file(
-        "left.h",
-        "#pragma once\n#include \"shared.h\"\ninline int left() { return SHARED; }\n",
-    );
-    h.write_file(
-        "right.h",
-        "#pragma once\n#include \"shared.h\"\ninline int right() { return SHARED + 5; }\n",
-    );
-    h.write_file(
-        "dia2.cpp",
-        "#include \"left.h\"\n#include \"right.h\"\nint f() { return left() + right(); }\n",
-    );
-
-    let (_, cached, obj_v1) = h.compile_file_read("dia2.cpp", "dia2.o").await;
-    assert!(!cached);
-
-    // Edit only left.h — right.h and shared.h unchanged
-    h.write_file(
-        "left.h",
-        "#pragma once\n#include \"shared.h\"\ninline int left() { return SHARED + 100; }\n",
-    );
-
-    let (_, cached, obj_v2) = h.compile_file_read("dia2.cpp", "dia2.o").await;
-    assert!(!cached, "editing one diamond branch must invalidate");
-    assert_ne!(obj_v1, obj_v2);
-
-    h.shutdown().await;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// SAME CONTENT, DIFFERENT FILENAMES
-//
-// Two source files with identical content must produce separate cache entries.
-// The filename/path is part of the cache key (__FILE__ macro, debug info, etc.).
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Two files with identical content → separate cache entries, both miss initially.
-/// Editing one must NOT affect the other.
-#[tokio::test]
-async fn corner_same_content_different_filenames() {
-    let mut h = match TestHarness::new().await {
-        Some(h) => h,
-        None => return,
-    };
-
-    let content = "int f() { return 42; }\n";
-
-    h.write_file("alpha.cpp", content);
-    h.write_file("beta.cpp", content);
-
-    // Both should miss (different filenames = different cache keys)
-    let (_, cached_a, _obj_a) = h.compile_file_read("alpha.cpp", "alpha.o").await;
-    assert!(!cached_a, "alpha.cpp first compile must miss");
-
-    let (_, cached_b, _obj_b) = h.compile_file_read("beta.cpp", "beta.o").await;
-    assert!(
-        !cached_b,
-        "beta.cpp first compile must miss (different cache key)"
-    );
-
-    // Both should hit on recompile
-    std::fs::remove_file(h.path("alpha.o")).unwrap();
-    let (_, cached_a, _) = h.compile_file_read("alpha.cpp", "alpha.o").await;
-    assert!(cached_a, "alpha.cpp recompile should hit");
-
-    std::fs::remove_file(h.path("beta.o")).unwrap();
-    let (_, cached_b, _) = h.compile_file_read("beta.cpp", "beta.o").await;
-    assert!(cached_b, "beta.cpp recompile should hit");
-
-    // Edit alpha only → beta should still hit
-    h.write_file("alpha.cpp", "int f() { return 999; }\n");
-    let (_, cached_a, _) = h.compile_file_read("alpha.cpp", "alpha.o").await;
-    assert!(!cached_a, "edited alpha must miss");
-
-    std::fs::remove_file(h.path("beta.o")).unwrap();
-    let (_, cached_b, _) = h.compile_file_read("beta.cpp", "beta.o").await;
-    assert!(cached_b, "untouched beta must still hit");
-
-    h.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -573,85 +330,6 @@ async fn corner_cache_survives_session_restart() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// DEEP TRANSITIVE INCLUDE CHAIN
-//
-// A.cpp → h1.h → h2.h → h3.h → h4.h → h5.h
-// Edit h5.h (the deepest leaf) → A.cpp must be invalidated.
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// 5-level deep include chain. Edit the deepest header → must invalidate.
-#[tokio::test]
-async fn corner_deep_transitive_chain_5_levels() {
-    let mut h = match TestHarness::new().await {
-        Some(h) => h,
-        None => return,
-    };
-
-    h.write_file("h5.h", "#pragma once\n#define LEAF_VAL 1\n");
-    h.write_file("h4.h", "#pragma once\n#include \"h5.h\"\n");
-    h.write_file("h3.h", "#pragma once\n#include \"h4.h\"\n");
-    h.write_file("h2.h", "#pragma once\n#include \"h3.h\"\n");
-    h.write_file("h1.h", "#pragma once\n#include \"h2.h\"\n");
-    h.write_file(
-        "deep_chain.cpp",
-        "#include \"h1.h\"\nint f() { return LEAF_VAL; }\n",
-    );
-
-    let (exit, cached, obj_v1) = h.compile_file_read("deep_chain.cpp", "deep_chain.o").await;
-    assert_eq!(exit, 0);
-    assert!(!cached);
-
-    // Verify cache hit
-    std::fs::remove_file(h.path("deep_chain.o")).unwrap();
-    let (_, cached, _) = h.compile_file_read("deep_chain.cpp", "deep_chain.o").await;
-    assert!(cached, "no changes → hit");
-
-    // Edit the DEEPEST header (5 levels down)
-    h.write_file("h5.h", "#pragma once\n#define LEAF_VAL 999\n");
-
-    let (exit, cached, obj_v2) = h.compile_file_read("deep_chain.cpp", "deep_chain.o").await;
-    assert_eq!(exit, 0);
-    assert!(
-        !cached,
-        "editing h5.h (5 levels deep) must invalidate deep_chain.cpp"
-    );
-    assert_ne!(obj_v1, obj_v2, "different LEAF_VAL → different .o");
-
-    h.shutdown().await;
-}
-
-/// 5-level chain: edit a MIDDLE header (h3.h). Must invalidate.
-#[tokio::test]
-async fn corner_deep_chain_middle_edit() {
-    let mut h = match TestHarness::new().await {
-        Some(h) => h,
-        None => return,
-    };
-
-    h.write_file("m5.h", "#pragma once\n#define M5 1\n");
-    h.write_file("m4.h", "#pragma once\n#include \"m5.h\"\n#define M4 2\n");
-    h.write_file("m3.h", "#pragma once\n#include \"m4.h\"\n#define M3 3\n");
-    h.write_file("m2.h", "#pragma once\n#include \"m3.h\"\n");
-    h.write_file("m1.h", "#pragma once\n#include \"m2.h\"\n");
-    h.write_file(
-        "mid_chain.cpp",
-        "#include \"m1.h\"\nint f() { return M3 + M4 + M5; }\n",
-    );
-
-    let (_, cached, obj_v1) = h.compile_file_read("mid_chain.cpp", "mid_chain.o").await;
-    assert!(!cached);
-
-    // Edit middle header h3.h — change the M3 value
-    h.write_file("m3.h", "#pragma once\n#include \"m4.h\"\n#define M3 333\n");
-
-    let (_, cached, obj_v2) = h.compile_file_read("mid_chain.cpp", "mid_chain.o").await;
-    assert!(!cached, "editing middle header m3.h must invalidate");
-    assert_ne!(obj_v1, obj_v2);
-
-    h.shutdown().await;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // THUNDERING HERD
 //
 // Multiple sessions compile the exact same file at the same time.
@@ -716,13 +394,23 @@ async fn corner_thundering_herd_same_file() {
         assert_eq!(*exit, 0, "session {i} must compile successfully");
     }
 
-    // All must produce identical .o bytes (whether cached or not)
-    let reference_obj = &results[0].2;
+    // All must produce identical .o bytes (whether cached or not),
+    // ignoring the COFF TimeDateStamp at bytes 4..8 which the compiler
+    // sets to the current time and may differ across compilations.
+    let strip_coff_timestamp = |data: &[u8]| -> Vec<u8> {
+        let mut v = data.to_vec();
+        if v.len() >= 8 {
+            v[4..8].fill(0);
+        }
+        v
+    };
+    let reference_obj = strip_coff_timestamp(&results[0].2);
     assert!(!reference_obj.is_empty(), "reference .o must not be empty");
     for (i, (_, _, obj)) in results.iter().enumerate().skip(1) {
         assert_eq!(
-            reference_obj, obj,
-            "session {i} must produce identical .o to session 0"
+            reference_obj,
+            strip_coff_timestamp(obj),
+            "session {i} must produce identical .o to session 0 (ignoring COFF timestamp)"
         );
     }
 

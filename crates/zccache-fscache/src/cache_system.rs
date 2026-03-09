@@ -135,6 +135,18 @@ impl CacheSystem {
         self.metadata.downgrade_all();
         self.journal.mark_overflow()
     }
+
+    /// Register files as tracked by the journal without downgrading their
+    /// confidence.
+    ///
+    /// This enables the zero-syscall fast path in `lookup_since` for files
+    /// that the watcher hasn't reported yet. Call after scanning includes
+    /// on a cache miss so headers get the fast path on subsequent hits.
+    pub fn register_tracked(&self, paths: &[PathBuf]) {
+        for path in paths {
+            self.journal.register(path.clone());
+        }
+    }
 }
 
 impl Default for CacheSystem {
@@ -323,6 +335,27 @@ mod tests {
 
         // Journal: queries before overflow return "changed".
         assert!(cache.journal().changed_since(&path_a, c_before));
+    }
+
+    #[test]
+    fn register_tracked_enables_fast_path() {
+        let dir = TempDir::new().unwrap();
+        let path = create_file(&dir, "header.h", "content");
+
+        let cache = CacheSystem::new();
+
+        // First lookup populates metadata cache at High confidence.
+        let r1 = cache.lookup_since(&path, Clock::ZERO).unwrap();
+
+        // Register the file so journal tracks it.
+        cache.register_tracked(std::slice::from_ref(&path));
+
+        let clock = cache.current_clock();
+
+        // Now lookup_since should use fast path (journal says no change, hash cached).
+        let r2 = cache.lookup_since(&path, clock).unwrap();
+        assert_eq!(r1.hash, r2.hash);
+        assert_eq!(r2.hash, zccache_hash::hash_bytes(b"content"));
     }
 
     #[test]

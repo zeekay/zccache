@@ -307,6 +307,8 @@ int main() {
                 output_obj.to_string_lossy().into_owned(),
             ],
             cwd: tmp.path().to_string_lossy().into_owned(),
+            compiler: None,
+            env: None,
         })
         .await
         .unwrap();
@@ -342,6 +344,8 @@ int main() {
                 output_obj.to_string_lossy().into_owned(),
             ],
             cwd: tmp.path().to_string_lossy().into_owned(),
+            compiler: None,
+            env: None,
         })
         .await
         .unwrap();

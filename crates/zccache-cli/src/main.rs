@@ -127,6 +127,7 @@ fn main() -> ExitCode {
             endpoint,
         } => {
             let endpoint = resolve_endpoint(endpoint.as_deref());
+            let compiler = zccache_core::path::normalize_msys_path(&compiler);
             let cwd = cwd.unwrap_or_else(|| {
                 std::env::current_dir()
                     .unwrap_or_default()
@@ -355,37 +356,22 @@ async fn cmd_session_end(endpoint: &str, session_id: u64) -> ExitCode {
 
 // ─── Wrap (compiler wrapper) ───────────────────────────────────────────────
 
-/// Wrap a compiler invocation. Reads ZCCACHE_SESSION_ID from env,
-/// connects to the daemon, sends Compile, relays stdout/stderr/exit_code.
+/// Wrap a compiler invocation.
 ///
 /// `args` is the full compiler command: ["clang++", "-c", "foo.cpp", "-o", "foo.o"]
-/// The first arg (compiler path) is stripped since the daemon already knows
-/// the compiler from SessionStart.
+///
+/// If ZCCACHE_SESSION_ID is set, uses that session and sends the compiler
+/// as a per-request override. If unset, auto-creates an ephemeral session
+/// for this single compilation (drop-in mode).
 fn run_wrap(args: &[String]) -> ExitCode {
-    let session_id: u64 = match std::env::var("ZCCACHE_SESSION_ID") {
-        Ok(val) => match val.parse() {
-            Ok(id) => id,
-            Err(_) => {
-                eprintln!("ZCCACHE_SESSION_ID={val:?} is not a valid u64");
-                return ExitCode::FAILURE;
-            }
-        },
-        Err(_) => {
-            eprintln!("ZCCACHE_SESSION_ID not set. Start a session first:");
-            eprintln!(
-                "  export ZCCACHE_SESSION_ID=$(zccache session-start --compiler /path/to/clang++)"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-
     if args.is_empty() {
         eprintln!("usage: zccache <compiler> <args...>");
         return ExitCode::FAILURE;
     }
 
-    // args[0] is the compiler (redundant — daemon knows from session).
-    // args[1..] are the actual compiler flags.
+    // Normalize MSYS paths (e.g. /c/Users/... → C:\Users\...) on Windows,
+    // then resolve to an absolute path so the daemon can find it.
+    let wrapped_compiler = resolve_compiler_path(&args[0]);
     let compiler_args: Vec<String> = if args.len() > 1 {
         args[1..].to_vec()
     } else {
@@ -397,12 +383,65 @@ fn run_wrap(args: &[String]) -> ExitCode {
         .to_string_lossy()
         .into_owned();
 
+    // Capture the client's environment for the daemon to pass to the compiler.
+    let client_env: Vec<(String, String)> = std::env::vars().collect();
+
     let endpoint = resolve_endpoint(None);
 
-    run_async(cmd_compile(&endpoint, session_id, compiler_args, cwd))
+    match std::env::var("ZCCACHE_SESSION_ID") {
+        Ok(val) => match val.parse::<u64>() {
+            Ok(session_id) => run_async(cmd_compile(
+                &endpoint,
+                session_id,
+                compiler_args,
+                cwd,
+                Some(wrapped_compiler),
+                client_env,
+            )),
+            Err(_) => {
+                eprintln!("ZCCACHE_SESSION_ID={val:?} is not a valid u64");
+                ExitCode::FAILURE
+            }
+        },
+        Err(_) => {
+            // No session — auto-create an ephemeral one for this compilation.
+            run_async(cmd_compile_ephemeral(
+                &endpoint,
+                &wrapped_compiler,
+                compiler_args,
+                cwd,
+                client_env,
+            ))
+        }
+    }
 }
 
-async fn cmd_compile(endpoint: &str, session_id: u64, args: Vec<String>, cwd: String) -> ExitCode {
+/// Resolve a compiler name/path to an absolute path.
+/// Normalizes MSYS paths on Windows, then searches PATH if not already absolute.
+fn resolve_compiler_path(compiler: &str) -> String {
+    let normalized = zccache_core::path::normalize_msys_path(compiler);
+    let path = std::path::Path::new(&normalized);
+
+    // Already absolute — return as-is.
+    if path.is_absolute() {
+        return normalized;
+    }
+
+    // Search PATH for the compiler.
+    match which_on_path(&normalized) {
+        Some(abs) => abs.to_string_lossy().into_owned(),
+        None => normalized, // Let the daemon report the error.
+    }
+}
+
+async fn cmd_compile(
+    endpoint: &str,
+    session_id: u64,
+    args: Vec<String>,
+    cwd: String,
+    compiler: Option<String>,
+    client_env: Vec<(String, String)>,
+) -> ExitCode {
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
         Err(e) => {
@@ -415,6 +454,8 @@ async fn cmd_compile(endpoint: &str, session_id: u64, args: Vec<String>, cwd: St
         session_id,
         args,
         cwd,
+        compiler,
+        env: Some(client_env),
     })
     .await
     .unwrap();
@@ -441,6 +482,93 @@ async fn cmd_compile(endpoint: &str, session_id: u64, args: Vec<String>, cwd: St
             ExitCode::FAILURE
         }
     }
+}
+
+/// Ephemeral session: auto-create a session, compile, then end the session.
+/// Used when ZCCACHE_SESSION_ID is not set (drop-in mode).
+async fn cmd_compile_ephemeral(
+    endpoint: &str,
+    compiler: &str,
+    args: Vec<String>,
+    cwd: String,
+    client_env: Vec<(String, String)>,
+) -> ExitCode {
+    if let Err(e) = ensure_daemon(endpoint).await {
+        eprintln!("cannot start daemon at {endpoint}: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let mut conn = match connect(endpoint).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cannot connect to daemon at {endpoint}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Start ephemeral session
+    conn.send(&zccache_protocol::Request::SessionStart {
+        client_pid: std::process::id(),
+        working_dir: cwd.clone(),
+        compiler: compiler.to_string(),
+        log_file: None,
+        track_stats: false,
+    })
+    .await
+    .unwrap();
+
+    let session_id = match conn.recv().await.unwrap() {
+        Some(zccache_protocol::Response::SessionStarted { session_id, .. }) => session_id,
+        Some(zccache_protocol::Response::Error { message }) => {
+            eprintln!("zccache: failed to create session: {message}");
+            return ExitCode::FAILURE;
+        }
+        other => {
+            eprintln!("unexpected response: {other:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Compile (no compiler override needed — session compiler IS the wrapped compiler)
+    conn.send(&zccache_protocol::Request::Compile {
+        session_id,
+        args,
+        cwd,
+        compiler: None,
+        env: Some(client_env),
+    })
+    .await
+    .unwrap();
+
+    let result = match conn.recv().await.unwrap() {
+        Some(zccache_protocol::Response::CompileResult {
+            exit_code,
+            stdout,
+            stderr,
+            ..
+        }) => {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&stdout);
+            let _ = std::io::stderr().write_all(&stderr);
+            ExitCode::from(exit_code as u8)
+        }
+        Some(zccache_protocol::Response::Error { message }) => {
+            eprintln!("zccache error: {message}");
+            ExitCode::FAILURE
+        }
+        other => {
+            eprintln!("unexpected response: {other:?}");
+            ExitCode::FAILURE
+        }
+    };
+
+    // End ephemeral session (best-effort)
+    let _ = conn
+        .send(&zccache_protocol::Request::SessionEnd { session_id })
+        .await;
+    let _: Option<zccache_protocol::Response> = conn.recv().await.unwrap_or(None);
+
+    result
 }
 
 // ─── Daemon auto-start ─────────────────────────────────────────────────────
@@ -507,12 +635,23 @@ fn find_daemon_binary() -> Option<std::path::PathBuf> {
 }
 
 /// Simple PATH lookup (no external crate needed).
+/// On Windows, also tries appending `.exe` if the name has no extension.
 fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
     let path_var = std::env::var_os("PATH")?;
+    let has_ext = std::path::Path::new(name).extension().is_some();
+
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(name);
         if candidate.is_file() {
             return Some(candidate);
+        }
+        // On Windows, try with .exe suffix
+        #[cfg(windows)]
+        if !has_ext {
+            let with_exe = dir.join(format!("{name}.exe"));
+            if with_exe.is_file() {
+                return Some(with_exe);
+            }
         }
     }
     None

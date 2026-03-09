@@ -44,6 +44,15 @@ pub enum Request {
         args: Vec<String>,
         /// Working directory for the compilation.
         cwd: String,
+        /// Override the session compiler for this compilation.
+        /// Used by `zccache wrap` when the wrapped compiler differs from
+        /// the session compiler (e.g., session started with g++ but wrapping gcc).
+        /// If `None`, uses the session's compiler.
+        compiler: Option<String>,
+        /// Client environment variables to pass to the compiler process.
+        /// If `None`, the daemon's own environment is inherited (backward compat).
+        /// If `Some`, the compiler process uses exactly these env vars.
+        env: Option<Vec<(String, String)>>,
     },
     /// End a session.
     SessionEnd {
@@ -319,6 +328,8 @@ mod tests {
             session_id: 1,
             args: vec!["-c".into(), "foo.c".into()],
             cwd: "/tmp".into(),
+            compiler: None,
+            env: None,
         });
     }
 

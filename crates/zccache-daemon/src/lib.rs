@@ -9,4 +9,4 @@ pub mod server;
 pub mod stats;
 
 pub use server::DaemonServer;
-pub use stats::StatsCollector;
+pub use stats::{PhaseProfiler, ProfileSnapshot, StatsCollector};

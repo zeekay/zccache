@@ -259,11 +259,11 @@ impl DepGraph {
     /// Trim entries not accessed within the given duration.
     /// Returns the number of entries removed.
     pub fn trim(&self, max_age: Duration) -> usize {
-        let cutoff = Instant::now() - max_age;
+        let now = Instant::now();
         let mut removed = 0;
 
         self.contexts.retain(|_, entry| {
-            if entry.last_accessed < cutoff {
+            if now.duration_since(entry.last_accessed) > max_age {
                 removed += 1;
                 false
             } else {
@@ -555,12 +555,11 @@ mod tests {
         };
         graph.update(&key, scan, dummy_hash);
 
-        // Artificially age the entry.
-        if let Some(mut entry) = graph.contexts.get_mut(&key) {
-            entry.last_accessed = Instant::now() - Duration::from_secs(3600);
-        }
+        // Sleep briefly so the entry's last_accessed is older than Duration::ZERO.
+        std::thread::sleep(Duration::from_millis(5));
 
-        let removed = graph.trim(Duration::from_secs(60));
+        // Trim with max_age=0: everything not accessed this exact instant is removed.
+        let removed = graph.trim(Duration::ZERO);
         assert_eq!(removed, 1);
         assert_eq!(graph.stats().context_count, 0);
     }

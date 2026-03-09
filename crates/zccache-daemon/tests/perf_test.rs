@@ -129,6 +129,8 @@ async fn compile(
             session_id,
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_string(),
+            compiler: None,
+            env: None,
         })
         .await
         .unwrap();

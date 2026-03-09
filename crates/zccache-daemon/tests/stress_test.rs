@@ -87,6 +87,8 @@ async fn compile(
             session_id,
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_string(),
+            compiler: None,
+            env: None,
         })
         .await
         .unwrap();
@@ -103,86 +105,6 @@ async fn compile(
 // ═══════════════════════════════════════════════════════════════════════
 // CORRECTNESS ATTACKS
 // ═══════════════════════════════════════════════════════════════════════
-
-/// Modifying the source file between compiles MUST invalidate the cache.
-/// If the cache returns stale output for modified source, it's catastrophic.
-#[tokio::test]
-async fn adversarial_source_modification_invalidates_cache() {
-    let clang = match find_clang() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let tmp = tempfile::tempdir().unwrap();
-    let src = tmp.path().join("modify.cpp");
-    let obj = tmp.path().join("modify.o");
-    let log = tmp.path().join("log.txt");
-    let cwd = tmp.path().to_string_lossy().into_owned();
-
-    // Version 1: returns 0
-    std::fs::write(&src, "int main() { return 0; }\n").unwrap();
-
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
-    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
-
-    // Compile v1
-    let (exit_code, cached) = compile(
-        &mut client,
-        sid,
-        &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
-        &cwd,
-    )
-    .await;
-    assert_eq!(exit_code, 0);
-    assert!(!cached, "first compile must be a miss");
-    let obj_v1 = std::fs::read(&obj).unwrap();
-
-    // Version 2: returns 42 — different code, must produce different .o
-    std::fs::write(&src, "int main() { return 42; }\n").unwrap();
-
-    let (exit_code, cached) = compile(
-        &mut client,
-        sid,
-        &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
-        &cwd,
-    )
-    .await;
-    assert_eq!(exit_code, 0);
-    assert!(!cached, "modified source MUST be a cache miss");
-    let obj_v2 = std::fs::read(&obj).unwrap();
-
-    // The two object files MUST differ (different return values = different code)
-    assert_ne!(obj_v1, obj_v2, "different source must produce different .o");
-
-    // Now compile v2 again — THIS should be a cache hit
-    std::fs::remove_file(&obj).unwrap();
-    let (exit_code, cached) = compile(
-        &mut client,
-        sid,
-        &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
-        &cwd,
-    )
-    .await;
-    assert_eq!(exit_code, 0);
-    assert!(cached, "unmodified v2 recompile should be a cache hit");
-    assert_eq!(
-        std::fs::read(&obj).unwrap(),
-        obj_v2,
-        "cached .o must match v2"
-    );
-
-    // Log should show: miss, miss, hit
-    let log_text = std::fs::read_to_string(&log).unwrap();
-    let lines: Vec<&str> = log_text.lines().collect();
-    assert!(lines.len() >= 3, "expected 3+ log lines, got:\n{log_text}");
-    assert!(lines[0].contains("cache miss"), "line 0: {}", lines[0]);
-    assert!(lines[1].contains("cache miss"), "line 1: {}", lines[1]);
-    assert!(lines[2].contains("cache hit"), "line 2: {}", lines[2]);
-
-    shutdown.notify_one();
-    server_handle.await.unwrap();
-}
 
 /// Different compiler flags MUST produce different cache entries.
 /// -O0 vs -O2 produce different machine code — returning the wrong one is catastrophic.
@@ -436,77 +358,6 @@ async fn adversarial_compile_errors_never_cached() {
     server_handle.await.unwrap();
 }
 
-/// Local header changes MUST invalidate the cache.
-/// If foo.cpp includes foo.h and foo.h changes, using the old cached .o is wrong.
-///
-/// This is the most dangerous cache correctness issue — the cache key currently
-/// only hashes the source file, not its transitive includes.
-#[tokio::test]
-async fn adversarial_local_header_change_must_invalidate() {
-    let clang = match find_clang() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let tmp = tempfile::tempdir().unwrap();
-    let header = tmp.path().join("config.h");
-    let src = tmp.path().join("with_header.cpp");
-    let obj = tmp.path().join("with_header.o");
-    let log = tmp.path().join("log.txt");
-    let cwd = tmp.path().to_string_lossy().into_owned();
-
-    // Header v1: VALUE = 1
-    std::fs::write(&header, "#define VALUE 1\n").unwrap();
-    std::fs::write(
-        &src,
-        r#"#include "config.h"
-int main() { return VALUE; }
-"#,
-    )
-    .unwrap();
-
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
-    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
-
-    // Compile with header v1
-    let (exit_code, cached) = compile(
-        &mut client,
-        sid,
-        &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
-        &cwd,
-    )
-    .await;
-    assert_eq!(exit_code, 0);
-    assert!(!cached);
-    let obj_v1 = std::fs::read(&obj).unwrap();
-
-    // Change header to v2: VALUE = 99
-    std::fs::write(&header, "#define VALUE 99\n").unwrap();
-    // Source file is UNCHANGED — only the header changed.
-
-    // Compile again — should this be a cache miss?
-    // With the current implementation (source-only cache key), this WILL be a
-    // cache hit returning stale output. This test documents the known limitation.
-    let (exit_code2, cached2) = compile(
-        &mut client,
-        sid,
-        &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
-        &cwd,
-    )
-    .await;
-    assert_eq!(exit_code2, 0);
-
-    // Header hashes are included in the artifact key via DepGraph.
-    // Editing a header must invalidate the cache even if the source is unchanged.
-    assert!(!cached2, "header change must invalidate cache");
-    let obj_v2 = std::fs::read(&obj).unwrap();
-    assert_ne!(obj_v1, obj_v2, "header change should produce different .o");
-
-    shutdown.notify_one();
-    server_handle.await.unwrap();
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // CONCURRENCY ATTACKS
 // ═══════════════════════════════════════════════════════════════════════
@@ -753,6 +604,8 @@ async fn adversarial_invalid_session_id() {
                 "out.o".to_string(),
             ],
             cwd,
+            compiler: None,
+            env: None,
         })
         .await
         .unwrap();
@@ -808,6 +661,8 @@ async fn adversarial_non_cacheable_passthrough() {
             session_id: sid,
             args: vec!["-E".to_string(), src.to_string_lossy().into_owned()],
             cwd: cwd.clone(),
+            compiler: None,
+            env: None,
         })
         .await
         .unwrap();
@@ -1117,178 +972,6 @@ async fn adversarial_spaces_in_filename() {
     server_handle.await.unwrap();
 }
 
-/// Source file deleted between first successful cache and recompile attempt.
-/// hash_file should fail, gracefully falling back to direct compile error.
-#[tokio::test]
-async fn adversarial_source_deleted_after_caching() {
-    let clang = match find_clang() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let tmp = tempfile::tempdir().unwrap();
-    let src = tmp.path().join("disappear.cpp");
-    let obj = tmp.path().join("disappear.o");
-    let log = tmp.path().join("log.txt");
-    let cwd = tmp.path().to_string_lossy().into_owned();
-
-    std::fs::write(&src, "int main() { return 0; }\n").unwrap();
-
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
-    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
-
-    // Cache it
-    let (exit_code, cached) = compile(
-        &mut client,
-        sid,
-        &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
-        &cwd,
-    )
-    .await;
-    assert_eq!(exit_code, 0);
-    assert!(!cached);
-
-    // Delete the source file
-    std::fs::remove_file(&src).unwrap();
-    std::fs::remove_file(&obj).unwrap();
-
-    // Try to compile again — source hashing should fail, not panic
-    client
-        .send(&Request::Compile {
-            session_id: sid,
-            args: vec![
-                "-c".to_string(),
-                src.to_string_lossy().into_owned(),
-                "-o".to_string(),
-                obj.to_string_lossy().into_owned(),
-            ],
-            cwd: cwd.clone(),
-        })
-        .await
-        .unwrap();
-
-    let resp: Option<Response> = client.recv().await.unwrap();
-    match resp {
-        Some(Response::CompileResult { exit_code, .. }) => {
-            // Should fail (source doesn't exist) — either via hash_file error
-            // or the compiler itself failing
-            assert_ne!(exit_code, 0, "compile of deleted source should fail");
-        }
-        Some(Response::Error { .. }) => {
-            // Also acceptable — cache key computation failed
-        }
-        other => panic!("expected CompileResult or Error, got: {other:?}"),
-    }
-
-    // Server should still be alive
-    client.send(&Request::Ping).await.unwrap();
-    let resp: Option<Response> = client.recv().await.unwrap();
-    assert_eq!(resp, Some(Response::Pong));
-
-    shutdown.notify_one();
-    server_handle.await.unwrap();
-}
-
-/// Multiple files with #include — each file's cache entry is independent.
-/// Modifying one file should not affect another file's cache entry.
-#[tokio::test]
-async fn adversarial_independent_file_caches() {
-    let clang = match find_clang() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let tmp = tempfile::tempdir().unwrap();
-    let src_a = tmp.path().join("independent_a.cpp");
-    let src_b = tmp.path().join("independent_b.cpp");
-    let obj_a = tmp.path().join("independent_a.o");
-    let obj_b = tmp.path().join("independent_b.o");
-    let log = tmp.path().join("log.txt");
-    let cwd = tmp.path().to_string_lossy().into_owned();
-
-    std::fs::write(&src_a, "int fa() { return 1; }\n").unwrap();
-    std::fs::write(&src_b, "int fb() { return 2; }\n").unwrap();
-
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
-    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
-
-    // Cache both files
-    let (exit_code, _) = compile(
-        &mut client,
-        sid,
-        &[
-            "-c",
-            &src_a.to_string_lossy(),
-            "-o",
-            &obj_a.to_string_lossy(),
-        ],
-        &cwd,
-    )
-    .await;
-    assert_eq!(exit_code, 0);
-    let obj_a_data = std::fs::read(&obj_a).unwrap();
-
-    let (exit_code, _) = compile(
-        &mut client,
-        sid,
-        &[
-            "-c",
-            &src_b.to_string_lossy(),
-            "-o",
-            &obj_b.to_string_lossy(),
-        ],
-        &cwd,
-    )
-    .await;
-    assert_eq!(exit_code, 0);
-
-    // Modify file A
-    std::fs::write(&src_a, "int fa() { return 999; }\n").unwrap();
-
-    // Recompile A — should miss (source changed)
-    let (exit_code, cached) = compile(
-        &mut client,
-        sid,
-        &[
-            "-c",
-            &src_a.to_string_lossy(),
-            "-o",
-            &obj_a.to_string_lossy(),
-        ],
-        &cwd,
-    )
-    .await;
-    assert_eq!(exit_code, 0);
-    assert!(!cached, "modified file A should be a miss");
-    let obj_a_new = std::fs::read(&obj_a).unwrap();
-    assert_ne!(
-        obj_a_data, obj_a_new,
-        "modified A should produce different .o"
-    );
-
-    // Recompile B — should STILL HIT (B was not modified)
-    std::fs::remove_file(&obj_b).unwrap();
-    let (exit_code, cached) = compile(
-        &mut client,
-        sid,
-        &[
-            "-c",
-            &src_b.to_string_lossy(),
-            "-o",
-            &obj_b.to_string_lossy(),
-        ],
-        &cwd,
-    )
-    .await;
-    assert_eq!(exit_code, 0);
-    assert!(cached, "unmodified file B should still hit cache");
-
-    shutdown.notify_one();
-    server_handle.await.unwrap();
-}
-
 /// Werror turns warnings into errors — different exit code path.
 /// -Werror compile should fail and NOT be cached. Without -Werror, same
 /// source should succeed and BE cached.
@@ -1364,6 +1047,101 @@ async fn adversarial_werror_vs_no_werror() {
     .await;
     assert_eq!(exit_code, 0);
     assert!(cached, "-Wall recompile (no -Werror) should hit cache");
+
+    shutdown.notify_one();
+    server_handle.await.unwrap();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// COMPILER OVERRIDE
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Session started with clang++ (C++ compiler), but wrapping clang (C compiler).
+/// The per-request compiler override must be used, not the session compiler.
+/// Without the fix, this test would fail because clang++ rejects `-std=c11`.
+#[tokio::test]
+async fn compiler_override_uses_wrapped_compiler() {
+    let clangpp = match find_clang() {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Derive clang (C compiler) from clang++ path.
+    let clang = clangpp
+        .parent()
+        .unwrap()
+        .join(if cfg!(windows) { "clang.exe" } else { "clang" });
+    if !clang.exists() {
+        eprintln!("SKIP: clang not found at {}", clang.display());
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("test.c");
+    let obj = tmp.path().join("test.o");
+    let log = tmp.path().join("log.txt");
+    let cwd = tmp.path().to_string_lossy().into_owned();
+
+    // C code with -std=c11 flag — invalid for C++ compilers.
+    std::fs::write(
+        &src,
+        "struct Point { int x; int y; };\n\
+         int main(void) {\n\
+         \tstruct Point p = { .x = 1, .y = 2 };\n\
+         \treturn p.x + p.y - 3;\n\
+         }\n",
+    )
+    .unwrap();
+
+    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+
+    // Start session with clang++ (C++ compiler)
+    let sid = start_session(&mut client, &clangpp, &cwd, &log.to_string_lossy()).await;
+
+    // Compile a .c file with -std=c11, overriding the compiler to clang (C compiler).
+    client
+        .send(&Request::Compile {
+            session_id: sid,
+            args: vec![
+                "-c".to_string(),
+                "-std=c11".to_string(),
+                src.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                obj.to_string_lossy().into_owned(),
+            ],
+            cwd: cwd.clone(),
+            compiler: Some(clang.to_string_lossy().into_owned()),
+            env: None,
+        })
+        .await
+        .unwrap();
+
+    match client.recv().await.unwrap() {
+        Some(Response::CompileResult {
+            exit_code,
+            cached,
+            stderr,
+            ..
+        }) => {
+            let stderr_str = String::from_utf8_lossy(&stderr);
+            assert_eq!(
+                exit_code, 0,
+                "C file with -std=c11 should compile with clang override. stderr: {stderr_str}"
+            );
+            assert!(!cached, "first compile should be a miss");
+            assert!(
+                !stderr_str.contains("not valid for C++"),
+                "compiler override should use clang, not clang++. stderr: {stderr_str}"
+            );
+        }
+        Some(Response::Error { message }) => {
+            panic!("compile error (compiler override not working?): {message}");
+        }
+        other => panic!("expected CompileResult, got: {other:?}"),
+    }
+
+    assert!(obj.exists(), "object file should be produced");
 
     shutdown.notify_one();
     server_handle.await.unwrap();

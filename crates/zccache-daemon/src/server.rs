@@ -12,7 +12,7 @@ use zccache_ipc::{IpcConnection, IpcListener};
 use zccache_protocol::{ArtifactData, ArtifactOutput, Request, Response};
 use zccache_watcher::{NotifyWatcher, SettleBuffer, SettledEvent};
 
-use crate::stats::StatsCollector;
+use crate::stats::{HitPhases, MissPhases, PhaseProfiler, StatsCollector};
 
 /// Cached compilation artifact.
 #[derive(Debug, Clone)]
@@ -45,6 +45,10 @@ struct SharedState {
     start_time: u64,
     /// Global stats collector.
     stats: StatsCollector,
+    /// Phase-level profiler for hot-path breakdown.
+    profiler: PhaseProfiler,
+    /// On-disk artifact cache for hardlink optimization on cache hits.
+    artifact_dir: PathBuf,
 }
 
 /// The daemon server that listens for IPC connections.
@@ -82,6 +86,13 @@ impl DaemonServer {
                 last_activity: AtomicU64::new(now),
                 start_time: now,
                 stats: StatsCollector::new(),
+                profiler: PhaseProfiler::new(),
+                artifact_dir: {
+                    let dir = std::env::temp_dir()
+                        .join(format!("zccache-artifacts-{}", std::process::id()));
+                    std::fs::create_dir_all(&dir).ok();
+                    dir
+                },
             }),
         })
     }
@@ -90,6 +101,12 @@ impl DaemonServer {
     #[must_use]
     pub fn shutdown_handle(&self) -> Arc<Notify> {
         Arc::clone(&self.shutdown)
+    }
+
+    /// Get a snapshot of the phase profiler (for benchmarks).
+    #[must_use]
+    pub fn profile_snapshot(&self) -> crate::stats::ProfileSnapshot {
+        self.state.profiler.snapshot()
     }
 
     /// Run the server, accepting connections until shutdown is signaled.
@@ -298,7 +315,9 @@ async fn handle_connection(
                 session_id,
                 args,
                 cwd,
-            } => handle_compile(&state, session_id, &args, &cwd).await,
+                compiler,
+                env,
+            } => handle_compile(&state, session_id, &args, &cwd, compiler.as_deref(), env).await,
             Request::SessionEnd { session_id } => {
                 let sid = SessionId::from_raw(session_id);
                 if let Some(session) = state.sessions.end(&sid) {
@@ -428,8 +447,8 @@ fn write_session_log(sessions: &SessionManager, session_id: &SessionId, message:
 /// on changes, ensuring stale hashes are re-computed.
 fn hash_file(cache_system: &CacheSystem, path: &Path) -> Result<ContentHash, String> {
     cache_system
-        .metadata()
-        .lookup(path)
+        .lookup_since(path, cache_system.current_clock())
+        .map(|r| r.hash)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -459,6 +478,8 @@ async fn handle_compile(
     session_id: u64,
     args: &[String],
     cwd: &str,
+    compiler_override: Option<&str>,
+    client_env: Option<Vec<(String, String)>>,
 ) -> Response {
     let compile_start = std::time::Instant::now();
     let sid = SessionId::from_raw(session_id);
@@ -466,7 +487,7 @@ async fn handle_compile(
     state.stats.record_compilation();
 
     // Look up session
-    let (compiler, system_includes) = match (
+    let (session_compiler, system_includes) = match (
         state.sessions.compiler(&sid),
         state.sessions.system_includes(&sid),
     ) {
@@ -478,9 +499,17 @@ async fn handle_compile(
         }
     };
 
+    // Use per-request compiler override if provided (e.g., `wrap gcc` on a g++ session),
+    // otherwise fall back to the session compiler.
+    let compiler = match compiler_override {
+        Some(path) => PathBuf::from(path),
+        None => session_compiler,
+    };
+
     state.sessions.touch(&sid);
 
-    // Parse the args to find source file, output file, and cache-relevant args
+    // ── Phase: parse args ────────────────────────────────────────────
+    let t0 = std::time::Instant::now();
     let parsed = zccache_compiler::parse_invocation(compiler.to_str().unwrap_or(""), args);
     let compilation = match parsed {
         zccache_compiler::ParsedInvocation::Cacheable(c) => c,
@@ -488,9 +517,11 @@ async fn handle_compile(
             state.stats.record_non_cacheable();
             record_session_stat(&state.sessions, &sid, |t| t.record_non_cacheable());
             write_session_log(&state.sessions, &sid, &format!("non-cacheable: {reason}"));
-            return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid).await;
+            return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid, &client_env)
+                .await;
         }
     };
+    let parse_args_us = t0.elapsed().as_micros() as u64;
 
     let cwd_path = PathBuf::from(cwd);
     let source_path = if compilation.source_file.is_absolute() {
@@ -504,68 +535,88 @@ async fn handle_compile(
         cwd_path.join(&compilation.output_file)
     };
 
-    // Build CompileContext and register with depgraph
+    // ── Phase: build context + register ──────────────────────────────
+    let t1 = std::time::Instant::now();
     let ctx = build_compile_context(&compilation, &cwd_path, &system_includes);
     let context_key = state.dep_graph.register(ctx.clone());
+    let build_context_us = t1.elapsed().as_micros() as u64;
 
-    // Check depgraph for cache verdict.
-    // is_fresh always returns true: content hashing via CacheSystem is ground truth.
-    // The watcher helps CacheSystem know when to re-hash (by downgrading confidence),
-    // but correctness doesn't depend on is_fresh — the artifact key comparison is
-    // what determines hit/miss.
-    let verdict = {
-        let is_fresh = |_: &Path| true;
-
-        let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
-
-        // Hash source file
-        match hash_file(&state.cache_system, &source_path) {
-            Ok(h) => {
-                hash_map.insert(source_path.clone(), h);
-            }
-            Err(e) => {
-                write_session_log(
-                    &state.sessions,
-                    &sid,
-                    &format!("cache key error: {e}, falling back to direct compile"),
-                );
-                return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid).await;
-            }
+    // ── Phase: hash source ───────────────────────────────────────────
+    let t2 = std::time::Instant::now();
+    let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
+    match hash_file(&state.cache_system, &source_path) {
+        Ok(h) => {
+            hash_map.insert(source_path.clone(), h);
         }
+        Err(e) => {
+            write_session_log(
+                &state.sessions,
+                &sid,
+                &format!("cache key error: {e}, falling back to direct compile"),
+            );
+            return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid, &client_env)
+                .await;
+        }
+    }
+    let hash_source_us = t2.elapsed().as_micros() as u64;
 
-        // Hash all known headers (from previous scan, if any)
-        if let Some(includes) = state.dep_graph.get_includes(&context_key) {
-            for header in &includes {
-                match hash_file(&state.cache_system, header) {
-                    Ok(h) => {
-                        hash_map.insert(header.clone(), h);
-                    }
-                    Err(_) => {
-                        // Header disappeared — force rescan
-                    }
+    // ── Phase: hash headers ──────────────────────────────────────────
+    let t3 = std::time::Instant::now();
+    if let Some(includes) = state.dep_graph.get_includes(&context_key) {
+        for header in &includes {
+            match hash_file(&state.cache_system, header) {
+                Ok(h) => {
+                    hash_map.insert(header.clone(), h);
+                }
+                Err(_) => {
+                    // Header disappeared — force rescan
                 }
             }
         }
+    }
+    let hash_headers_us = t3.elapsed().as_micros() as u64;
 
+    // ── Phase: depgraph check ────────────────────────────────────────
+    let t4 = std::time::Instant::now();
+    let verdict = {
+        let is_fresh = |_: &Path| true;
         let get_hash = |p: &Path| hash_map.get(p).copied();
         state.dep_graph.check(&context_key, is_fresh, get_hash)
     };
+    let depgraph_check_us = t4.elapsed().as_micros() as u64;
 
     // Process verdict
     match verdict {
         zccache_depgraph::CacheVerdict::Hit { artifact_key }
         | zccache_depgraph::CacheVerdict::SourceChanged { artifact_key } => {
+            // ── Phase: artifact lookup ────────────────────────────────
+            let t5 = std::time::Instant::now();
             let artifact_key_hex = artifact_key.hash().to_hex();
             let artifacts = state.artifacts.lock().await;
-            if let Some(cached) = artifacts.get(&artifact_key_hex) {
-                // Cache hit! Write outputs to disk.
+            let cached = artifacts.get(&artifact_key_hex).cloned();
+            drop(artifacts);
+            let artifact_lookup_us = t5.elapsed().as_micros() as u64;
+
+            if let Some(cached) = cached {
+                // ── Phase: write output ──────────────────────────────
+                let t6 = std::time::Instant::now();
                 for (i, output) in cached.artifact.outputs.iter().enumerate() {
                     let out_path = if i == 0 {
                         output_path.clone()
                     } else {
                         cwd_path.join(&output.name)
                     };
-                    if let Err(e) = std::fs::write(&out_path, &output.data) {
+                    // Try hardlink from on-disk cache (zero data copy),
+                    // fall back to fs::write from memory.
+                    let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                    let _ = std::fs::remove_file(&out_path);
+                    let written = if cache_file.exists() {
+                        std::fs::hard_link(&cache_file, &out_path)
+                            .or_else(|_| std::fs::write(&out_path, &output.data))
+                    } else {
+                        std::fs::write(&out_path, &output.data)
+                    };
+                    if let Err(e) = written {
                         return Response::Error {
                             message: format!(
                                 "failed to write cached output {}: {e}",
@@ -574,7 +625,10 @@ async fn handle_compile(
                         };
                     }
                 }
+                let write_output_us = t6.elapsed().as_micros() as u64;
 
+                // ── Phase: bookkeeping ───────────────────────────────
+                let t7 = std::time::Instant::now();
                 let latency_us = compile_start.elapsed().as_micros() as u64;
                 let artifact_bytes: u64 = cached
                     .artifact
@@ -587,7 +641,6 @@ async fn handle_compile(
                 record_session_stat(&state.sessions, &sid, move |t| {
                     t.record_hit(src, latency_us, artifact_bytes);
                 });
-
                 write_session_log(
                     &state.sessions,
                     &sid,
@@ -597,6 +650,21 @@ async fn handle_compile(
                         output_path.display()
                     ),
                 );
+                let bookkeeping_us = t7.elapsed().as_micros() as u64;
+
+                // Record phase profile
+                let total_us = compile_start.elapsed().as_micros() as u64;
+                state.profiler.record_hit(&HitPhases {
+                    parse_args_us,
+                    build_context_us,
+                    hash_source_us,
+                    hash_headers_us,
+                    depgraph_check_us,
+                    artifact_lookup_us,
+                    write_output_us,
+                    bookkeeping_us,
+                    total_us,
+                });
 
                 return Response::CompileResult {
                     exit_code: cached.artifact.exit_code,
@@ -625,11 +693,12 @@ async fn handle_compile(
         ),
     );
 
-    let result = tokio::process::Command::new(&compiler)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .await;
+    // ── Phase: compiler exec ─────────────────────────────────────────
+    let t_exec = std::time::Instant::now();
+    let mut cmd = tokio::process::Command::new(&compiler);
+    cmd.args(args).current_dir(cwd);
+    apply_client_env(&mut cmd, &client_env);
+    let result = cmd.output().await;
 
     let output = match result {
         Ok(o) => o,
@@ -639,6 +708,7 @@ async fn handle_compile(
             };
         }
     };
+    let compiler_exec_us = t_exec.elapsed().as_micros() as u64;
 
     let exit_code = output.status.code().unwrap_or(-1);
 
@@ -663,13 +733,21 @@ async fn handle_compile(
             }
         };
 
-        // Scan includes and update depgraph
+        // ── Phase: include scan ──────────────────────────────────────
+        let t_scan = std::time::Instant::now();
         let scan_result =
             zccache_depgraph::scanner::scan_recursive(&source_path, &ctx.include_search);
+        let include_scan_us = t_scan.elapsed().as_micros() as u64;
 
-        // Hash all files for the artifact key
+        // Register scanned paths for zero-syscall fast path on future hits.
+        let tracked_paths: Vec<PathBuf> = std::iter::once(source_path.clone())
+            .chain(scan_result.resolved.iter().cloned())
+            .collect();
+        state.cache_system.register_tracked(&tracked_paths);
+
+        // ── Phase: hash all files ────────────────────────────────────
+        let t_hash = std::time::Instant::now();
         let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
-
         if let Ok(h) = hash_file(&state.cache_system, &source_path) {
             hash_map.insert(source_path.clone(), h);
         }
@@ -678,7 +756,10 @@ async fn handle_compile(
                 hash_map.insert(header.clone(), h);
             }
         }
+        let hash_all_us = t_hash.elapsed().as_micros() as u64;
 
+        // ── Phase: store artifact ────────────────────────────────────
+        let t_store = std::time::Instant::now();
         let get_hash = |p: &Path| hash_map.get(p).copied();
         if let Some(artifact_key) = state.dep_graph.update(&context_key, scan_result, get_hash) {
             let artifact = ArtifactData {
@@ -695,8 +776,14 @@ async fn handle_compile(
                 exit_code,
             };
 
-            let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
+            // Persist outputs to on-disk cache for hardlink optimization.
             let artifact_key_hex = artifact_key.hash().to_hex();
+            for (i, out) in artifact.outputs.iter().enumerate() {
+                let cache_path = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                let _ = std::fs::write(&cache_path, &out.data);
+            }
+
+            let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
             let mut artifacts = state.artifacts.lock().await;
             artifacts.insert(artifact_key_hex, CachedArtifact { artifact });
 
@@ -707,6 +794,17 @@ async fn handle_compile(
                 t.record_miss(src, artifact_bytes);
             });
         }
+        let artifact_store_us = t_store.elapsed().as_micros() as u64;
+
+        // Record miss phase profile
+        let total_us = compile_start.elapsed().as_micros() as u64;
+        state.profiler.record_miss(&MissPhases {
+            compiler_exec_us,
+            include_scan_us,
+            hash_all_us,
+            artifact_store_us,
+            total_us,
+        });
     }
 
     Response::CompileResult {
@@ -717,6 +815,17 @@ async fn handle_compile(
     }
 }
 
+/// Apply client environment variables to a compiler command.
+/// If `client_env` is `Some`, clears the inherited env and sets only the client's vars.
+fn apply_client_env(cmd: &mut tokio::process::Command, client_env: &Option<Vec<(String, String)>>) {
+    if let Some(vars) = client_env {
+        cmd.env_clear();
+        for (key, val) in vars {
+            cmd.env(key, val);
+        }
+    }
+}
+
 /// Run the compiler directly without caching.
 async fn run_compiler_direct(
     compiler: &PathBuf,
@@ -724,12 +833,12 @@ async fn run_compiler_direct(
     cwd: &str,
     sessions: &SessionManager,
     sid: &SessionId,
+    client_env: &Option<Vec<(String, String)>>,
 ) -> Response {
-    let result = tokio::process::Command::new(compiler)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .await;
+    let mut cmd = tokio::process::Command::new(compiler);
+    cmd.args(args).current_dir(cwd);
+    apply_client_env(&mut cmd, client_env);
+    let result = cmd.output().await;
 
     match result {
         Ok(output) => {

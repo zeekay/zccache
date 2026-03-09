@@ -161,6 +161,17 @@ impl ChangeJournal {
         self.last_overflow.store(new_tick, Ordering::Release);
         Clock(new_tick)
     }
+
+    /// Register a file as tracked at the current clock tick without advancing
+    /// the clock.
+    ///
+    /// Enables `changed_since` to return `false` for files that haven't been
+    /// seen by the watcher yet. If the file is already tracked with a more
+    /// recent clock, the entry is NOT overwritten.
+    pub fn register(&self, path: PathBuf) {
+        let current = Clock(self.current.load(Ordering::Acquire));
+        self.last_change.entry(path).or_insert(current);
+    }
 }
 
 impl Default for ChangeJournal {
@@ -342,6 +353,31 @@ mod tests {
         // but the query is since=overflow_clock which is >= overflow,
         // so overflow check doesn't trigger.
         assert!(!journal.changed_since(Path::new("a.c"), overflow_clock));
+    }
+
+    #[test]
+    fn register_makes_file_tracked() {
+        let journal = ChangeJournal::new();
+
+        // Before register: untracked → conservative true
+        assert!(journal.changed_since(Path::new("registered.h"), Clock::ZERO));
+
+        journal.register(PathBuf::from("registered.h"));
+
+        // After register at Clock(0): changed_since(Clock(0)) → false
+        assert!(!journal.changed_since(Path::new("registered.h"), Clock::ZERO));
+    }
+
+    #[test]
+    fn register_does_not_overwrite_newer_change() {
+        let journal = ChangeJournal::new();
+        let path = PathBuf::from("modified.h");
+
+        let _c1 = journal.advance(vec![path.clone()]); // Changed at c1
+        journal.register(PathBuf::from("modified.h")); // Try to register at current (c1)
+
+        // Should still show as changed since Clock::ZERO (changed at c1 > 0)
+        assert!(journal.changed_since(Path::new("modified.h"), Clock::ZERO));
     }
 
     #[test]
