@@ -638,8 +638,6 @@ fn find_daemon_binary() -> Option<std::path::PathBuf> {
 /// On Windows, also tries appending `.exe` if the name has no extension.
 fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
     let path_var = std::env::var_os("PATH")?;
-    let has_ext = std::path::Path::new(name).extension().is_some();
-
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(name);
         if candidate.is_file() {
@@ -647,7 +645,7 @@ fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
         }
         // On Windows, try with .exe suffix
         #[cfg(windows)]
-        if !has_ext {
+        if std::path::Path::new(name).extension().is_none() {
             let with_exe = dir.join(format!("{name}.exe"));
             if with_exe.is_file() {
                 return Some(with_exe);
