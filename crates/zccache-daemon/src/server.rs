@@ -20,6 +20,12 @@ struct SharedState {
     system_includes: Mutex<SystemIncludeCache>,
     /// In-memory artifact cache: cache_key_hex → artifact data.
     artifacts: Mutex<HashMap<String, CachedArtifact>>,
+    /// Cached compiler hashes: compiler_path → content_hash.
+    /// Avoids rehashing the (often ~100MB) compiler binary on every compile.
+    compiler_hashes: Mutex<HashMap<PathBuf, zccache_hash::ContentHash>>,
+    /// Cached source hashes: (source_path, file_len, mtime_secs) → content_hash.
+    /// Avoids rehashing unchanged source files.
+    source_hash_cache: Mutex<HashMap<(PathBuf, u64, i64), zccache_hash::ContentHash>>,
 }
 
 /// The daemon server that listens for IPC connections.
@@ -40,6 +46,8 @@ impl DaemonServer {
                 sessions: SessionManager::new(std::time::Duration::from_secs(300)),
                 system_includes: Mutex::new(SystemIncludeCache::new()),
                 artifacts: Mutex::new(HashMap::new()),
+                compiler_hashes: Mutex::new(HashMap::new()),
+                source_hash_cache: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -115,6 +123,16 @@ async fn handle_connection(
                 args,
                 cwd,
             } => handle_compile(&state, session_id, &args, &cwd).await,
+            Request::SessionEnd { session_id } => {
+                let sid = SessionId::from_raw(session_id);
+                if state.sessions.end(&sid).is_some() {
+                    Response::SessionEnded
+                } else {
+                    Response::Error {
+                        message: format!("unknown session: {session_id}"),
+                    }
+                }
+            }
         };
 
         conn.send(&response).await?;
@@ -239,18 +257,24 @@ async fn handle_compile(
         cwd_path.join(&compilation.output_file)
     };
 
-    let cache_key =
-        match compute_cache_key(&compiler, &source_path, &compilation.cache_relevant_args) {
-            Ok(k) => k,
-            Err(e) => {
-                write_session_log(
-                    &state.sessions,
-                    &sid,
-                    &format!("cache key error: {e}, falling back to direct compile"),
-                );
-                return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid).await;
-            }
-        };
+    let cache_key = match compute_cache_key(
+        state,
+        &compiler,
+        &source_path,
+        &compilation.cache_relevant_args,
+    )
+    .await
+    {
+        Ok(k) => k,
+        Err(e) => {
+            write_session_log(
+                &state.sessions,
+                &sid,
+                &format!("cache key error: {e}, falling back to direct compile"),
+            );
+            return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid).await;
+        }
+    };
 
     // Check cache
     {
@@ -400,14 +424,45 @@ async fn run_compiler_direct(
 }
 
 /// Compute a cache key from compiler binary hash + source hash + args.
-fn compute_cache_key(
+async fn compute_cache_key(
+    state: &SharedState,
     compiler: &std::path::Path,
     source: &std::path::Path,
     args: &[String],
 ) -> Result<String, String> {
-    let compiler_hash =
-        zccache_hash::hash_file(compiler).map_err(|e| format!("hash compiler: {e}"))?;
-    let source_hash = zccache_hash::hash_file(source).map_err(|e| format!("hash source: {e}"))?;
+    // Compiler hash: cached by path (binary doesn't change within a session)
+    let compiler_hash = {
+        let mut cache = state.compiler_hashes.lock().await;
+        if let Some(h) = cache.get(compiler) {
+            *h
+        } else {
+            let h = zccache_hash::hash_file(compiler).map_err(|e| format!("hash compiler: {e}"))?;
+            cache.insert(compiler.to_path_buf(), h);
+            h
+        }
+    };
+
+    // Source hash: cached by (path, size, mtime) to skip rehashing unchanged files
+    let source_hash = {
+        let meta = std::fs::metadata(source).map_err(|e| format!("stat source: {e}"))?;
+        let len = meta.len();
+        let mtime = meta
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let key = (source.to_path_buf(), len, mtime);
+
+        let mut cache = state.source_hash_cache.lock().await;
+        if let Some(h) = cache.get(&key) {
+            *h
+        } else {
+            let h = zccache_hash::hash_file(source).map_err(|e| format!("hash source: {e}"))?;
+            cache.insert(key, h);
+            h
+        }
+    };
 
     let mut builder = zccache_hash::cache_key::CacheKeyBuilder::new()
         .compiler(compiler_hash)

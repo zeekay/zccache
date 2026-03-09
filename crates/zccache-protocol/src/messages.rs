@@ -43,6 +43,11 @@ pub enum Request {
         /// Working directory for the compilation.
         cwd: String,
     },
+    /// End a session.
+    SessionEnd {
+        /// Session ID to end.
+        session_id: u64,
+    },
 }
 
 /// A response from daemon to client.
@@ -76,6 +81,8 @@ pub enum Response {
         /// Whether this was served from cache.
         cached: bool,
     },
+    /// Session ended successfully.
+    SessionEnded,
     /// An error occurred processing the request.
     Error {
         /// Human-readable error message.
