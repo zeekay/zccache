@@ -135,6 +135,8 @@ This document records the key architectural and technical decisions for **zccach
 - Hash output is 32 bytes (256 bits), which is used as the basis for cache key paths.
 - Changing the hash function later would invalidate the entire artifact cache (acceptable but worth noting).
 
+**Performance note (profiled):** Content hashing accounts for only ~0.3% of cold cache miss time. The real cold-start bottlenecks are compiler execution (~49%) and include scanning (~47%). An mtime-only prototype was tested and showed no measurable improvement, confirming that blake3 hashing cost is negligible relative to the actual compilation and dependency discovery work.
+
 ---
 
 ## DD-006: Tokio for Async Runtime

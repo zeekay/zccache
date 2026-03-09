@@ -106,6 +106,11 @@ impl MetadataCache {
         self.entries.is_empty()
     }
 
+    /// Remove all entries from the cache.
+    pub fn clear(&self) {
+        self.entries.clear();
+    }
+
     /// Return a cached content hash if the entry has High or Medium confidence.
     ///
     /// This is the clock-aware fast path: the caller has journal-based
@@ -349,6 +354,26 @@ mod tests {
     fn get_cached_hash_missing_path_returns_none() {
         let cache = MetadataCache::new();
         assert!(cache.get_cached_hash(Path::new("/no/such")).is_none());
+    }
+
+    #[test]
+    fn clear_removes_all_entries() {
+        let cache = MetadataCache::new();
+        for i in 0..5 {
+            cache.insert(
+                PathBuf::from(format!("/tmp/clear{i}.c")),
+                FileMetadata {
+                    mtime: SystemTime::now(),
+                    size: i as u64,
+                    confidence: Confidence::High,
+                    last_verified: Instant::now(),
+                    content_hash: None,
+                },
+            );
+        }
+        assert_eq!(cache.len(), 5);
+        cache.clear();
+        assert!(cache.is_empty());
     }
 
     #[test]

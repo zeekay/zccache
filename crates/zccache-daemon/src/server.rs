@@ -1,18 +1,37 @@
 //! Daemon server — accepts IPC connections and handles requests.
 
+use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
-use zccache_depgraph::{CompileContext, DepGraph, SessionId, SessionManager, SystemIncludeCache};
-use zccache_fscache::CacheSystem;
+use zccache_depgraph::{
+    CompileContext, ContextKey, DepGraph, SessionId, SessionManager, SystemIncludeCache,
+};
+use zccache_fscache::{CacheSystem, Clock};
 use zccache_hash::ContentHash;
 use zccache_ipc::{IpcConnection, IpcListener};
 use zccache_protocol::{ArtifactData, ArtifactOutput, Request, Response};
 use zccache_watcher::{NotifyWatcher, SettleBuffer, SettledEvent};
 
 use crate::stats::{HitPhases, MissPhases, PhaseProfiler, StatsCollector};
+
+/// Cached result of a verified cache hit, enabling zero-hash fast path.
+///
+/// When the journal clock hasn't advanced since the last verified hit for a
+/// context, we can skip all stat/hash/depgraph work and jump straight to
+/// artifact lookup.
+struct FastHitEntry {
+    clock: Clock,
+    artifact_key_hex: String,
+    cached_at: std::time::Instant,
+}
+
+/// Maximum age for fast-hit cache entries. Matches the High→Medium confidence
+/// decay in the metadata cache. Without watcher events, entries expire and
+/// fall through to the stat-verify slow path.
+const FAST_HIT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Cached compilation artifact.
 #[derive(Debug, Clone)]
@@ -27,7 +46,7 @@ struct SharedState {
     /// Dependency graph: tracks include relationships and cache verdicts.
     dep_graph: DepGraph,
     /// In-memory artifact cache: artifact_key_hex → artifact data.
-    artifacts: Mutex<HashMap<String, CachedArtifact>>,
+    artifacts: DashMap<String, CachedArtifact>,
     /// Metadata cache + change journal. The watcher feeds file-change events
     /// into this, which downgrades confidence so `lookup()` re-hashes on
     /// next access. Without the watcher, stat-verify on every `lookup()` is
@@ -49,6 +68,13 @@ struct SharedState {
     profiler: PhaseProfiler,
     /// On-disk artifact cache for hardlink optimization on cache hits.
     artifact_dir: PathBuf,
+    /// Ultra-fast hit cache: context_key → (clock, artifact_key_hex, timestamp).
+    /// When the journal clock hasn't advanced since the last verified hit,
+    /// we skip all stat/hash/depgraph work and jump straight to artifact lookup.
+    fast_hit_cache: DashMap<ContextKey, FastHitEntry>,
+    /// Whether the file watcher is active. Fast-hit cache is only used when
+    /// the watcher is running, since we rely on it for change detection.
+    watcher_active: AtomicBool,
 }
 
 /// The daemon server that listens for IPC connections.
@@ -78,7 +104,7 @@ impl DaemonServer {
                 sessions: SessionManager::new(std::time::Duration::from_secs(300)),
                 system_includes: Mutex::new(SystemIncludeCache::new()),
                 dep_graph: DepGraph::new(),
-                artifacts: Mutex::new(HashMap::new()),
+                artifacts: DashMap::new(),
                 cache_system: CacheSystem::new(),
                 watcher: Mutex::new(None),
                 watched_dirs: Mutex::new(HashSet::new()),
@@ -93,6 +119,8 @@ impl DaemonServer {
                     std::fs::create_dir_all(&dir).ok();
                     dir
                 },
+                fast_hit_cache: DashMap::new(),
+                watcher_active: AtomicBool::new(false),
             }),
         })
     }
@@ -172,6 +200,7 @@ impl DaemonServer {
         };
 
         *self.state.watcher.lock().await = Some(watcher);
+        self.state.watcher_active.store(true, Ordering::Release);
 
         // Settle buffer: coalesces raw events into batches after a quiet period.
         let (settled_tx, mut settled_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -213,27 +242,55 @@ impl DaemonServer {
 
 /// Watch a directory for file changes, if not already watched.
 async fn watch_directory(state: &SharedState, dir: &Path) {
-    let canonical = match dir.canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::debug!("cannot canonicalize {}: {e}", dir.display());
-            return;
-        }
-    };
+    watch_directories(state, &[dir.to_path_buf()]).await;
+}
 
+/// Watch multiple directories in a single batch, acquiring locks once.
+///
+/// Canonicalizes all paths up front, deduplicates against already-watched set,
+/// then registers all new watches in one lock acquisition.
+async fn watch_directories(state: &SharedState, dirs: &[PathBuf]) {
+    if dirs.is_empty() {
+        return;
+    }
+
+    // Canonicalize all paths (filesystem work, no lock needed).
+    let canonical: Vec<PathBuf> = dirs
+        .iter()
+        .filter_map(|dir| match dir.canonicalize() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::debug!("cannot canonicalize {}: {e}", dir.display());
+                None
+            }
+        })
+        .collect();
+
+    if canonical.is_empty() {
+        return;
+    }
+
+    // Single lock acquisition: filter already-watched and register new ones.
     let mut watched = state.watched_dirs.lock().await;
-    if watched.contains(&canonical) {
+    let new_dirs: Vec<PathBuf> = canonical
+        .into_iter()
+        .filter(|p| !watched.contains(p))
+        .collect();
+
+    if new_dirs.is_empty() {
         return;
     }
 
     let mut watcher_guard = state.watcher.lock().await;
     if let Some(ref mut w) = *watcher_guard {
-        if let Err(e) = w.watch(&canonical) {
-            tracing::warn!("failed to watch {}: {e}", canonical.display());
-            return;
+        for dir in new_dirs {
+            if let Err(e) = w.watch(&dir) {
+                tracing::warn!("failed to watch {}: {e}", dir.display());
+                continue;
+            }
+            tracing::info!("watching directory: {}", dir.display());
+            watched.insert(dir);
         }
-        tracing::info!("watching directory: {}", canonical.display());
-        watched.insert(canonical);
     }
 }
 
@@ -262,14 +319,20 @@ async fn handle_connection(
             Request::Status => {
                 let snap = state.stats.snapshot();
                 let dg = state.dep_graph.stats();
-                let artifacts = state.artifacts.lock().await;
-                let artifact_count = artifacts.len() as u64;
-                let cache_size_bytes: u64 = artifacts
-                    .values()
-                    .flat_map(|c| &c.artifact.outputs)
-                    .map(|o| o.data.len() as u64)
+                let artifact_count = state.artifacts.len() as u64;
+                let cache_size_bytes: u64 = state
+                    .artifacts
+                    .iter()
+                    .flat_map(|entry| {
+                        entry
+                            .value()
+                            .artifact
+                            .outputs
+                            .iter()
+                            .map(|o| o.data.len() as u64)
+                            .collect::<Vec<_>>()
+                    })
                     .sum();
-                drop(artifacts);
                 let metadata_entries = state.cache_system.metadata().len() as u64;
                 Response::Status(zccache_protocol::DaemonStatus {
                     artifact_count,
@@ -293,6 +356,7 @@ async fn handle_connection(
             }
             Request::Lookup { .. } => Response::LookupResult(zccache_protocol::LookupResult::Miss),
             Request::Store { .. } => Response::StoreResult(zccache_protocol::StoreResult::Stored),
+            Request::Clear => handle_clear(&state).await,
             Request::SessionStart {
                 client_pid,
                 working_dir,
@@ -349,6 +413,60 @@ async fn handle_connection(
     }
 }
 
+/// Handle a Clear request: wipe all caches and reset stats.
+async fn handle_clear(state: &SharedState) -> Response {
+    // Snapshot counts before clearing.
+    let artifacts_removed = {
+        let count = state.artifacts.len() as u64;
+        state.artifacts.clear();
+        count
+    };
+    let metadata_cleared = state.cache_system.metadata().len() as u64;
+    let dep_graph_contexts_cleared = state.dep_graph.stats().context_count as u64;
+
+    // Calculate on-disk artifact size before deleting.
+    let on_disk_bytes_freed = match std::fs::read_dir(&state.artifact_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum(),
+        Err(_) => 0,
+    };
+
+    // Clear all subsystems.
+    state.dep_graph.clear();
+    state.cache_system.clear();
+    state.fast_hit_cache.clear();
+    state.system_includes.lock().await.clear();
+    state.watched_dirs.lock().await.clear();
+
+    // Reset stats and profiler.
+    state.stats.reset();
+    state.profiler.reset();
+
+    // Delete on-disk artifact files.
+    if let Ok(entries) = std::fs::read_dir(&state.artifact_dir) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+
+    tracing::info!(
+        artifacts_removed,
+        metadata_cleared,
+        dep_graph_contexts_cleared,
+        on_disk_bytes_freed,
+        "cache cleared"
+    );
+
+    Response::Cleared {
+        artifacts_removed,
+        metadata_cleared,
+        dep_graph_contexts_cleared,
+        on_disk_bytes_freed,
+    }
+}
+
 /// Handle a SessionStart request: discover system includes, create session.
 async fn handle_session_start(
     state: &SharedState,
@@ -401,6 +519,10 @@ async fn handle_session_start(
 
     // Watch the working directory for file changes.
     watch_directory(state, &PathBuf::from(working_dir)).await;
+
+    // Watch system include directories so the journal can track header changes
+    // and enable the zero-syscall fast path for system headers.
+    watch_directories(state, &system_includes).await;
 
     Response::SessionStarted {
         session_id: session_id.value(),
@@ -472,15 +594,34 @@ fn build_compile_context(
     ctx
 }
 
+/// Write cached output to disk. Optimized syscall sequence:
+/// 1. Try hardlink directly (1 syscall — common case when output doesn't exist)
+/// 2. If that fails, remove existing output and retry hardlink (2 syscalls)
+/// 3. Fall back to fs::write from memory (1 syscall)
+fn write_cached_output(out_path: &Path, cache_file: &Path, data: &[u8]) -> std::io::Result<()> {
+    // Fast path: hardlink directly (works when out_path doesn't exist yet)
+    if std::fs::hard_link(cache_file, out_path).is_ok() {
+        return Ok(());
+    }
+    // Output exists or cache file missing — remove and retry
+    let _ = std::fs::remove_file(out_path);
+    if std::fs::hard_link(cache_file, out_path).is_ok() {
+        return Ok(());
+    }
+    // Hardlink failed entirely (cross-device, no cache file) — copy from memory
+    std::fs::write(out_path, data)
+}
+
 /// Handle a Compile request: parse args, check depgraph, run compiler or return cached.
 async fn handle_compile(
-    state: &SharedState,
+    state_arc: &Arc<SharedState>,
     session_id: u64,
     args: &[String],
     cwd: &str,
     compiler_override: Option<&str>,
     client_env: Option<Vec<(String, String)>>,
 ) -> Response {
+    let state = state_arc.as_ref();
     let compile_start = std::time::Instant::now();
     let sid = SessionId::from_raw(session_id);
 
@@ -520,6 +661,21 @@ async fn handle_compile(
             return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid, &client_env)
                 .await;
         }
+        zccache_compiler::ParsedInvocation::MultiFile {
+            compilations,
+            original_args: _,
+        } => {
+            return handle_compile_multi(
+                Arc::clone(state_arc),
+                sid,
+                compiler,
+                compilations,
+                cwd.to_string(),
+                system_includes,
+                client_env,
+            )
+            .await;
+        }
     };
     let parse_args_us = t0.elapsed().as_micros() as u64;
 
@@ -540,6 +696,89 @@ async fn handle_compile(
     let ctx = build_compile_context(&compilation, &cwd_path, &system_includes);
     let context_key = state.dep_graph.register(ctx.clone());
     let build_context_us = t1.elapsed().as_micros() as u64;
+
+    // ── Ultra-fast path: clock-based skip ────────────────────────────
+    // If the watcher is active and the journal clock hasn't advanced since
+    // our last verified hit for this context, skip ALL hash/depgraph work
+    // and reuse the stored artifact key directly.
+    if state.watcher_active.load(Ordering::Acquire) {
+        if let Some(entry) = state.fast_hit_cache.get(&context_key) {
+            let current_clock = state.cache_system.current_clock();
+            if entry.clock == current_clock && entry.cached_at.elapsed() < FAST_HIT_MAX_AGE {
+                let artifact_key_hex = &entry.artifact_key_hex;
+                let t5 = std::time::Instant::now();
+                let cached = state.artifacts.get(artifact_key_hex).map(|r| r.clone());
+                let artifact_lookup_us = t5.elapsed().as_micros() as u64;
+
+                if let Some(cached) = cached {
+                    let t6 = std::time::Instant::now();
+                    for (i, output) in cached.artifact.outputs.iter().enumerate() {
+                        let out_path = if i == 0 {
+                            output_path.clone()
+                        } else {
+                            cwd_path.join(&output.name)
+                        };
+                        let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                        if let Err(e) = write_cached_output(&out_path, &cache_file, &output.data) {
+                            return Response::Error {
+                                message: format!(
+                                    "failed to write cached output {}: {e}",
+                                    out_path.display()
+                                ),
+                            };
+                        }
+                    }
+                    let write_output_us = t6.elapsed().as_micros() as u64;
+
+                    let t7 = std::time::Instant::now();
+                    let latency_us = compile_start.elapsed().as_micros() as u64;
+                    let artifact_bytes: u64 = cached
+                        .artifact
+                        .outputs
+                        .iter()
+                        .map(|o| o.data.len() as u64)
+                        .sum();
+                    state.stats.record_hit(latency_us, artifact_bytes);
+                    let src = source_path.clone();
+                    record_session_stat(&state.sessions, &sid, move |t| {
+                        t.record_hit(src, latency_us, artifact_bytes);
+                    });
+                    write_session_log(
+                        &state.sessions,
+                        &sid,
+                        &format!(
+                            "cache hit (fast): {} -> {}",
+                            source_path.display(),
+                            output_path.display()
+                        ),
+                    );
+                    let bookkeeping_us = t7.elapsed().as_micros() as u64;
+
+                    let total_us = compile_start.elapsed().as_micros() as u64;
+                    state.profiler.record_hit(&HitPhases {
+                        parse_args_us,
+                        build_context_us,
+                        hash_source_us: 0,
+                        hash_headers_us: 0,
+                        depgraph_check_us: 0,
+                        artifact_lookup_us,
+                        write_output_us,
+                        bookkeeping_us,
+                        total_us,
+                    });
+
+                    return Response::CompileResult {
+                        exit_code: cached.artifact.exit_code,
+                        stdout: cached.artifact.stdout.clone(),
+                        stderr: cached.artifact.stderr.clone(),
+                        cached: true,
+                    };
+                }
+            }
+        }
+    }
+
+    // ── Slow path: hash + depgraph verify ────────────────────────────
 
     // ── Phase: hash source ───────────────────────────────────────────
     let t2 = std::time::Instant::now();
@@ -592,9 +831,7 @@ async fn handle_compile(
             // ── Phase: artifact lookup ────────────────────────────────
             let t5 = std::time::Instant::now();
             let artifact_key_hex = artifact_key.hash().to_hex();
-            let artifacts = state.artifacts.lock().await;
-            let cached = artifacts.get(&artifact_key_hex).cloned();
-            drop(artifacts);
+            let cached = state.artifacts.get(&artifact_key_hex).map(|r| r.clone());
             let artifact_lookup_us = t5.elapsed().as_micros() as u64;
 
             if let Some(cached) = cached {
@@ -606,17 +843,8 @@ async fn handle_compile(
                     } else {
                         cwd_path.join(&output.name)
                     };
-                    // Try hardlink from on-disk cache (zero data copy),
-                    // fall back to fs::write from memory.
                     let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                    let _ = std::fs::remove_file(&out_path);
-                    let written = if cache_file.exists() {
-                        std::fs::hard_link(&cache_file, &out_path)
-                            .or_else(|_| std::fs::write(&out_path, &output.data))
-                    } else {
-                        std::fs::write(&out_path, &output.data)
-                    };
-                    if let Err(e) = written {
+                    if let Err(e) = write_cached_output(&out_path, &cache_file, &output.data) {
                         return Response::Error {
                             message: format!(
                                 "failed to write cached output {}: {e}",
@@ -652,6 +880,17 @@ async fn handle_compile(
                 );
                 let bookkeeping_us = t7.elapsed().as_micros() as u64;
 
+                // Populate fast-hit cache for future requests
+                let current_clock = state.cache_system.current_clock();
+                state.fast_hit_cache.insert(
+                    context_key,
+                    FastHitEntry {
+                        clock: current_clock,
+                        artifact_key_hex: artifact_key_hex.clone(),
+                        cached_at: std::time::Instant::now(),
+                    },
+                );
+
                 // Record phase profile
                 let total_us = compile_start.elapsed().as_micros() as u64;
                 state.profiler.record_hit(&HitPhases {
@@ -681,6 +920,9 @@ async fn handle_compile(
             // Need to compile and scan includes
         }
     }
+
+    // Cache miss — invalidate fast-hit cache for this context
+    state.fast_hit_cache.remove(&context_key);
 
     // Cache miss — run the compiler
     write_session_log(
@@ -745,6 +987,21 @@ async fn handle_compile(
             .collect();
         state.cache_system.register_tracked(&tracked_paths);
 
+        // Watch parent directories of discovered headers so watcher events
+        // keep the journal accurate and enable the zero-syscall fast path.
+        {
+            let header_dirs: Vec<PathBuf> = {
+                let mut dirs = HashSet::new();
+                for header in &scan_result.resolved {
+                    if let Some(parent) = header.parent() {
+                        dirs.insert(parent.to_path_buf());
+                    }
+                }
+                dirs.into_iter().collect()
+            };
+            watch_directories(state, &header_dirs).await;
+        }
+
         // ── Phase: hash all files ────────────────────────────────────
         let t_hash = std::time::Instant::now();
         let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
@@ -784,8 +1041,9 @@ async fn handle_compile(
             }
 
             let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
-            let mut artifacts = state.artifacts.lock().await;
-            artifacts.insert(artifact_key_hex, CachedArtifact { artifact });
+            state
+                .artifacts
+                .insert(artifact_key_hex, CachedArtifact { artifact });
 
             let latency_us = compile_start.elapsed().as_micros() as u64;
             state.stats.record_miss(latency_us, artifact_bytes);
@@ -823,6 +1081,409 @@ fn apply_client_env(cmd: &mut tokio::process::Command, client_env: &Option<Vec<(
         for (key, val) in vars {
             cmd.env(key, val);
         }
+    }
+}
+
+/// A deferred output write for a cache hit.
+struct PendingWrite {
+    out_path: PathBuf,
+    cache_file: PathBuf,
+    data: Vec<u8>,
+}
+
+/// Result of a per-unit cache check in multi-file compile.
+enum UnitCacheResult {
+    /// Cache hit — output write is deferred for batching.
+    Hit {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        artifact_bytes: u64,
+        source_path: PathBuf,
+        pending_writes: Vec<PendingWrite>,
+    },
+    /// Cache miss — needs compilation.
+    Miss {
+        source_path: PathBuf,
+        output_path: PathBuf,
+        context_key: ContextKey,
+        ctx: Box<CompileContext>,
+    },
+}
+
+/// Check cache for a single compilation unit. Returns Hit (output written) or Miss.
+fn check_unit_cache(
+    state: &SharedState,
+    compilation: &zccache_compiler::CacheableCompilation,
+    cwd_path: &Path,
+    system_includes: &[PathBuf],
+) -> UnitCacheResult {
+    let t0 = std::time::Instant::now();
+    state.stats.record_compilation();
+
+    let source_path = if compilation.source_file.is_absolute() {
+        compilation.source_file.clone()
+    } else {
+        cwd_path.join(&compilation.source_file)
+    };
+    let output_path = if compilation.output_file.is_absolute() {
+        compilation.output_file.clone()
+    } else {
+        cwd_path.join(&compilation.output_file)
+    };
+
+    let ctx = build_compile_context(compilation, cwd_path, system_includes);
+    let t_ctx = t0.elapsed();
+    let context_key = state.dep_graph.register(ctx.clone());
+    let t_register = t0.elapsed();
+
+    // Hash source
+    let source_hash = match hash_file(&state.cache_system, &source_path) {
+        Ok(h) => h,
+        Err(_) => {
+            return UnitCacheResult::Miss {
+                source_path,
+                output_path,
+                context_key,
+                ctx: Box::new(ctx),
+            };
+        }
+    };
+    let t_hash_source = t0.elapsed();
+
+    // Hash known headers
+    let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
+    hash_map.insert(source_path.clone(), source_hash);
+    if let Some(includes) = state.dep_graph.get_includes(&context_key) {
+        for header in &includes {
+            if let Ok(h) = hash_file(&state.cache_system, header) {
+                hash_map.insert(header.clone(), h);
+            }
+        }
+    }
+    let t_hash_headers = t0.elapsed();
+
+    // Depgraph check
+    let verdict = {
+        let is_fresh = |_: &Path| true;
+        let get_hash = |p: &Path| hash_map.get(p).copied();
+        state.dep_graph.check(&context_key, is_fresh, get_hash)
+    };
+    let t_depgraph = t0.elapsed();
+
+    // Try to serve from cache
+    if let zccache_depgraph::CacheVerdict::Hit { artifact_key }
+    | zccache_depgraph::CacheVerdict::SourceChanged { artifact_key } = verdict
+    {
+        let artifact_key_hex = artifact_key.hash().to_hex();
+        if let Some(cached) = state.artifacts.get(&artifact_key_hex).map(|r| r.clone()) {
+            let t_lookup = t0.elapsed();
+            // Build deferred writes instead of writing immediately
+            let mut pending = Vec::with_capacity(cached.artifact.outputs.len());
+            for (i, output) in cached.artifact.outputs.iter().enumerate() {
+                let out_path = if i == 0 {
+                    output_path.clone()
+                } else {
+                    cwd_path.join(&output.name)
+                };
+                let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                pending.push(PendingWrite {
+                    out_path,
+                    cache_file,
+                    data: output.data.clone(),
+                });
+            }
+
+            let artifact_bytes: u64 = cached
+                .artifact
+                .outputs
+                .iter()
+                .map(|o| o.data.len() as u64)
+                .sum();
+            state.stats.record_hit(0, artifact_bytes);
+
+            // Profile output (write_output is now deferred, so 0)
+            let total_us = t0.elapsed().as_micros() as u64;
+            state.profiler.record_hit(&HitPhases {
+                parse_args_us: 0,
+                build_context_us: t_ctx.as_micros() as u64,
+                hash_source_us: (t_hash_source - t_register).as_micros() as u64,
+                hash_headers_us: (t_hash_headers - t_hash_source).as_micros() as u64,
+                depgraph_check_us: (t_depgraph - t_hash_headers).as_micros() as u64,
+                artifact_lookup_us: (t_lookup - t_depgraph).as_micros() as u64,
+                write_output_us: 0,
+                bookkeeping_us: 0,
+                total_us,
+            });
+
+            return UnitCacheResult::Hit {
+                stdout: cached.artifact.stdout.clone(),
+                stderr: cached.artifact.stderr.clone(),
+                artifact_bytes,
+                source_path,
+                pending_writes: pending,
+            };
+        }
+    }
+
+    state.fast_hit_cache.remove(&context_key);
+    UnitCacheResult::Miss {
+        source_path,
+        output_path,
+        context_key,
+        ctx: Box::new(ctx),
+    }
+}
+
+/// Handle a multi-file compile: check cache per-unit in parallel, serve hits, batch misses.
+#[allow(clippy::too_many_arguments)]
+async fn handle_compile_multi(
+    state: Arc<SharedState>,
+    sid: SessionId,
+    compiler: PathBuf,
+    compilations: Vec<zccache_compiler::CacheableCompilation>,
+    cwd: String,
+    system_includes: Vec<PathBuf>,
+    client_env: Option<Vec<(String, String)>>,
+) -> Response {
+    let cwd_path = PathBuf::from(&cwd);
+    let mut all_stdout = Vec::new();
+    let mut all_stderr = Vec::new();
+
+    // ── Phase 1: Check cache for each unit (parallel, as-completed) ──
+    let mut join_set = tokio::task::JoinSet::new();
+    for (idx, compilation) in compilations.iter().enumerate() {
+        let state = Arc::clone(&state);
+        let cwd_path = cwd_path.clone();
+        let system_includes = system_includes.clone();
+        let compilation = compilation.clone();
+        join_set.spawn_blocking(move || {
+            (
+                idx,
+                check_unit_cache(&state, &compilation, &cwd_path, &system_includes),
+            )
+        });
+    }
+
+    // Collect results in original order
+    let mut indexed_results: Vec<(usize, UnitCacheResult)> = Vec::with_capacity(compilations.len());
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(pair) => indexed_results.push(pair),
+            Err(e) => {
+                return Response::Error {
+                    message: format!("cache check task panicked: {e}"),
+                };
+            }
+        }
+    }
+    indexed_results.sort_by_key(|(idx, _)| *idx);
+
+    let mut unit_results: Vec<UnitCacheResult> = Vec::with_capacity(indexed_results.len());
+    let mut all_pending_writes: Vec<PendingWrite> = Vec::new();
+    for (_, mut result) in indexed_results {
+        match &result {
+            UnitCacheResult::Hit {
+                stdout,
+                stderr,
+                artifact_bytes,
+                source_path,
+                ..
+            } => {
+                all_stdout.extend_from_slice(stdout);
+                all_stderr.extend_from_slice(stderr);
+                let src = source_path.clone();
+                let bytes = *artifact_bytes;
+                record_session_stat(&state.sessions, &sid, move |t| {
+                    t.record_hit(src, 0, bytes);
+                });
+            }
+            UnitCacheResult::Miss { source_path, .. } => {
+                write_session_log(
+                    &state.sessions,
+                    &sid,
+                    &format!("multi-file cache miss: {}", source_path.display()),
+                );
+            }
+        }
+        // Drain pending writes from hits for batched parallel execution
+        if let UnitCacheResult::Hit {
+            ref mut pending_writes,
+            ..
+        } = result
+        {
+            all_pending_writes.append(pending_writes);
+        }
+        unit_results.push(result);
+    }
+
+    // ── Phase 1b: Execute all output writes in parallel ─────────────
+    if !all_pending_writes.is_empty() {
+        let mut write_set = tokio::task::JoinSet::new();
+        for pw in all_pending_writes {
+            write_set.spawn_blocking(move || {
+                let _ = write_cached_output(&pw.out_path, &pw.cache_file, &pw.data);
+            });
+        }
+        while write_set.join_next().await.is_some() {}
+    }
+
+    let miss_sources: Vec<&PathBuf> = unit_results
+        .iter()
+        .filter_map(|r| match r {
+            UnitCacheResult::Miss { source_path, .. } => Some(source_path),
+            UnitCacheResult::Hit { .. } => None,
+        })
+        .collect();
+
+    if miss_sources.is_empty() {
+        return Response::CompileResult {
+            exit_code: 0,
+            stdout: all_stdout,
+            stderr: all_stderr,
+            cached: true,
+        };
+    }
+
+    write_session_log(
+        &state.sessions,
+        &sid,
+        &format!(
+            "multi-file: compiling {} of {} files",
+            miss_sources.len(),
+            compilations.len()
+        ),
+    );
+
+    // Build compiler args: -c <miss sources...> <shared flags>
+    let shared_flags = &compilations[0].cache_relevant_args;
+    let mut compiler_args: Vec<String> = vec!["-c".to_string()];
+    for src in &miss_sources {
+        compiler_args.push(src.to_string_lossy().into_owned());
+    }
+    compiler_args.extend(shared_flags.iter().cloned());
+
+    let mut cmd = tokio::process::Command::new(&compiler);
+    cmd.args(&compiler_args).current_dir(&cwd);
+    apply_client_env(&mut cmd, &client_env);
+    let result = cmd.output().await;
+
+    let output = match result {
+        Ok(o) => o,
+        Err(e) => {
+            return Response::Error {
+                message: format!("failed to run compiler: {e}"),
+            };
+        }
+    };
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    all_stdout.extend_from_slice(&output.stdout);
+    all_stderr.extend_from_slice(&output.stderr);
+
+    if exit_code != 0 {
+        state.stats.record_error();
+        record_session_stat(&state.sessions, &sid, |t| t.record_error());
+        return Response::CompileResult {
+            exit_code,
+            stdout: all_stdout,
+            stderr: all_stderr,
+            cached: false,
+        };
+    }
+
+    // ── Phase 3: Cache each miss result individually ─────────────────
+    for unit in &unit_results {
+        let (source_path, output_path, context_key, ctx) = match unit {
+            UnitCacheResult::Miss {
+                source_path,
+                output_path,
+                context_key,
+                ctx,
+            } => (source_path, output_path, context_key, ctx),
+            UnitCacheResult::Hit { .. } => continue,
+        };
+
+        let output_data = match std::fs::read(output_path) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+
+        // Scan includes
+        let scan_result =
+            zccache_depgraph::scanner::scan_recursive(source_path, &ctx.include_search);
+
+        let tracked_paths: Vec<PathBuf> = std::iter::once(source_path.clone())
+            .chain(scan_result.resolved.iter().cloned())
+            .collect();
+        state.cache_system.register_tracked(&tracked_paths);
+
+        // Watch parent directories of discovered headers.
+        {
+            let header_dirs: Vec<PathBuf> = {
+                let mut dirs = HashSet::new();
+                for header in &scan_result.resolved {
+                    if let Some(parent) = header.parent() {
+                        dirs.insert(parent.to_path_buf());
+                    }
+                }
+                dirs.into_iter().collect()
+            };
+            watch_directories(&state, &header_dirs).await;
+        }
+
+        // Hash all files
+        let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
+        if let Ok(h) = hash_file(&state.cache_system, source_path) {
+            hash_map.insert(source_path.clone(), h);
+        }
+        for header in &scan_result.resolved {
+            if let Ok(h) = hash_file(&state.cache_system, header) {
+                hash_map.insert(header.clone(), h);
+            }
+        }
+
+        // Store artifact
+        let get_hash = |p: &Path| hash_map.get(p).copied();
+        let update_result = state.dep_graph.update(context_key, scan_result, get_hash);
+        if let Some(artifact_key) = update_result {
+            let artifact = ArtifactData {
+                outputs: vec![ArtifactOutput {
+                    name: output_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    data: output_data,
+                }],
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_code: 0,
+            };
+
+            let artifact_key_hex = artifact_key.hash().to_hex();
+            for (i, out) in artifact.outputs.iter().enumerate() {
+                let cache_path = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                let _ = std::fs::write(&cache_path, &out.data);
+            }
+
+            let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
+            state
+                .artifacts
+                .insert(artifact_key_hex, CachedArtifact { artifact });
+
+            state.stats.record_miss(0, artifact_bytes);
+            let src = source_path.clone();
+            record_session_stat(&state.sessions, &sid, move |t| {
+                t.record_miss(src, artifact_bytes);
+            });
+        }
+    }
+
+    Response::CompileResult {
+        exit_code: 0,
+        stdout: all_stdout,
+        stderr: all_stderr,
+        cached: false,
     }
 }
 
@@ -898,6 +1559,37 @@ mod tests {
         client.send(&Request::Shutdown).await.unwrap();
         let resp: Option<Response> = client.recv().await.unwrap();
         assert_eq!(resp, Some(Response::ShuttingDown));
+
+        shutdown.notify_one();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_server_clear_empty() {
+        let endpoint = zccache_ipc::unique_test_endpoint();
+        let mut server = DaemonServer::bind(&endpoint).unwrap();
+        let shutdown = server.shutdown_handle();
+
+        let server_task = tokio::spawn(async move {
+            server.run(0).await.unwrap();
+        });
+
+        let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+        client.send(&Request::Clear).await.unwrap();
+        let resp: Option<Response> = client.recv().await.unwrap();
+        match resp {
+            Some(Response::Cleared {
+                artifacts_removed,
+                metadata_cleared,
+                dep_graph_contexts_cleared,
+                ..
+            }) => {
+                assert_eq!(artifacts_removed, 0);
+                assert_eq!(metadata_cleared, 0);
+                assert_eq!(dep_graph_contexts_cleared, 0);
+            }
+            other => panic!("expected Cleared, got: {other:?}"),
+        }
 
         shutdown.notify_one();
         server_task.await.unwrap();

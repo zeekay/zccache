@@ -5,6 +5,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod crash;
 pub mod server;
 pub mod stats;
 

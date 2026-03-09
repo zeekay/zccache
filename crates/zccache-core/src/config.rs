@@ -64,9 +64,33 @@ pub fn default_cache_dir() -> PathBuf {
     }
 }
 
+/// Returns the directory for crash dump files.
+#[must_use]
+pub fn crash_dump_dir() -> PathBuf {
+    default_cache_dir().join("crashes")
+}
+
 fn dirs_fallback() -> PathBuf {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crash_dump_dir_ends_with_crashes() {
+        let dir = crash_dump_dir();
+        assert!(dir.ends_with("crashes"));
+    }
+
+    #[test]
+    fn crash_dump_dir_is_under_cache_dir() {
+        let cache = default_cache_dir();
+        let crashes = crash_dump_dir();
+        assert!(crashes.starts_with(&cache));
+    }
 }

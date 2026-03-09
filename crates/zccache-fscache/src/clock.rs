@@ -162,6 +162,17 @@ impl ChangeJournal {
         Clock(new_tick)
     }
 
+    /// Clear all tracked state and mark an overflow.
+    ///
+    /// Empties the journal and last-change map, then marks an overflow
+    /// so that any query with a clock from before the clear returns "changed".
+    /// Returns the new overflow clock.
+    pub fn clear(&self) -> Clock {
+        self.last_change.clear();
+        self.journal.write().expect("journal lock poisoned").clear();
+        self.mark_overflow()
+    }
+
     /// Register a file as tracked at the current clock tick without advancing
     /// the clock.
     ///
@@ -378,6 +389,26 @@ mod tests {
 
         // Should still show as changed since Clock::ZERO (changed at c1 > 0)
         assert!(journal.changed_since(Path::new("modified.h"), Clock::ZERO));
+    }
+
+    #[test]
+    fn clear_empties_journal_and_marks_overflow() {
+        let journal = ChangeJournal::new();
+        let c1 = journal.advance(vec![PathBuf::from("a.c")]);
+        let _c2 = journal.advance(vec![PathBuf::from("b.c")]);
+
+        let overflow_clock = journal.clear();
+
+        // Journal should be empty.
+        let changes = journal.changes_since(Clock::ZERO);
+        assert!(changes.is_empty());
+
+        // Queries before the overflow clock return "changed" (overflow).
+        assert!(journal.changed_since(Path::new("a.c"), c1));
+
+        // After the overflow clock, a newly tracked file should be "not changed".
+        journal.register(PathBuf::from("new.c"));
+        assert!(!journal.changed_since(Path::new("new.c"), overflow_clock));
     }
 
     #[test]

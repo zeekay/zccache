@@ -64,6 +64,12 @@ All hooks are Python scripts in `ci/hooks/`, invoked via `uv run`:
 - **SessionStart**: `ci/hooks/check-on-start.py` captures git fingerprint
 - **Stop**: `ci/hooks/check-on-stop.py` runs full workspace lint + tests (skips if no changes)
 
+## Language Policy
+
+- **Python is only for CI scripts, packaging, and hooks.** All tests, benchmarks, and application logic must be written in Rust.
+- `uv run` is required only because hooks enforce it for toolchain management — it is not an endorsement of Python for project code.
+- When in doubt, write it in Rust.
+
 ## Development Philosophy: TDD
 
 - **Red → Green → Refactor.** Write failing tests first, then implement the minimum code to make them pass, then refactor.

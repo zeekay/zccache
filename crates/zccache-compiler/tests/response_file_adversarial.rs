@@ -1053,9 +1053,7 @@ fn integration_all_args_from_response_file() {
             assert!(c.cache_relevant_args.contains(&"-O2".to_string()));
             assert!(c.cache_relevant_args.contains(&"-Wall".to_string()));
         }
-        zccache_compiler::ParsedInvocation::NonCacheable { reason } => {
-            panic!("expected cacheable, got: {reason}")
-        }
+        other => panic!("expected cacheable, got: {other:?}"),
     }
 }
 
@@ -1073,9 +1071,7 @@ fn integration_c_flag_from_response_file() {
             assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
             assert_eq!(c.output_file, PathBuf::from("foo.o"));
         }
-        zccache_compiler::ParsedInvocation::NonCacheable { reason } => {
-            panic!("expected cacheable, got: {reason}")
-        }
+        other => panic!("expected cacheable, got: {other:?}"),
     }
 }
 
@@ -1090,9 +1086,7 @@ fn integration_noncacheable_flag_from_response_file() {
     let expanded = expand_response_files(&args).unwrap();
     match zccache_compiler::parse_invocation("gcc", &expanded) {
         zccache_compiler::ParsedInvocation::NonCacheable { .. } => { /* expected */ }
-        zccache_compiler::ParsedInvocation::Cacheable(_) => {
-            panic!("expected non-cacheable due to -E from response file")
-        }
+        other => panic!("expected cacheable, got: {other:?}"),
     }
 }
 
@@ -1110,9 +1104,7 @@ fn integration_quoted_source_path_from_response_file() {
             assert_eq!(c.source_file, PathBuf::from("path with spaces/main.cpp"));
             assert_eq!(c.output_file, PathBuf::from("main.o"));
         }
-        zccache_compiler::ParsedInvocation::NonCacheable { reason } => {
-            panic!("expected cacheable, got: {reason}")
-        }
+        other => panic!("expected cacheable, got: {other:?}"),
     }
 }
 
@@ -1141,9 +1133,7 @@ fn integration_nested_response_files_cacheable() {
             assert!(c.cache_relevant_args.contains(&"-Wall".to_string()));
             assert!(c.cache_relevant_args.contains(&"-DNDEBUG".to_string()));
         }
-        zccache_compiler::ParsedInvocation::NonCacheable { reason } => {
-            panic!("expected cacheable, got: {reason}")
-        }
+        other => panic!("expected cacheable, got: {other:?}"),
     }
 }
 
@@ -1157,14 +1147,11 @@ fn integration_multiple_sources_via_response_file() {
     let args = s(&["-c", "a.cpp", &format!("@{}", path.display())]);
     let expanded = expand_response_files(&args).unwrap();
     match zccache_compiler::parse_invocation("gcc", &expanded) {
-        zccache_compiler::ParsedInvocation::NonCacheable { reason } => {
-            assert!(
-                reason.contains("multiple source"),
-                "expected 'multiple source' reason, got: {reason}"
-            );
+        zccache_compiler::ParsedInvocation::MultiFile { compilations, .. } => {
+            assert_eq!(compilations.len(), 2);
         }
-        zccache_compiler::ParsedInvocation::Cacheable(_) => {
-            panic!("expected non-cacheable with multiple sources")
+        other => {
+            panic!("expected MultiFile with 2 sources, got: {other:?}")
         }
     }
 }
@@ -1194,9 +1181,7 @@ fn integration_define_with_quoted_value_in_cache_key() {
                 .cache_relevant_args
                 .contains(&"-DPATH=/usr/local".to_string()));
         }
-        zccache_compiler::ParsedInvocation::NonCacheable { reason } => {
-            panic!("expected cacheable, got: {reason}")
-        }
+        other => panic!("expected cacheable, got: {other:?}"),
     }
 }
 

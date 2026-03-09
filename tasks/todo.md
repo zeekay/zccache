@@ -1,42 +1,34 @@
-# Stats System Implementation (TDD)
+# Warm Cache Hit Optimization
 
-## Overview
-Add global daemon stats and opt-in per-session stats tracking.
+Profile showed 425µs/hit with these bottlenecks:
+- write_output (fs::write): 250µs (59%) — 3 syscalls (remove + exists + hardlink)
+- hash_headers: 63µs (15%) — per-file stat/DashMap lookups
+- depgraph_check: 33µs (8%) — redundant artifact key recomputation
 
-## Phase 1: Protocol types
-- [x] Add `SessionStats` struct to protocol
-- [x] Expand `DaemonStatus` with new fields
-- [x] Add `track_stats: bool` to `Request::SessionStart`
-- [x] Change `Response::SessionEnded` to carry `Option<SessionStats>`
-- [x] Serialization roundtrip tests for all new/changed types (7 tests)
+## Plan
 
-## Phase 2: StatsCollector (daemon-side global stats)
-- [x] Create `stats.rs` module in `zccache-daemon`
-- [x] `StatsCollector` struct with atomic counters
-- [x] Methods: `record_compilation`, `record_hit`, `record_miss`, `record_non_cacheable`, `record_error`, `record_session`
-- [x] `snapshot()` → returns current values, `time_saved_ms()` derived
-- [x] Unit tests (8 tests: zeros, hit, miss, non-cacheable, error, session, time_saved, concurrent)
+- [x] Add dashmap dependency to zccache-daemon
+- [x] Add clock-based fast path: skip hash_source + hash_headers + depgraph_check when journal clock hasn't advanced since last verified hit
+- [x] Optimize write_output: try hardlink first (1 syscall), remove+retry only on failure
+- [x] Update profiler to track fast-path hits (zero hash/depgraph phases)
+- [x] Invalidate fast-path cache on miss
+- [x] Run profile test to measure improvement
+- [x] Run full test suite (484 tests pass)
+- [x] Run bench.py to measure end-to-end improvement
 
-## Phase 3: Per-session stats tracking
-- [x] Add `SessionStatsTracker` to `Session` (optional, only when opted in via `track_stats`)
-- [x] Track: compilations, hits, misses, non_cacheable, errors, time_saved, unique sources, bytes
-- [x] `finalize()` → returns `FinalizedSessionStats` with duration computed
-- [x] `SessionManager::mutate()` for in-place stat recording
-- [x] Unit tests (7 tests: zeros, hit, miss, non_cacheable+error, finalize, with/without tracking)
+## Results
 
-## Phase 4: Wire up in daemon server
-- [x] Add `StatsCollector` to `SharedState`
-- [x] Instrument `handle_compile` to record hits/misses/non-cacheable/errors with timing
-- [x] Populate `DaemonStatus` from real data (StatsCollector + DepGraph + MetadataCache + artifacts)
-- [x] Pass `track_stats` through `SessionStart` → `SessionConfig`
-- [x] Return `SessionStats` in `SessionEnd` response via finalize
-- [x] `record_session_stat()` helper for per-session stat mutations
+### Profile test (daemon-side, debug build)
+- BEFORE: 425µs/hit, IPC round-trip 709µs
+- AFTER:  288µs/hit, IPC round-trip 538µs (32% faster)
+- hash_source: 9µs → 0µs, hash_headers: 63µs → 1µs, depgraph: 33µs → 0µs
 
-## Phase 5: CLI output formatting
-- [x] Pretty-print expanded `DaemonStatus` in `cmd_status`
-- [x] Print session stats on `session-end` when present
-- [x] Format helpers: `format_uptime`, `format_duration_ms`, `format_bytes`
+### Benchmark (release build, end-to-end)
+| Tool | Warm Build | Speedup vs Bare |
+|------|-----------|-----------------|
+| bare clang | 1.148s | 1.0x |
+| sccache | 0.035s | 32.5x |
+| **zccache (before)** | **0.018s** | **33.8x** |
+| **zccache (after)** | **0.008s** | **141.6x** |
 
-## Verification
-- Workspace compiles clean (cargo check + clippy -D warnings)
-- 191 tests pass, 1 pre-existing failure (cli_binary_session_round_trip — needs compiled binary)
+zccache warm hits: 18ms → 8ms (2.25x faster), now 4.4x faster than sccache.

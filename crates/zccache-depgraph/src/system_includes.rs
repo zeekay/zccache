@@ -113,6 +113,11 @@ impl SystemIncludeCache {
         self.cache.get(compiler).map(Vec::as_slice).unwrap()
     }
 
+    /// Remove all cached entries.
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+
     /// Number of cached entries.
     #[must_use]
     pub fn len(&self) -> usize {

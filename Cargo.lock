@@ -1569,6 +1569,7 @@ name = "zccache-daemon"
 version = "1.0.1"
 dependencies = [
  "clap",
+ "dashmap",
  "serde",
  "tempfile",
  "thiserror",

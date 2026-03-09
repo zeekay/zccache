@@ -30,6 +30,7 @@ zccache-watcher = { path = "../zccache-watcher" }
 zccache-hash = { path = "../zccache-hash" }
 zccache-compiler = { path = "../zccache-compiler" }
 zccache-depgraph = { path = "../zccache-depgraph" }
+dashmap = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

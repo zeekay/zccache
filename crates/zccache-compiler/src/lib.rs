@@ -24,6 +24,14 @@ pub enum CompilerFamily {
 pub enum ParsedInvocation {
     /// A cacheable compilation (single source to single object).
     Cacheable(CacheableCompilation),
+    /// Multiple source files with `-c` — each is independently cacheable.
+    /// The shared flags are carried so cache misses can be batched into one compiler call.
+    MultiFile {
+        /// One entry per source file, each with its own output path.
+        compilations: Vec<CacheableCompilation>,
+        /// The original full argument list (for batched compiler invocation of misses).
+        original_args: Vec<String>,
+    },
     /// A non-cacheable invocation (linking, preprocessing, etc.).
     NonCacheable {
         /// Reason why this invocation is not cacheable.
@@ -104,10 +112,9 @@ const FLAGS_WITH_VALUE: &[&str] = &[
 #[must_use]
 pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     let mut has_c_flag = false;
-    let mut source_file: Option<String> = None;
+    let mut source_files: Vec<String> = Vec::new();
     let mut output_file: Option<String> = None;
     let mut cache_relevant_args = Vec::new();
-    let mut multiple_sources = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -164,19 +171,10 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
 
         // Positional arg — should be a source file
         if is_source_file(arg) {
-            if source_file.is_some() {
-                multiple_sources = true;
-            }
-            source_file = Some(arg.clone());
+            source_files.push(arg.clone());
         }
 
         i += 1;
-    }
-
-    if multiple_sources {
-        return ParsedInvocation::NonCacheable {
-            reason: "multiple source files".to_string(),
-        };
     }
 
     if !has_c_flag {
@@ -185,16 +183,46 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
         };
     }
 
-    let source = match source_file {
-        Some(s) => s,
-        None => {
-            return ParsedInvocation::NonCacheable {
-                reason: "no source file found".to_string(),
-            };
-        }
-    };
+    if source_files.is_empty() {
+        return ParsedInvocation::NonCacheable {
+            reason: "no source file found".to_string(),
+        };
+    }
 
-    // Default output: source stem + .o
+    let family = detect_family(compiler);
+
+    // Multi-file: `-o` is invalid with `-c` and multiple sources (compiler rejects it),
+    // so each source gets its default output name (stem.o).
+    if source_files.len() > 1 {
+        let compilations = source_files
+            .iter()
+            .map(|src| {
+                let stem = std::path::Path::new(src)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("a");
+                // Each unit gets its own single-file args for correct context building.
+                let mut unit_args = vec!["-c".to_string(), src.clone()];
+                unit_args.extend(cache_relevant_args.iter().cloned());
+                CacheableCompilation {
+                    compiler: PathBuf::from(compiler),
+                    family,
+                    source_file: PathBuf::from(src),
+                    output_file: PathBuf::from(format!("{stem}.o")),
+                    cache_relevant_args: cache_relevant_args.clone(),
+                    pass_through_args: Vec::new(),
+                    original_args: unit_args,
+                }
+            })
+            .collect();
+        return ParsedInvocation::MultiFile {
+            compilations,
+            original_args: args.to_vec(),
+        };
+    }
+
+    // Single source file
+    let source = source_files.into_iter().next().unwrap();
     let output = output_file.unwrap_or_else(|| {
         let stem = std::path::Path::new(&source)
             .file_stem()
@@ -202,8 +230,6 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             .unwrap_or("a");
         format!("{stem}.o")
     });
-
-    let family = detect_family(compiler);
 
     ParsedInvocation::Cacheable(CacheableCompilation {
         compiler: PathBuf::from(compiler),
@@ -233,9 +259,7 @@ mod tests {
                 assert_eq!(c.output_file, PathBuf::from("hello.o"));
                 assert_eq!(c.family, CompilerFamily::Clang);
             }
-            ParsedInvocation::NonCacheable { reason } => {
-                panic!("expected cacheable, got: {reason}")
-            }
+            other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
@@ -252,9 +276,60 @@ mod tests {
     }
 
     #[test]
-    fn multiple_sources_non_cacheable() {
+    fn multi_file_split() {
         let result = parse_invocation("gcc", &args(&["-c", "a.cpp", "b.cpp"]));
-        assert!(matches!(result, ParsedInvocation::NonCacheable { .. }));
+        match result {
+            ParsedInvocation::MultiFile { compilations, .. } => {
+                assert_eq!(compilations.len(), 2);
+                assert_eq!(compilations[0].source_file, PathBuf::from("a.cpp"));
+                assert_eq!(compilations[0].output_file, PathBuf::from("a.o"));
+                assert_eq!(compilations[1].source_file, PathBuf::from("b.cpp"));
+                assert_eq!(compilations[1].output_file, PathBuf::from("b.o"));
+            }
+            other => panic!("expected MultiFile, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_file_with_flags() {
+        let result = parse_invocation(
+            "g++",
+            &args(&["-c", "-O2", "main.cpp", "-Wall", "util.cpp"]),
+        );
+        match result {
+            ParsedInvocation::MultiFile { compilations, .. } => {
+                assert_eq!(compilations.len(), 2);
+                assert_eq!(compilations[0].source_file, PathBuf::from("main.cpp"));
+                assert_eq!(compilations[1].source_file, PathBuf::from("util.cpp"));
+                // Shared flags are preserved on each compilation
+                assert!(compilations[0]
+                    .cache_relevant_args
+                    .contains(&"-O2".to_string()));
+                assert!(compilations[0]
+                    .cache_relevant_args
+                    .contains(&"-Wall".to_string()));
+                assert!(compilations[1]
+                    .cache_relevant_args
+                    .contains(&"-O2".to_string()));
+                assert!(compilations[1]
+                    .cache_relevant_args
+                    .contains(&"-Wall".to_string()));
+            }
+            other => panic!("expected MultiFile, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_file_mixed_extensions() {
+        let result = parse_invocation("gcc", &args(&["-c", "file1.c", "file2.cpp"]));
+        match result {
+            ParsedInvocation::MultiFile { compilations, .. } => {
+                assert_eq!(compilations.len(), 2);
+                assert_eq!(compilations[0].source_file, PathBuf::from("file1.c"));
+                assert_eq!(compilations[1].source_file, PathBuf::from("file2.cpp"));
+            }
+            other => panic!("expected MultiFile, got: {other:?}"),
+        }
     }
 
     #[test]

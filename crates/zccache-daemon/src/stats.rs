@@ -111,6 +111,20 @@ impl StatsCollector {
         self.sessions_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Reset all counters to zero.
+    pub fn reset(&self) {
+        self.compilations.store(0, Ordering::Relaxed);
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
+        self.non_cacheable.store(0, Ordering::Relaxed);
+        self.compile_errors.store(0, Ordering::Relaxed);
+        self.sessions_total.store(0, Ordering::Relaxed);
+        self.hit_time_us.store(0, Ordering::Relaxed);
+        self.miss_time_us.store(0, Ordering::Relaxed);
+        self.bytes_read.store(0, Ordering::Relaxed);
+        self.bytes_written.store(0, Ordering::Relaxed);
+    }
+
     /// Take a consistent snapshot of all counters.
     #[must_use]
     pub fn snapshot(&self) -> StatsSnapshot {
@@ -235,6 +249,26 @@ impl PhaseProfiler {
             .fetch_add(phases.artifact_store_us, Ordering::Relaxed);
         self.total_miss_us
             .fetch_add(phases.total_us, Ordering::Relaxed);
+    }
+
+    /// Reset all phase counters to zero.
+    pub fn reset(&self) {
+        self.count.store(0, Ordering::Relaxed);
+        self.parse_args_us.store(0, Ordering::Relaxed);
+        self.build_context_us.store(0, Ordering::Relaxed);
+        self.hash_source_us.store(0, Ordering::Relaxed);
+        self.hash_headers_us.store(0, Ordering::Relaxed);
+        self.depgraph_check_us.store(0, Ordering::Relaxed);
+        self.artifact_lookup_us.store(0, Ordering::Relaxed);
+        self.write_output_us.store(0, Ordering::Relaxed);
+        self.bookkeeping_us.store(0, Ordering::Relaxed);
+        self.total_hit_us.store(0, Ordering::Relaxed);
+        self.compiler_exec_us.store(0, Ordering::Relaxed);
+        self.include_scan_us.store(0, Ordering::Relaxed);
+        self.hash_all_us.store(0, Ordering::Relaxed);
+        self.artifact_store_us.store(0, Ordering::Relaxed);
+        self.total_miss_us.store(0, Ordering::Relaxed);
+        self.miss_count.store(0, Ordering::Relaxed);
     }
 
     /// Return a snapshot of average phase durations.
@@ -398,6 +432,65 @@ mod tests {
         // Only hits, no misses — can't estimate
         c.record_hit(500, 0);
         assert_eq!(c.snapshot().time_saved_ms(), 0);
+    }
+
+    #[test]
+    fn reset_clears_all_counters() {
+        let c = StatsCollector::new();
+        c.record_compilation();
+        c.record_hit(500, 1024);
+        c.record_miss(50_000, 2048);
+        c.record_non_cacheable();
+        c.record_error();
+        c.record_session();
+
+        c.reset();
+
+        let s = c.snapshot();
+        assert_eq!(
+            s,
+            StatsSnapshot {
+                compilations: 0,
+                hits: 0,
+                misses: 0,
+                non_cacheable: 0,
+                compile_errors: 0,
+                sessions_total: 0,
+                hit_time_us: 0,
+                miss_time_us: 0,
+                bytes_read: 0,
+                bytes_written: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn profiler_reset_clears_all_counters() {
+        let p = PhaseProfiler::new();
+        p.record_hit(&HitPhases {
+            parse_args_us: 100,
+            build_context_us: 200,
+            hash_source_us: 300,
+            hash_headers_us: 400,
+            depgraph_check_us: 500,
+            artifact_lookup_us: 600,
+            write_output_us: 700,
+            bookkeeping_us: 800,
+            total_us: 3600,
+        });
+        p.record_miss(&MissPhases {
+            compiler_exec_us: 1000,
+            include_scan_us: 2000,
+            hash_all_us: 3000,
+            artifact_store_us: 4000,
+            total_us: 10000,
+        });
+
+        p.reset();
+
+        let s = p.snapshot();
+        assert_eq!(s.hit_count, 0);
+        assert_eq!(s.miss_count, 0);
     }
 
     #[test]

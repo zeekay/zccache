@@ -136,6 +136,14 @@ impl CacheSystem {
         self.journal.mark_overflow()
     }
 
+    /// Clear all cached metadata and journal state.
+    ///
+    /// Returns the new overflow clock (all pre-clear clocks are invalidated).
+    pub fn clear(&self) -> Clock {
+        self.metadata.clear();
+        self.journal.clear()
+    }
+
     /// Register files as tracked by the journal without downgrading their
     /// confidence.
     ///
@@ -396,6 +404,22 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn clear_empties_metadata_and_invalidates_clocks() {
+        let dir = TempDir::new().unwrap();
+        let path_a = create_file(&dir, "a.h", "aaa");
+        let path_b = create_file(&dir, "b.h", "bbb");
+
+        let cache = CacheSystem::new();
+        cache.lookup_since(&path_a, Clock::ZERO).unwrap();
+        cache.lookup_since(&path_b, Clock::ZERO).unwrap();
+        assert_eq!(cache.metadata().len(), 2);
+
+        let overflow_clock = cache.clear();
+        assert!(cache.metadata().is_empty());
+        assert!(overflow_clock > Clock::ZERO);
     }
 
     #[test]

@@ -19,11 +19,33 @@ PYTHON_TOOLS = {"python", "python3", "pip", "pip3"}
 ALLOWED_PREFIXES = ("uv run ", "uv pip ")
 
 
+FORBIDDEN_SCRIPT_DIRS = re.compile(
+    r"""(?:^|[\s/\\])      # start or separator
+        (?:bench|tests?)   # forbidden directories
+        [/\\]              # path separator
+        \S*\.py            # any .py file
+    """,
+    re.VERBOSE,
+)
+
+DENY_PYTHON_IN_CODE = (
+    "Do not use Python for benchmarks or tests. "
+    "Write them in Rust instead. Python is only for CI scripts and packaging."
+)
+
+
 def check_command(command):
     """Check a command string for forbidden bare invocations.
 
     Returns (tool, reason) if forbidden, None if allowed.
     """
+    # ── Global check: block .py scripts in bench/ or tests/ dirs ─────
+    # Catches all forms: uv run python bench/x.py, uv run bench/x.py,
+    # uv run --script bench/x.py, ./bench/x.py, python tests/x.py, etc.
+    if FORBIDDEN_SCRIPT_DIRS.search(command):
+        return ("python", DENY_PYTHON_IN_CODE)
+
+    # ── Per-segment checks ───────────────────────────────────────────
     segments = re.split(r"&&|\|\||;", command)
 
     for seg in segments:

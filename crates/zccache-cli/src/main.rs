@@ -71,6 +71,12 @@ enum Commands {
         /// Cache key (hex).
         key: String,
     },
+    /// Show or clear crash dumps from previous daemon crashes.
+    Crashes {
+        /// Delete all crash dumps.
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 /// Known subcommand names for auto-detect.
@@ -83,6 +89,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "inspect",
     "session-start",
     "session-end",
+    "crashes",
     "help",
     "--help",
     "-h",
@@ -117,8 +124,8 @@ fn main() -> ExitCode {
             run_async(cmd_status(&endpoint))
         }
         Commands::Clear => {
-            eprintln!("zccache clear: not yet implemented");
-            ExitCode::FAILURE
+            let endpoint = resolve_endpoint(None);
+            run_async(cmd_clear(&endpoint))
         }
         Commands::SessionStart {
             compiler,
@@ -153,6 +160,7 @@ fn main() -> ExitCode {
             eprintln!("zccache inspect {key}: not yet implemented");
             ExitCode::FAILURE
         }
+        Commands::Crashes { clear } => cmd_crashes(clear),
     }
 }
 
@@ -259,6 +267,42 @@ async fn cmd_status(endpoint: &str) -> ExitCode {
     }
 }
 
+async fn cmd_clear(endpoint: &str) -> ExitCode {
+    let mut conn = match connect(endpoint).await {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("daemon not running at {endpoint} — nothing to clear");
+            return ExitCode::SUCCESS;
+        }
+    };
+
+    conn.send(&zccache_protocol::Request::Clear).await.unwrap();
+    match conn.recv().await.unwrap() {
+        Some(zccache_protocol::Response::Cleared {
+            artifacts_removed,
+            metadata_cleared,
+            dep_graph_contexts_cleared,
+            on_disk_bytes_freed,
+        }) => {
+            println!("Cache cleared:");
+            println!("  Artifacts removed:  {artifacts_removed}");
+            println!("  Metadata cleared:   {metadata_cleared}");
+            println!("  Dep graph contexts: {dep_graph_contexts_cleared}");
+            if on_disk_bytes_freed > 0 {
+                println!(
+                    "  Disk freed:         {}",
+                    format_bytes(on_disk_bytes_freed)
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!("unexpected response: {other:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 async fn cmd_session_start(
     endpoint: &str,
     compiler: &str,
@@ -352,6 +396,64 @@ async fn cmd_session_end(endpoint: &str, session_id: u64) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn cmd_crashes(clear: bool) -> ExitCode {
+    let crash_dir = zccache_core::config::crash_dump_dir();
+
+    if clear {
+        let count = match std::fs::read_dir(&crash_dir) {
+            Ok(entries) => {
+                let mut n = 0u64;
+                for entry in entries.flatten() {
+                    if std::fs::remove_file(entry.path()).is_ok() {
+                        n += 1;
+                    }
+                }
+                n
+            }
+            Err(_) => 0,
+        };
+        println!("Deleted {count} crash dump(s).");
+        return ExitCode::SUCCESS;
+    }
+
+    let mut dumps: Vec<_> = match std::fs::read_dir(&crash_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "txt"))
+            .collect(),
+        Err(_) => {
+            println!("No crash dumps found.");
+            return ExitCode::SUCCESS;
+        }
+    };
+
+    if dumps.is_empty() {
+        println!("No crash dumps found.");
+        return ExitCode::SUCCESS;
+    }
+
+    dumps.sort_by_key(|e| e.file_name());
+
+    println!("Crash dumps ({}):", dumps.len());
+    println!();
+    for entry in &dumps {
+        let path = entry.path();
+        println!("  {}", path.display());
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for (i, line) in content.lines().enumerate() {
+                if i >= 5 {
+                    println!("    ...");
+                    break;
+                }
+                println!("    {line}");
+            }
+            println!();
+        }
+    }
+
+    ExitCode::SUCCESS
 }
 
 // ─── Wrap (compiler wrapper) ───────────────────────────────────────────────

@@ -59,6 +59,8 @@ pub enum Request {
         /// Session ID to end.
         session_id: u64,
     },
+    /// Clear all caches (artifacts, metadata, dep graph).
+    Clear,
 }
 
 /// A response from daemon to client.
@@ -101,6 +103,17 @@ pub enum Response {
     Error {
         /// Human-readable error message.
         message: String,
+    },
+    /// Cache cleared successfully.
+    Cleared {
+        /// Number of in-memory artifacts removed.
+        artifacts_removed: u64,
+        /// Number of metadata cache entries cleared.
+        metadata_cleared: u64,
+        /// Number of dep graph contexts cleared.
+        dep_graph_contexts_cleared: u64,
+        /// Bytes freed from on-disk artifact cache.
+        on_disk_bytes_freed: u64,
     },
 }
 
@@ -316,6 +329,21 @@ mod tests {
 
         let resp_no_stats = Response::SessionEnded { stats: None };
         roundtrip(&resp_no_stats);
+    }
+
+    #[test]
+    fn clear_request_roundtrip() {
+        roundtrip(&Request::Clear);
+    }
+
+    #[test]
+    fn cleared_response_roundtrip() {
+        roundtrip(&Response::Cleared {
+            artifacts_removed: 42,
+            metadata_cleared: 100,
+            dep_graph_contexts_cleared: 25,
+            on_disk_bytes_freed: 1024 * 1024,
+        });
     }
 
     #[test]

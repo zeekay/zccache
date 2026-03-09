@@ -425,9 +425,7 @@ mod tests {
                 assert!(c.cache_relevant_args.contains(&"-Wall".to_string()));
                 assert!(c.cache_relevant_args.contains(&"-DNDEBUG".to_string()));
             }
-            crate::ParsedInvocation::NonCacheable { reason } => {
-                panic!("expected cacheable, got: {reason}")
-            }
+            _ => panic!("unexpected variant"),
         }
     }
 }

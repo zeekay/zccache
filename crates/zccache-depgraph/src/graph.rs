@@ -289,6 +289,15 @@ impl DepGraph {
         removed
     }
 
+    /// Clear all graph state: files, contexts, and stats counters.
+    pub fn clear(&self) {
+        self.files.clear();
+        self.contexts.clear();
+        self.checks.store(0, Ordering::Relaxed);
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
+    }
+
     /// Get statistics about the graph.
     #[must_use]
     pub fn stats(&self) -> DepGraphStats {
@@ -743,6 +752,34 @@ mod tests {
         let system_includes = vec![PathBuf::from("/usr/include")];
         let keys = graph.ingest_compile_commands(&commands, &system_includes);
         assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn clear_resets_everything() {
+        let graph = DepGraph::new();
+        let key = graph.register(make_ctx("/src/a.c"));
+
+        let scan = ScanResult {
+            resolved: vec![PathBuf::from("/inc/b.h")],
+            unresolved: Vec::new(),
+            has_computed: false,
+        };
+        graph.update(&key, scan, dummy_hash);
+        graph.check(&key, always_fresh, dummy_hash);
+
+        let stats_before = graph.stats();
+        assert!(stats_before.context_count > 0);
+        assert!(stats_before.checks > 0);
+        assert!(stats_before.hits > 0);
+
+        graph.clear();
+
+        let stats_after = graph.stats();
+        assert_eq!(stats_after.context_count, 0);
+        assert_eq!(stats_after.file_count, 0);
+        assert_eq!(stats_after.checks, 0);
+        assert_eq!(stats_after.hits, 0);
+        assert_eq!(stats_after.misses, 0);
     }
 
     #[test]

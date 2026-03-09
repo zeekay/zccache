@@ -96,6 +96,9 @@ fn run_server(args: Args) {
     let endpoint = args.endpoint.unwrap_or_else(zccache_ipc::default_endpoint);
     let idle_timeout = args.idle_timeout;
 
+    zccache_daemon::crash::install_panic_hook();
+    zccache_daemon::crash::check_previous_crashes();
+
     tracing::info!(%endpoint, idle_timeout, "zccache-daemon starting");
 
     // Write lock file so CLI can detect us
