@@ -105,12 +105,12 @@ fn main() -> ExitCode {
 
     match cli.command {
         Commands::Start => {
-            eprintln!("zccache daemon start: not yet implemented");
-            ExitCode::FAILURE
+            let endpoint = resolve_endpoint(None);
+            run_async(cmd_start(&endpoint))
         }
         Commands::Stop => {
-            eprintln!("zccache daemon stop: not yet implemented");
-            ExitCode::FAILURE
+            let endpoint = resolve_endpoint(None);
+            run_async(cmd_stop(&endpoint))
         }
         Commands::Status => {
             let endpoint = resolve_endpoint(None);
@@ -157,6 +157,43 @@ fn main() -> ExitCode {
 
 // ─── Subcommand implementations ────────────────────────────────────────────
 
+async fn cmd_start(endpoint: &str) -> ExitCode {
+    match ensure_daemon(endpoint).await {
+        Ok(()) => {
+            eprintln!("daemon running at {endpoint}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to start daemon: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn cmd_stop(endpoint: &str) -> ExitCode {
+    let mut conn = match connect(endpoint).await {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("daemon not running at {endpoint}");
+            return ExitCode::SUCCESS;
+        }
+    };
+
+    conn.send(&zccache_protocol::Request::Shutdown)
+        .await
+        .unwrap();
+    match conn.recv().await.unwrap() {
+        Some(zccache_protocol::Response::ShuttingDown) => {
+            eprintln!("daemon stopped");
+            ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!("unexpected response: {other:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 async fn cmd_status(endpoint: &str) -> ExitCode {
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
@@ -190,6 +227,11 @@ async fn cmd_session_start(
     cwd: &str,
     log: Option<&str>,
 ) -> ExitCode {
+    if let Err(e) = ensure_daemon(endpoint).await {
+        eprintln!("cannot start daemon at {endpoint}: {e}");
+        return ExitCode::FAILURE;
+    }
+
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
         Err(e) => {
@@ -339,6 +381,105 @@ async fn cmd_compile(endpoint: &str, session_id: u64, args: Vec<String>, cwd: St
             ExitCode::FAILURE
         }
     }
+}
+
+// ─── Daemon auto-start ─────────────────────────────────────────────────────
+
+/// Ensure the daemon is running. If not, spawn it and wait for it to accept.
+async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
+    // Fast path: try to connect
+    if connect(endpoint).await.is_ok() {
+        return Ok(());
+    }
+
+    // Check lock file for a running daemon we just can't reach yet
+    if let Some(pid) = zccache_ipc::check_running_daemon() {
+        // Daemon process exists — wait a bit for it to become ready
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if connect(endpoint).await.is_ok() {
+                return Ok(());
+            }
+        }
+        return Err(format!(
+            "daemon process {pid} exists but not accepting connections"
+        ));
+    }
+
+    // No daemon running — spawn one
+    let daemon_bin = find_daemon_binary().ok_or("cannot find zccache-daemon binary")?;
+
+    tracing::debug!(?daemon_bin, %endpoint, "spawning daemon");
+
+    spawn_daemon(&daemon_bin, endpoint)?;
+
+    // Wait for daemon to become ready (up to 5s)
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if connect(endpoint).await.is_ok() {
+            return Ok(());
+        }
+    }
+
+    Err("daemon started but not accepting connections after 5s".to_string())
+}
+
+/// Find the daemon binary. Looks next to the CLI binary first, then on PATH.
+fn find_daemon_binary() -> Option<std::path::PathBuf> {
+    let name = if cfg!(windows) {
+        "zccache-daemon.exe"
+    } else {
+        "zccache-daemon"
+    };
+
+    // Look next to the CLI binary
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    // Fall back to PATH
+    which_on_path(name)
+}
+
+/// Simple PATH lookup (no external crate needed).
+fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Spawn the daemon as a detached background process.
+fn spawn_daemon(bin: &std::path::Path, endpoint: &str) -> Result<(), String> {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(["--foreground", "--endpoint", endpoint]);
+
+    // Detach stdio so the daemon doesn't hold our console
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+
+    // Platform-specific: prevent console window on Windows
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    cmd.spawn()
+        .map_err(|e| format!("failed to spawn daemon: {e}"))?;
+
+    Ok(())
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────

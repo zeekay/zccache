@@ -1,12 +1,16 @@
 //! Daemon server — accepts IPC connections and handles requests.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
-use zccache_depgraph::{SessionId, SessionManager, SystemIncludeCache};
+use zccache_depgraph::{CompileContext, DepGraph, SessionId, SessionManager, SystemIncludeCache};
+use zccache_fscache::CacheSystem;
+use zccache_hash::ContentHash;
 use zccache_ipc::{IpcConnection, IpcListener};
 use zccache_protocol::{ArtifactData, ArtifactOutput, Request, Response};
+use zccache_watcher::{NotifyWatcher, SettleBuffer, SettledEvent};
 
 /// Cached compilation artifact.
 #[derive(Debug, Clone)]
@@ -18,14 +22,25 @@ struct CachedArtifact {
 struct SharedState {
     sessions: SessionManager,
     system_includes: Mutex<SystemIncludeCache>,
-    /// In-memory artifact cache: cache_key_hex → artifact data.
+    /// Dependency graph: tracks include relationships and cache verdicts.
+    dep_graph: DepGraph,
+    /// In-memory artifact cache: artifact_key_hex → artifact data.
     artifacts: Mutex<HashMap<String, CachedArtifact>>,
-    /// Cached compiler hashes: compiler_path → content_hash.
-    /// Avoids rehashing the (often ~100MB) compiler binary on every compile.
-    compiler_hashes: Mutex<HashMap<PathBuf, zccache_hash::ContentHash>>,
-    /// Cached source hashes: (source_path, file_len, mtime_secs) → content_hash.
-    /// Avoids rehashing unchanged source files.
-    source_hash_cache: Mutex<HashMap<(PathBuf, u64, i64), zccache_hash::ContentHash>>,
+    /// Metadata cache + change journal. The watcher feeds file-change events
+    /// into this, which downgrades confidence so `lookup()` re-hashes on
+    /// next access. Without the watcher, stat-verify on every `lookup()` is
+    /// the fallback (correct but slower).
+    cache_system: CacheSystem,
+    /// File watcher for proactive metadata invalidation.
+    watcher: Mutex<Option<NotifyWatcher>>,
+    /// Directories currently being watched (avoid duplicate watches).
+    watched_dirs: Mutex<HashSet<PathBuf>>,
+    /// Shutdown signal — shared so request handlers can trigger shutdown.
+    shutdown: Arc<Notify>,
+    /// Epoch seconds of last client activity (for idle timeout).
+    last_activity: AtomicU64,
+    /// Daemon start time (epoch seconds).
+    start_time: u64,
 }
 
 /// The daemon server that listens for IPC connections.
@@ -35,19 +50,33 @@ pub struct DaemonServer {
     state: Arc<SharedState>,
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 impl DaemonServer {
     /// Create a new daemon server bound to the given endpoint.
     pub fn bind(endpoint: &str) -> Result<Self, zccache_ipc::IpcError> {
         let listener = IpcListener::bind(endpoint)?;
+        let shutdown = Arc::new(Notify::new());
+        let now = now_secs();
         Ok(Self {
             listener,
-            shutdown: Arc::new(Notify::new()),
+            shutdown: Arc::clone(&shutdown),
             state: Arc::new(SharedState {
                 sessions: SessionManager::new(std::time::Duration::from_secs(300)),
                 system_includes: Mutex::new(SystemIncludeCache::new()),
+                dep_graph: DepGraph::new(),
                 artifacts: Mutex::new(HashMap::new()),
-                compiler_hashes: Mutex::new(HashMap::new()),
-                source_hash_cache: Mutex::new(HashMap::new()),
+                cache_system: CacheSystem::new(),
+                watcher: Mutex::new(None),
+                watched_dirs: Mutex::new(HashSet::new()),
+                shutdown,
+                last_activity: AtomicU64::new(now),
+                start_time: now,
             }),
         })
     }
@@ -59,8 +88,31 @@ impl DaemonServer {
     }
 
     /// Run the server, accepting connections until shutdown is signaled.
-    pub async fn run(&mut self) -> Result<(), zccache_ipc::IpcError> {
+    ///
+    /// `idle_timeout_secs`: if non-zero, the daemon shuts down after this many
+    /// seconds with no client activity. Pass 0 to disable.
+    pub async fn run(&mut self, idle_timeout_secs: u64) -> Result<(), zccache_ipc::IpcError> {
         tracing::info!("daemon server running");
+
+        self.start_watcher_pipeline().await;
+
+        // Start idle watchdog if timeout is configured.
+        if idle_timeout_secs > 0 {
+            let state = Arc::clone(&self.state);
+            let timeout = idle_timeout_secs;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    let last = state.last_activity.load(Ordering::Relaxed);
+                    let idle = now_secs().saturating_sub(last);
+                    if idle >= timeout {
+                        tracing::info!(idle_secs = idle, "idle timeout — shutting down");
+                        state.shutdown.notify_one();
+                        break;
+                    }
+                }
+            });
+        }
 
         loop {
             tokio::select! {
@@ -75,10 +127,91 @@ impl DaemonServer {
                 }
                 () = self.shutdown.notified() => {
                     tracing::info!("daemon server shutting down");
+                    // Drop the watcher to stop the OS thread and close channels.
+                    // The settle buffer and consumer tasks will exit when their
+                    // input channels close.
+                    *self.state.watcher.lock().await = None;
                     return Ok(());
                 }
             }
         }
+    }
+
+    /// Initialize the file watcher pipeline:
+    /// `NotifyWatcher (OS thread) → SettleBuffer (tokio task) → CacheSystem consumer (tokio task)`
+    async fn start_watcher_pipeline(&self) {
+        let ignore = Arc::new(zccache_watcher::IgnoreFilter::default());
+        let (watcher, raw_rx) = match NotifyWatcher::new(ignore) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("failed to start file watcher: {e} — running without watcher");
+                return;
+            }
+        };
+
+        *self.state.watcher.lock().await = Some(watcher);
+
+        // Settle buffer: coalesces raw events into batches after a quiet period.
+        let (settled_tx, mut settled_rx) = tokio::sync::mpsc::unbounded_channel();
+        let settle = SettleBuffer::default_window();
+        tokio::spawn(async move {
+            settle.run(raw_rx, settled_tx).await;
+        });
+
+        // Consumer: feeds settled events into CacheSystem for metadata invalidation.
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            while let Some(event) = settled_rx.recv().await {
+                match event {
+                    SettledEvent::Batch { changed, removed } => {
+                        let count = changed.len() + removed.len();
+                        if count > 0 {
+                            tracing::debug!(
+                                changed = changed.len(),
+                                removed = removed.len(),
+                                "watcher batch applied"
+                            );
+                            state
+                                .cache_system
+                                .apply_changes_with_removals(changed, removed);
+                        }
+                    }
+                    SettledEvent::Overflow => {
+                        tracing::warn!("watcher overflow — downgrading all metadata");
+                        state.cache_system.apply_overflow();
+                    }
+                }
+            }
+            tracing::debug!("watcher consumer task exiting");
+        });
+
+        tracing::info!("file watcher pipeline started");
+    }
+}
+
+/// Watch a directory for file changes, if not already watched.
+async fn watch_directory(state: &SharedState, dir: &Path) {
+    let canonical = match dir.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!("cannot canonicalize {}: {e}", dir.display());
+            return;
+        }
+    };
+
+    let mut watched = state.watched_dirs.lock().await;
+    if watched.contains(&canonical) {
+        return;
+    }
+
+    let mut watcher_guard = state.watcher.lock().await;
+    if let Some(ref mut w) = *watcher_guard {
+        if let Err(e) = w.watch(&canonical) {
+            tracing::warn!("failed to watch {}: {e}", canonical.display());
+            return;
+        }
+        tracing::info!("watching directory: {}", canonical.display());
+        watched.insert(canonical);
     }
 }
 
@@ -95,18 +228,20 @@ async fn handle_connection(
         };
 
         tracing::debug!(?request, "received request");
+        state.last_activity.store(now_secs(), Ordering::Relaxed);
 
         let response = match request {
             Request::Ping => Response::Pong,
             Request::Shutdown => {
                 conn.send(&Response::ShuttingDown).await?;
+                state.shutdown.notify_one();
                 return Ok(());
             }
             Request::Status => Response::Status(zccache_protocol::DaemonStatus {
                 artifact_count: 0,
                 cache_size_bytes: 0,
                 metadata_entries: 0,
-                uptime_secs: 0,
+                uptime_secs: now_secs().saturating_sub(state.start_time),
                 cache_hits: 0,
                 cache_misses: 0,
             }),
@@ -187,6 +322,9 @@ async fn handle_session_start(
 
     let session_id = state.sessions.create(session_config);
 
+    // Watch the working directory for file changes.
+    watch_directory(state, &PathBuf::from(working_dir)).await;
+
     Response::SessionStarted {
         session_id: session_id.value(),
         system_includes: system_includes
@@ -212,7 +350,39 @@ fn write_session_log(sessions: &SessionManager, session_id: &SessionId, message:
     }
 }
 
-/// Handle a Compile request: parse args, check cache, run compiler or return cached.
+/// Hash a file using the CacheSystem's metadata cache.
+///
+/// This stat-verifies the file, hashes if needed (with TOCTOU protection),
+/// and caches the result. The file watcher proactively downgrades confidence
+/// on changes, ensuring stale hashes are re-computed.
+fn hash_file(cache_system: &CacheSystem, path: &Path) -> Result<ContentHash, String> {
+    cache_system
+        .metadata()
+        .lookup(path)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Build a CompileContext from a CacheableCompilation and session info.
+fn build_compile_context(
+    compilation: &zccache_compiler::CacheableCompilation,
+    cwd: &Path,
+    system_includes: &[PathBuf],
+) -> CompileContext {
+    // Parse the original args through depgraph's parser to get structured search paths
+    let parsed = zccache_depgraph::args::parse_compile_args(&compilation.original_args, cwd);
+    let mut ctx = CompileContext::from_parsed_args(&parsed);
+
+    // Inject session's system includes
+    for path in system_includes {
+        if !ctx.include_search.system.contains(path) {
+            ctx.include_search.system.push(path.clone());
+        }
+    }
+
+    ctx
+}
+
+/// Handle a Compile request: parse args, check depgraph, run compiler or return cached.
 async fn handle_compile(
     state: &SharedState,
     session_id: u64,
@@ -222,9 +392,12 @@ async fn handle_compile(
     let sid = SessionId::from_raw(session_id);
 
     // Look up session
-    let compiler = match state.sessions.compiler(&sid) {
-        Some(c) => c,
-        None => {
+    let (compiler, system_includes) = match (
+        state.sessions.compiler(&sid),
+        state.sessions.system_includes(&sid),
+    ) {
+        (Some(c), Some(si)) => (c, si),
+        _ => {
             return Response::Error {
                 message: format!("unknown session: {session_id}"),
             };
@@ -233,18 +406,16 @@ async fn handle_compile(
 
     state.sessions.touch(&sid);
 
-    // Parse the args to find source file, output file, and compute cache key
+    // Parse the args to find source file, output file, and cache-relevant args
     let parsed = zccache_compiler::parse_invocation(compiler.to_str().unwrap_or(""), args);
     let compilation = match parsed {
         zccache_compiler::ParsedInvocation::Cacheable(c) => c,
         zccache_compiler::ParsedInvocation::NonCacheable { reason } => {
             write_session_log(&state.sessions, &sid, &format!("non-cacheable: {reason}"));
-            // Fall through to direct compilation
             return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid).await;
         }
     };
 
-    // Compute cache key: hash(compiler_binary + source_content + cache_relevant_args)
     let cwd_path = PathBuf::from(cwd);
     let source_path = if compilation.source_file.is_absolute() {
         compilation.source_file.clone()
@@ -257,64 +428,100 @@ async fn handle_compile(
         cwd_path.join(&compilation.output_file)
     };
 
-    let cache_key = match compute_cache_key(
-        state,
-        &compiler,
-        &source_path,
-        &compilation.cache_relevant_args,
-    )
-    .await
-    {
-        Ok(k) => k,
-        Err(e) => {
-            write_session_log(
-                &state.sessions,
-                &sid,
-                &format!("cache key error: {e}, falling back to direct compile"),
-            );
-            return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid).await;
-        }
-    };
+    // Build CompileContext and register with depgraph
+    let ctx = build_compile_context(&compilation, &cwd_path, &system_includes);
+    let context_key = state.dep_graph.register(ctx.clone());
 
-    // Check cache
-    {
-        let artifacts = state.artifacts.lock().await;
-        if let Some(cached) = artifacts.get(&cache_key) {
-            // Cache hit! Write the primary output to the requested output_path.
-            // Secondary outputs (if any) go to cwd.
-            for (i, output) in cached.artifact.outputs.iter().enumerate() {
-                let out_path = if i == 0 {
-                    // Primary output always goes to the requested path
-                    output_path.clone()
-                } else {
-                    cwd_path.join(&output.name)
-                };
-                if let Err(e) = std::fs::write(&out_path, &output.data) {
-                    return Response::Error {
-                        message: format!(
-                            "failed to write cached output {}: {e}",
-                            out_path.display()
-                        ),
-                    };
+    // Check depgraph for cache verdict.
+    // is_fresh always returns true: content hashing via CacheSystem is ground truth.
+    // The watcher helps CacheSystem know when to re-hash (by downgrading confidence),
+    // but correctness doesn't depend on is_fresh — the artifact key comparison is
+    // what determines hit/miss.
+    let verdict = {
+        let is_fresh = |_: &Path| true;
+
+        let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
+
+        // Hash source file
+        match hash_file(&state.cache_system, &source_path) {
+            Ok(h) => {
+                hash_map.insert(source_path.clone(), h);
+            }
+            Err(e) => {
+                write_session_log(
+                    &state.sessions,
+                    &sid,
+                    &format!("cache key error: {e}, falling back to direct compile"),
+                );
+                return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid).await;
+            }
+        }
+
+        // Hash all known headers (from previous scan, if any)
+        if let Some(includes) = state.dep_graph.get_includes(&context_key) {
+            for header in &includes {
+                match hash_file(&state.cache_system, header) {
+                    Ok(h) => {
+                        hash_map.insert(header.clone(), h);
+                    }
+                    Err(_) => {
+                        // Header disappeared — force rescan
+                    }
                 }
             }
+        }
 
-            write_session_log(
-                &state.sessions,
-                &sid,
-                &format!(
-                    "cache hit: {} -> {}",
-                    source_path.display(),
-                    output_path.display()
-                ),
-            );
+        let get_hash = |p: &Path| hash_map.get(p).copied();
+        state.dep_graph.check(&context_key, is_fresh, get_hash)
+    };
 
-            return Response::CompileResult {
-                exit_code: cached.artifact.exit_code,
-                stdout: cached.artifact.stdout.clone(),
-                stderr: cached.artifact.stderr.clone(),
-                cached: true,
-            };
+    // Process verdict
+    match verdict {
+        zccache_depgraph::CacheVerdict::Hit { artifact_key }
+        | zccache_depgraph::CacheVerdict::SourceChanged { artifact_key } => {
+            let artifact_key_hex = artifact_key.hash().to_hex();
+            let artifacts = state.artifacts.lock().await;
+            if let Some(cached) = artifacts.get(&artifact_key_hex) {
+                // Cache hit! Write outputs to disk.
+                for (i, output) in cached.artifact.outputs.iter().enumerate() {
+                    let out_path = if i == 0 {
+                        output_path.clone()
+                    } else {
+                        cwd_path.join(&output.name)
+                    };
+                    if let Err(e) = std::fs::write(&out_path, &output.data) {
+                        return Response::Error {
+                            message: format!(
+                                "failed to write cached output {}: {e}",
+                                out_path.display()
+                            ),
+                        };
+                    }
+                }
+
+                write_session_log(
+                    &state.sessions,
+                    &sid,
+                    &format!(
+                        "cache hit: {} -> {}",
+                        source_path.display(),
+                        output_path.display()
+                    ),
+                );
+
+                return Response::CompileResult {
+                    exit_code: cached.artifact.exit_code,
+                    stdout: cached.artifact.stdout.clone(),
+                    stderr: cached.artifact.stderr.clone(),
+                    cached: true,
+                };
+            }
+            // Artifact key computed but no artifact stored yet — fall through to compile
+        }
+        zccache_depgraph::CacheVerdict::Cold
+        | zccache_depgraph::CacheVerdict::HeadersChanged { .. }
+        | zccache_depgraph::CacheVerdict::NeedsPreprocessor => {
+            // Need to compile and scan includes
         }
     }
 
@@ -362,22 +569,42 @@ async fn handle_compile(
             }
         };
 
-        let artifact = ArtifactData {
-            outputs: vec![ArtifactOutput {
-                name: output_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-                data: output_data,
-            }],
-            stdout: output.stdout.clone(),
-            stderr: output.stderr.clone(),
-            exit_code,
-        };
+        // Scan includes and update depgraph
+        let scan_result =
+            zccache_depgraph::scanner::scan_recursive(&source_path, &ctx.include_search);
 
-        let mut artifacts = state.artifacts.lock().await;
-        artifacts.insert(cache_key, CachedArtifact { artifact });
+        // Hash all files for the artifact key
+        let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
+
+        if let Ok(h) = hash_file(&state.cache_system, &source_path) {
+            hash_map.insert(source_path.clone(), h);
+        }
+        for header in &scan_result.resolved {
+            if let Ok(h) = hash_file(&state.cache_system, header) {
+                hash_map.insert(header.clone(), h);
+            }
+        }
+
+        let get_hash = |p: &Path| hash_map.get(p).copied();
+        if let Some(artifact_key) = state.dep_graph.update(&context_key, scan_result, get_hash) {
+            let artifact = ArtifactData {
+                outputs: vec![ArtifactOutput {
+                    name: output_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    data: output_data,
+                }],
+                stdout: output.stdout.clone(),
+                stderr: output.stderr.clone(),
+                exit_code,
+            };
+
+            let artifact_key_hex = artifact_key.hash().to_hex();
+            let mut artifacts = state.artifacts.lock().await;
+            artifacts.insert(artifact_key_hex, CachedArtifact { artifact });
+        }
     }
 
     Response::CompileResult {
@@ -423,58 +650,6 @@ async fn run_compiler_direct(
     }
 }
 
-/// Compute a cache key from compiler binary hash + source hash + args.
-async fn compute_cache_key(
-    state: &SharedState,
-    compiler: &std::path::Path,
-    source: &std::path::Path,
-    args: &[String],
-) -> Result<String, String> {
-    // Compiler hash: cached by path (binary doesn't change within a session)
-    let compiler_hash = {
-        let mut cache = state.compiler_hashes.lock().await;
-        if let Some(h) = cache.get(compiler) {
-            *h
-        } else {
-            let h = zccache_hash::hash_file(compiler).map_err(|e| format!("hash compiler: {e}"))?;
-            cache.insert(compiler.to_path_buf(), h);
-            h
-        }
-    };
-
-    // Source hash: cached by (path, size, mtime) to skip rehashing unchanged files
-    let source_hash = {
-        let meta = std::fs::metadata(source).map_err(|e| format!("stat source: {e}"))?;
-        let len = meta.len();
-        let mtime = meta
-            .modified()
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let key = (source.to_path_buf(), len, mtime);
-
-        let mut cache = state.source_hash_cache.lock().await;
-        if let Some(h) = cache.get(&key) {
-            *h
-        } else {
-            let h = zccache_hash::hash_file(source).map_err(|e| format!("hash source: {e}"))?;
-            cache.insert(key, h);
-            h
-        }
-    };
-
-    let mut builder = zccache_hash::cache_key::CacheKeyBuilder::new()
-        .compiler(compiler_hash)
-        .source(source_hash);
-    for a in args {
-        builder = builder.arg(a);
-    }
-    let key = builder.build();
-
-    Ok(key.to_hex())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,7 +661,7 @@ mod tests {
         let shutdown = server.shutdown_handle();
 
         let server_task = tokio::spawn(async move {
-            server.run().await.unwrap();
+            server.run(0).await.unwrap();
         });
 
         let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
@@ -505,7 +680,7 @@ mod tests {
         let shutdown = server.shutdown_handle();
 
         let server_task = tokio::spawn(async move {
-            server.run().await.unwrap();
+            server.run(0).await.unwrap();
         });
 
         let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
@@ -524,7 +699,7 @@ mod tests {
         let shutdown = server.shutdown_handle();
 
         let server_task = tokio::spawn(async move {
-            server.run().await.unwrap();
+            server.run(0).await.unwrap();
         });
 
         let mut client = zccache_ipc::connect(&endpoint).await.unwrap();

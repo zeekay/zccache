@@ -28,7 +28,7 @@ async fn start_daemon() -> (
     let mut server = DaemonServer::bind(&endpoint).unwrap();
     let shutdown = server.shutdown_handle();
     let handle = tokio::spawn(async move {
-        server.run().await.unwrap();
+        server.run(0).await.unwrap();
     });
     (endpoint, handle, shutdown)
 }
@@ -496,26 +496,11 @@ int main() { return VALUE; }
     .await;
     assert_eq!(exit_code2, 0);
 
-    // KNOWN LIMITATION: The current cache key does not include header hashes.
-    // This test documents the expected (incorrect) behavior: cache hit despite
-    // header change. When dependency tracking is implemented, this assertion
-    // should flip from `assert!(cached2)` to `assert!(!cached2)`.
-    if cached2 {
-        eprintln!(
-            "WARNING: header change produced a cache hit — \
-             this is a known limitation (no header dependency tracking yet)"
-        );
-        // The returned .o is stale (matches v1, not v2)
-        let obj_after = std::fs::read(&obj).unwrap();
-        assert_eq!(
-            obj_after, obj_v1,
-            "stale cache hit should return v1 output (known limitation)"
-        );
-    } else {
-        // If we get here, header tracking has been implemented — great!
-        let obj_v2 = std::fs::read(&obj).unwrap();
-        assert_ne!(obj_v1, obj_v2, "header change should produce different .o");
-    }
+    // Header hashes are included in the artifact key via DepGraph.
+    // Editing a header must invalidate the cache even if the source is unchanged.
+    assert!(!cached2, "header change must invalidate cache");
+    let obj_v2 = std::fs::read(&obj).unwrap();
+    assert_ne!(obj_v1, obj_v2, "header change should produce different .o");
 
     shutdown.notify_one();
     server_handle.await.unwrap();

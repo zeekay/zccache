@@ -24,6 +24,10 @@ struct Args {
     /// IPC endpoint (default: platform-specific).
     #[arg(long)]
     endpoint: Option<String>,
+
+    /// Idle timeout in seconds (0 = no timeout). Default: 3600.
+    #[arg(long, default_value = "3600")]
+    idle_timeout: u64,
 }
 
 fn main() {
@@ -90,8 +94,15 @@ async fn query_daemon_status(
 
 fn run_server(args: Args) {
     let endpoint = args.endpoint.unwrap_or_else(zccache_ipc::default_endpoint);
+    let idle_timeout = args.idle_timeout;
 
-    tracing::info!(%endpoint, "zccache-daemon starting");
+    tracing::info!(%endpoint, idle_timeout, "zccache-daemon starting");
+
+    // Write lock file so CLI can detect us
+    let pid = std::process::id();
+    if let Err(e) = zccache_ipc::write_lock_file(pid) {
+        tracing::warn!("failed to write lock file: {e}");
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -103,16 +114,30 @@ fn run_server(args: Args) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("failed to bind {endpoint}: {e}");
+                zccache_ipc::remove_lock_file();
                 std::process::exit(1);
             }
         };
 
+        // Wire up Ctrl+C to trigger graceful shutdown
+        let shutdown = server.shutdown_handle();
+        tokio::spawn(async move {
+            if let Ok(()) = tokio::signal::ctrl_c().await {
+                tracing::info!("received Ctrl+C — shutting down");
+                shutdown.notify_one();
+            }
+        });
+
         tracing::info!(%endpoint, "listening for connections");
 
-        if let Err(e) = server.run().await {
+        if let Err(e) = server.run(idle_timeout).await {
             tracing::error!("server error: {e}");
+            zccache_ipc::remove_lock_file();
             std::process::exit(1);
         }
+
+        tracing::info!("daemon exiting cleanly");
+        zccache_ipc::remove_lock_file();
     });
 }
 

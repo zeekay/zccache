@@ -15,7 +15,7 @@ async fn start_daemon() -> (
     let mut server = DaemonServer::bind(&endpoint).unwrap();
     let shutdown = server.shutdown_handle();
     let handle = tokio::spawn(async move {
-        server.run().await.unwrap();
+        server.run(0).await.unwrap();
     });
     (endpoint, handle, shutdown)
 }

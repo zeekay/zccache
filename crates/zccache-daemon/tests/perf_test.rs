@@ -1,6 +1,6 @@
-//! Performance comparison: zccache (in-memory) vs sccache (disk-based).
+//! Performance comparison: bare clang vs sccache vs zccache.
 //!
-//! Benchmarks cache-hit latency for single-file compilations.
+//! Three-way benchmark measuring compile latency across cache-miss and cache-hit scenarios.
 //! Run with: uv run cargo test -p zccache-daemon --test perf_test -- --nocapture --ignored
 
 use std::path::PathBuf;
@@ -13,6 +13,14 @@ use zccache_protocol::{Request, Response};
 type ClientConn = zccache_ipc::IpcConnection;
 #[cfg(windows)]
 type ClientConn = zccache_ipc::IpcClientConnection;
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+
+const FILE_COUNT: usize = 50;
+const WARM_ITERATIONS: usize = 100;
+const BARE_ITERATIONS: usize = 20; // bare clang is slow, fewer iterations needed
+
+// ─── Tool discovery ──────────────────────────────────────────────────────────
 
 fn find_clang() -> Option<PathBuf> {
     let home = std::env::var("USERPROFILE")
@@ -33,7 +41,6 @@ fn find_clang() -> Option<PathBuf> {
 }
 
 fn find_sccache() -> Option<PathBuf> {
-    // Try common locations
     for path in &[
         "sccache",
         "sccache.exe",
@@ -48,6 +55,33 @@ fn find_sccache() -> Option<PathBuf> {
     None
 }
 
+fn sccache_version(sccache: &std::path::Path) -> String {
+    std::process::Command::new(sccache)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn clang_version(clang: &std::path::Path) -> String {
+    std::process::Command::new(clang)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+// ─── Daemon helpers ──────────────────────────────────────────────────────────
+
 async fn start_daemon() -> (
     String,
     tokio::task::JoinHandle<()>,
@@ -57,7 +91,7 @@ async fn start_daemon() -> (
     let mut server = DaemonServer::bind(&endpoint).unwrap();
     let shutdown = server.shutdown_handle();
     let handle = tokio::spawn(async move {
-        server.run().await.unwrap();
+        server.run(0).await.unwrap();
     });
     (endpoint, handle, shutdown)
 }
@@ -107,12 +141,13 @@ async fn compile(
     }
 }
 
-/// Generate test source files of varying complexity.
+// ─── Test file generation ────────────────────────────────────────────────────
+
+/// Generate realistic test source files with headers and cross-references.
 fn generate_test_files(dir: &std::path::Path, count: usize) {
-    // A header shared by all files
-    let header = dir.join("common.h");
+    // Shared headers
     std::fs::write(
-        &header,
+        dir.join("common.h"),
         r#"#pragma once
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,23 +159,75 @@ inline int common_mul(int a, int b) { return a * b; }
     )
     .unwrap();
 
+    std::fs::write(
+        dir.join("math_utils.h"),
+        r#"#pragma once
+
+template<typename T>
+T clamp(T val, T lo, T hi) {
+    return val < lo ? lo : (val > hi ? hi : val);
+}
+
+template<typename T>
+T lerp(T a, T b, float t) {
+    return static_cast<T>(a + (b - a) * t);
+}
+
+inline unsigned int hash_combine(unsigned int a, unsigned int b) {
+    return a ^ (b + 0x9e3779b9 + (a << 6) + (a >> 2));
+}
+"#,
+    )
+    .unwrap();
+
     for i in 0..count {
         let src = dir.join(format!("file_{i}.cpp"));
         std::fs::write(
             &src,
             format!(
                 r#"#include "common.h"
+#include "math_utils.h"
+
+namespace ns_{i} {{
+
+struct Data_{i} {{
+    int values[16];
+    int count;
+
+    int sum() const {{
+        int s = 0;
+        for (int j = 0; j < count; j++) {{
+            s = common_add(s, values[j]);
+        }}
+        return s;
+    }}
+
+    int product() const {{
+        int p = 1;
+        for (int j = 0; j < count; j++) {{
+            p = common_mul(p, values[j]);
+        }}
+        return p;
+    }}
+}};
 
 static int compute_{i}(int x) {{
-    int result = 0;
-    for (int j = 0; j < x; j++) {{
-        result = common_add(result, common_mul(j, {i}));
+    Data_{i} d;
+    d.count = clamp(x, 0, 16);
+    for (int j = 0; j < d.count; j++) {{
+        d.values[j] = common_add(j, {i});
     }}
-    return result;
+    unsigned int h = 0;
+    for (int j = 0; j < d.count; j++) {{
+        h = hash_combine(h, static_cast<unsigned int>(d.values[j]));
+    }}
+    return static_cast<int>(h) + d.sum() + d.product();
 }}
 
+}} // namespace ns_{i}
+
 int func_{i}() {{
-    return compute_{i}(100);
+    return ns_{i}::compute_{i}(10);
 }}
 "#
             ),
@@ -149,10 +236,56 @@ int func_{i}() {{
     }
 }
 
+// ─── Benchmark runners ──────────────────────────────────────────────────────
+
 struct BenchResult {
     label: String,
     cold_ms: Vec<f64>,
     warm_ms: Vec<f64>,
+}
+
+/// Benchmark bare clang: direct `clang++ -c file.cpp -o file.o` with no cache.
+fn bench_bare_clang(
+    clang: &std::path::Path,
+    src_dir: &std::path::Path,
+    file_count: usize,
+    iterations: usize,
+) -> BenchResult {
+    let cwd = src_dir.to_string_lossy().into_owned();
+    let mut all_ms = Vec::new();
+
+    for iter in 0..iterations {
+        for i in 0..file_count {
+            let src = format!("file_{i}.cpp");
+            let obj = format!("file_{i}.o");
+            let _ = std::fs::remove_file(src_dir.join(&obj));
+
+            let start = Instant::now();
+            let output = std::process::Command::new(clang)
+                .args(["-c", &src, "-o", &obj])
+                .current_dir(&cwd)
+                .output()
+                .unwrap();
+            let elapsed = start.elapsed();
+
+            assert!(
+                output.status.success(),
+                "bare clang failed for {src}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            all_ms.push(elapsed.as_secs_f64() * 1000.0);
+        }
+        if (iter + 1) % 5 == 0 {
+            eprint!("    bare clang: {}/{iterations} iterations\r", iter + 1);
+        }
+    }
+    eprintln!();
+
+    BenchResult {
+        label: format!("bare clang ({})", clang_version(clang)),
+        cold_ms: all_ms.clone(),
+        warm_ms: all_ms,
+    }
 }
 
 /// Benchmark sccache: shell out to `sccache clang++ -c file.cpp -o file.o`.
@@ -163,12 +296,9 @@ fn bench_sccache(
     file_count: usize,
     warm_iterations: usize,
 ) -> BenchResult {
-    // Clear sccache stats
     let _ = std::process::Command::new(sccache)
         .arg("--zero-stats")
         .output();
-
-    // Start sccache server
     let _ = std::process::Command::new(sccache)
         .arg("--start-server")
         .output();
@@ -193,19 +323,22 @@ fn bench_sccache(
 
         assert!(
             output.status.success(),
-            "sccache cold compile failed for {src}: {}",
+            "sccache cold failed for {src}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         cold_ms.push(elapsed.as_secs_f64() * 1000.0);
+
+        if (i + 1) % 10 == 0 {
+            eprint!("    sccache cold: {}/{file_count} files\r", i + 1);
+        }
     }
+    eprintln!();
 
     // Warm passes (cache hit)
-    for _ in 0..warm_iterations {
+    for iter in 0..warm_iterations {
         for i in 0..file_count {
             let src = format!("file_{i}.cpp");
             let obj = format!("file_{i}.o");
-
-            // Delete .o to force cache retrieval
             let _ = std::fs::remove_file(src_dir.join(&obj));
 
             let start = Instant::now();
@@ -219,29 +352,25 @@ fn bench_sccache(
 
             assert!(
                 output.status.success(),
-                "sccache warm compile failed for {src}: {}",
+                "sccache warm failed for {src}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
             warm_ms.push(elapsed.as_secs_f64() * 1000.0);
         }
+        if (iter + 1) % 10 == 0 {
+            eprint!(
+                "    sccache warm: {}/{warm_iterations} iterations\r",
+                iter + 1
+            );
+        }
     }
+    eprintln!();
 
     BenchResult {
-        label: format!("sccache {}", sccache_version(sccache)),
+        label: format!("sccache ({})", sccache_version(sccache)),
         cold_ms,
         warm_ms,
     }
-}
-
-fn sccache_version(sccache: &std::path::Path) -> String {
-    std::process::Command::new(sccache)
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default()
-        .trim()
-        .to_string()
 }
 
 /// Benchmark zccache: use IPC to daemon.
@@ -270,18 +399,21 @@ async fn bench_zccache(
         let (exit_code, cached) = compile(&mut client, sid, &["-c", &src, "-o", &obj], &cwd).await;
         let elapsed = start.elapsed();
 
-        assert_eq!(exit_code, 0, "zccache cold compile failed for {src}");
+        assert_eq!(exit_code, 0, "zccache cold failed for {src}");
         assert!(!cached, "first compile should be a miss");
         cold_ms.push(elapsed.as_secs_f64() * 1000.0);
+
+        if (i + 1) % 10 == 0 {
+            eprint!("    zccache cold: {}/{file_count} files\r", i + 1);
+        }
     }
+    eprintln!();
 
     // Warm passes (cache hit)
-    for _ in 0..warm_iterations {
+    for iter in 0..warm_iterations {
         for i in 0..file_count {
             let src = format!("file_{i}.cpp");
             let obj = format!("file_{i}.o");
-
-            // Delete .o to force cache retrieval
             let _ = std::fs::remove_file(src_dir.join(&obj));
 
             let start = Instant::now();
@@ -289,11 +421,18 @@ async fn bench_zccache(
                 compile(&mut client, sid, &["-c", &src, "-o", &obj], &cwd).await;
             let elapsed = start.elapsed();
 
-            assert_eq!(exit_code, 0, "zccache warm compile failed for {src}");
+            assert_eq!(exit_code, 0, "zccache warm failed for {src}");
             assert!(cached, "recompile should be a hit");
             warm_ms.push(elapsed.as_secs_f64() * 1000.0);
         }
+        if (iter + 1) % 10 == 0 {
+            eprint!(
+                "    zccache warm: {}/{warm_iterations} iterations\r",
+                iter + 1
+            );
+        }
     }
+    eprintln!();
 
     shutdown.notify_one();
     server_handle.await.unwrap();
@@ -305,72 +444,143 @@ async fn bench_zccache(
     }
 }
 
-fn stats(values: &[f64]) -> (f64, f64, f64, f64) {
+// ─── Statistics & reporting ──────────────────────────────────────────────────
+
+fn stats(values: &[f64]) -> (f64, f64, f64, f64, f64) {
     let n = values.len() as f64;
     let mean = values.iter().sum::<f64>() / n;
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let median = sorted[sorted.len() / 2];
+    let p50 = sorted[sorted.len() / 2];
+    let p95 = sorted[(sorted.len() as f64 * 0.95) as usize];
     let min = sorted[0];
     let max = sorted[sorted.len() - 1];
-    (mean, median, min, max)
+    (mean, p50, p95, min, max)
 }
 
-fn print_results(results: &[BenchResult]) {
-    let sep = "=".repeat(78);
-    let dash = "-".repeat(60);
-
-    println!("\n{sep}");
-    println!("  PERFORMANCE COMPARISON: zccache vs sccache");
-    println!("{sep}\n");
-
-    for r in results {
-        let (cold_mean, cold_med, cold_min, cold_max) = stats(&r.cold_ms);
-        let (warm_mean, warm_med, warm_min, warm_max) = stats(&r.warm_ms);
-
-        println!("  {}", r.label);
-        println!("  {dash}");
-        println!(
-            "  Cold (cache miss):  mean={cold_mean:>8.2}ms  median={cold_med:>8.2}ms  min={cold_min:>8.2}ms  max={cold_max:>8.2}ms  (n={})",
-            r.cold_ms.len()
-        );
-        println!(
-            "  Warm (cache hit):   mean={warm_mean:>8.2}ms  median={warm_med:>8.2}ms  min={warm_min:>8.2}ms  max={warm_max:>8.2}ms  (n={})",
-            r.warm_ms.len()
-        );
-        println!();
-    }
-
-    // Speedup comparison
-    if results.len() == 2 {
-        let (_, sccache_warm_med, _, _) = stats(&results[0].warm_ms);
-        let (_, zccache_warm_med, _, _) = stats(&results[1].warm_ms);
-        let speedup = sccache_warm_med / zccache_warm_med;
-
-        let (_, sccache_cold_med, _, _) = stats(&results[0].cold_ms);
-        let (_, zccache_cold_med, _, _) = stats(&results[1].cold_ms);
-        let cold_speedup = sccache_cold_med / zccache_cold_med;
-
-        println!("  SPEEDUP (median)");
-        println!("  {dash}");
-        println!(
-            "  Cache hit:   zccache is {speedup:>6.1}x faster  ({zccache_warm_med:.2}ms vs {sccache_warm_med:.2}ms)"
-        );
-        println!(
-            "  Cache miss:  zccache is {cold_speedup:>6.1}x faster  ({zccache_cold_med:.2}ms vs {sccache_cold_med:.2}ms)"
-        );
-        println!();
-    }
-
-    println!("{sep}");
+fn print_stat_line(label: &str, values: &[f64]) {
+    let (mean, p50, p95, min, max) = stats(values);
+    println!(
+        "  {label:<22} mean={mean:>8.2}ms  p50={p50:>8.2}ms  p95={p95:>8.2}ms  min={min:>8.2}ms  max={max:>8.2}ms  (n={})",
+        values.len()
+    );
 }
 
-/// Main benchmark: compile 10 files, 50 warm iterations each.
+fn print_three_way(bare: &BenchResult, sccache: &BenchResult, zccache: &BenchResult) {
+    let wide = "=".repeat(110);
+    let dash = "-".repeat(100);
+
+    println!("\n{wide}");
+    println!("  BENCHMARK: bare clang vs sccache vs zccache");
+    println!("  {FILE_COUNT} source files, {BARE_ITERATIONS} bare iterations, {WARM_ITERATIONS} cached iterations");
+    println!("{wide}\n");
+
+    // Individual results
+    println!("  {}", bare.label);
+    println!("  {dash}");
+    print_stat_line("Compile:", &bare.cold_ms);
+    println!();
+
+    println!("  {}", sccache.label);
+    println!("  {dash}");
+    print_stat_line("Cold (cache miss):", &sccache.cold_ms);
+    print_stat_line("Warm (cache hit):", &sccache.warm_ms);
+    println!();
+
+    println!("  {}", zccache.label);
+    println!("  {dash}");
+    print_stat_line("Cold (cache miss):", &zccache.cold_ms);
+    print_stat_line("Warm (cache hit):", &zccache.warm_ms);
+    println!();
+
+    // Comparison table
+    let (_, bare_p50, _, _, _) = stats(&bare.cold_ms);
+    let (_, scc_cold_p50, _, _, _) = stats(&sccache.cold_ms);
+    let (_, scc_warm_p50, _, _, _) = stats(&sccache.warm_ms);
+    let (_, zcc_cold_p50, _, _, _) = stats(&zccache.cold_ms);
+    let (_, zcc_warm_p50, _, _, _) = stats(&zccache.warm_ms);
+
+    println!("  COMPARISON (median / p50)");
+    println!("  {dash}");
+    println!(
+        "  {:.<50} {:>8.2}ms (baseline)",
+        "bare clang compile", bare_p50
+    );
+    println!(
+        "  {:.<50} {:>8.2}ms ({:.1}x vs bare)",
+        "sccache cache miss",
+        scc_cold_p50,
+        scc_cold_p50 / bare_p50
+    );
+    println!(
+        "  {:.<50} {:>8.2}ms ({:.1}x vs bare)",
+        "sccache cache hit",
+        scc_warm_p50,
+        scc_warm_p50 / bare_p50
+    );
+    println!(
+        "  {:.<50} {:>8.2}ms ({:.1}x vs bare)",
+        "zccache cache miss",
+        zcc_cold_p50,
+        zcc_cold_p50 / bare_p50
+    );
+    println!(
+        "  {:.<50} {:>8.2}ms ({:.1}x vs bare)",
+        "zccache cache hit",
+        zcc_warm_p50,
+        zcc_warm_p50 / bare_p50
+    );
+    println!();
+
+    // Head-to-head
+    let scc_vs_zcc_hit = scc_warm_p50 / zcc_warm_p50;
+    let bare_vs_zcc_hit = bare_p50 / zcc_warm_p50;
+    println!("  HEAD-TO-HEAD");
+    println!("  {dash}");
+    println!(
+        "  zccache cache hit vs sccache cache hit:  {scc_vs_zcc_hit:>6.1}x faster  ({zcc_warm_p50:.2}ms vs {scc_warm_p50:.2}ms)"
+    );
+    println!(
+        "  zccache cache hit vs bare clang:          {bare_vs_zcc_hit:>6.1}x faster  ({zcc_warm_p50:.2}ms vs {bare_p50:.2}ms)"
+    );
+    println!();
+
+    // ASCII bar chart
+    let max_bar = 60.0;
+    let scale = max_bar / bare_p50; // bare clang = full bar
+
+    println!(
+        "  LATENCY BAR CHART (p50, each = = {:.1}ms)",
+        bare_p50 / max_bar
+    );
+    println!("  {dash}");
+
+    let bars = [
+        ("bare clang", bare_p50),
+        ("sccache miss", scc_cold_p50),
+        ("sccache hit", scc_warm_p50),
+        ("zccache miss", zcc_cold_p50),
+        ("zccache hit", zcc_warm_p50),
+    ];
+
+    for (name, val) in &bars {
+        let bar_len = (val * scale).round().max(1.0) as usize;
+        let bar: String = "=".repeat(bar_len);
+        println!("  {name:<14} |{bar} {val:.2}ms");
+    }
+
+    println!();
+    println!("{wide}");
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+/// Full three-way benchmark: bare clang vs sccache vs zccache.
 ///
-/// Run with: uv run cargo test -p zccache-daemon --test perf_test -- --nocapture --ignored
+/// Run with: uv run cargo test -p zccache-daemon --test perf_test -- perf_full_benchmark --nocapture --ignored
 #[tokio::test]
 #[ignore]
-async fn perf_zccache_vs_sccache() {
+async fn perf_full_benchmark() {
     let clang = match find_clang() {
         Some(p) => p,
         None => {
@@ -386,40 +596,43 @@ async fn perf_zccache_vs_sccache() {
         }
     };
 
-    let file_count = 10;
-    let warm_iterations = 50;
-
-    // Separate temp dirs so caches don't interfere
+    let bare_dir = tempfile::tempdir().unwrap();
     let sccache_dir = tempfile::tempdir().unwrap();
     let zccache_dir = tempfile::tempdir().unwrap();
 
-    // Generate identical test files in both dirs
-    generate_test_files(sccache_dir.path(), file_count);
-    generate_test_files(zccache_dir.path(), file_count);
+    generate_test_files(bare_dir.path(), FILE_COUNT);
+    generate_test_files(sccache_dir.path(), FILE_COUNT);
+    generate_test_files(zccache_dir.path(), FILE_COUNT);
 
-    println!("\nBenchmarking with {file_count} files x {warm_iterations} warm iterations...\n");
+    println!();
+    println!("  Config: {FILE_COUNT} files, {BARE_ITERATIONS} bare iters, {WARM_ITERATIONS} cached iters");
+    println!("  clang:   {}", clang_version(&clang));
+    println!("  sccache: {}", sccache_version(&sccache));
+    println!();
 
-    // Benchmark sccache first (blocking, runs external process)
-    println!("  Running sccache benchmark...");
+    println!("  [1/3] Running bare clang benchmark...");
+    let bare_result = bench_bare_clang(&clang, bare_dir.path(), FILE_COUNT, BARE_ITERATIONS);
+    println!("  [1/3] bare clang done.");
+
+    println!("  [2/3] Running sccache benchmark...");
     let sccache_result = bench_sccache(
         &sccache,
         &clang,
         sccache_dir.path(),
-        file_count,
-        warm_iterations,
+        FILE_COUNT,
+        WARM_ITERATIONS,
     );
-    println!("  sccache done.");
+    println!("  [2/3] sccache done.");
 
-    // Benchmark zccache
-    println!("  Running zccache benchmark...");
+    println!("  [3/3] Running zccache benchmark...");
     let zccache_result =
-        bench_zccache(&clang, zccache_dir.path(), file_count, warm_iterations).await;
-    println!("  zccache done.");
+        bench_zccache(&clang, zccache_dir.path(), FILE_COUNT, WARM_ITERATIONS).await;
+    println!("  [3/3] zccache done.");
 
-    print_results(&[sccache_result, zccache_result]);
+    print_three_way(&bare_result, &sccache_result, &zccache_result);
 }
 
-/// Quick sanity check that both tools produce cache hits.
+/// Quick sanity check that both cached tools produce cache hits.
 #[tokio::test]
 #[ignore]
 async fn perf_sanity_check() {
@@ -467,7 +680,6 @@ async fn perf_sanity_check() {
         .unwrap();
     assert!(out.status.success(), "sccache warm failed");
 
-    // Verify sccache got a hit
     let stats_out = std::process::Command::new(&sccache)
         .arg("--show-stats")
         .output()
