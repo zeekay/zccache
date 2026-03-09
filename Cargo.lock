@@ -1584,6 +1584,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "zccache-depgraph"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "dashmap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "zccache-core",
+ "zccache-hash",
+]
+
+[[package]]
 name = "zccache-fscache"
 version = "0.1.0"
 dependencies = [

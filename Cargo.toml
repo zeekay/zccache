@@ -6,6 +6,7 @@ members = [
     "crates/zccache-protocol",
     "crates/zccache-fscache",
     "crates/zccache-artifact",
+    "crates/zccache-depgraph",
     "crates/zccache-watcher",
     "crates/zccache-compiler",
     "crates/zccache-ipc",
