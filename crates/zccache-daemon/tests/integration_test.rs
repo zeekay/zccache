@@ -90,6 +90,7 @@ async fn test_session_start_with_nonexistent_compiler() {
                 .into_owned(),
             compiler: "/nonexistent/compiler".to_string(),
             log_file: None,
+            track_stats: false,
         })
         .await
         .unwrap();
@@ -133,6 +134,7 @@ async fn test_session_start_with_clang_toolchain() {
                 .into_owned(),
             compiler: clang_path.to_string_lossy().into_owned(),
             log_file: None,
+            track_stats: false,
         })
         .await
         .unwrap();
@@ -170,6 +172,7 @@ async fn test_session_start_with_clang_toolchain() {
                 .into_owned(),
             compiler: clang_path.to_string_lossy().into_owned(),
             log_file: None,
+            track_stats: false,
         })
         .await
         .unwrap();
@@ -218,6 +221,7 @@ async fn test_full_client_flow() {
                 .into_owned(),
             compiler: clang_path.to_string_lossy().into_owned(),
             log_file: None,
+            track_stats: false,
         })
         .await
         .unwrap();
@@ -282,6 +286,7 @@ int main() {
             working_dir: tmp.path().to_string_lossy().into_owned(),
             compiler: clang_path.to_string_lossy().into_owned(),
             log_file: Some(log_file.to_string_lossy().into_owned()),
+            track_stats: false,
         })
         .await
         .unwrap();

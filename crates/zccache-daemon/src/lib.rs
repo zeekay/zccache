@@ -6,5 +6,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 pub mod server;
+pub mod stats;
 
 pub use server::DaemonServer;
+pub use stats::StatsCollector;

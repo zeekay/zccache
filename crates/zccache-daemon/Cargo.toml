@@ -33,3 +33,4 @@ zccache-depgraph = { path = "../zccache-depgraph" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+zccache-cli = { path = "../zccache-cli" }

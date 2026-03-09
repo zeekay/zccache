@@ -12,6 +12,8 @@ use zccache_ipc::{IpcConnection, IpcListener};
 use zccache_protocol::{ArtifactData, ArtifactOutput, Request, Response};
 use zccache_watcher::{NotifyWatcher, SettleBuffer, SettledEvent};
 
+use crate::stats::StatsCollector;
+
 /// Cached compilation artifact.
 #[derive(Debug, Clone)]
 struct CachedArtifact {
@@ -41,6 +43,8 @@ struct SharedState {
     last_activity: AtomicU64,
     /// Daemon start time (epoch seconds).
     start_time: u64,
+    /// Global stats collector.
+    stats: StatsCollector,
 }
 
 /// The daemon server that listens for IPC connections.
@@ -77,6 +81,7 @@ impl DaemonServer {
                 shutdown,
                 last_activity: AtomicU64::new(now),
                 start_time: now,
+                stats: StatsCollector::new(),
             }),
         })
     }
@@ -237,14 +242,38 @@ async fn handle_connection(
                 state.shutdown.notify_one();
                 return Ok(());
             }
-            Request::Status => Response::Status(zccache_protocol::DaemonStatus {
-                artifact_count: 0,
-                cache_size_bytes: 0,
-                metadata_entries: 0,
-                uptime_secs: now_secs().saturating_sub(state.start_time),
-                cache_hits: 0,
-                cache_misses: 0,
-            }),
+            Request::Status => {
+                let snap = state.stats.snapshot();
+                let dg = state.dep_graph.stats();
+                let artifacts = state.artifacts.lock().await;
+                let artifact_count = artifacts.len() as u64;
+                let cache_size_bytes: u64 = artifacts
+                    .values()
+                    .flat_map(|c| &c.artifact.outputs)
+                    .map(|o| o.data.len() as u64)
+                    .sum();
+                drop(artifacts);
+                let metadata_entries = state.cache_system.metadata().len() as u64;
+                Response::Status(zccache_protocol::DaemonStatus {
+                    artifact_count,
+                    cache_size_bytes,
+                    metadata_entries,
+                    uptime_secs: now_secs().saturating_sub(state.start_time),
+                    cache_hits: snap.hits,
+                    cache_misses: snap.misses,
+                    total_compilations: snap.compilations,
+                    non_cacheable: snap.non_cacheable,
+                    compile_errors: snap.compile_errors,
+                    time_saved_ms: snap.time_saved_ms(),
+                    dep_graph_contexts: dg.context_count as u64,
+                    dep_graph_files: dg.file_count as u64,
+                    sessions_total: snap.sessions_total,
+                    sessions_active: state.sessions.active_count() as u64,
+                    cache_dir: zccache_core::config::default_cache_dir()
+                        .to_string_lossy()
+                        .into_owned(),
+                })
+            }
             Request::Lookup { .. } => Response::LookupResult(zccache_protocol::LookupResult::Miss),
             Request::Store { .. } => Response::StoreResult(zccache_protocol::StoreResult::Stored),
             Request::SessionStart {
@@ -252,7 +281,19 @@ async fn handle_connection(
                 working_dir,
                 compiler,
                 log_file,
-            } => handle_session_start(&state, client_pid, &working_dir, &compiler, log_file).await,
+                track_stats,
+            } => {
+                state.stats.record_session();
+                handle_session_start(
+                    &state,
+                    client_pid,
+                    &working_dir,
+                    &compiler,
+                    log_file,
+                    track_stats,
+                )
+                .await
+            }
             Request::Compile {
                 session_id,
                 args,
@@ -260,8 +301,23 @@ async fn handle_connection(
             } => handle_compile(&state, session_id, &args, &cwd).await,
             Request::SessionEnd { session_id } => {
                 let sid = SessionId::from_raw(session_id);
-                if state.sessions.end(&sid).is_some() {
-                    Response::SessionEnded
+                if let Some(session) = state.sessions.end(&sid) {
+                    let stats = session.stats_tracker.map(|tracker| {
+                        let f = tracker.finalize(session.created_at);
+                        zccache_protocol::SessionStats {
+                            duration_ms: f.duration_ms,
+                            compilations: f.compilations,
+                            hits: f.hits,
+                            misses: f.misses,
+                            non_cacheable: f.non_cacheable,
+                            errors: f.errors,
+                            time_saved_ms: f.time_saved_ms,
+                            unique_sources: f.unique_sources,
+                            bytes_read: f.bytes_read,
+                            bytes_written: f.bytes_written,
+                        }
+                    });
+                    Response::SessionEnded { stats }
                 } else {
                     Response::Error {
                         message: format!("unknown session: {session_id}"),
@@ -281,6 +337,7 @@ async fn handle_session_start(
     working_dir: &str,
     compiler: &str,
     log_file: Option<String>,
+    track_stats: bool,
 ) -> Response {
     let compiler_path = PathBuf::from(compiler);
 
@@ -318,6 +375,7 @@ async fn handle_session_start(
         compiler: compiler_path,
         system_includes: system_includes.clone(),
         log_file: log_file.map(PathBuf::from),
+        track_stats,
     };
 
     let session_id = state.sessions.create(session_config);
@@ -332,6 +390,19 @@ async fn handle_session_start(
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
     }
+}
+
+/// Apply a mutation to the session's stats tracker (if tracking is enabled).
+fn record_session_stat(
+    sessions: &SessionManager,
+    session_id: &SessionId,
+    f: impl FnOnce(&mut zccache_depgraph::SessionStatsTracker),
+) {
+    sessions.mutate(session_id, |session| {
+        if let Some(ref mut tracker) = session.stats_tracker {
+            f(tracker);
+        }
+    });
 }
 
 /// Write a log line to the session's log file (if configured).
@@ -389,7 +460,10 @@ async fn handle_compile(
     args: &[String],
     cwd: &str,
 ) -> Response {
+    let compile_start = std::time::Instant::now();
     let sid = SessionId::from_raw(session_id);
+
+    state.stats.record_compilation();
 
     // Look up session
     let (compiler, system_includes) = match (
@@ -411,6 +485,8 @@ async fn handle_compile(
     let compilation = match parsed {
         zccache_compiler::ParsedInvocation::Cacheable(c) => c,
         zccache_compiler::ParsedInvocation::NonCacheable { reason } => {
+            state.stats.record_non_cacheable();
+            record_session_stat(&state.sessions, &sid, |t| t.record_non_cacheable());
             write_session_log(&state.sessions, &sid, &format!("non-cacheable: {reason}"));
             return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid).await;
         }
@@ -499,6 +575,19 @@ async fn handle_compile(
                     }
                 }
 
+                let latency_us = compile_start.elapsed().as_micros() as u64;
+                let artifact_bytes: u64 = cached
+                    .artifact
+                    .outputs
+                    .iter()
+                    .map(|o| o.data.len() as u64)
+                    .sum();
+                state.stats.record_hit(latency_us, artifact_bytes);
+                let src = source_path.clone();
+                record_session_stat(&state.sessions, &sid, move |t| {
+                    t.record_hit(src, latency_us, artifact_bytes);
+                });
+
                 write_session_log(
                     &state.sessions,
                     &sid,
@@ -553,6 +642,11 @@ async fn handle_compile(
 
     let exit_code = output.status.code().unwrap_or(-1);
 
+    if exit_code != 0 {
+        state.stats.record_error();
+        record_session_stat(&state.sessions, &sid, |t| t.record_error());
+    }
+
     // Only cache successful compilations
     if exit_code == 0 {
         // Read the output file
@@ -601,9 +695,17 @@ async fn handle_compile(
                 exit_code,
             };
 
+            let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
             let artifact_key_hex = artifact_key.hash().to_hex();
             let mut artifacts = state.artifacts.lock().await;
             artifacts.insert(artifact_key_hex, CachedArtifact { artifact });
+
+            let latency_us = compile_start.elapsed().as_micros() as u64;
+            state.stats.record_miss(latency_us, artifact_bytes);
+            let src = source_path.clone();
+            record_session_stat(&state.sessions, &sid, move |t| {
+                t.record_miss(src, artifact_bytes);
+            });
         }
     }
 

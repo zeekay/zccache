@@ -206,12 +206,49 @@ async fn cmd_status(endpoint: &str) -> ExitCode {
     conn.send(&zccache_protocol::Request::Status).await.unwrap();
     match conn.recv().await.unwrap() {
         Some(zccache_protocol::Response::Status(s)) => {
-            println!("zccache daemon ({})", endpoint);
-            println!("  artifacts:  {}", s.artifact_count);
-            println!("  cache size: {} bytes", s.cache_size_bytes);
-            println!("  metadata:   {} entries", s.metadata_entries);
-            println!("  uptime:     {}s", s.uptime_secs);
-            println!("  hits/miss:  {} / {}", s.cache_hits, s.cache_misses);
+            let total = s.cache_hits + s.cache_misses;
+            let hit_rate = if total > 0 {
+                format!("{:.1}%", s.cache_hits as f64 / total as f64 * 100.0)
+            } else {
+                "n/a".to_string()
+            };
+
+            println!(
+                "zccache daemon ({}) — uptime {}",
+                endpoint,
+                format_uptime(s.uptime_secs)
+            );
+            if !s.cache_dir.is_empty() {
+                println!("cache dir: {}", s.cache_dir);
+            }
+            println!();
+            println!(
+                "  Compilations:  {} total ({} cached, {} cold, {} non-cacheable)",
+                s.total_compilations, s.cache_hits, s.cache_misses, s.non_cacheable
+            );
+            println!("  Hit rate:      {hit_rate}");
+            if s.time_saved_ms > 0 {
+                println!("  Time saved:    ~{}", format_duration_ms(s.time_saved_ms));
+            }
+            if s.compile_errors > 0 {
+                println!("  Errors:        {}", s.compile_errors);
+            }
+            println!();
+            println!(
+                "  Artifacts:     {} ({})",
+                s.artifact_count,
+                format_bytes(s.cache_size_bytes)
+            );
+            println!(
+                "  Dep graph:     {} contexts, {} files",
+                s.dep_graph_contexts, s.dep_graph_files
+            );
+            println!("  Metadata:      {} entries", s.metadata_entries);
+            println!();
+            println!(
+                "  Sessions:      {} active / {} total",
+                s.sessions_active, s.sessions_total
+            );
             ExitCode::SUCCESS
         }
         other => {
@@ -245,6 +282,7 @@ async fn cmd_session_start(
         working_dir: cwd.to_string(),
         compiler: compiler.to_string(),
         log_file: log.map(String::from),
+        track_stats: false,
     })
     .await
     .unwrap();
@@ -281,7 +319,29 @@ async fn cmd_session_end(endpoint: &str, session_id: u64) -> ExitCode {
         .unwrap();
 
     match conn.recv().await.unwrap() {
-        Some(zccache_protocol::Response::SessionEnded) => ExitCode::SUCCESS,
+        Some(zccache_protocol::Response::SessionEnded { stats }) => {
+            if let Some(s) = stats {
+                let total = s.hits + s.misses;
+                let hit_rate = if total > 0 {
+                    format!("{:.1}%", s.hits as f64 / total as f64 * 100.0)
+                } else {
+                    "n/a".to_string()
+                };
+                eprintln!(
+                    "Session {session_id} complete ({})",
+                    format_duration_ms(s.duration_ms)
+                );
+                eprintln!(
+                    "  {} compilations: {} hits, {} misses, {} non-cacheable",
+                    s.compilations, s.hits, s.misses, s.non_cacheable
+                );
+                eprintln!("  Hit rate: {hit_rate}");
+                if s.time_saved_ms > 0 {
+                    eprintln!("  Time saved: ~{}", format_duration_ms(s.time_saved_ms));
+                }
+            }
+            ExitCode::SUCCESS
+        }
         Some(zccache_protocol::Response::Error { message }) => {
             eprintln!("session-end failed: {message}");
             ExitCode::FAILURE
@@ -513,6 +573,43 @@ fn run_async(future: impl std::future::Future<Output = ExitCode>) -> ExitCode {
         .build()
         .expect("failed to create tokio runtime")
         .block_on(future)
+}
+
+fn format_uptime(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        format!("{h}h {m}m")
+    }
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let secs = ms / 1000;
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes == 0 {
+        "0 B".to_string()
+    } else if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
 }
 
 fn init_tracing() {

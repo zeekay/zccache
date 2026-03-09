@@ -1547,6 +1547,7 @@ dependencies = [
 name = "zccache-compiler"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
  "thiserror",
  "tracing",
  "zccache-core",
@@ -1575,6 +1576,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zccache-artifact",
+ "zccache-cli",
  "zccache-compiler",
  "zccache-core",
  "zccache-depgraph",

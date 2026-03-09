@@ -5,6 +5,8 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod response_file;
+
 use std::path::PathBuf;
 
 /// Supported compiler families.

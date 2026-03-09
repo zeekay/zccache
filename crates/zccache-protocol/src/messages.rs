@@ -33,6 +33,8 @@ pub enum Request {
         compiler: String,
         /// Optional path to a log file for this session.
         log_file: Option<String>,
+        /// Whether to track per-session statistics.
+        track_stats: bool,
     },
     /// Compile a source file within an existing session.
     Compile {
@@ -82,7 +84,10 @@ pub enum Response {
         cached: bool,
     },
     /// Session ended successfully.
-    SessionEnded,
+    SessionEnded {
+        /// Per-session stats, if the session opted in to tracking.
+        stats: Option<SessionStats>,
+    },
     /// An error occurred processing the request.
     Error {
         /// Human-readable error message.
@@ -105,6 +110,24 @@ pub struct DaemonStatus {
     pub cache_hits: u64,
     /// Total cache misses since startup.
     pub cache_misses: u64,
+    /// Total compile requests received.
+    pub total_compilations: u64,
+    /// Non-cacheable invocations (linking, preprocessing, etc.).
+    pub non_cacheable: u64,
+    /// Compilations that exited with non-zero status.
+    pub compile_errors: u64,
+    /// Estimated wall-clock time saved in milliseconds.
+    pub time_saved_ms: u64,
+    /// Number of compilation contexts in the dependency graph.
+    pub dep_graph_contexts: u64,
+    /// Number of tracked files in the dependency graph.
+    pub dep_graph_files: u64,
+    /// Total sessions created since daemon start.
+    pub sessions_total: u64,
+    /// Currently active sessions.
+    pub sessions_active: u64,
+    /// Path to the cache directory.
+    pub cache_dir: String,
 }
 
 /// Result of a cache lookup.
@@ -141,6 +164,31 @@ pub struct ArtifactData {
     pub exit_code: i32,
 }
 
+/// Per-session statistics, returned when the session opted in to tracking.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionStats {
+    /// Wall-clock duration of the session in milliseconds.
+    pub duration_ms: u64,
+    /// Total compile requests in this session.
+    pub compilations: u64,
+    /// Cache hits in this session.
+    pub hits: u64,
+    /// Cache misses (cold compiles) in this session.
+    pub misses: u64,
+    /// Non-cacheable invocations (linking, preprocessing, etc.).
+    pub non_cacheable: u64,
+    /// Compilations that exited with non-zero status.
+    pub errors: u64,
+    /// Estimated wall-clock time saved in milliseconds.
+    pub time_saved_ms: u64,
+    /// Distinct source files compiled.
+    pub unique_sources: u64,
+    /// Total artifact bytes served from cache.
+    pub bytes_read: u64,
+    /// Total artifact bytes stored into cache.
+    pub bytes_written: u64,
+}
+
 /// A single output file from compilation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactOutput {
@@ -148,4 +196,144 @@ pub struct ArtifactOutput {
     pub name: String,
     /// File contents.
     pub data: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: roundtrip a value through bincode.
+    fn roundtrip<T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(
+        val: &T,
+    ) {
+        let bytes = bincode::serialize(val).unwrap();
+        let decoded: T = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(*val, decoded);
+    }
+
+    #[test]
+    fn session_stats_roundtrip() {
+        let stats = SessionStats {
+            duration_ms: 12345,
+            compilations: 100,
+            hits: 80,
+            misses: 15,
+            non_cacheable: 5,
+            errors: 2,
+            time_saved_ms: 8000,
+            unique_sources: 42,
+            bytes_read: 1024 * 1024,
+            bytes_written: 512 * 1024,
+        };
+        roundtrip(&stats);
+    }
+
+    #[test]
+    fn session_stats_default_zeros() {
+        let stats = SessionStats {
+            duration_ms: 0,
+            compilations: 0,
+            hits: 0,
+            misses: 0,
+            non_cacheable: 0,
+            errors: 0,
+            time_saved_ms: 0,
+            unique_sources: 0,
+            bytes_read: 0,
+            bytes_written: 0,
+        };
+        roundtrip(&stats);
+    }
+
+    #[test]
+    fn daemon_status_expanded_roundtrip() {
+        let status = DaemonStatus {
+            artifact_count: 892,
+            cache_size_bytes: 147_000_000,
+            metadata_entries: 5430,
+            uptime_secs: 8040,
+            cache_hits: 1089,
+            cache_misses: 143,
+            total_compilations: 1247,
+            non_cacheable: 15,
+            compile_errors: 3,
+            time_saved_ms: 750_000,
+            dep_graph_contexts: 892,
+            dep_graph_files: 4201,
+            sessions_total: 41,
+            sessions_active: 3,
+            cache_dir: "/home/user/.cache/zccache".to_string(),
+        };
+        roundtrip(&status);
+    }
+
+    #[test]
+    fn session_start_with_track_stats_roundtrip() {
+        let req = Request::SessionStart {
+            client_pid: 1234,
+            working_dir: "/home/user/project".to_string(),
+            compiler: "/usr/bin/g++".to_string(),
+            log_file: None,
+            track_stats: true,
+        };
+        roundtrip(&req);
+
+        let req_no_stats = Request::SessionStart {
+            client_pid: 1234,
+            working_dir: "/home/user/project".to_string(),
+            compiler: "/usr/bin/g++".to_string(),
+            log_file: None,
+            track_stats: false,
+        };
+        roundtrip(&req_no_stats);
+    }
+
+    #[test]
+    fn session_ended_with_stats_roundtrip() {
+        let stats = SessionStats {
+            duration_ms: 34000,
+            compilations: 32,
+            hits: 28,
+            misses: 3,
+            non_cacheable: 1,
+            errors: 0,
+            time_saved_ms: 8200,
+            unique_sources: 30,
+            bytes_read: 2_000_000,
+            bytes_written: 500_000,
+        };
+        let resp = Response::SessionEnded { stats: Some(stats) };
+        roundtrip(&resp);
+
+        let resp_no_stats = Response::SessionEnded { stats: None };
+        roundtrip(&resp_no_stats);
+    }
+
+    #[test]
+    fn existing_request_variants_still_work() {
+        roundtrip(&Request::Ping);
+        roundtrip(&Request::Shutdown);
+        roundtrip(&Request::Status);
+        roundtrip(&Request::SessionEnd { session_id: 42 });
+        roundtrip(&Request::Compile {
+            session_id: 1,
+            args: vec!["-c".into(), "foo.c".into()],
+            cwd: "/tmp".into(),
+        });
+    }
+
+    #[test]
+    fn existing_response_variants_still_work() {
+        roundtrip(&Response::Pong);
+        roundtrip(&Response::ShuttingDown);
+        roundtrip(&Response::CompileResult {
+            exit_code: 0,
+            stdout: vec![],
+            stderr: vec![],
+            cached: true,
+        });
+        roundtrip(&Response::Error {
+            message: "test".into(),
+        });
+    }
 }

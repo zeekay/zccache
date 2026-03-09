@@ -108,6 +108,7 @@ async fn start_session(
             working_dir: cwd.to_string(),
             compiler: clang.to_string_lossy().into_owned(),
             log_file: Some(log_file.to_string()),
+            track_stats: false,
         })
         .await
         .unwrap();

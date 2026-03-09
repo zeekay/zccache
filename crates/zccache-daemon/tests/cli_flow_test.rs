@@ -72,6 +72,7 @@ async fn cli_session_lifecycle() {
             working_dir: cwd.clone(),
             compiler: clang.to_string_lossy().into_owned(),
             log_file: Some(log.to_string_lossy().into_owned()),
+            track_stats: false,
         })
         .await
         .unwrap();
@@ -153,7 +154,7 @@ async fn cli_session_lifecycle() {
         .unwrap();
 
     match client.recv().await.unwrap() {
-        Some(Response::SessionEnded) => {}
+        Some(Response::SessionEnded { .. }) => {}
         other => panic!("expected SessionEnded, got: {other:?}"),
     }
 
@@ -228,26 +229,21 @@ async fn cli_binary_session_round_trip() {
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
 
-    // Find the zccache CLI binary in the same directory as the test binary.
-    // CARGO_BIN_EXE_zccache-daemon resolves to the daemon binary in target/debug/deps,
-    // but the CLI binary is at target/debug/zccache(.exe).
-    let test_bin = std::path::Path::new(env!("CARGO_BIN_EXE_zccache-daemon"));
-    // Go up from target/debug/zccache-daemon.exe to target/debug/
-    let bin_dir = test_bin.parent().unwrap();
+    // zccache-cli is a dev-dependency, so Cargo always builds the `zccache` binary.
+    // Locate it relative to the daemon binary (both land in target/debug/).
+    let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_zccache-daemon"))
+        .parent()
+        .unwrap();
     let cli_binary = if cfg!(windows) {
         bin_dir.join("zccache.exe")
     } else {
         bin_dir.join("zccache")
     };
-    if !cli_binary.exists() {
-        eprintln!(
-            "SKIP: zccache binary not found at {}. Run `cargo build -p zccache-cli` first.",
-            cli_binary.display()
-        );
-        shutdown.notify_one();
-        server_handle.await.unwrap();
-        return;
-    }
+    assert!(
+        cli_binary.exists(),
+        "zccache binary not found at {} — zccache-cli dev-dependency should ensure it is built",
+        cli_binary.display()
+    );
 
     // session-start via CLI binary
     let output = std::process::Command::new(&cli_binary)

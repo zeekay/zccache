@@ -20,6 +20,8 @@ pub use context::{compute_artifact_key, ArtifactKey, CompileContext, ContextKey}
 pub use graph::{CacheVerdict, ContextState, DepGraph, DepGraphStats};
 pub use scanner::{IncludeDirective, IncludeKind, ScanResult};
 pub use search_paths::IncludeSearchPaths;
-pub use session::{Session, SessionConfig, SessionId, SessionManager};
+pub use session::{
+    FinalizedSessionStats, Session, SessionConfig, SessionId, SessionManager, SessionStatsTracker,
+};
 pub use system_includes::{discovery_args, parse_system_include_output, SystemIncludeCache};
 pub use watcher_support::WatchSet;

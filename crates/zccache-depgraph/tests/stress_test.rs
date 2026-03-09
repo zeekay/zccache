@@ -398,6 +398,7 @@ End of search list.
         compiler: PathBuf::from("/usr/bin/g++"),
         system_includes: sys_includes.clone(),
         log_file: None,
+        track_stats: false,
     });
     assert!(mgr.exists(&session_id));
 
@@ -750,6 +751,7 @@ fn stress_concurrent_session_operations() {
                     compiler: PathBuf::from("/usr/bin/g++"),
                     system_includes: vec![PathBuf::from("/usr/include")],
                     log_file: None,
+                    track_stats: false,
                 });
                 ids.push(id);
                 mgr.touch(&id);

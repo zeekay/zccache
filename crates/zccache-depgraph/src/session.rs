@@ -16,6 +16,113 @@ use dashmap::DashMap;
 
 use crate::context::ContextKey;
 
+/// Per-session statistics tracker. Only allocated when the session opts in.
+#[derive(Debug, Clone)]
+pub struct SessionStatsTracker {
+    /// Total compile requests in this session.
+    pub compilations: u64,
+    /// Cache hits.
+    pub hits: u64,
+    /// Cache misses.
+    pub misses: u64,
+    /// Non-cacheable invocations.
+    pub non_cacheable: u64,
+    /// Compilations with non-zero exit.
+    pub errors: u64,
+    /// Estimated time saved in microseconds.
+    pub time_saved_us: u64,
+    /// Distinct source files compiled.
+    pub sources: HashSet<PathBuf>,
+    /// Artifact bytes served from cache.
+    pub bytes_read: u64,
+    /// Artifact bytes stored into cache.
+    pub bytes_written: u64,
+}
+
+/// Finalized session statistics (plain data, no sets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizedSessionStats {
+    pub duration_ms: u64,
+    pub compilations: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub non_cacheable: u64,
+    pub errors: u64,
+    pub time_saved_ms: u64,
+    pub unique_sources: u64,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+}
+
+impl SessionStatsTracker {
+    /// Create a new tracker with all counters at zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            compilations: 0,
+            hits: 0,
+            misses: 0,
+            non_cacheable: 0,
+            errors: 0,
+            time_saved_us: 0,
+            sources: HashSet::new(),
+            bytes_read: 0,
+            bytes_written: 0,
+        }
+    }
+
+    /// Record a cache hit.
+    pub fn record_hit(&mut self, source: PathBuf, saved_us: u64, bytes: u64) {
+        self.compilations += 1;
+        self.hits += 1;
+        self.time_saved_us += saved_us;
+        self.sources.insert(source);
+        self.bytes_read += bytes;
+    }
+
+    /// Record a cache miss.
+    pub fn record_miss(&mut self, source: PathBuf, bytes: u64) {
+        self.compilations += 1;
+        self.misses += 1;
+        self.sources.insert(source);
+        self.bytes_written += bytes;
+    }
+
+    /// Record a non-cacheable invocation.
+    pub fn record_non_cacheable(&mut self) {
+        self.compilations += 1;
+        self.non_cacheable += 1;
+    }
+
+    /// Record a compile error.
+    pub fn record_error(&mut self) {
+        self.errors += 1;
+    }
+
+    /// Finalize into a plain stats struct given the session's creation time.
+    #[must_use]
+    pub fn finalize(&self, created_at: Instant) -> FinalizedSessionStats {
+        FinalizedSessionStats {
+            duration_ms: created_at.elapsed().as_millis() as u64,
+            compilations: self.compilations,
+            hits: self.hits,
+            misses: self.misses,
+            non_cacheable: self.non_cacheable,
+            errors: self.errors,
+            time_saved_ms: self.time_saved_us / 1000,
+            unique_sources: self.sources.len() as u64,
+            bytes_read: self.bytes_read,
+            bytes_written: self.bytes_written,
+        }
+    }
+}
+
+impl Default for SessionStatsTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Unique identifier for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(u64);
@@ -53,6 +160,8 @@ pub struct SessionConfig {
     pub system_includes: Vec<PathBuf>,
     /// Optional log file path for session-scoped logging.
     pub log_file: Option<PathBuf>,
+    /// Whether to track per-session statistics.
+    pub track_stats: bool,
 }
 
 /// An active session.
@@ -76,6 +185,8 @@ pub struct Session {
     pub created_at: Instant,
     /// When the session was last active (compile request or heartbeat).
     pub last_activity: Instant,
+    /// Per-session stats tracker (only present when opted in).
+    pub stats_tracker: Option<SessionStatsTracker>,
 }
 
 /// Manages active sessions.
@@ -104,6 +215,12 @@ impl SessionManager {
         let id = SessionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let now = Instant::now();
 
+        let stats_tracker = if config.track_stats {
+            Some(SessionStatsTracker::new())
+        } else {
+            None
+        };
+
         let session = Session {
             id,
             client_pid: config.client_pid,
@@ -114,6 +231,7 @@ impl SessionManager {
             context_keys: HashSet::new(),
             created_at: now,
             last_activity: now,
+            stats_tracker,
         };
 
         self.sessions.insert(id, session);
@@ -216,6 +334,19 @@ impl SessionManager {
         dead
     }
 
+    /// Mutate a session in-place. Returns `false` if the session doesn't exist.
+    pub fn mutate<F>(&self, id: &SessionId, f: F) -> bool
+    where
+        F: FnOnce(&mut Session),
+    {
+        if let Some(mut session) = self.sessions.get_mut(id) {
+            f(&mut session);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Number of active sessions.
     #[must_use]
     pub fn active_count(&self) -> usize {
@@ -246,6 +377,7 @@ mod tests {
             compiler: PathBuf::from("/usr/bin/g++"),
             system_includes: vec![PathBuf::from("/usr/include")],
             log_file: None,
+            track_stats: false,
         }
     }
 
@@ -419,5 +551,92 @@ mod tests {
         }
 
         assert_eq!(mgr.active_count(), 100);
+    }
+
+    // ─── SessionStatsTracker tests ──────────────────────────────────────
+
+    #[test]
+    fn tracker_new_is_zero() {
+        let t = SessionStatsTracker::new();
+        assert_eq!(t.compilations, 0);
+        assert_eq!(t.hits, 0);
+        assert_eq!(t.misses, 0);
+        assert_eq!(t.non_cacheable, 0);
+        assert_eq!(t.errors, 0);
+        assert_eq!(t.bytes_read, 0);
+        assert_eq!(t.bytes_written, 0);
+        assert!(t.sources.is_empty());
+    }
+
+    #[test]
+    fn tracker_record_hit() {
+        let mut t = SessionStatsTracker::new();
+        t.record_hit(PathBuf::from("/src/a.c"), 5000, 1024);
+        t.record_hit(PathBuf::from("/src/a.c"), 3000, 2048); // same source
+        assert_eq!(t.compilations, 2);
+        assert_eq!(t.hits, 2);
+        assert_eq!(t.time_saved_us, 8000);
+        assert_eq!(t.bytes_read, 3072);
+        assert_eq!(t.sources.len(), 1); // deduplicated
+    }
+
+    #[test]
+    fn tracker_record_miss() {
+        let mut t = SessionStatsTracker::new();
+        t.record_miss(PathBuf::from("/src/b.c"), 4096);
+        assert_eq!(t.compilations, 1);
+        assert_eq!(t.misses, 1);
+        assert_eq!(t.bytes_written, 4096);
+        assert_eq!(t.sources.len(), 1);
+    }
+
+    #[test]
+    fn tracker_record_non_cacheable_and_error() {
+        let mut t = SessionStatsTracker::new();
+        t.record_non_cacheable();
+        t.record_error();
+        assert_eq!(t.compilations, 1);
+        assert_eq!(t.non_cacheable, 1);
+        assert_eq!(t.errors, 1);
+    }
+
+    #[test]
+    fn tracker_finalize() {
+        let mut t = SessionStatsTracker::new();
+        t.record_hit(PathBuf::from("/src/a.c"), 5_000, 1024);
+        t.record_miss(PathBuf::from("/src/b.c"), 2048);
+        t.record_non_cacheable();
+
+        let created_at = Instant::now() - Duration::from_millis(500);
+        let f = t.finalize(created_at);
+
+        assert!(f.duration_ms >= 500);
+        assert_eq!(f.compilations, 3);
+        assert_eq!(f.hits, 1);
+        assert_eq!(f.misses, 1);
+        assert_eq!(f.non_cacheable, 1);
+        assert_eq!(f.time_saved_ms, 5); // 5000us / 1000
+        assert_eq!(f.unique_sources, 2);
+        assert_eq!(f.bytes_read, 1024);
+        assert_eq!(f.bytes_written, 2048);
+    }
+
+    #[test]
+    fn session_with_stats_tracking() {
+        let mut config = test_config();
+        config.track_stats = true;
+        let mgr = SessionManager::new(Duration::from_secs(900));
+        let id = mgr.create(config);
+
+        let session = mgr.get(&id).unwrap();
+        assert!(session.stats_tracker.is_some());
+    }
+
+    #[test]
+    fn session_without_stats_tracking() {
+        let mgr = SessionManager::new(Duration::from_secs(900));
+        let id = mgr.create(test_config()); // track_stats: false
+        let session = mgr.get(&id).unwrap();
+        assert!(session.stats_tracker.is_none());
     }
 }
