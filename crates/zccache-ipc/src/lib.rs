@@ -6,6 +6,14 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod error;
+pub mod transport;
+
+pub use error::IpcError;
+#[cfg(windows)]
+pub use transport::IpcClientConnection;
+pub use transport::{connect, unique_test_endpoint, IpcConnection, IpcListener};
+
 use std::path::PathBuf;
 
 /// Returns the platform-specific default IPC endpoint path.

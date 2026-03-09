@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A request from client to daemon.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Request {
     /// Health check.
     Ping,
@@ -23,10 +23,19 @@ pub enum Request {
         /// The artifact data to store.
         artifact: ArtifactData,
     },
+    /// Start a new session with the daemon.
+    SessionStart {
+        /// Client process ID.
+        client_pid: u32,
+        /// Client working directory.
+        working_dir: String,
+        /// Path to the compiler executable.
+        compiler: String,
+    },
 }
 
 /// A response from daemon to client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Response {
     /// Response to Ping.
     Pong,
@@ -38,6 +47,13 @@ pub enum Response {
     LookupResult(LookupResult),
     /// Store result.
     StoreResult(StoreResult),
+    /// Session successfully started.
+    SessionStarted {
+        /// Assigned session ID.
+        session_id: u64,
+        /// System include paths discovered for the compiler.
+        system_includes: Vec<String>,
+    },
     /// An error occurred processing the request.
     Error {
         /// Human-readable error message.
@@ -46,7 +62,7 @@ pub enum Response {
 }
 
 /// Daemon status information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     /// Number of artifacts in cache.
     pub artifact_count: u64,
@@ -63,7 +79,7 @@ pub struct DaemonStatus {
 }
 
 /// Result of a cache lookup.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LookupResult {
     /// Cache hit.
     Hit {
@@ -75,7 +91,7 @@ pub enum LookupResult {
 }
 
 /// Result of storing an artifact.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StoreResult {
     /// Successfully stored.
     Stored,
@@ -84,7 +100,7 @@ pub enum StoreResult {
 }
 
 /// Artifact data exchanged over the protocol.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactData {
     /// The output files (filename to contents).
     pub outputs: Vec<ArtifactOutput>,
@@ -97,7 +113,7 @@ pub struct ArtifactData {
 }
 
 /// A single output file from compilation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactOutput {
     /// Relative filename (e.g., "foo.o").
     pub name: String,

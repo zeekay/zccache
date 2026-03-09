@@ -6,6 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 
 
+[lib]
+name = "zccache_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zccache-daemon"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -21,3 +29,7 @@ zccache-artifact = { path = "../zccache-artifact" }
 zccache-watcher = { path = "../zccache-watcher" }
 zccache-hash = { path = "../zccache-hash" }
 zccache-compiler = { path = "../zccache-compiler" }
+zccache-depgraph = { path = "../zccache-depgraph" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

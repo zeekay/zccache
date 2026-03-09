@@ -21,5 +21,5 @@ pub use graph::{CacheVerdict, ContextState, DepGraph, DepGraphStats};
 pub use scanner::{IncludeDirective, IncludeKind, ScanResult};
 pub use search_paths::IncludeSearchPaths;
 pub use session::{Session, SessionConfig, SessionId, SessionManager};
-pub use system_includes::{parse_system_include_output, SystemIncludeCache};
+pub use system_includes::{discovery_args, parse_system_include_output, SystemIncludeCache};
 pub use watcher_support::WatchSet;
