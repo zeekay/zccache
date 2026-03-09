@@ -1517,7 +1517,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-artifact"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "redb",
  "serde",
@@ -1531,7 +1531,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "thiserror",
@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-compiler"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -1556,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-daemon"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "serde",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-depgraph"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "dashmap",
@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-fscache"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "dashmap",
  "serde",
@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-hash"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "criterion",
@@ -1627,7 +1627,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-ipc"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "serde",
@@ -1639,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-protocol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bincode",
  "bytes",
@@ -1650,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-test-support"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "tempfile",
  "tokio",
@@ -1660,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-watcher"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "notify",
  "tempfile",

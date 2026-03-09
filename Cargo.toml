@@ -16,11 +16,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/user/zccache"
+repository = "https://github.com/zackees/zccache"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
