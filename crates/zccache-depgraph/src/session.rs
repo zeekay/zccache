@@ -26,6 +26,12 @@ impl SessionId {
     pub fn value(&self) -> u64 {
         self.0
     }
+
+    /// Reconstruct a `SessionId` from a raw u64 value.
+    #[must_use]
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 impl std::fmt::Display for SessionId {
@@ -45,6 +51,8 @@ pub struct SessionConfig {
     pub compiler: PathBuf,
     /// Discovered system include paths for this compiler.
     pub system_includes: Vec<PathBuf>,
+    /// Optional log file path for session-scoped logging.
+    pub log_file: Option<PathBuf>,
 }
 
 /// An active session.
@@ -60,6 +68,8 @@ pub struct Session {
     pub compiler: PathBuf,
     /// System include paths discovered for this compiler.
     pub system_includes: Vec<PathBuf>,
+    /// Optional log file path for session-scoped logging.
+    pub log_file: Option<PathBuf>,
     /// Context keys registered by this session.
     pub context_keys: HashSet<ContextKey>,
     /// When the session was created.
@@ -100,6 +110,7 @@ impl SessionManager {
             working_dir: config.working_dir,
             compiler: config.compiler,
             system_includes: config.system_includes,
+            log_file: config.log_file,
             context_keys: HashSet::new(),
             created_at: now,
             last_activity: now,
@@ -135,6 +146,12 @@ impl SessionManager {
         } else {
             false
         }
+    }
+
+    /// Get a snapshot of a session.
+    #[must_use]
+    pub fn get(&self, id: &SessionId) -> Option<Session> {
+        self.sessions.get(id).map(|s| s.clone())
     }
 
     /// Get a session's system include paths.
@@ -228,6 +245,7 @@ mod tests {
             working_dir: PathBuf::from("/home/user/project"),
             compiler: PathBuf::from("/usr/bin/g++"),
             system_includes: vec![PathBuf::from("/usr/include")],
+            log_file: None,
         }
     }
 

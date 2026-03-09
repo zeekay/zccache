@@ -1,16 +1,25 @@
 //! Daemon server — accepts IPC connections and handles requests.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
-use zccache_depgraph::{SessionManager, SystemIncludeCache};
+use zccache_depgraph::{SessionId, SessionManager, SystemIncludeCache};
 use zccache_ipc::{IpcConnection, IpcListener};
-use zccache_protocol::{Request, Response};
+use zccache_protocol::{ArtifactData, ArtifactOutput, Request, Response};
+
+/// Cached compilation artifact.
+#[derive(Debug, Clone)]
+struct CachedArtifact {
+    artifact: ArtifactData,
+}
 
 /// Shared state accessible by all connection handlers.
 struct SharedState {
     sessions: SessionManager,
     system_includes: Mutex<SystemIncludeCache>,
+    /// In-memory artifact cache: cache_key_hex → artifact data.
+    artifacts: Mutex<HashMap<String, CachedArtifact>>,
 }
 
 /// The daemon server that listens for IPC connections.
@@ -30,6 +39,7 @@ impl DaemonServer {
             state: Arc::new(SharedState {
                 sessions: SessionManager::new(std::time::Duration::from_secs(300)),
                 system_includes: Mutex::new(SystemIncludeCache::new()),
+                artifacts: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -98,7 +108,13 @@ async fn handle_connection(
                 client_pid,
                 working_dir,
                 compiler,
-            } => handle_session_start(&state, client_pid, &working_dir, &compiler).await,
+                log_file,
+            } => handle_session_start(&state, client_pid, &working_dir, &compiler, log_file).await,
+            Request::Compile {
+                session_id,
+                args,
+                cwd,
+            } => handle_compile(&state, session_id, &args, &cwd).await,
         };
 
         conn.send(&response).await?;
@@ -111,6 +127,7 @@ async fn handle_session_start(
     client_pid: u32,
     working_dir: &str,
     compiler: &str,
+    log_file: Option<String>,
 ) -> Response {
     let compiler_path = PathBuf::from(compiler);
 
@@ -147,6 +164,7 @@ async fn handle_session_start(
         working_dir: PathBuf::from(working_dir),
         compiler: compiler_path,
         system_includes: system_includes.clone(),
+        log_file: log_file.map(PathBuf::from),
     };
 
     let session_id = state.sessions.create(session_config);
@@ -158,6 +176,248 @@ async fn handle_session_start(
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
     }
+}
+
+/// Write a log line to the session's log file (if configured).
+fn write_session_log(sessions: &SessionManager, session_id: &SessionId, message: &str) {
+    if let Some(session) = sessions.get(session_id) {
+        if let Some(ref log_path) = session.log_file {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+            {
+                let _ = writeln!(f, "{message}");
+            }
+        }
+    }
+}
+
+/// Handle a Compile request: parse args, check cache, run compiler or return cached.
+async fn handle_compile(
+    state: &SharedState,
+    session_id: u64,
+    args: &[String],
+    cwd: &str,
+) -> Response {
+    let sid = SessionId::from_raw(session_id);
+
+    // Look up session
+    let compiler = match state.sessions.compiler(&sid) {
+        Some(c) => c,
+        None => {
+            return Response::Error {
+                message: format!("unknown session: {session_id}"),
+            };
+        }
+    };
+
+    state.sessions.touch(&sid);
+
+    // Parse the args to find source file, output file, and compute cache key
+    let parsed = zccache_compiler::parse_invocation(compiler.to_str().unwrap_or(""), args);
+    let compilation = match parsed {
+        zccache_compiler::ParsedInvocation::Cacheable(c) => c,
+        zccache_compiler::ParsedInvocation::NonCacheable { reason } => {
+            write_session_log(&state.sessions, &sid, &format!("non-cacheable: {reason}"));
+            // Fall through to direct compilation
+            return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid).await;
+        }
+    };
+
+    // Compute cache key: hash(compiler_binary + source_content + cache_relevant_args)
+    let cwd_path = PathBuf::from(cwd);
+    let source_path = if compilation.source_file.is_absolute() {
+        compilation.source_file.clone()
+    } else {
+        cwd_path.join(&compilation.source_file)
+    };
+    let output_path = if compilation.output_file.is_absolute() {
+        compilation.output_file.clone()
+    } else {
+        cwd_path.join(&compilation.output_file)
+    };
+
+    let cache_key =
+        match compute_cache_key(&compiler, &source_path, &compilation.cache_relevant_args) {
+            Ok(k) => k,
+            Err(e) => {
+                write_session_log(
+                    &state.sessions,
+                    &sid,
+                    &format!("cache key error: {e}, falling back to direct compile"),
+                );
+                return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid).await;
+            }
+        };
+
+    // Check cache
+    {
+        let artifacts = state.artifacts.lock().await;
+        if let Some(cached) = artifacts.get(&cache_key) {
+            // Cache hit! Write the primary output to the requested output_path.
+            // Secondary outputs (if any) go to cwd.
+            for (i, output) in cached.artifact.outputs.iter().enumerate() {
+                let out_path = if i == 0 {
+                    // Primary output always goes to the requested path
+                    output_path.clone()
+                } else {
+                    cwd_path.join(&output.name)
+                };
+                if let Err(e) = std::fs::write(&out_path, &output.data) {
+                    return Response::Error {
+                        message: format!(
+                            "failed to write cached output {}: {e}",
+                            out_path.display()
+                        ),
+                    };
+                }
+            }
+
+            write_session_log(
+                &state.sessions,
+                &sid,
+                &format!(
+                    "cache hit: {} -> {}",
+                    source_path.display(),
+                    output_path.display()
+                ),
+            );
+
+            return Response::CompileResult {
+                exit_code: cached.artifact.exit_code,
+                stdout: cached.artifact.stdout.clone(),
+                stderr: cached.artifact.stderr.clone(),
+                cached: true,
+            };
+        }
+    }
+
+    // Cache miss — run the compiler
+    write_session_log(
+        &state.sessions,
+        &sid,
+        &format!(
+            "cache miss: {} -> {}",
+            source_path.display(),
+            output_path.display()
+        ),
+    );
+
+    let result = tokio::process::Command::new(&compiler)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await;
+
+    let output = match result {
+        Ok(o) => o,
+        Err(e) => {
+            return Response::Error {
+                message: format!("failed to run compiler: {e}"),
+            };
+        }
+    };
+
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    // Only cache successful compilations
+    if exit_code == 0 {
+        // Read the output file
+        let output_data = match std::fs::read(&output_path) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!("failed to read output file {}: {e}", output_path.display());
+                return Response::CompileResult {
+                    exit_code,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                    cached: false,
+                };
+            }
+        };
+
+        let artifact = ArtifactData {
+            outputs: vec![ArtifactOutput {
+                name: output_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                data: output_data,
+            }],
+            stdout: output.stdout.clone(),
+            stderr: output.stderr.clone(),
+            exit_code,
+        };
+
+        let mut artifacts = state.artifacts.lock().await;
+        artifacts.insert(cache_key, CachedArtifact { artifact });
+    }
+
+    Response::CompileResult {
+        exit_code,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        cached: false,
+    }
+}
+
+/// Run the compiler directly without caching.
+async fn run_compiler_direct(
+    compiler: &PathBuf,
+    args: &[String],
+    cwd: &str,
+    sessions: &SessionManager,
+    sid: &SessionId,
+) -> Response {
+    let result = tokio::process::Command::new(compiler)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await;
+
+    match result {
+        Ok(output) => {
+            let exit_code = output.status.code().unwrap_or(-1);
+            write_session_log(
+                sessions,
+                sid,
+                &format!("direct compile: exit_code={exit_code}"),
+            );
+            Response::CompileResult {
+                exit_code,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                cached: false,
+            }
+        }
+        Err(e) => Response::Error {
+            message: format!("failed to run compiler: {e}"),
+        },
+    }
+}
+
+/// Compute a cache key from compiler binary hash + source hash + args.
+fn compute_cache_key(
+    compiler: &std::path::Path,
+    source: &std::path::Path,
+    args: &[String],
+) -> Result<String, String> {
+    let compiler_hash =
+        zccache_hash::hash_file(compiler).map_err(|e| format!("hash compiler: {e}"))?;
+    let source_hash = zccache_hash::hash_file(source).map_err(|e| format!("hash source: {e}"))?;
+
+    let mut builder = zccache_hash::cache_key::CacheKeyBuilder::new()
+        .compiler(compiler_hash)
+        .source(source_hash);
+    for a in args {
+        builder = builder.arg(a);
+    }
+    let key = builder.build();
+
+    Ok(key.to_hex())
 }
 
 #[cfg(test)]

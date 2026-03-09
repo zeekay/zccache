@@ -31,6 +31,17 @@ pub enum Request {
         working_dir: String,
         /// Path to the compiler executable.
         compiler: String,
+        /// Optional path to a log file for this session.
+        log_file: Option<String>,
+    },
+    /// Compile a source file within an existing session.
+    Compile {
+        /// Session ID from a prior SessionStart.
+        session_id: u64,
+        /// Compiler arguments (e.g., ["-c", "hello.cpp", "-o", "hello.o"]).
+        args: Vec<String>,
+        /// Working directory for the compilation.
+        cwd: String,
     },
 }
 
@@ -53,6 +64,17 @@ pub enum Response {
         session_id: u64,
         /// System include paths discovered for the compiler.
         system_includes: Vec<String>,
+    },
+    /// Result of a compilation request.
+    CompileResult {
+        /// Compiler exit code.
+        exit_code: i32,
+        /// Captured stdout.
+        stdout: Vec<u8>,
+        /// Captured stderr.
+        stderr: Vec<u8>,
+        /// Whether this was served from cache.
+        cached: bool,
     },
     /// An error occurred processing the request.
     Error {

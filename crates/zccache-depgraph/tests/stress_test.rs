@@ -397,6 +397,7 @@ End of search list.
         working_dir: root.to_path_buf(),
         compiler: PathBuf::from("/usr/bin/g++"),
         system_includes: sys_includes.clone(),
+        log_file: None,
     });
     assert!(mgr.exists(&session_id));
 
@@ -748,6 +749,7 @@ fn stress_concurrent_session_operations() {
                     working_dir: PathBuf::from(format!("/project/{t}")),
                     compiler: PathBuf::from("/usr/bin/g++"),
                     system_includes: vec![PathBuf::from("/usr/include")],
+                    log_file: None,
                 });
                 ids.push(id);
                 mgr.touch(&id);
