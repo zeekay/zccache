@@ -14,7 +14,7 @@ import os
 import sys
 from pathlib import Path
 
-EXCLUDED_DIRS = {".git", "target", ".loop", "__pycache__", ".venv", "node_modules"}
+EXCLUDED_DIRS = {".git", ".github", "target", ".loop", "__pycache__", ".venv", "node_modules"}
 
 
 def main():
