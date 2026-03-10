@@ -1,12 +1,15 @@
 # zccache
 
+### A blazing fast cpp compiler cache
+
+*A high-performance, portable compiler-cache daemon for fast local development workflows.*
 
 
 ![New Project](https://github.com/user-attachments/assets/f4d85974-0772-4710-b9f8-47bbd9439cef)
 
 
 
-A high-performance, portable compiler-cache daemon for fast local development workflows.
+
 
 Inspired by [sccache](https://github.com/mozilla/sccache), but optimized for local-first use
 with aggressive file metadata caching and filesystem watching.
