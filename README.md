@@ -1,5 +1,7 @@
 # zccache
 
+<img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/89b4ca71-28dd-44fb-aee9-416248699aa9" />
+
 A high-performance, portable compiler-cache daemon for fast local development workflows.
 
 Inspired by [sccache](https://github.com/mozilla/sccache), but optimized for local-first use
