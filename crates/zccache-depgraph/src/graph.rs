@@ -219,6 +219,131 @@ impl DepGraph {
         }
     }
 
+    /// Check if a compilation can use cached output, with diagnostic reason.
+    ///
+    /// Same logic as [`check()`](Self::check) but returns a reason string
+    /// explaining why the verdict was reached (useful for session logs).
+    pub fn check_diagnostic<F, G>(
+        &self,
+        key: &ContextKey,
+        is_fresh: F,
+        get_hash: G,
+    ) -> (CacheVerdict, String)
+    where
+        F: Fn(&Path) -> bool,
+        G: Fn(&Path) -> Option<ContentHash>,
+    {
+        self.checks.fetch_add(1, Ordering::Relaxed);
+
+        let mut entry = match self.contexts.get_mut(key) {
+            Some(e) => e,
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return (CacheVerdict::Cold, "context_key not registered".to_string());
+            }
+        };
+
+        entry.last_accessed = Instant::now();
+
+        if entry.state == ContextState::Cold {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return (
+                CacheVerdict::Cold,
+                "context never updated (state=Cold)".to_string(),
+            );
+        }
+
+        if entry.has_computed_includes {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return (
+                CacheVerdict::NeedsPreprocessor,
+                "has computed includes, needs preprocessor".to_string(),
+            );
+        }
+
+        // Check source file freshness.
+        let source_fresh = is_fresh(&entry.context.source_file);
+
+        // Check all headers.
+        let mut changed_headers = Vec::new();
+        for header in &entry.resolved_includes {
+            if !is_fresh(header) {
+                changed_headers.push(header.clone());
+            }
+        }
+
+        if !changed_headers.is_empty() {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            entry.state = ContextState::Stale;
+            let names: Vec<String> = changed_headers
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            return (
+                CacheVerdict::HeadersChanged {
+                    changed: changed_headers,
+                },
+                format!("headers changed: [{}]", names.join(", ")),
+            );
+        }
+
+        // All headers fresh. Compute artifact key.
+        let mut file_hashes = Vec::new();
+
+        if let Some(h) = get_hash(&entry.context.source_file) {
+            file_hashes.push((entry.context.source_file.clone(), h));
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return (
+                CacheVerdict::Cold,
+                format!(
+                    "source hash missing: {}",
+                    entry.context.source_file.display()
+                ),
+            );
+        }
+
+        for header in &entry.resolved_includes {
+            if let Some(h) = get_hash(header) {
+                file_hashes.push((header.clone(), h));
+            } else {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return (
+                    CacheVerdict::Cold,
+                    format!("header hash missing: {}", header.display()),
+                );
+            }
+        }
+
+        let artifact_key = compute_artifact_key(key, &mut file_hashes);
+
+        if source_fresh {
+            if entry.artifact_key == Some(artifact_key) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                let hex = &artifact_key.hash().to_hex()[..8];
+                return (
+                    CacheVerdict::Hit { artifact_key },
+                    format!("hit: artifact_key={hex}"),
+                );
+            }
+            // Source is "fresh" by watcher but artifact key differs.
+            entry.artifact_key = Some(artifact_key);
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            let hex = &artifact_key.hash().to_hex()[..8];
+            (
+                CacheVerdict::Hit { artifact_key },
+                format!("hit: artifact_key={hex} (first check after update)"),
+            )
+        } else {
+            entry.artifact_key = Some(artifact_key);
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            (
+                CacheVerdict::SourceChanged { artifact_key },
+                "source content changed".to_string(),
+            )
+        }
+    }
+
     /// After a compile (or on cold path), record the full include list.
     ///
     /// `get_hash` retrieves the content hash for a file from Layer 1.

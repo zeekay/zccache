@@ -21,6 +21,7 @@ uv run cargo clippy --workspace --all-targets -- -D warnings
 uv run cargo fmt --all
 RUSTDOCFLAGS="-D warnings" uv run cargo doc --workspace --no-deps
 uv run cargo bench -p zccache-hash
+uv run perf                 # performance benchmark (zccache vs sccache vs bare clang)
 ```
 
 ## Distribution

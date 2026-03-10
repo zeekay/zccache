@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use zccache_depgraph::{
-    CompileContext, ContextKey, DepGraph, SessionId, SessionManager, SystemIncludeCache,
+    CompileContext, ContextKey, DepGraph, DepfileStrategy, SessionId, SessionManager,
+    SystemIncludeCache, UserDepFlags,
 };
 use zccache_fscache::{CacheSystem, Clock};
 use zccache_hash::ContentHash;
@@ -68,6 +69,8 @@ struct SharedState {
     profiler: PhaseProfiler,
     /// On-disk artifact cache for hardlink optimization on cache hits.
     artifact_dir: PathBuf,
+    /// Temporary directory for injected depfiles.
+    depfile_tmpdir: PathBuf,
     /// Ultra-fast hit cache: context_key → (clock, artifact_key_hex, timestamp).
     /// When the journal clock hasn't advanced since the last verified hit,
     /// we skip all stat/hash/depgraph work and jump straight to artifact lookup.
@@ -91,12 +94,17 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Monotonic counter ensuring each `DaemonServer` instance gets unique
+/// artifact and depfile directories, even within the same process.
+static SERVER_INSTANCE: AtomicU64 = AtomicU64::new(0);
+
 impl DaemonServer {
     /// Create a new daemon server bound to the given endpoint.
     pub fn bind(endpoint: &str) -> Result<Self, zccache_ipc::IpcError> {
         let listener = IpcListener::bind(endpoint)?;
         let shutdown = Arc::new(Notify::new());
         let now = now_secs();
+        let instance = SERVER_INSTANCE.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             listener,
             shutdown: Arc::clone(&shutdown),
@@ -114,8 +122,18 @@ impl DaemonServer {
                 stats: StatsCollector::new(),
                 profiler: PhaseProfiler::new(),
                 artifact_dir: {
-                    let dir = std::env::temp_dir()
-                        .join(format!("zccache-artifacts-{}", std::process::id()));
+                    let dir = std::env::temp_dir().join(format!(
+                        "zccache-artifacts-{}-{instance}",
+                        std::process::id()
+                    ));
+                    std::fs::create_dir_all(&dir).ok();
+                    dir
+                },
+                depfile_tmpdir: {
+                    let dir = std::env::temp_dir().join(format!(
+                        "zccache-depfiles-{}-{instance}",
+                        std::process::id()
+                    ));
                     std::fs::create_dir_all(&dir).ok();
                     dir
                 },
@@ -574,14 +592,15 @@ fn hash_file(cache_system: &CacheSystem, path: &Path) -> Result<ContentHash, Str
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Build a CompileContext from a CacheableCompilation and session info.
+/// Build a CompileContext and UserDepFlags from a CacheableCompilation and session info.
 fn build_compile_context(
     compilation: &zccache_compiler::CacheableCompilation,
     cwd: &Path,
     system_includes: &[PathBuf],
-) -> CompileContext {
+) -> (CompileContext, UserDepFlags) {
     // Parse the original args through depgraph's parser to get structured search paths
     let parsed = zccache_depgraph::args::parse_compile_args(&compilation.original_args, cwd);
+    let dep_flags = parsed.dep_flags.clone();
     let mut ctx = CompileContext::from_parsed_args(&parsed);
 
     // Inject session's system includes
@@ -591,7 +610,7 @@ fn build_compile_context(
         }
     }
 
-    ctx
+    (ctx, dep_flags)
 }
 
 /// Write cached output to disk. Optimized syscall sequence:
@@ -693,7 +712,7 @@ async fn handle_compile(
 
     // ── Phase: build context + register ──────────────────────────────
     let t1 = std::time::Instant::now();
-    let ctx = build_compile_context(&compilation, &cwd_path, &system_includes);
+    let (ctx, dep_flags) = build_compile_context(&compilation, &cwd_path, &system_includes);
     let context_key = state.dep_graph.register(ctx.clone());
     let build_context_us = t1.elapsed().as_micros() as u64;
 
@@ -807,8 +826,12 @@ async fn handle_compile(
                 Ok(h) => {
                     hash_map.insert(header.clone(), h);
                 }
-                Err(_) => {
-                    // Header disappeared — force rescan
+                Err(e) => {
+                    write_session_log(
+                        &state.sessions,
+                        &sid,
+                        &format!("[DIAG] header_hash_fail: {} error={e}", header.display()),
+                    );
                 }
             }
         }
@@ -817,14 +840,31 @@ async fn handle_compile(
 
     // ── Phase: depgraph check ────────────────────────────────────────
     let t4 = std::time::Instant::now();
-    let verdict = {
+    let (verdict, diag_reason) = {
         let is_fresh = |_: &Path| true;
         let get_hash = |p: &Path| hash_map.get(p).copied();
-        state.dep_graph.check(&context_key, is_fresh, get_hash)
+        state
+            .dep_graph
+            .check_diagnostic(&context_key, is_fresh, get_hash)
     };
     let depgraph_check_us = t4.elapsed().as_micros() as u64;
-
-    // Process verdict
+    write_session_log(
+        &state.sessions,
+        &sid,
+        &format!(
+            "[DIAG] depgraph_check: {} -> {} verdict={} reason={}",
+            source_path.display(),
+            output_path.display(),
+            match &verdict {
+                zccache_depgraph::CacheVerdict::Hit { .. } => "Hit",
+                zccache_depgraph::CacheVerdict::SourceChanged { .. } => "SourceChanged",
+                zccache_depgraph::CacheVerdict::HeadersChanged { .. } => "HeadersChanged",
+                zccache_depgraph::CacheVerdict::Cold => "Cold",
+                zccache_depgraph::CacheVerdict::NeedsPreprocessor => "NeedsPreprocessor",
+            },
+            diag_reason,
+        ),
+    );
     match verdict {
         zccache_depgraph::CacheVerdict::Hit { artifact_key }
         | zccache_depgraph::CacheVerdict::SourceChanged { artifact_key } => {
@@ -913,6 +953,11 @@ async fn handle_compile(
                 };
             }
             // Artifact key computed but no artifact stored yet — fall through to compile
+            write_session_log(
+                &state.sessions,
+                &sid,
+                &format!("[DIAG] artifact_not_found: key={artifact_key_hex}"),
+            );
         }
         zccache_depgraph::CacheVerdict::Cold
         | zccache_depgraph::CacheVerdict::HeadersChanged { .. }
@@ -929,16 +974,27 @@ async fn handle_compile(
         &state.sessions,
         &sid,
         &format!(
-            "cache miss: {} -> {}",
+            "cache miss: {} -> {} (reason: {diag_reason})",
             source_path.display(),
             output_path.display()
         ),
     );
 
-    // ── Phase: compiler exec ─────────────────────────────────────────
+    // ── Phase: compiler exec (with depfile injection) ────────────────
     let t_exec = std::time::Instant::now();
+    let supports_depfile = compilation.family.supports_depfile();
+    let (extra_args, depfile_strategy) = zccache_depgraph::depfile::prepare_depfile(
+        supports_depfile,
+        &dep_flags,
+        &output_path,
+        &state.depfile_tmpdir,
+    );
+
     let mut cmd = tokio::process::Command::new(&compiler);
     cmd.args(args).current_dir(cwd);
+    if !extra_args.is_empty() {
+        cmd.args(&extra_args);
+    }
     apply_client_env(&mut cmd, &client_env);
     let result = cmd.output().await;
 
@@ -975,10 +1031,41 @@ async fn handle_compile(
             }
         };
 
-        // ── Phase: include scan ──────────────────────────────────────
+        // ── Phase: include scan (depfile or fallback) ────────────────
         let t_scan = std::time::Instant::now();
-        let scan_result =
-            zccache_depgraph::scanner::scan_recursive(&source_path, &ctx.include_search);
+        let scan_result = match &depfile_strategy {
+            DepfileStrategy::Injected { path }
+            | DepfileStrategy::UserSpecified { path }
+            | DepfileStrategy::UserDefault { path } => {
+                let cwd_path = PathBuf::from(cwd);
+                match zccache_depgraph::depfile::parse_depfile_path(path, &source_path, &cwd_path) {
+                    Ok(result) => {
+                        if matches!(depfile_strategy, DepfileStrategy::Injected { .. }) {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        result
+                    }
+                    Err(e) => {
+                        tracing::warn!("depfile parse failed, falling back to scanner: {e}");
+                        write_session_log(
+                            &state.sessions,
+                            &sid,
+                            &format!(
+                                "[DIAG] depfile_parse_fail: path={} error={e}",
+                                path.display()
+                            ),
+                        );
+                        if matches!(depfile_strategy, DepfileStrategy::Injected { .. }) {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        zccache_depgraph::scanner::scan_recursive(&source_path, &ctx.include_search)
+                    }
+                }
+            }
+            DepfileStrategy::Unsupported => {
+                zccache_depgraph::scanner::scan_recursive(&source_path, &ctx.include_search)
+            }
+        };
         let include_scan_us = t_scan.elapsed().as_micros() as u64;
 
         // Register scanned paths for zero-syscall fast path on future hits.
@@ -1018,7 +1105,18 @@ async fn handle_compile(
         // ── Phase: store artifact ────────────────────────────────────
         let t_store = std::time::Instant::now();
         let get_hash = |p: &Path| hash_map.get(p).copied();
+        let include_count = scan_result.resolved.len();
         if let Some(artifact_key) = state.dep_graph.update(&context_key, scan_result, get_hash) {
+            let artifact_key_hex = artifact_key.hash().to_hex();
+            write_session_log(
+                &state.sessions,
+                &sid,
+                &format!(
+                    "[DIAG] update: {} artifact_key={} includes={include_count}",
+                    source_path.display(),
+                    &artifact_key_hex[..8],
+                ),
+            );
             let artifact = ArtifactData {
                 outputs: vec![ArtifactOutput {
                     name: output_path
@@ -1034,7 +1132,6 @@ async fn handle_compile(
             };
 
             // Persist outputs to on-disk cache for hardlink optimization.
-            let artifact_key_hex = artifact_key.hash().to_hex();
             for (i, out) in artifact.outputs.iter().enumerate() {
                 let cache_path = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
                 let _ = std::fs::write(&cache_path, &out.data);
@@ -1131,7 +1228,7 @@ fn check_unit_cache(
         cwd_path.join(&compilation.output_file)
     };
 
-    let ctx = build_compile_context(compilation, cwd_path, system_includes);
+    let (ctx, _dep_flags) = build_compile_context(compilation, cwd_path, system_includes);
     let t_ctx = t0.elapsed();
     let context_key = state.dep_graph.register(ctx.clone());
     let t_register = t0.elapsed();
@@ -1355,12 +1452,17 @@ async fn handle_compile_multi(
     );
 
     // Build compiler args: -c <miss sources...> <shared flags>
+    // Inject -MD for depfile generation if compiler supports it.
+    let supports_depfile = compilations[0].family.supports_depfile();
     let shared_flags = &compilations[0].cache_relevant_args;
     let mut compiler_args: Vec<String> = vec!["-c".to_string()];
     for src in &miss_sources {
         compiler_args.push(src.to_string_lossy().into_owned());
     }
     compiler_args.extend(shared_flags.iter().cloned());
+    if supports_depfile {
+        compiler_args.push("-MD".to_string());
+    }
 
     let mut cmd = tokio::process::Command::new(&compiler);
     cmd.args(&compiler_args).current_dir(&cwd);
@@ -1408,9 +1510,46 @@ async fn handle_compile_multi(
             Err(_) => continue,
         };
 
-        // Scan includes
-        let scan_result =
-            zccache_depgraph::scanner::scan_recursive(source_path, &ctx.include_search);
+        // Scan includes: use depfile if available, fall back to scanner.
+        let scan_result = if supports_depfile {
+            let d_path = source_path.with_extension("d");
+            // Multi-file -MD places .d files relative to the source
+            let cwd_d_path = cwd_path.join(
+                d_path
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("deps.d")),
+            );
+            let depfile_path = if d_path.exists() {
+                d_path
+            } else if cwd_d_path.exists() {
+                cwd_d_path
+            } else {
+                // Try deriving from source file stem in cwd
+                let stem = source_path
+                    .file_stem()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("out"));
+                cwd_path.join(stem).with_extension("d")
+            };
+            match zccache_depgraph::depfile::parse_depfile_path(
+                &depfile_path,
+                source_path,
+                &cwd_path,
+            ) {
+                Ok(result) => {
+                    let _ = std::fs::remove_file(&depfile_path);
+                    result
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "multi-file depfile parse failed for {}: {e}",
+                        source_path.display()
+                    );
+                    zccache_depgraph::scanner::scan_recursive(source_path, &ctx.include_search)
+                }
+            }
+        } else {
+            zccache_depgraph::scanner::scan_recursive(source_path, &ctx.include_search)
+        };
 
         let tracked_paths: Vec<PathBuf> = std::iter::once(source_path.clone())
             .chain(scan_result.resolved.iter().cloned())

@@ -38,6 +38,21 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full system design.
 
 ## Performance
 
+### Benchmark: 50 C++ files, warm cache
+
+| Scenario | Bare Clang | sccache | zccache | vs sccache | vs bare clang |
+|:---------|----------:|--------:|--------:|-----------:|--------------:|
+| Single-file, Cold | 10.336s | 17.292s | 11.489s | 1.5x faster | 0.9x |
+| Single-file, Warm | 10.141s | 1.331s | **0.031s** | **43x faster** | **324x faster** |
+| Multi-file, Cold | 9.898s | 9.906s | 10.337s | 1.0x faster | 1.0x |
+| Multi-file, Warm | 10.422s | 9.809s | **0.023s** | **419x faster** | **446x faster** |
+
+> **Cold** = first compile (empty cache). **Warm** = median of 5 subsequent runs.
+> Single-file = 50 sequential `clang++ -c unit.cpp` invocations. Multi-file = one `clang++ -c *.cpp` invocation.
+> sccache cannot cache multi-file compilations — its "warm" multi-file time is a full recompile.
+
+Run the benchmark yourself: `uv run perf`
+
 ### Multi-file compilation (fast path)
 
 When a build system passes multiple source files to a single compiler invocation

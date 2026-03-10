@@ -7,6 +7,15 @@ use std::path::{Path, PathBuf};
 
 use crate::search_paths::IncludeSearchPaths;
 
+/// Dependency-generation flags already present in the user's compiler args.
+#[derive(Debug, Clone, Default)]
+pub struct UserDepFlags {
+    /// User has -MD or -MMD (emit depfile as side-effect of compilation).
+    pub has_md: bool,
+    /// User has -MF <path> (explicit depfile output path).
+    pub mf_path: Option<PathBuf>,
+}
+
 /// Result of parsing compiler arguments.
 #[derive(Debug, Clone)]
 pub struct ParsedArgs {
@@ -27,6 +36,8 @@ pub struct ParsedArgs {
     pub force_includes: Vec<PathBuf>,
     /// The compiler executable (first arg or from context).
     pub compiler: Option<PathBuf>,
+    /// Dependency generation flags detected in the user's args.
+    pub dep_flags: UserDepFlags,
 }
 
 /// Parse compile arguments into structured form.
@@ -43,6 +54,7 @@ pub fn parse_compile_args(args: &[String], cwd: &Path) -> ParsedArgs {
         flags: Vec::new(),
         force_includes: Vec::new(),
         compiler: None,
+        dep_flags: UserDepFlags::default(),
     };
 
     let mut i = 0;
@@ -180,7 +192,28 @@ pub fn parse_compile_args(args: &[String], cwd: &Path) -> ParsedArgs {
             continue;
         }
 
-        // Skip flags we don't care about.
+        // Dependency-generation flags: track but don't include in cache key.
+        if arg == "-MD" || arg == "-MMD" {
+            result.dep_flags.has_md = true;
+            i += 1;
+            continue;
+        }
+
+        // -MF takes a following argument — capture path.
+        if arg == "-MF" {
+            if let Some(next) = args.get(i + 1) {
+                result.dep_flags.mf_path = Some(resolve_path(next, cwd));
+            }
+            i += 2;
+            continue;
+        }
+
+        // -MQ, -MT take a following argument.
+        if arg == "-MQ" || arg == "-MT" {
+            i += 2;
+            continue;
+        }
+
         if arg == "-c"
             || arg == "-S"
             || arg == "-E"
@@ -189,16 +222,9 @@ pub fn parse_compile_args(args: &[String], cwd: &Path) -> ParsedArgs {
             || arg == "-g"
             || arg.starts_with("-g")
             || arg.starts_with("-M")
-            || arg == "-MMD"
             || arg == "-MP"
         {
             i += 1;
-            continue;
-        }
-
-        // -MF, -MQ, -MT take a following argument.
-        if arg == "-MF" || arg == "-MQ" || arg == "-MT" {
-            i += 2;
             continue;
         }
 
@@ -472,5 +498,40 @@ mod tests {
     fn split_empty() {
         let result = split_command("");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn dep_flags_none_by_default() {
+        let parsed = parse_compile_args(&args(&["-c", "foo.c", "-O2"]), Path::new("/p"));
+        assert!(!parsed.dep_flags.has_md);
+        assert!(parsed.dep_flags.mf_path.is_none());
+    }
+
+    #[test]
+    fn dep_flags_md_detected() {
+        let parsed = parse_compile_args(&args(&["-MMD", "-c", "foo.c"]), Path::new("/p"));
+        assert!(parsed.dep_flags.has_md);
+    }
+
+    #[test]
+    fn dep_flags_mf_detected() {
+        let parsed = parse_compile_args(&args(&["-MF", "deps.d", "-c", "foo.c"]), Path::new("/p"));
+        assert_eq!(
+            parsed.dep_flags.mf_path.as_deref(),
+            Some(Path::new("/p/deps.d"))
+        );
+    }
+
+    #[test]
+    fn dep_flags_combined() {
+        let parsed = parse_compile_args(
+            &args(&["-MMD", "-MF", "custom.d", "-c", "foo.c"]),
+            Path::new("/p"),
+        );
+        assert!(parsed.dep_flags.has_md);
+        assert_eq!(
+            parsed.dep_flags.mf_path.as_deref(),
+            Some(Path::new("/p/custom.d"))
+        );
     }
 }

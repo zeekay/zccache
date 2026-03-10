@@ -174,6 +174,7 @@ pub fn compute_artifact_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args::UserDepFlags;
 
     fn make_context(source: &str, user_dirs: &[&str], defines: &[&str]) -> CompileContext {
         CompileContext {
@@ -292,6 +293,7 @@ mod tests {
             flags: vec!["-Wall".into(), "-O2".into()],
             force_includes: Vec::new(),
             compiler: None,
+            dep_flags: UserDepFlags::default(),
         };
         let ctx = CompileContext::from_parsed_args(&args);
         assert_eq!(ctx.defines, vec!["AAA", "ZZZ"]);

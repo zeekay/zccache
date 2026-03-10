@@ -7,6 +7,7 @@
 pub mod args;
 pub mod compile_commands;
 pub mod context;
+pub mod depfile;
 pub mod graph;
 pub mod scanner;
 pub mod search_paths;
@@ -14,9 +15,10 @@ pub mod session;
 pub mod system_includes;
 pub mod watcher_support;
 
-pub use args::ParsedArgs;
+pub use args::{ParsedArgs, UserDepFlags};
 pub use compile_commands::{parse_compile_commands_json, CompileCommand};
 pub use context::{compute_artifact_key, ArtifactKey, CompileContext, ContextKey};
+pub use depfile::{prepare_depfile, DepfileError, DepfileStrategy};
 pub use graph::{CacheVerdict, ContextState, DepGraph, DepGraphStats};
 pub use scanner::{IncludeDirective, IncludeKind, ScanResult};
 pub use search_paths::IncludeSearchPaths;
