@@ -586,8 +586,8 @@ async fn cmd_compile(
     }
 }
 
-/// Ephemeral session: auto-create a session, compile, then end the session.
-/// Used when ZCCACHE_SESSION_ID is not set (drop-in mode).
+/// Ephemeral session: single-roundtrip compile (session start + compile + session end
+/// in one IPC message). Used when ZCCACHE_SESSION_ID is not set (drop-in mode).
 async fn cmd_compile_ephemeral(
     endpoint: &str,
     compiler: &str,
@@ -608,41 +608,18 @@ async fn cmd_compile_ephemeral(
         }
     };
 
-    // Start ephemeral session
-    conn.send(&zccache_protocol::Request::SessionStart {
+    conn.send(&zccache_protocol::Request::CompileEphemeral {
         client_pid: std::process::id(),
         working_dir: cwd.clone(),
         compiler: compiler.to_string(),
-        log_file: None,
-        track_stats: false,
-    })
-    .await
-    .unwrap();
-
-    let session_id = match conn.recv().await.unwrap() {
-        Some(zccache_protocol::Response::SessionStarted { session_id, .. }) => session_id,
-        Some(zccache_protocol::Response::Error { message }) => {
-            eprintln!("zccache: failed to create session: {message}");
-            return ExitCode::FAILURE;
-        }
-        other => {
-            eprintln!("unexpected response: {other:?}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Compile (no compiler override needed — session compiler IS the wrapped compiler)
-    conn.send(&zccache_protocol::Request::Compile {
-        session_id,
         args,
         cwd,
-        compiler: None,
         env: Some(client_env),
     })
     .await
     .unwrap();
 
-    let result = match conn.recv().await.unwrap() {
+    match conn.recv().await.unwrap() {
         Some(zccache_protocol::Response::CompileResult {
             exit_code,
             stdout,
@@ -662,20 +639,16 @@ async fn cmd_compile_ephemeral(
             eprintln!("unexpected response: {other:?}");
             ExitCode::FAILURE
         }
-    };
-
-    // End ephemeral session (best-effort)
-    let _ = conn
-        .send(&zccache_protocol::Request::SessionEnd { session_id })
-        .await;
-    let _: Option<zccache_protocol::Response> = conn.recv().await.unwrap_or(None);
-
-    result
+    }
 }
 
 // ─── Daemon auto-start ─────────────────────────────────────────────────────
 
 /// Ensure the daemon is running. If not, spawn it and wait for it to accept.
+///
+/// Handles concurrent calls gracefully: when multiple processes race to start
+/// the daemon, only one wins the bind. The losers detect this and connect to
+/// the winning daemon instead of failing.
 async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
     // Fast path: try to connect
     if connect(endpoint).await.is_ok() {
@@ -703,15 +676,29 @@ async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
 
     spawn_daemon(&daemon_bin, endpoint)?;
 
-    // Wait for daemon to become ready (up to 5s)
-    for _ in 0..50 {
+    // Wait for daemon to become ready (up to 10s).
+    // Our daemon might win the bind, or another concurrent spawn might win.
+    // Either way, we just need a daemon accepting connections on the endpoint.
+    for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if connect(endpoint).await.is_ok() {
             return Ok(());
         }
     }
 
-    Err("daemon started but not accepting connections after 5s".to_string())
+    // Final attempt: our daemon may have lost the bind race to another
+    // process. The winning daemon might have started after our polling began.
+    // Check if any daemon is now running and give it one more chance.
+    if zccache_ipc::check_running_daemon().is_some() {
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if connect(endpoint).await.is_ok() {
+                return Ok(());
+            }
+        }
+    }
+
+    Err("daemon started but not accepting connections after 12s".to_string())
 }
 
 /// Find the daemon binary. Looks next to the CLI binary first, then on PATH.
@@ -758,6 +745,12 @@ fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Spawn the daemon as a detached background process.
+///
+/// On Windows, we must prevent the daemon from inheriting pipe handles.
+/// When the CLI is invoked via `subprocess.run(capture_output=True)` (e.g. from
+/// Python/meson), the parent creates pipes for stdout/stderr. If the daemon
+/// inherits these handles, the parent hangs forever waiting for pipe closure
+/// because the daemon never exits.
 fn spawn_daemon(bin: &std::path::Path, endpoint: &str) -> Result<(), String> {
     let mut cmd = std::process::Command::new(bin);
     cmd.args(["--foreground", "--endpoint", endpoint]);
@@ -767,18 +760,77 @@ fn spawn_daemon(bin: &std::path::Path, endpoint: &str) -> Result<(), String> {
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
 
-    // Platform-specific: prevent console window on Windows
+    // Platform-specific: prevent console window on Windows and avoid
+    // inheriting parent pipe handles (which cause subprocess hangs).
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
+
+        // Mark our stdout/stderr as non-inheritable before spawning the daemon.
+        // This prevents the daemon from inheriting pipe handles that a grandparent
+        // process (e.g. Python subprocess.run) may have created for capture.
+        // Without this, the daemon keeps the pipe open indefinitely, causing the
+        // grandparent to hang waiting for EOF on the pipe.
+        disable_handle_inheritance();
     }
 
     cmd.spawn()
         .map_err(|e| format!("failed to spawn daemon: {e}"))?;
 
+    // Re-enable inheritance for our own handles (in case we do further spawns)
+    #[cfg(windows)]
+    restore_handle_inheritance();
+
     Ok(())
+}
+
+/// On Windows, mark stdout/stderr handles as non-inheritable so that child
+/// processes (the daemon) do not inherit pipe handles from grandparent processes.
+#[cfg(windows)]
+fn disable_handle_inheritance() {
+    use std::os::windows::io::AsRawHandle;
+
+    extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+
+    // Safety: we're calling a standard Win32 API with valid handle values.
+    // The handles come from Rust's stdout/stderr which are always valid.
+    unsafe {
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        SetHandleInformation(stdout.as_raw_handle() as *mut _, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(stderr.as_raw_handle() as *mut _, HANDLE_FLAG_INHERIT, 0);
+    }
+}
+
+/// Restore stdout/stderr handles as inheritable (undo `disable_handle_inheritance`).
+#[cfg(windows)]
+fn restore_handle_inheritance() {
+    use std::os::windows::io::AsRawHandle;
+
+    extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+
+    unsafe {
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        SetHandleInformation(
+            stdout.as_raw_handle() as *mut _,
+            HANDLE_FLAG_INHERIT,
+            HANDLE_FLAG_INHERIT,
+        );
+        SetHandleInformation(
+            stderr.as_raw_handle() as *mut _,
+            HANDLE_FLAG_INHERIT,
+            HANDLE_FLAG_INHERIT,
+        );
+    }
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────

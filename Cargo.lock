@@ -1568,6 +1568,7 @@ dependencies = [
 name = "zccache-daemon"
 version = "1.0.2"
 dependencies = [
+ "bincode",
  "clap",
  "dashmap",
  "serde",
@@ -1585,6 +1586,7 @@ dependencies = [
  "zccache-hash",
  "zccache-ipc",
  "zccache-protocol",
+ "zccache-test-support",
  "zccache-watcher",
 ]
 

@@ -116,42 +116,31 @@ trait TransportStream: AsyncRead + AsyncWrite + Send + Unpin {}
 [u32 little-endian: payload length][payload: bincode-serialized Message]
 ```
 
-**Message types:**
+**Message types (simplified):**
 ```rust
 enum Request {
-    Compile {
-        compiler: PathBuf,
-        args: Vec<String>,
-        cwd: PathBuf,
-        env: Vec<(String, String)>,  // filtered to relevant vars
-    },
+    Ping,
     Shutdown,
-    Stats,
-    ClearCache,
+    Status,
+    Clear,
+    SessionStart { client_pid, working_dir, compiler, log_file, track_stats },
+    Compile { session_id, args, cwd, compiler, env },
+    SessionEnd { session_id },
+    // Single-roundtrip ephemeral compile (drop-in wrapper mode).
+    // Combines SessionStart + Compile + SessionEnd into one message,
+    // saving 2 IPC roundtrips per invocation.
+    CompileEphemeral { client_pid, working_dir, compiler, args, cwd, env },
 }
 
 enum Response {
-    CacheHit {
-        exit_code: i32,
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
-        // Artifacts already written to output paths by daemon
-    },
-    CacheMiss {
-        exit_code: i32,
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
-    },
-    Passthrough {
-        exit_code: i32,
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
-    },
-    Error {
-        message: String,
-    },
-    Stats { /* counters */ },
-    Ok,
+    Pong,
+    ShuttingDown,
+    Status(DaemonStatus),
+    Cleared { artifacts_removed, metadata_cleared, ... },
+    SessionStarted { session_id, system_includes },
+    CompileResult { exit_code, stdout, stderr, cached },
+    SessionEnded { stats },
+    Error { message },
 }
 ```
 

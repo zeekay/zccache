@@ -8,13 +8,22 @@ For component details see [overview.md](overview.md). For IPC specifics see [ipc
 
 ## Cache Hit Path
 
-```
-User invokes:  zccache-cc -c foo.c -o foo.o
+There are two IPC modes:
 
-1. CLI parses argv. Determines: compiler=cc, source=foo.c, output=foo.o.
+- **Ephemeral mode** (drop-in wrapper, no `ZCCACHE_SESSION_ID`): CLI sends a single
+  `Request::CompileEphemeral` message. The daemon creates an internal session,
+  compiles, ends the session, and returns the result — **1 IPC roundtrip**.
+- **Session mode** (`ZCCACHE_SESSION_ID` set by a build system integration):
+  CLI sends `Request::Compile` within an existing session — also 1 roundtrip,
+  but the session was created separately.
+
+```
+User invokes:  zccache clang++ -c foo.c -o foo.o
+
+1. CLI parses argv. Determines: compiler=clang++, source=foo.c, output=foo.o.
    This is a single-source compilation — cacheable.
 
-2. CLI calls DaemonConnector::connect().
+2. CLI calls connect().
    a. Compute socket path: $XDG_RUNTIME_DIR/zccache/sock (Unix)
       or \\.\pipe\zccache-{username} (Windows).
    b. Attempt connect. If refused or socket missing:
@@ -22,7 +31,9 @@ User invokes:  zccache-cc -c foo.c -o foo.o
       - Otherwise, clean stale socket/lock, fork/spawn daemon, wait for
         socket to appear, connect.
 
-3. CLI sends Request::Compile { compiler, args, cwd, env } over IPC.
+3. CLI sends Request::CompileEphemeral { client_pid, working_dir, compiler,
+   args, cwd, env } over IPC. (Single roundtrip — session start, compile,
+   and session end are handled internally by the daemon.)
 
 4. Daemon IPC server receives request, spawns a tokio task.
 

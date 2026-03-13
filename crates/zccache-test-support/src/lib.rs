@@ -3,6 +3,8 @@
 //! Provides helpers for integration tests, including temp directories,
 //! daemon lifecycle management, and test fixtures.
 
+use std::path::{Path, PathBuf};
+
 /// Create a temporary directory for test artifacts.
 ///
 /// The directory and its contents are deleted when the returned
@@ -26,4 +28,596 @@ pub fn init_test_tracing() {
             .try_init()
             .ok();
     });
+}
+
+// ─── Test C++ project generator ─────────────────────────────────────────────
+
+/// Configuration for generating a synthetic C++ project.
+///
+/// The generated project has a realistic structure: shared headers in
+/// `include/`, source files in `src/`, and object files in `obj/`.
+/// Each source file includes all shared headers, creating a dependency
+/// fan-out that exercises the include scanner and dep graph.
+pub struct TestProject {
+    /// Number of `.cpp` source files to generate.
+    pub source_count: usize,
+    /// Number of shared headers included by every source file.
+    pub header_count: usize,
+    /// Number of "private" headers — each included by only one source file.
+    /// Creates deeper include trees without shared-header fan-out.
+    pub private_header_count: usize,
+    /// Approximate lines of generated code per source file (controls body size).
+    /// Higher values produce heavier compilation but more realistic files.
+    pub body_weight: BodyWeight,
+}
+
+/// Controls how much code each source file contains.
+#[derive(Clone, Copy)]
+pub enum BodyWeight {
+    /// ~20 lines: a function, a struct, a loop. Fast to compile.
+    Light,
+    /// ~60 lines: templates, multiple functions, hash chains. Medium compile.
+    Medium,
+    /// ~150 lines: deep template instantiation, multiple structs, heavy math.
+    Heavy,
+}
+
+impl Default for TestProject {
+    fn default() -> Self {
+        Self {
+            source_count: 50,
+            header_count: 5,
+            private_header_count: 0,
+            body_weight: BodyWeight::Medium,
+        }
+    }
+}
+
+impl TestProject {
+    /// Small project for quick integration tests (~30 files, light bodies).
+    #[must_use]
+    pub fn integration() -> Self {
+        Self {
+            source_count: 30,
+            header_count: 4,
+            private_header_count: 2,
+            body_weight: BodyWeight::Light,
+        }
+    }
+
+    /// Medium project for benchmarks (~100 files, medium bodies).
+    #[must_use]
+    pub fn benchmark() -> Self {
+        Self {
+            source_count: 100,
+            header_count: 8,
+            private_header_count: 4,
+            body_weight: BodyWeight::Medium,
+        }
+    }
+
+    /// Large stress-test project (~250 files, heavy bodies).
+    #[must_use]
+    pub fn stress() -> Self {
+        Self {
+            source_count: 250,
+            header_count: 12,
+            private_header_count: 8,
+            body_weight: BodyWeight::Heavy,
+        }
+    }
+
+    /// Generate the project on disk under `root`.
+    ///
+    /// Creates `include/`, `src/`, and `obj/` directories.
+    /// Returns the list of (source_path, object_path) compilation units.
+    pub fn generate(&self, root: &Path) -> Vec<(PathBuf, PathBuf)> {
+        let incdir = root.join("include");
+        let srcdir = root.join("src");
+        let objdir = root.join("obj");
+        std::fs::create_dir_all(&incdir).unwrap();
+        std::fs::create_dir_all(&srcdir).unwrap();
+        std::fs::create_dir_all(&objdir).unwrap();
+
+        self.write_shared_headers(&incdir);
+        self.write_private_headers(&incdir);
+        self.write_sources(&srcdir, &incdir);
+
+        (0..self.source_count)
+            .map(|i| {
+                (
+                    srcdir.join(format!("unit_{i:04}.cpp")),
+                    objdir.join(format!("unit_{i:04}.o")),
+                )
+            })
+            .collect()
+    }
+
+    /// Delete all `.o` files in the project (simulates `ninja -t clean`).
+    pub fn clean_objects(root: &Path) {
+        let objdir = root.join("obj");
+        if let Ok(entries) = std::fs::read_dir(&objdir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("o") {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+    }
+
+    /// Compiler flags needed to build this project.
+    #[must_use]
+    pub fn compiler_flags() -> Vec<&'static str> {
+        vec!["-c", "-Iinclude", "-std=c++17"]
+    }
+
+    /// Generate a meson-compatible project on disk under `root`.
+    ///
+    /// Creates:
+    /// - `include/` — shared and private headers
+    /// - `src/` — source files
+    /// - `meson.build` — project definition that builds a static library
+    ///
+    /// Returns a `MesonProject` with methods to run meson setup and ninja.
+    pub fn generate_meson(&self, root: &Path) -> MesonProject {
+        let incdir = root.join("include");
+        let srcdir = root.join("src");
+        std::fs::create_dir_all(&incdir).unwrap();
+        std::fs::create_dir_all(&srcdir).unwrap();
+
+        self.write_shared_headers(&incdir);
+        self.write_private_headers(&incdir);
+        self.write_sources(&srcdir, &incdir);
+
+        // Generate meson.build
+        let source_list: String = (0..self.source_count)
+            .map(|i| format!("  'src/unit_{i:04}.cpp',\n"))
+            .collect();
+
+        let meson_build = format!(
+            r#"project('zccache-test', 'cpp',
+  version: '1.0.0',
+  default_options: ['cpp_std=c++17', 'optimization=0', 'debug=false'],
+)
+
+sources = files(
+{source_list})
+
+inc = include_directories('include')
+
+static_library('testlib', sources, include_directories: inc)
+"#
+        );
+        std::fs::write(root.join("meson.build"), meson_build).unwrap();
+
+        MesonProject {
+            source_dir: root.to_path_buf(),
+            source_count: self.source_count,
+        }
+    }
+
+    fn write_shared_headers(&self, incdir: &Path) {
+        for h in 0..self.header_count {
+            let content = format!(
+                r#"#pragma once
+#include <cstdint>
+
+namespace shared_{h} {{
+
+inline uint64_t hash_{h}(uint64_t x) {{
+    x ^= x >> {shift};
+    x *= 0x{magic:016x}ULL;
+    x ^= x >> {shift2};
+    return x;
+}}
+
+template<typename T>
+inline T transform_{h}(T val, T offset) {{
+    return static_cast<T>(val ^ (offset + {h}));
+}}
+
+inline int compute_{h}(int n) {{
+    int acc = 0;
+    for (int i = 0; i < n; i++) {{
+        acc += static_cast<int>(hash_{h}(static_cast<uint64_t>(i)));
+    }}
+    return acc;
+}}
+
+}} // namespace shared_{h}
+"#,
+                shift = 13 + h,
+                shift2 = 17 + h % 7,
+                magic = 0xBF58476D1CE4E5B9u64
+                    .wrapping_add((h as u64).wrapping_mul(0x1234567890ABCDEFu64)),
+            );
+            std::fs::write(incdir.join(format!("shared_{h}.h")), content).unwrap();
+        }
+    }
+
+    fn write_private_headers(&self, incdir: &Path) {
+        for h in 0..self.private_header_count {
+            let content = format!(
+                r#"#pragma once
+
+namespace priv_{h} {{
+
+struct Helper_{h} {{
+    int data[4];
+
+    int sum() const {{
+        int s = 0;
+        for (int i = 0; i < 4; i++) s += data[i];
+        return s;
+    }}
+}};
+
+inline int private_func_{h}(int x) {{
+    return x * {factor} + {offset};
+}}
+
+}} // namespace priv_{h}
+"#,
+                factor = 3 + h * 7,
+                offset = 42 + h * 13,
+            );
+            std::fs::write(incdir.join(format!("private_{h}.h")), content).unwrap();
+        }
+    }
+
+    fn write_sources(&self, srcdir: &Path, _incdir: &Path) {
+        for i in 0..self.source_count {
+            let content = self.generate_source(i);
+            std::fs::write(srcdir.join(format!("unit_{i:04}.cpp")), content).unwrap();
+        }
+    }
+
+    fn generate_source(&self, index: usize) -> String {
+        let mut src = String::with_capacity(4096);
+
+        // Include all shared headers
+        for h in 0..self.header_count {
+            src.push_str(&format!("#include \"shared_{h}.h\"\n"));
+        }
+
+        // Include one private header if available (round-robin)
+        if self.private_header_count > 0 {
+            let priv_h = index % self.private_header_count;
+            src.push_str(&format!("#include \"private_{priv_h}.h\"\n"));
+        }
+
+        src.push_str("#include <cmath>\n\n");
+        src.push_str(&format!("namespace unit_{index:04} {{\n\n"));
+
+        match self.body_weight {
+            BodyWeight::Light => self.write_light_body(&mut src, index),
+            BodyWeight::Medium => self.write_medium_body(&mut src, index),
+            BodyWeight::Heavy => self.write_heavy_body(&mut src, index),
+        }
+
+        src.push_str(&format!("\n}} // namespace unit_{index:04}\n"));
+        src
+    }
+
+    fn write_light_body(&self, src: &mut String, index: usize) {
+        src.push_str(&format!(
+            r#"double compute(int n) {{
+    double v = std::sin(n * 0.{index:04}1);
+    v += shared_0::hash_0(static_cast<uint64_t>(n)) * 1e-18;
+    return v;
+}}
+"#
+        ));
+    }
+
+    fn write_medium_body(&self, src: &mut String, index: usize) {
+        src.push_str(&format!(
+            r#"struct Data {{
+    int values[16];
+    int count;
+
+    int sum() const {{
+        int s = 0;
+        for (int j = 0; j < count; j++) s += values[j];
+        return s;
+    }}
+}};
+
+double compute(int n) {{
+    Data d;
+    d.count = n > 16 ? 16 : (n < 0 ? 0 : n);
+    for (int j = 0; j < d.count; j++) {{
+        d.values[j] = static_cast<int>(shared_0::hash_0(j + {index}ULL));
+    }}
+    double v = std::sin(d.sum() * 0.{index:04}1);
+"#
+        ));
+        // Reference a few shared headers
+        let refs = self.header_count.min(4);
+        for h in 0..refs {
+            src.push_str(&format!(
+                "    v += shared_{h}::hash_{h}(static_cast<uint64_t>(n)) * 1e-18;\n"
+            ));
+        }
+        src.push_str("    return v;\n}\n");
+    }
+
+    fn write_heavy_body(&self, src: &mut String, index: usize) {
+        // Multiple structs
+        src.push_str(&format!(
+            r#"struct Config {{
+    int iterations;
+    double scale;
+    uint64_t seed;
+}};
+
+struct Accumulator {{
+    double values[32];
+    int count;
+
+    void add(double v) {{
+        if (count < 32) values[count++] = v;
+    }}
+
+    double total() const {{
+        double s = 0;
+        for (int i = 0; i < count; i++) s += values[i];
+        return s;
+    }}
+
+    double mean() const {{
+        return count > 0 ? total() / count : 0.0;
+    }}
+}};
+
+template<typename T>
+T heavy_transform(T x, int depth) {{
+    for (int i = 0; i < depth; i++) {{
+        x = shared_0::transform_0(x, static_cast<T>(i));
+    }}
+    return x;
+}}
+
+double compute(int n) {{
+    Config cfg;
+    cfg.iterations = n > 100 ? 100 : (n < 1 ? 1 : n);
+    cfg.scale = 0.{index:04}1;
+    cfg.seed = {seed}ULL;
+
+    Accumulator acc;
+    acc.count = 0;
+    for (int i = 0; i < cfg.iterations; i++) {{
+        uint64_t h = shared_0::hash_0(cfg.seed + static_cast<uint64_t>(i));
+"#,
+            seed = 0xDEADBEEFu64.wrapping_add((index as u64).wrapping_mul(0x1111111111111111u64)),
+        ));
+        // Reference all shared headers
+        for h in 1..self.header_count {
+            src.push_str(&format!("        h ^= shared_{h}::hash_{h}(h);\n"));
+        }
+        src.push_str(&format!(
+            r#"        double v = std::sin(static_cast<double>(h) * cfg.scale);
+        v += heavy_transform(static_cast<int>(h & 0xFF), 3);
+        acc.add(v);
+    }}
+    return acc.mean();
+}}
+
+int entry_{index}() {{
+    return static_cast<int>(compute(50) * 1000);
+}}
+"#
+        ));
+    }
+}
+
+// ─── Meson project helper ───────────────────────────────────────────────────
+
+/// A generated meson project with methods to run meson setup and ninja builds.
+pub struct MesonProject {
+    /// Root directory containing `meson.build` and source files.
+    pub source_dir: PathBuf,
+    /// Number of source files in the project.
+    pub source_count: usize,
+}
+
+/// Result of a meson+ninja build.
+pub struct MesonBuildResult {
+    /// Wall-clock time for `meson setup` in milliseconds.
+    pub setup_ms: u128,
+    /// Wall-clock time for `ninja` in milliseconds.
+    pub build_ms: u128,
+    /// Total time (setup + build) in milliseconds.
+    pub total_ms: u128,
+}
+
+impl MesonProject {
+    /// Write a meson native file that wraps the compiler with a cache tool.
+    ///
+    /// If `wrapper` is `None`, the compiler is invoked directly (bare mode).
+    /// If `wrapper` is `Some(path)`, the compiler is wrapped: `[wrapper, compiler]`.
+    ///
+    /// The `ar` path is optional — if `None`, the native file omits it and meson
+    /// will auto-detect the archiver.
+    pub fn write_native_file(
+        path: &Path,
+        cpp_compiler: &Path,
+        ar: Option<&Path>,
+        wrapper: Option<&Path>,
+    ) {
+        // Meson native files use forward slashes even on Windows.
+        let cpp = cpp_compiler.to_string_lossy().replace('\\', "/");
+
+        let cpp_entry = match wrapper {
+            Some(w) => {
+                let w = w.to_string_lossy().replace('\\', "/");
+                format!("['{w}', '{cpp}']")
+            }
+            None => format!("['{cpp}']"),
+        };
+
+        // Use the same compiler for C (most C++ compilers handle C too).
+        let c_entry = cpp_entry.clone();
+
+        let ar_line = match ar {
+            Some(ar_path) => {
+                let ar = ar_path.to_string_lossy().replace('\\', "/");
+                format!("ar = ['{ar}']\n")
+            }
+            None => String::new(),
+        };
+
+        let system = if cfg!(windows) {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "darwin"
+        } else {
+            "linux"
+        };
+
+        let cpu_family = if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            "x86_64"
+        };
+
+        let content = format!(
+            r#"[binaries]
+c = {c_entry}
+cpp = {cpp_entry}
+{ar_line}
+[host_machine]
+system = '{system}'
+cpu_family = '{cpu_family}'
+cpu = '{cpu_family}'
+endian = 'little'
+"#
+        );
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// Run `meson setup` followed by `ninja`, returning timing results.
+    ///
+    /// - `build_dir`: where meson places the build tree (created fresh).
+    /// - `native_file`: path to the native file (from `write_native_file`).
+    /// - `meson_bin`: path to the `meson` executable.
+    /// - `ninja_bin`: path to the `ninja` executable.
+    /// - `extra_env`: additional environment variables (e.g., `ZCCACHE_ENDPOINT`).
+    pub fn build(
+        &self,
+        build_dir: &Path,
+        native_file: &Path,
+        meson_bin: &Path,
+        ninja_bin: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> MesonBuildResult {
+        // Clean build dir
+        if build_dir.exists() {
+            std::fs::remove_dir_all(build_dir).unwrap();
+        }
+
+        // Ninja must be on PATH for meson to find it.
+        let ninja_dir = ninja_bin.parent().unwrap_or(Path::new("."));
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!(
+            "{}{}{}",
+            ninja_dir.to_string_lossy(),
+            if cfg!(windows) { ";" } else { ":" },
+            path_var,
+        );
+
+        // meson setup
+        let t0 = std::time::Instant::now();
+        let mut cmd = std::process::Command::new(meson_bin);
+        cmd.args([
+            "setup",
+            "--native-file",
+            &native_file.to_string_lossy(),
+            &build_dir.to_string_lossy(),
+        ]);
+        cmd.current_dir(&self.source_dir);
+        cmd.env("PATH", &new_path);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().expect("failed to run meson setup");
+        let setup_ms = t0.elapsed().as_millis();
+
+        assert!(
+            output.status.success(),
+            "meson setup failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        // ninja build
+        let t1 = std::time::Instant::now();
+        let mut cmd = std::process::Command::new(ninja_bin);
+        cmd.args(["-C", &build_dir.to_string_lossy()]);
+        cmd.env("PATH", &new_path);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().expect("failed to run ninja");
+        let build_ms = t1.elapsed().as_millis();
+
+        assert!(
+            output.status.success(),
+            "ninja build failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        MesonBuildResult {
+            setup_ms,
+            build_ms,
+            total_ms: setup_ms + build_ms,
+        }
+    }
+
+    /// Run `ninja -t clean` in the build directory (removes all build outputs).
+    pub fn ninja_clean(ninja_bin: &Path, build_dir: &Path) {
+        let output = std::process::Command::new(ninja_bin)
+            .args(["-C", &build_dir.to_string_lossy(), "-t", "clean"])
+            .output()
+            .expect("failed to run ninja -t clean");
+        assert!(
+            output.status.success(),
+            "ninja clean failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// Run a ninja rebuild (after clean), returning the build time in milliseconds.
+    pub fn ninja_rebuild(ninja_bin: &Path, build_dir: &Path, extra_env: &[(&str, &str)]) -> u128 {
+        let ninja_dir = ninja_bin.parent().unwrap_or(Path::new("."));
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!(
+            "{}{}{}",
+            ninja_dir.to_string_lossy(),
+            if cfg!(windows) { ";" } else { ":" },
+            path_var,
+        );
+
+        let t = std::time::Instant::now();
+        let mut cmd = std::process::Command::new(ninja_bin);
+        cmd.args(["-C", &build_dir.to_string_lossy()]);
+        cmd.env("PATH", &new_path);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().expect("failed to run ninja");
+        let ms = t.elapsed().as_millis();
+
+        assert!(
+            output.status.success(),
+            "ninja rebuild failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        ms
+    }
 }

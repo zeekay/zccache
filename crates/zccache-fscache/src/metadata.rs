@@ -53,7 +53,7 @@ impl MetadataCache {
     pub fn new() -> Self {
         Self {
             entries: DashMap::new(),
-            high_decay: Duration::from_secs(5),
+            high_decay: Duration::from_secs(60),
             medium_decay: Duration::from_secs(30),
         }
     }

@@ -61,6 +61,23 @@ pub enum Request {
     },
     /// Clear all caches (artifacts, metadata, dep graph).
     Clear,
+    /// Single-roundtrip ephemeral compile: session start + compile + session end
+    /// in one message. Used by the CLI in drop-in wrapper mode to avoid 3 IPC
+    /// roundtrips per invocation.
+    CompileEphemeral {
+        /// Client process ID.
+        client_pid: u32,
+        /// Client working directory.
+        working_dir: String,
+        /// Path to the compiler executable.
+        compiler: String,
+        /// Compiler arguments (e.g., ["-c", "hello.cpp", "-o", "hello.o"]).
+        args: Vec<String>,
+        /// Working directory for the compilation.
+        cwd: String,
+        /// Client environment variables to pass to the compiler process.
+        env: Option<Vec<(String, String)>>,
+    },
 }
 
 /// A response from daemon to client.
@@ -343,6 +360,27 @@ mod tests {
             metadata_cleared: 100,
             dep_graph_contexts_cleared: 25,
             on_disk_bytes_freed: 1024 * 1024,
+        });
+    }
+
+    #[test]
+    fn compile_ephemeral_roundtrip() {
+        roundtrip(&Request::CompileEphemeral {
+            client_pid: 9876,
+            working_dir: "/home/user/project".to_string(),
+            compiler: "/usr/bin/clang++".to_string(),
+            args: vec!["-c".into(), "main.cpp".into(), "-o".into(), "main.o".into()],
+            cwd: "/home/user/project/build".to_string(),
+            env: Some(vec![("PATH".into(), "/usr/bin".into())]),
+        });
+        // Also test with env = None
+        roundtrip(&Request::CompileEphemeral {
+            client_pid: 1,
+            working_dir: ".".to_string(),
+            compiler: "gcc".to_string(),
+            args: vec![],
+            cwd: ".".to_string(),
+            env: None,
         });
     }
 

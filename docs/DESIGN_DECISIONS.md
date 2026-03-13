@@ -551,3 +551,52 @@ v1 is deliberately minimal. The goal is a correct, useful tool for the most comm
 - Cache sharing between users on the same machine.
 
 **Rationale for simplicity:** Every feature adds surface area for bugs. v1 must be *correct* above all else. Features are added incrementally, each validated for correctness before merging.
+
+---
+
+## DD-016: Single-Roundtrip Ephemeral Compile
+
+**Context:** In drop-in wrapper mode (`zccache clang++ -c foo.cpp -o foo.o`), each invocation created an ephemeral session using 3 IPC roundtrips: SessionStart → Compile → SessionEnd. With ~170ms per-invocation overhead, this dominated compilation time for small files and caused zccache-warm to be 1.79x slower than bare clang in ninja-based builds.
+
+**Decision:** Add a `Request::CompileEphemeral` protocol message that combines session creation, compilation, and session teardown into a single IPC roundtrip. The daemon handles all three steps internally.
+
+**Rationale:**
+- Eliminates 2 of 3 IPC roundtrips, saving ~10-20ms per invocation.
+- Most zccache invocations from build systems (ninja, make) are ephemeral — they don't use long-lived sessions.
+- Backward-compatible: session mode (`ZCCACHE_SESSION_ID`) still uses the 3-message flow for build system integrations that manage sessions explicitly.
+
+**Alternatives Considered:**
+| Alternative | Why not |
+|-------------|---------|
+| Persistent session per build dir | Requires build system cooperation; not transparent drop-in. |
+| Pipelining 3 messages on one connection | Still 3 serialization/deserialization cycles server-side. |
+| UDP for IPC | Unreliable; can't guarantee delivery. Named pipes don't support datagram mode on Windows. |
+
+**Consequences:**
+- Protocol grows by one variant (`CompileEphemeral`). Old daemons reject it with `Error`; the CLI could fall back to 3-message flow (not implemented — upgrade both).
+- Drop-in mode is now as fast as session mode from an IPC perspective.
+
+---
+
+## DD-017: Persistent Artifact Storage
+
+**Context:** Artifacts were stored in `$TMPDIR/zccache-artifacts-{pid}`, lost on daemon restart. After a reboot or daemon crash, the entire cache was cold.
+
+**Decision:** Store artifacts in `~/.cache/zccache/artifacts/` (Linux/macOS) or `%LOCALAPPDATA%\zccache\artifacts\` (Windows). Write `.meta` sidecar files (bincode-serialized `ArtifactData`) alongside output files. On startup, scan for `.meta` files and rebuild the in-memory artifact map.
+
+**Rationale:**
+- Eliminates cold-start penalty after daemon restarts.
+- The cache directory is the same one used for the redb index and other persistent state.
+- `.meta` sidecars are simple and atomic (write-then-rename pattern).
+
+**Alternatives Considered:**
+| Alternative | Why not |
+|-------------|---------|
+| SQLite/redb for artifact data | Over-engineered; artifacts are already on disk as files. |
+| Memory-mapped file | Complex, platform-specific, fragile on crash. |
+| No persistence | Status quo; cold-start penalty was measurable in benchmarks. |
+
+**Consequences:**
+- Disk usage is slightly higher (~1x metadata overhead per artifact).
+- `zccache clear` must delete `.meta` files alongside output files (already handled).
+- Dep graph is NOT persisted — cold compiles still re-discover include dependencies. Only the artifact data survives restarts.

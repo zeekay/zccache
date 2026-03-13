@@ -25,6 +25,36 @@ with aggressive file metadata caching and filesystem watching.
 
 Run the benchmark yourself: `uv run perf`
 
+### Build system integration (ninja, meson, cmake, make)
+
+zccache is a **drop-in compiler wrapper**. Point your build system's compiler
+at `zccache <real-compiler>` and it handles the rest:
+
+```ini
+# meson native file
+[binaries]
+c = ['zccache', '/usr/bin/clang']
+cpp = ['zccache', '/usr/bin/clang++']
+```
+
+```cmake
+# CMake
+set(CMAKE_C_COMPILER_LAUNCHER zccache)
+set(CMAKE_CXX_COMPILER_LAUNCHER zccache)
+```
+
+The first build (cold cache) runs at near-bare speed. Subsequent rebuilds
+(`ninja -t clean && ninja`, or touching source files) serve cached artifacts
+via hardlinks in under a second.
+
+**Single-roundtrip IPC:** In drop-in mode, zccache sends a single
+`CompileEphemeral` message that combines session creation, compilation, and
+session teardown — eliminating 2 of 3 IPC roundtrips per invocation.
+
+**Persistent cache:** Artifacts are stored in `~/.cache/zccache/artifacts/`
+(or `%LOCALAPPDATA%\zccache\artifacts\` on Windows) and survive daemon
+restarts. No need to re-warm the cache after a reboot.
+
 ### Multi-file compilation (fast path)
 
 When a build system passes multiple source files to a single compiler invocation

@@ -33,22 +33,27 @@ type PlatformTransport = NamedPipeTransport;
 
 ## Connection Lifecycle
 
-**CLI side:**
+**CLI side (drop-in wrapper mode):**
 1. Compute socket address.
-2. Attempt `Transport::connect()`.
-3. On success: send request, read response, close.
-4. On failure (connection refused, socket not found):
-   a. Read lock file. If it contains a PID and that process is alive, wait up to 2 seconds and retry.
-   b. Otherwise, remove stale lock file and socket.
-   c. Spawn daemon process (detached), passing `--daemon` flag.
-   d. Poll for socket availability (up to 5 seconds, 50ms intervals).
-   e. Connect.
+2. Ensure daemon is running (auto-start if needed).
+3. Connect and send a single `Request::CompileEphemeral` message.
+4. Read one `Response::CompileResult`, relay stdout/stderr, exit.
+
+This single-roundtrip flow replaced an earlier 3-message sequence
+(SessionStart → Compile → SessionEnd) that added ~10-20ms overhead
+per invocation.
+
+**CLI side (session mode, `ZCCACHE_SESSION_ID` set):**
+1. Connect and send `Request::Compile` with the existing session ID.
+2. Read `Response::CompileResult`, relay output, exit.
 
 **Daemon side:**
 1. Acquire lock file (write PID).
 2. Bind transport listener.
 3. Loop: accept connections, spawn a tokio task per connection.
-4. Each task: read one `Request`, process it, send one `Response`, close.
+4. Each task: read requests in a loop, process them, send responses.
+   A connection may carry multiple requests (session mode) or a single
+   `CompileEphemeral` (drop-in mode).
 
 ## Error Handling
 

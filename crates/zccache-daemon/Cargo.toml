@@ -31,7 +31,9 @@ zccache-hash = { path = "../zccache-hash" }
 zccache-compiler = { path = "../zccache-compiler" }
 zccache-depgraph = { path = "../zccache-depgraph" }
 dashmap = { workspace = true }
+bincode = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 zccache-cli = { path = "../zccache-cli" }
+zccache-test-support = { path = "../zccache-test-support" }

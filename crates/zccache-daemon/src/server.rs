@@ -31,8 +31,9 @@ struct FastHitEntry {
 
 /// Maximum age for fast-hit cache entries. Matches the High→Medium confidence
 /// decay in the metadata cache. Without watcher events, entries expire and
-/// fall through to the stat-verify slow path.
-const FAST_HIT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+/// fall through to the stat-verify slow path. Set to 60s because the watcher
+/// + journal provide real invalidation — this timer is just a safety net.
+const FAST_HIT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Cached compilation artifact.
 #[derive(Debug, Clone)]
@@ -105,6 +106,35 @@ impl DaemonServer {
         let shutdown = Arc::new(Notify::new());
         let now = now_secs();
         let instance = SERVER_INSTANCE.fetch_add(1, Ordering::Relaxed);
+        let artifact_dir = zccache_core::config::default_cache_dir().join("artifacts");
+        std::fs::create_dir_all(&artifact_dir).ok();
+
+        let artifacts: DashMap<String, CachedArtifact> = DashMap::new();
+
+        // Reload persisted artifacts from .meta sidecars so cache survives
+        // daemon restarts.
+        if let Ok(entries) = std::fs::read_dir(&artifact_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("meta") {
+                    if let Ok(data) = std::fs::read(&path) {
+                        if let Ok(artifact) = bincode::deserialize::<ArtifactData>(&data) {
+                            let stem = path
+                                .file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned();
+                            artifacts.insert(stem, CachedArtifact { artifact });
+                        }
+                    }
+                }
+            }
+        }
+        let loaded = artifacts.len();
+        if loaded > 0 {
+            tracing::info!(loaded, "restored persisted artifacts");
+        }
+
         Ok(Self {
             listener,
             shutdown: Arc::clone(&shutdown),
@@ -112,7 +142,7 @@ impl DaemonServer {
                 sessions: SessionManager::new(std::time::Duration::from_secs(300)),
                 system_includes: Mutex::new(SystemIncludeCache::new()),
                 dep_graph: DepGraph::new(),
-                artifacts: DashMap::new(),
+                artifacts,
                 cache_system: CacheSystem::new(),
                 watcher: Mutex::new(None),
                 watched_dirs: Mutex::new(HashSet::new()),
@@ -121,14 +151,7 @@ impl DaemonServer {
                 start_time: now,
                 stats: StatsCollector::new(),
                 profiler: PhaseProfiler::new(),
-                artifact_dir: {
-                    let dir = std::env::temp_dir().join(format!(
-                        "zccache-artifacts-{}-{instance}",
-                        std::process::id()
-                    ));
-                    std::fs::create_dir_all(&dir).ok();
-                    dir
-                },
+                artifact_dir,
                 depfile_tmpdir: {
                     let dir = std::env::temp_dir().join(format!(
                         "zccache-depfiles-{}-{instance}",
@@ -400,6 +423,25 @@ async fn handle_connection(
                 compiler,
                 env,
             } => handle_compile(&state, session_id, &args, &cwd, compiler.as_deref(), env).await,
+            Request::CompileEphemeral {
+                client_pid,
+                working_dir,
+                compiler,
+                args,
+                cwd,
+                env,
+            } => {
+                handle_compile_ephemeral(
+                    &state,
+                    client_pid,
+                    &working_dir,
+                    &compiler,
+                    &args,
+                    &cwd,
+                    env,
+                )
+                .await
+            }
             Request::SessionEnd { session_id } => {
                 let sid = SessionId::from_raw(session_id);
                 if let Some(session) = state.sessions.end(&sid) {
@@ -483,6 +525,41 @@ async fn handle_clear(state: &SharedState) -> Response {
         dep_graph_contexts_cleared,
         on_disk_bytes_freed,
     }
+}
+
+/// Handle a single-roundtrip ephemeral compile: session start + compile + session end.
+/// Avoids 3 IPC roundtrips for drop-in wrapper mode.
+async fn handle_compile_ephemeral(
+    state: &Arc<SharedState>,
+    client_pid: u32,
+    working_dir: &str,
+    compiler: &str,
+    args: &[String],
+    cwd: &str,
+    env: Option<Vec<(String, String)>>,
+) -> Response {
+    // 1. Start ephemeral session (inline, no IPC roundtrip)
+    state.stats.record_session();
+    let session_resp =
+        handle_session_start(state, client_pid, working_dir, compiler, None, false).await;
+    let session_id = match session_resp {
+        Response::SessionStarted { session_id, .. } => session_id,
+        Response::Error { message } => return Response::Error { message },
+        other => {
+            return Response::Error {
+                message: format!("unexpected session start response: {other:?}"),
+            };
+        }
+    };
+
+    // 2. Compile (no compiler override — session compiler IS the wrapped compiler)
+    let result = handle_compile(state, session_id, args, cwd, None, env).await;
+
+    // 3. End session (best-effort, no response needed)
+    let sid = SessionId::from_raw(session_id);
+    state.sessions.end(&sid);
+
+    result
 }
 
 /// Handle a SessionStart request: discover system includes, create session.
@@ -585,9 +662,12 @@ fn write_session_log(sessions: &SessionManager, session_id: &SessionId, message:
 /// This stat-verifies the file, hashes if needed (with TOCTOU protection),
 /// and caches the result. The file watcher proactively downgrades confidence
 /// on changes, ensuring stale hashes are re-computed.
-fn hash_file(cache_system: &CacheSystem, path: &Path) -> Result<ContentHash, String> {
+///
+/// `clock` should be snapped once at the start of each compile request so all
+/// files in a single compilation see a consistent journal clock.
+fn hash_file(cache_system: &CacheSystem, path: &Path, clock: Clock) -> Result<ContentHash, String> {
     cache_system
-        .lookup_since(path, cache_system.current_clock())
+        .lookup_since(path, clock)
         .map(|r| r.hash)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -643,6 +723,9 @@ async fn handle_compile(
     let state = state_arc.as_ref();
     let compile_start = std::time::Instant::now();
     let sid = SessionId::from_raw(session_id);
+    // Snap the journal clock once so all file hashes in this request see a
+    // consistent view (avoids per-file current_clock() syscalls).
+    let snap_clock = state.cache_system.current_clock();
 
     state.stats.record_compilation();
 
@@ -802,7 +885,7 @@ async fn handle_compile(
     // ── Phase: hash source ───────────────────────────────────────────
     let t2 = std::time::Instant::now();
     let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
-    match hash_file(&state.cache_system, &source_path) {
+    match hash_file(&state.cache_system, &source_path, snap_clock) {
         Ok(h) => {
             hash_map.insert(source_path.clone(), h);
         }
@@ -822,7 +905,7 @@ async fn handle_compile(
     let t3 = std::time::Instant::now();
     if let Some(includes) = state.dep_graph.get_includes(&context_key) {
         for header in &includes {
-            match hash_file(&state.cache_system, header) {
+            match hash_file(&state.cache_system, header, snap_clock) {
                 Ok(h) => {
                     hash_map.insert(header.clone(), h);
                 }
@@ -1092,11 +1175,11 @@ async fn handle_compile(
         // ── Phase: hash all files ────────────────────────────────────
         let t_hash = std::time::Instant::now();
         let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
-        if let Ok(h) = hash_file(&state.cache_system, &source_path) {
+        if let Ok(h) = hash_file(&state.cache_system, &source_path, snap_clock) {
             hash_map.insert(source_path.clone(), h);
         }
         for header in &scan_result.resolved {
-            if let Ok(h) = hash_file(&state.cache_system, header) {
+            if let Ok(h) = hash_file(&state.cache_system, header, snap_clock) {
                 hash_map.insert(header.clone(), h);
             }
         }
@@ -1135,6 +1218,12 @@ async fn handle_compile(
             for (i, out) in artifact.outputs.iter().enumerate() {
                 let cache_path = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
                 let _ = std::fs::write(&cache_path, &out.data);
+            }
+
+            // Persist .meta sidecar so artifacts survive daemon restarts.
+            let meta_path = state.artifact_dir.join(format!("{artifact_key_hex}.meta"));
+            if let Ok(meta_bytes) = bincode::serialize(&artifact) {
+                let _ = std::fs::write(&meta_path, &meta_bytes);
             }
 
             let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
@@ -1215,6 +1304,7 @@ fn check_unit_cache(
     system_includes: &[PathBuf],
 ) -> UnitCacheResult {
     let t0 = std::time::Instant::now();
+    let snap_clock = state.cache_system.current_clock();
     state.stats.record_compilation();
 
     let source_path = if compilation.source_file.is_absolute() {
@@ -1234,7 +1324,7 @@ fn check_unit_cache(
     let t_register = t0.elapsed();
 
     // Hash source
-    let source_hash = match hash_file(&state.cache_system, &source_path) {
+    let source_hash = match hash_file(&state.cache_system, &source_path, snap_clock) {
         Ok(h) => h,
         Err(_) => {
             return UnitCacheResult::Miss {
@@ -1252,7 +1342,7 @@ fn check_unit_cache(
     hash_map.insert(source_path.clone(), source_hash);
     if let Some(includes) = state.dep_graph.get_includes(&context_key) {
         for header in &includes {
-            if let Ok(h) = hash_file(&state.cache_system, header) {
+            if let Ok(h) = hash_file(&state.cache_system, header, snap_clock) {
                 hash_map.insert(header.clone(), h);
             }
         }
@@ -1343,6 +1433,7 @@ async fn handle_compile_multi(
     client_env: Option<Vec<(String, String)>>,
 ) -> Response {
     let cwd_path = PathBuf::from(&cwd);
+    let snap_clock = state.cache_system.current_clock();
     let mut all_stdout = Vec::new();
     let mut all_stderr = Vec::new();
 
@@ -1572,11 +1663,11 @@ async fn handle_compile_multi(
 
         // Hash all files
         let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
-        if let Ok(h) = hash_file(&state.cache_system, source_path) {
+        if let Ok(h) = hash_file(&state.cache_system, source_path, snap_clock) {
             hash_map.insert(source_path.clone(), h);
         }
         for header in &scan_result.resolved {
-            if let Ok(h) = hash_file(&state.cache_system, header) {
+            if let Ok(h) = hash_file(&state.cache_system, header, snap_clock) {
                 hash_map.insert(header.clone(), h);
             }
         }
@@ -1603,6 +1694,12 @@ async fn handle_compile_multi(
             for (i, out) in artifact.outputs.iter().enumerate() {
                 let cache_path = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
                 let _ = std::fs::write(&cache_path, &out.data);
+            }
+
+            // Persist .meta sidecar so artifacts survive daemon restarts.
+            let meta_path = state.artifact_dir.join(format!("{artifact_key_hex}.meta"));
+            if let Ok(meta_bytes) = bincode::serialize(&artifact) {
+                let _ = std::fs::write(&meta_path, &meta_bytes);
             }
 
             let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
@@ -1718,12 +1815,12 @@ mod tests {
         let resp: Option<Response> = client.recv().await.unwrap();
         match resp {
             Some(Response::Cleared {
-                artifacts_removed,
                 metadata_cleared,
                 dep_graph_contexts_cleared,
                 ..
             }) => {
-                assert_eq!(artifacts_removed, 0);
+                // artifacts_removed may be >0 if persistent cache has entries
+                // from a prior run. Metadata and dep graph are always fresh.
                 assert_eq!(metadata_cleared, 0);
                 assert_eq!(dep_graph_contexts_cleared, 0);
             }
