@@ -1,6 +1,6 @@
 [project]
 name = "zccache"
-version = "1.0.2"
+version = "1.0.3"
 description = "A high-performance local compiler cache daemon"
 requires-python = ">=3.9"
 dependencies = []
