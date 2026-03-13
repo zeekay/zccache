@@ -595,16 +595,24 @@ async fn cmd_compile_ephemeral(
     cwd: String,
     client_env: Vec<(String, String)>,
 ) -> ExitCode {
-    if let Err(e) = ensure_daemon(endpoint).await {
-        eprintln!("cannot start daemon at {endpoint}: {e}");
-        return ExitCode::FAILURE;
-    }
-
+    // Try to connect directly first (fast path — avoids a throwaway connection
+    // that ensure_daemon would make). Only fall back to ensure_daemon if the
+    // fast connect fails.
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("cannot connect to daemon at {endpoint}: {e}");
-            return ExitCode::FAILURE;
+        Err(_) => {
+            // Daemon not running — start it and connect
+            if let Err(e) = ensure_daemon(endpoint).await {
+                eprintln!("cannot start daemon at {endpoint}: {e}");
+                return ExitCode::FAILURE;
+            }
+            match connect(endpoint).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("cannot connect to daemon at {endpoint}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
     };
 

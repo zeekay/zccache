@@ -432,6 +432,26 @@ pub struct MesonBuildResult {
     pub total_ms: u128,
 }
 
+/// Compute a PATH value that includes the ninja binary's directory.
+fn path_with_ninja(ninja_bin: &Path) -> String {
+    let ninja_dir = ninja_bin.parent().unwrap_or(Path::new("."));
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    format!(
+        "{}{}{}",
+        ninja_dir.to_string_lossy(),
+        if cfg!(windows) { ";" } else { ":" },
+        path_var,
+    )
+}
+
+/// Apply extra environment variables + PATH to a command.
+fn apply_env(cmd: &mut std::process::Command, path: &str, extra_env: &[(&str, &str)]) {
+    cmd.env("PATH", path);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+}
+
 impl MesonProject {
     /// Write a meson native file that wraps the compiler with a cache tool.
     ///
@@ -520,15 +540,7 @@ endian = 'little'
             std::fs::remove_dir_all(build_dir).unwrap();
         }
 
-        // Ninja must be on PATH for meson to find it.
-        let ninja_dir = ninja_bin.parent().unwrap_or(Path::new("."));
-        let path_var = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!(
-            "{}{}{}",
-            ninja_dir.to_string_lossy(),
-            if cfg!(windows) { ";" } else { ":" },
-            path_var,
-        );
+        let path = path_with_ninja(ninja_bin);
 
         // meson setup
         let t0 = std::time::Instant::now();
@@ -540,10 +552,7 @@ endian = 'little'
             &build_dir.to_string_lossy(),
         ]);
         cmd.current_dir(&self.source_dir);
-        cmd.env("PATH", &new_path);
-        for (k, v) in extra_env {
-            cmd.env(k, v);
-        }
+        apply_env(&mut cmd, &path, extra_env);
         let output = cmd.output().expect("failed to run meson setup");
         let setup_ms = t0.elapsed().as_millis();
 
@@ -555,27 +564,12 @@ endian = 'little'
         );
 
         // ninja build
-        let t1 = std::time::Instant::now();
-        let mut cmd = std::process::Command::new(ninja_bin);
-        cmd.args(["-C", &build_dir.to_string_lossy()]);
-        cmd.env("PATH", &new_path);
-        for (k, v) in extra_env {
-            cmd.env(k, v);
-        }
-        let output = cmd.output().expect("failed to run ninja");
-        let build_ms = t1.elapsed().as_millis();
-
-        assert!(
-            output.status.success(),
-            "ninja build failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+        let build_ms = Self::run_ninja(ninja_bin, build_dir, &path, extra_env);
 
         MesonBuildResult {
             setup_ms,
             build_ms,
-            total_ms: setup_ms + build_ms,
+            total_ms: t0.elapsed().as_millis(),
         }
     }
 
@@ -594,28 +588,28 @@ endian = 'little'
 
     /// Run a ninja rebuild (after clean), returning the build time in milliseconds.
     pub fn ninja_rebuild(ninja_bin: &Path, build_dir: &Path, extra_env: &[(&str, &str)]) -> u128 {
-        let ninja_dir = ninja_bin.parent().unwrap_or(Path::new("."));
-        let path_var = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!(
-            "{}{}{}",
-            ninja_dir.to_string_lossy(),
-            if cfg!(windows) { ";" } else { ":" },
-            path_var,
-        );
+        let path = path_with_ninja(ninja_bin);
+        Self::run_ninja(ninja_bin, build_dir, &path, extra_env)
+    }
 
+    /// Internal: run ninja with the given PATH and env, return elapsed ms.
+    fn run_ninja(
+        ninja_bin: &Path,
+        build_dir: &Path,
+        path: &str,
+        extra_env: &[(&str, &str)],
+    ) -> u128 {
         let t = std::time::Instant::now();
         let mut cmd = std::process::Command::new(ninja_bin);
         cmd.args(["-C", &build_dir.to_string_lossy()]);
-        cmd.env("PATH", &new_path);
-        for (k, v) in extra_env {
-            cmd.env(k, v);
-        }
+        apply_env(&mut cmd, path, extra_env);
         let output = cmd.output().expect("failed to run ninja");
         let ms = t.elapsed().as_millis();
 
         assert!(
             output.status.success(),
-            "ninja rebuild failed: {}",
+            "ninja failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
         ms

@@ -53,6 +53,29 @@ fn find_cli_binary() -> PathBuf {
     }
 }
 
+/// Build + find the release CLI binary. Release is critical for meson tests
+/// because meson probes the compiler ~12 times during setup — each invocation
+/// goes through the zccache wrapper, so debug overhead (~1.5s/call) dominates.
+fn build_and_find_release_cli() -> PathBuf {
+    let build_status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "zccache-cli"])
+        .status()
+        .expect("failed to run cargo build --release");
+    assert!(build_status.success(), "cargo build --release failed");
+
+    // Release binary is in target/release/, not target/debug/
+    let debug_dir = std::path::Path::new(env!("CARGO_BIN_EXE_zccache-daemon"))
+        .parent()
+        .unwrap();
+    // debug_dir is target/debug/ — go up to target/ then into release/
+    let release_dir = debug_dir.parent().unwrap().join("release");
+    if cfg!(windows) {
+        release_dir.join("zccache.exe")
+    } else {
+        release_dir.join("zccache")
+    }
+}
+
 async fn start_daemon(endpoint: &str) -> (JoinHandle<()>, Arc<Notify>) {
     let mut server = DaemonServer::bind(endpoint).unwrap();
     let shutdown = server.shutdown_handle();
@@ -899,17 +922,15 @@ async fn meson_ninja_cold_then_warm_rebuild() {
         }
     };
 
-    // Ensure CLI binary is built
-    let build_status = std::process::Command::new("cargo")
-        .args(["build", "-p", "zccache-cli"])
-        .status()
-        .expect("failed to run cargo build");
-    assert!(build_status.success(), "cargo build failed");
-    let cli = find_cli_binary();
+    // Build release CLI binary — release is critical because meson probes the
+    // compiler ~12 times during setup, each through the zccache wrapper.
+    // Debug wrapper: ~1.5s/probe → 18s setup. Release: ~0.1s/probe → 1.2s setup.
+    let cli = build_and_find_release_cli();
 
     let project = TestProject::integration();
     let file_count = project.source_count;
 
+    // Generate project files and start daemon concurrently — they're independent.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&root).unwrap();
@@ -918,19 +939,17 @@ async fn meson_ninja_cold_then_warm_rebuild() {
     let build_dir = tmp.path().join("build");
     let native_file = tmp.path().join("native.ini");
 
-    // Start daemon
     let endpoint = zccache_ipc::unique_test_endpoint();
     let (server_handle, shutdown) = start_daemon(&endpoint).await;
     clear_cache(&endpoint).await;
 
-    // Write native file: c/cpp = ['zccache.exe', 'clang++.exe']
     MesonProject::write_native_file(&native_file, &clang, None, Some(&cli));
 
     eprintln!("Meson+Ninja test: {file_count} source files");
     eprintln!("  meson: {}", meson_bin.display());
     eprintln!("  ninja: {}", ninja_bin.display());
     eprintln!("  clang: {}", clang.display());
-    eprintln!("  zccache: {}", cli.display());
+    eprintln!("  zccache: {} (release)", cli.display());
     eprintln!("  endpoint: {endpoint}");
 
     let env = [("ZCCACHE_ENDPOINT", endpoint.as_str())];
@@ -1018,12 +1037,7 @@ async fn meson_ninja_bench_warm_iterations() {
         }
     };
 
-    let build_status = std::process::Command::new("cargo")
-        .args(["build", "-p", "zccache-cli"])
-        .status()
-        .expect("failed to run cargo build");
-    assert!(build_status.success(), "cargo build failed");
-    let cli = find_cli_binary();
+    let cli = build_and_find_release_cli();
 
     let project = TestProject::benchmark();
     let file_count = project.source_count;
@@ -1044,7 +1058,9 @@ async fn meson_ninja_bench_warm_iterations() {
 
     let env = [("ZCCACHE_ENDPOINT", endpoint.as_str())];
 
-    eprintln!("Meson+Ninja benchmark: {file_count} files, medium bodies, 3 warm iterations");
+    eprintln!(
+        "Meson+Ninja benchmark: {file_count} files, medium bodies, 3 warm iterations (release cli)"
+    );
 
     // ── Cold build ──────────────────────────────────────────────────
     let cold = meson.build(&build_dir, &native_file, &meson_bin, &ninja_bin, &env);
