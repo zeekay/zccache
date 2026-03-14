@@ -167,10 +167,30 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: &[String]) -> ParsedLink
     let mut input_files: Vec<PathBuf> = Vec::new();
     let mut cache_relevant_flags: Vec<String> = Vec::new();
     let mut has_build_id_uuid = false;
+    let mut secondary_outputs: Vec<PathBuf> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
+
+        // --out-implib=<path> — GNU/LLD import library (secondary output on Windows)
+        if let Some(implib) = arg.strip_prefix("--out-implib=") {
+            secondary_outputs.push(PathBuf::from(implib));
+            cache_relevant_flags.push(arg.clone());
+            i += 1;
+            continue;
+        }
+        // --out-implib <path> (space-separated variant)
+        if arg == "--out-implib" {
+            cache_relevant_flags.push(arg.clone());
+            i += 1;
+            if i < args.len() {
+                secondary_outputs.push(PathBuf::from(&args[i]));
+                cache_relevant_flags.push(args[i].clone());
+            }
+            i += 1;
+            continue;
+        }
 
         // -shared or --shared — shared library mode (cache-relevant: affects output type)
         if arg == "-shared" || arg == "--shared" {
@@ -328,7 +348,7 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: &[String]) -> ParsedLink
         family,
         input_files,
         output_file,
-        secondary_outputs: Vec::new(),
+        secondary_outputs,
         cache_relevant_flags,
         original_args: args.to_vec(),
         non_deterministic: has_build_id_uuid,
@@ -455,6 +475,7 @@ fn parse_compiler_driver_link(tool: &str, args: &[String]) -> ParsedLinkerInvoca
     let mut input_files: Vec<PathBuf> = Vec::new();
     let mut cache_relevant_flags: Vec<String> = Vec::new();
     let mut has_build_id_uuid = false;
+    let mut secondary_outputs: Vec<PathBuf> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -484,11 +505,16 @@ fn parse_compiler_driver_link(tool: &str, args: &[String]) -> ParsedLinkerInvoca
             continue;
         }
 
-        // -Wl, pass-through to linker — check for non-determinism
+        // -Wl, pass-through to linker — check for non-determinism and secondary outputs
         if arg.starts_with("-Wl,") {
             for part in arg.split(',') {
                 if part == "--build-id=uuid" {
                     has_build_id_uuid = true;
+                }
+                // GNU/LLD --out-implib produces an import library (.dll.a) as a side effect.
+                // Meson/ninja uses: -Wl,--out-implib=path/to/foo.dll.a
+                if let Some(implib) = part.strip_prefix("--out-implib=") {
+                    secondary_outputs.push(PathBuf::from(implib));
                 }
             }
             cache_relevant_flags.push(arg.clone());
@@ -572,7 +598,7 @@ fn parse_compiler_driver_link(tool: &str, args: &[String]) -> ParsedLinkerInvoca
         family: LinkerFamily::CompilerDriver,
         input_files,
         output_file,
-        secondary_outputs: Vec::new(),
+        secondary_outputs,
         cache_relevant_flags,
         original_args: args.to_vec(),
         non_deterministic: has_build_id_uuid,
@@ -1538,5 +1564,139 @@ mod tests {
             "rustc",
             &args(&["-shared", "-o", "foo.so"])
         ));
+    }
+
+    // ─── GNU/LLD --out-implib secondary output ───────────────────────
+
+    #[test]
+    fn gnu_ld_out_implib_equals() {
+        let result = parse_linker_invocation(
+            "ld",
+            &args(&[
+                "-shared",
+                "--out-implib=libfoo.dll.a",
+                "-o",
+                "libfoo.dll",
+                "a.o",
+            ]),
+        );
+        match result {
+            ParsedLinkerInvocation::Cacheable(c) => {
+                assert_eq!(c.secondary_outputs.len(), 1);
+                assert_eq!(c.secondary_outputs[0], PathBuf::from("libfoo.dll.a"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gnu_ld_out_implib_separate() {
+        let result = parse_linker_invocation(
+            "ld",
+            &args(&[
+                "-shared",
+                "--out-implib",
+                "libfoo.dll.a",
+                "-o",
+                "libfoo.dll",
+                "a.o",
+            ]),
+        );
+        match result {
+            ParsedLinkerInvocation::Cacheable(c) => {
+                assert_eq!(c.secondary_outputs.len(), 1);
+                assert_eq!(c.secondary_outputs[0], PathBuf::from("libfoo.dll.a"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gnu_ld_out_implib_with_path() {
+        // Meson passes relative paths like ci/meson/native\fastled.dll.a
+        let result = parse_linker_invocation(
+            "ld",
+            &args(&[
+                "-shared",
+                "--out-implib=ci/meson/native/fastled.dll.a",
+                "-o",
+                "ci/meson/native/fastled.dll",
+                "a.o",
+            ]),
+        );
+        match result {
+            ParsedLinkerInvocation::Cacheable(c) => {
+                assert_eq!(c.secondary_outputs.len(), 1);
+                assert_eq!(
+                    c.secondary_outputs[0],
+                    PathBuf::from("ci/meson/native/fastled.dll.a")
+                );
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compiler_driver_wl_out_implib() {
+        // clang++ -shared -Wl,--out-implib=foo.dll.a -o foo.dll a.o
+        let result = parse_linker_invocation(
+            "clang++",
+            &args(&[
+                "-shared",
+                "-Wl,--out-implib=foo.dll.a",
+                "-o",
+                "foo.dll",
+                "a.o",
+            ]),
+        );
+        match result {
+            ParsedLinkerInvocation::Cacheable(c) => {
+                assert_eq!(c.family, LinkerFamily::CompilerDriver);
+                assert_eq!(c.secondary_outputs.len(), 1);
+                assert_eq!(c.secondary_outputs[0], PathBuf::from("foo.dll.a"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compiler_driver_wl_out_implib_with_path() {
+        // Real-world meson invocation:
+        // clang++ -shared -Wl,--out-implib=ci/meson/native\fastled.dll.a -o fastled.dll a.o
+        let result = parse_linker_invocation(
+            "clang++",
+            &args(&[
+                "-shared",
+                "-Wl,--start-group",
+                "-Wl,--out-implib=ci/meson/native\\fastled.dll.a",
+                "-fuse-ld=lld",
+                "-o",
+                "ci/meson/native/fastled.dll",
+                "a.o",
+            ]),
+        );
+        match result {
+            ParsedLinkerInvocation::Cacheable(c) => {
+                assert_eq!(c.secondary_outputs.len(), 1);
+                assert_eq!(
+                    c.secondary_outputs[0],
+                    PathBuf::from("ci/meson/native\\fastled.dll.a")
+                );
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compiler_driver_no_implib_no_secondary() {
+        // Without --out-implib, no secondary outputs
+        let result =
+            parse_linker_invocation("clang++", &args(&["-shared", "-o", "foo.dll", "a.o"]));
+        match result {
+            ParsedLinkerInvocation::Cacheable(c) => {
+                assert!(c.secondary_outputs.is_empty());
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
     }
 }

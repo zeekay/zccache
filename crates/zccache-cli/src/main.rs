@@ -479,6 +479,26 @@ fn cmd_crashes(clear: bool) -> ExitCode {
 
 // ─── Wrap (compiler wrapper) ───────────────────────────────────────────────
 
+/// Run the compiler/tool directly without caching (ZCCACHE_DISABLE mode).
+fn run_passthrough(args: &[String]) -> ExitCode {
+    let tool = &args[0];
+    let tool_args = if args.len() > 1 { &args[1..] } else { &[] };
+
+    // Resolve the tool path (normalize MSYS paths, search PATH)
+    let resolved = resolve_compiler_path(tool);
+
+    match std::process::Command::new(&resolved)
+        .args(tool_args)
+        .status()
+    {
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(e) => {
+            eprintln!("zccache: failed to run {resolved}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Wrap a compiler or tool invocation.
 ///
 /// `args` is the full command: ["clang++", "-c", "foo.cpp", "-o", "foo.o"]
@@ -493,6 +513,11 @@ fn run_wrap(args: &[String]) -> ExitCode {
     if args.is_empty() {
         eprintln!("usage: zccache <compiler|tool> <args...>");
         return ExitCode::FAILURE;
+    }
+
+    // ZCCACHE_DISABLE=1 — passthrough to compiler/tool without caching.
+    if std::env::var("ZCCACHE_DISABLE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
+        return run_passthrough(args);
     }
 
     // Normalize MSYS paths (e.g. /c/Users/... → C:\Users\...) on Windows,
