@@ -55,11 +55,6 @@ pub enum Request {
         /// Session ID to end (UUID string).
         session_id: String,
     },
-    /// Query per-session statistics without ending the session.
-    SessionStats {
-        /// Session ID to query (UUID string).
-        session_id: String,
-    },
     /// Clear all caches (artifacts, metadata, dep graph).
     Clear,
     /// Single-roundtrip ephemeral compile: session start + compile + session end
@@ -94,6 +89,12 @@ pub enum Request {
         cwd: PathBuf,
         /// Client environment variables.
         env: Option<Vec<(String, String)>>,
+    },
+    /// Query per-session statistics without ending the session.
+    /// NOTE: Appended at end to preserve bincode variant indices.
+    SessionStats {
+        /// Session ID to query (UUID string).
+        session_id: String,
     },
 }
 
@@ -131,11 +132,6 @@ pub enum Response {
         /// Per-session stats, if the session opted in to tracking.
         stats: Option<SessionStats>,
     },
-    /// Mid-session statistics snapshot.
-    SessionStatsResult {
-        /// Per-session stats, if the session exists and opted in to tracking.
-        stats: Option<SessionStats>,
-    },
     /// Result of a link/archive request.
     LinkResult {
         /// Tool exit code.
@@ -164,6 +160,12 @@ pub enum Response {
         dep_graph_contexts_cleared: u64,
         /// Bytes freed from on-disk artifact cache.
         on_disk_bytes_freed: u64,
+    },
+    /// Mid-session statistics snapshot.
+    /// NOTE: Appended at end to preserve bincode variant indices.
+    SessionStatsResult {
+        /// Per-session stats, if the session exists and opted in to tracking.
+        stats: Option<SessionStats>,
     },
 }
 

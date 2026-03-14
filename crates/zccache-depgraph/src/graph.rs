@@ -47,6 +47,8 @@ pub struct ContextEntry {
     pub has_computed_includes: bool,
     /// Last computed artifact key.
     pub artifact_key: Option<ArtifactKey>,
+    /// File hashes from the last update() — used for drift diagnostics.
+    pub last_file_hashes: Vec<(PathBuf, ContentHash)>,
     /// When this entry was last accessed (for trimming).
     pub last_accessed: Instant,
     /// Current state.
@@ -119,6 +121,7 @@ impl DepGraph {
             unresolved_includes: Vec::new(),
             has_computed_includes: false,
             artifact_key: None,
+            last_file_hashes: Vec::new(),
             last_accessed: Instant::now(),
             state: ContextState::Cold,
         });
@@ -360,12 +363,64 @@ impl DepGraph {
                 );
             }
             // Source is "fresh" by watcher but artifact key differs.
+            let old_hex = entry
+                .artifact_key
+                .as_ref()
+                .map(|k| k.hash().to_hex()[..8].to_string())
+                .unwrap_or_else(|| "none".to_string());
+
+            // Find which files have different hashes vs last update().
+            let mut drifted: Vec<String> = Vec::new();
+            if !entry.last_file_hashes.is_empty() {
+                let old_map: std::collections::HashMap<&Path, &ContentHash> = entry
+                    .last_file_hashes
+                    .iter()
+                    .map(|(p, h)| (p.as_path(), h))
+                    .collect();
+                for (path, new_hash) in &file_hashes {
+                    match old_map.get(path.as_path()) {
+                        Some(old_hash) if *old_hash != new_hash => {
+                            let fname = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| path.display().to_string());
+                            drifted.push(fname);
+                        }
+                        None => {
+                            let fname = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| path.display().to_string());
+                            drifted.push(format!("{fname}(new)"));
+                        }
+                        _ => {} // Same hash, no drift
+                    }
+                }
+            }
+
             entry.artifact_key = Some(artifact_key);
             self.hits.fetch_add(1, Ordering::Relaxed);
             let hex = &artifact_key.hash().to_hex()[..8];
+            let file_count = file_hashes.len();
+            let drift_info = if drifted.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", drifted=[{}]",
+                    drifted
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            };
+            entry.last_file_hashes = file_hashes;
             (
                 CacheVerdict::Hit { artifact_key },
-                format!("hit: artifact_key={hex} (first check after update)"),
+                format!(
+                    "hit: artifact_key={hex} (first check after update, was={old_hex}, files={file_count}{drift_info})",
+                ),
             )
         } else {
             entry.artifact_key = Some(artifact_key);
@@ -397,25 +452,30 @@ impl DepGraph {
         entry.state = ContextState::Warm;
         entry.last_accessed = Instant::now();
 
-        // Compute artifact key.
+        // Compute artifact key — only if ALL files are hashable.
+        // If any file is missing a hash, skip artifact key computation so
+        // check() won't see a key computed from a partial file list.
         let mut file_hashes = Vec::new();
-        if let Some(h) = get_hash(&entry.context.source_file) {
-            file_hashes.push((entry.context.source_file.clone(), h));
-        }
+        let source_hash = get_hash(&entry.context.source_file)?;
+        file_hashes.push((entry.context.source_file.clone(), source_hash));
+
         for header in &entry.resolved_includes {
-            if let Some(h) = get_hash(header) {
-                file_hashes.push((header.clone(), h));
+            match get_hash(header) {
+                Some(h) => file_hashes.push((header.clone(), h)),
+                None => return None, // Incomplete hashes → don't store a partial key
             }
         }
         // Hash force-included files (PCH content must affect artifact key).
         for fi in &entry.context.force_includes {
-            if let Some(h) = get_hash(fi) {
-                file_hashes.push((fi.clone(), h));
+            match get_hash(fi) {
+                Some(h) => file_hashes.push((fi.clone(), h)),
+                None => return None,
             }
         }
 
         let artifact_key = compute_artifact_key(key, &mut file_hashes);
         entry.artifact_key = Some(artifact_key);
+        entry.last_file_hashes = file_hashes;
 
         Some(artifact_key)
     }

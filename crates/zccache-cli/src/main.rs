@@ -867,50 +867,37 @@ async fn cmd_link_ephemeral(
 
 // ─── Daemon auto-start ─────────────────────────────────────────────────────
 
-/// Check if the running daemon is outdated and restart it if needed.
+/// Check that the running daemon's version matches the CLI version.
 ///
-/// Sends a Status request to get the daemon's version. If the daemon version
-/// is older than the CLI version, shuts it down so `ensure_daemon` can spawn
-/// a new one.
-///
-/// Returns `true` if the daemon was restarted (caller should reconnect).
-async fn check_daemon_version(endpoint: &str) -> bool {
+/// Sends a Status request to get the daemon's version. Returns `Ok(())` if
+/// versions match, or `Err(message)` if there is a mismatch.
+async fn check_daemon_version(endpoint: &str) -> Result<(), String> {
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return Ok(()), // Can't connect — caller will handle separately.
     };
 
     if conn.send(&zccache_protocol::Request::Status).await.is_err() {
-        return false;
+        return Ok(());
     }
 
     match conn.recv().await {
         Ok(Some(zccache_protocol::Response::Status(status))) => {
-            // Only restart if the CLI is strictly newer than the daemon.
-            let dominated = if status.version.is_empty() {
-                true // Pre-version daemon, always upgrade.
+            let daemon_version = if status.version.is_empty() {
+                "unknown"
             } else {
-                version_less_than(&status.version, zccache_core::VERSION)
+                &status.version
             };
-            if !dominated {
-                return false; // Daemon is same version or newer, no restart.
+            if daemon_version != zccache_core::VERSION {
+                return Err(format!(
+                    "version mismatch: daemon is v{daemon_version}, client is v{}. \
+                     Run `zccache stop` first.",
+                    zccache_core::VERSION
+                ));
             }
-            eprintln!(
-                "daemon version {} is older than CLI version {} — restarting",
-                if status.version.is_empty() {
-                    "unknown"
-                } else {
-                    &status.version
-                },
-                zccache_core::VERSION
-            );
-            let _ = conn.send(&zccache_protocol::Request::Shutdown).await;
-            let _ = conn.recv::<zccache_protocol::Response>().await; // Wait for ShuttingDown ack.
-                                                                     // Give the daemon a moment to release the socket/pipe.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            true
+            Ok(())
         }
-        _ => false,
+        _ => Ok(()),
     }
 }
 
@@ -920,16 +907,14 @@ async fn check_daemon_version(endpoint: &str) -> bool {
 /// the daemon, only one wins the bind. The losers detect this and connect to
 /// the winning daemon instead of failing.
 ///
-/// If a running daemon has an older version than this CLI, it is stopped and
-/// a new one is spawned.
+/// If a running daemon has a different version than this CLI, returns an error
+/// telling the user to run `zccache stop` first.
 async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
     // Fast path: try to connect
     if connect(endpoint).await.is_ok() {
-        // Check version — restart if stale.
-        if !check_daemon_version(endpoint).await {
-            return Ok(()); // Version matches, we're good.
-        }
-        // Daemon was shut down, fall through to spawn a new one.
+        // Check version — fail if mismatched.
+        check_daemon_version(endpoint).await?;
+        return Ok(());
     }
 
     // Check lock file for a running daemon we just can't reach yet
@@ -1177,22 +1162,6 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
-}
-
-/// Semver less-than: returns true if `a < b` by comparing major.minor.patch
-/// numerically. Falls back to lexicographic comparison if parsing fails.
-fn version_less_than(a: &str, b: &str) -> bool {
-    fn parse(v: &str) -> Option<(u64, u64, u64)> {
-        let mut parts = v.split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next()?.parse().ok()?;
-        let patch = parts.next()?.parse().ok()?;
-        Some((major, minor, patch))
-    }
-    match (parse(a), parse(b)) {
-        (Some(a), Some(b)) => a < b,
-        _ => a < b,
     }
 }
 

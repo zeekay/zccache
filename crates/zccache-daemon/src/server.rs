@@ -1014,6 +1014,52 @@ fn hash_file(cache_system: &CacheSystem, path: &Path, clock: Clock) -> Result<Co
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// For a PCH binary (.pch/.gch), return the path to its source header.
+///
+/// Clang PCH output is non-deterministic (embeds timestamps), so hashing the
+/// binary produces different keys even when headers haven't changed. Instead,
+/// we hash the source header which IS deterministic.
+///
+/// `test_pch.h.pch` → `test_pch.h`
+/// `.build/meson-quick/tests/test_pch.h.pch` → tries sibling `test_pch.h`,
+/// then walks parent directories looking for `tests/test_pch.h`.
+fn pch_source_header(path: &Path) -> Option<PathBuf> {
+    let ext = path.extension()?.to_str()?;
+    if ext != "pch" && ext != "gch" {
+        return None;
+    }
+    // The stem of "test_pch.h.pch" is "test_pch.h"
+    let header_name = path.file_stem()?;
+    // Try sibling: same directory
+    let sibling = path.with_file_name(header_name);
+    if sibling.exists() {
+        return Some(sibling);
+    }
+    // The PCH is typically in a build directory. Walk up looking for the
+    // source header by matching the last path component(s).
+    // e.g., .build/meson-quick/tests/test_pch.h.pch → look for tests/test_pch.h
+    if let Some(parent) = path.parent() {
+        // Get the directory name (e.g., "tests")
+        if let Some(dir_name) = parent.file_name() {
+            let relative = PathBuf::from(dir_name).join(header_name);
+            // Walk up from the build dir looking for a matching path
+            let mut search = parent.to_path_buf();
+            for _ in 0..10 {
+                if let Some(up) = search.parent() {
+                    let candidate = up.join(&relative);
+                    if candidate.exists() {
+                        return Some(candidate);
+                    }
+                    search = up.to_path_buf();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Build a CompileContext and UserDepFlags from a CacheableCompilation and session info.
 fn build_compile_context(
     compilation: &zccache_compiler::CacheableCompilation,
@@ -1292,7 +1338,9 @@ async fn handle_compile(
     let t3 = std::time::Instant::now();
     if let Some(includes) = state.dep_graph.get_includes(&context_key) {
         for header in &includes {
-            match hash_file(&state.cache_system, header, snap_clock) {
+            // For PCH binaries in the include list, hash the source header instead.
+            let hash_path = pch_source_header(header).unwrap_or_else(|| header.clone());
+            match hash_file(&state.cache_system, &hash_path, snap_clock) {
                 Ok(h) => {
                     hash_map.insert(header.clone(), h);
                 }
@@ -1300,7 +1348,7 @@ async fn handle_compile(
                     write_session_log(
                         &state.sessions,
                         &sid,
-                        &format!("[DIAG] header_hash_fail: {} error={e}", header.display()),
+                        &format!("[DIAG] header_hash_fail: {} error={e}", hash_path.display()),
                     );
                 }
             }
@@ -1308,8 +1356,11 @@ async fn handle_compile(
     }
     // Hash force-included files (PCH, -include) so their content
     // is part of the artifact key.
+    // For PCH binaries (.pch/.gch), hash the SOURCE header instead — PCH
+    // binaries are not bit-reproducible (clang embeds timestamps).
     for fi in &ctx.force_includes {
-        match hash_file(&state.cache_system, fi, snap_clock) {
+        let hash_path = pch_source_header(fi).unwrap_or_else(|| fi.clone());
+        match hash_file(&state.cache_system, &hash_path, snap_clock) {
             Ok(h) => {
                 hash_map.insert(fi.clone(), h);
             }
@@ -1317,7 +1368,10 @@ async fn handle_compile(
                 write_session_log(
                     &state.sessions,
                     &sid,
-                    &format!("[DIAG] force_include_hash_fail: {} error={e}", fi.display()),
+                    &format!(
+                        "[DIAG] force_include_hash_fail: {} error={e}",
+                        hash_path.display()
+                    ),
                 );
             }
         }
@@ -1603,20 +1657,43 @@ async fn handle_compile(
         // ── Phase: hash all files ────────────────────────────────────
         let t_hash = std::time::Instant::now();
         let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
+        let mut hash_failures: u32 = 0;
         if let Ok(h) = hash_file(&state.cache_system, &source_path, snap_clock) {
             hash_map.insert(source_path.clone(), h);
+        } else {
+            hash_failures += 1;
         }
         for header in &scan_result.resolved {
-            if let Ok(h) = hash_file(&state.cache_system, header, snap_clock) {
+            // For PCH binaries in the resolved include list, hash the source header.
+            let hash_path = pch_source_header(header).unwrap_or_else(|| header.clone());
+            if let Ok(h) = hash_file(&state.cache_system, &hash_path, snap_clock) {
                 hash_map.insert(header.clone(), h);
+            } else {
+                hash_failures += 1;
             }
         }
         // Hash force-included files (PCH, -include) so their content
         // is part of the artifact key.
+        // For PCH binaries (.pch/.gch), hash the SOURCE header instead.
         for fi in &ctx.force_includes {
-            if let Ok(h) = hash_file(&state.cache_system, fi, snap_clock) {
+            let hash_path = pch_source_header(fi).unwrap_or_else(|| fi.clone());
+            if let Ok(h) = hash_file(&state.cache_system, &hash_path, snap_clock) {
                 hash_map.insert(fi.clone(), h);
+            } else {
+                hash_failures += 1;
             }
+        }
+        if hash_failures > 0 {
+            write_session_log(
+                &state.sessions,
+                &sid,
+                &format!(
+                    "[DIAG] hash_failures: {} of {} files failed to hash for {}",
+                    hash_failures,
+                    1 + scan_result.resolved.len() + ctx.force_includes.len(),
+                    source_path.display(),
+                ),
+            );
         }
         let hash_all_ns = t_hash.elapsed().as_nanos() as u64;
 
