@@ -12,7 +12,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::thread;
 use std::time::Duration;
 
 use wait_timeout::ChildExt;
@@ -238,64 +237,48 @@ fn main() -> ExitCode {
 
     eprintln!("Running full workspace checks (changes detected)");
 
-    // Run lint and unit tests concurrently.
-    // Cargo serialises access to the shared target directory via file locks,
-    // so both processes can safely target the same workspace.
-    let lint_root = root.clone();
-    let test_root = root.clone();
-
-    let lint_handle = thread::spawn(move || {
-        let lint_script = lint_root.join("lint").to_string_lossy().to_string();
-        let cmd: Vec<String> = vec![
-            "uv".into(),
-            "run".into(),
-            "--script".into(),
-            lint_script,
-            "--fix".into(),
-        ];
-        run_streaming(&lint_root, &cmd, "Lint")
-    });
-
-    let test_handle = thread::spawn(move || {
-        // Unit tests only — skip integration/stress tests (which need
-        // a fully compiled binary and are gated behind --include-ignored).
-        // Exclude zccache-daemon: its server tests start a real daemon with
-        // IPC + file watcher and are effectively integration tests.
-        let cmd: Vec<String> = vec![
-            "uv".into(),
-            "run".into(),
-            "cargo".into(),
-            "test".into(),
-            "--workspace".into(),
-            "--lib".into(),
-            "--exclude".into(),
-            "zccache-daemon".into(),
-        ];
-        run_streaming(&test_root, &cmd, "Tests")
-    });
-
-    let (lint_rc, lint_timeout) = lint_handle.join().expect("lint thread panicked");
-    let (test_rc, test_timeout) = test_handle.join().expect("test thread panicked");
-
-    let mut failed = false;
+    // Run lint first. If it fails, skip tests entirely.
+    let lint_script = root.join("lint").to_string_lossy().to_string();
+    let lint_cmd: Vec<String> = vec![
+        "uv".into(),
+        "run".into(),
+        "--script".into(),
+        lint_script,
+        "--fix".into(),
+    ];
+    let (lint_rc, lint_timeout) = run_streaming(&root, &lint_cmd, "Lint");
 
     if lint_timeout {
-        eprintln!("Lint timed out — failing");
-        failed = true;
-    } else if lint_rc != 0 {
-        eprintln!("Lint failed");
-        failed = true;
+        eprintln!("Lint timed out — skipping tests");
+        return ExitCode::from(2);
     }
+    if lint_rc != 0 {
+        eprintln!("Lint failed — skipping tests");
+        return ExitCode::from(2);
+    }
+
+    // Unit tests only — skip integration/stress tests (which need
+    // a fully compiled binary and are gated behind --include-ignored).
+    // Exclude zccache-daemon: its server tests start a real daemon with
+    // IPC + file watcher and are effectively integration tests.
+    let test_cmd: Vec<String> = vec![
+        "uv".into(),
+        "run".into(),
+        "cargo".into(),
+        "test".into(),
+        "--workspace".into(),
+        "--lib".into(),
+        "--exclude".into(),
+        "zccache-daemon".into(),
+    ];
+    let (test_rc, test_timeout) = run_streaming(&root, &test_cmd, "Tests");
 
     if test_timeout {
         eprintln!("Tests timed out — failing");
-        failed = true;
-    } else if test_rc != 0 {
-        eprintln!("Tests failed");
-        failed = true;
+        return ExitCode::from(2);
     }
-
-    if failed {
+    if test_rc != 0 {
+        eprintln!("Tests failed");
         return ExitCode::from(2);
     }
 
