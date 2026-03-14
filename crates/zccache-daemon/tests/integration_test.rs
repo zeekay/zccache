@@ -20,26 +20,6 @@ async fn start_daemon() -> (
     (endpoint, handle, shutdown)
 }
 
-/// Resolve the clang++ path from ~/.clang-tool-chain.
-/// Returns None if not installed.
-fn find_clang() -> Option<std::path::PathBuf> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
-    let clang_path = std::path::PathBuf::from(&home)
-        .join(".clang-tool-chain")
-        .join("clang")
-        .join("win")
-        .join("x86_64")
-        .join("bin")
-        .join("clang++.exe");
-    if clang_path.exists() {
-        Some(clang_path)
-    } else {
-        None
-    }
-}
-
 #[tokio::test]
 async fn test_client_connects_and_pings_daemon() {
     let (endpoint, server_handle, shutdown) = start_daemon().await;
@@ -114,7 +94,7 @@ async fn test_session_start_with_nonexistent_compiler() {
 /// with the real clang toolchain, and the daemon discovers system includes.
 #[tokio::test]
 async fn test_session_start_with_clang_toolchain() {
-    let clang_path = match find_clang() {
+    let clang_path = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("skipping test: clang not found");
@@ -194,7 +174,7 @@ async fn test_session_start_with_clang_toolchain() {
 /// Test the full flow: ping → session start → status → shutdown.
 #[tokio::test]
 async fn test_full_client_flow() {
-    let clang_path = match find_clang() {
+    let clang_path = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("skipping test: clang not found");
@@ -251,7 +231,7 @@ async fn test_full_client_flow() {
 /// 5. Read log_file → verify cache miss then cache hit entries
 #[tokio::test]
 async fn test_compile_hello_cpp_cached() {
-    let clang_path = match find_clang() {
+    let clang_path = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("skipping test: clang not found");

@@ -5,7 +5,6 @@
 //!
 //! Uses the daemon directly via IPC (same protocol the CLI uses).
 
-use std::path::PathBuf;
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
@@ -23,29 +22,11 @@ async fn start_daemon() -> (
     (endpoint, handle, shutdown)
 }
 
-fn find_clang() -> Option<PathBuf> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
-    let clang_path = PathBuf::from(&home)
-        .join(".clang-tool-chain")
-        .join("clang")
-        .join("win")
-        .join("x86_64")
-        .join("bin")
-        .join("clang++.exe");
-    if clang_path.exists() {
-        Some(clang_path)
-    } else {
-        None
-    }
-}
-
 /// Test the full session lifecycle: start → compile → compile (cached) → end.
 /// This mirrors exactly what the CLI does in production.
 #[tokio::test]
 async fn cli_session_lifecycle() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -220,7 +201,7 @@ async fn cli_session_end_invalid_id() {
 /// then runs `zccache session-end`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_binary_session_round_trip() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -348,7 +329,7 @@ async fn cli_binary_session_round_trip() {
 /// without ZCCACHE_SESSION_ID. The CLI should auto-create a session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_binary_ephemeral_session() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -423,7 +404,7 @@ async fn cli_binary_ephemeral_session() {
 /// session-start → compile (miss) → compile (hit) → clear → compile (miss again).
 #[tokio::test]
 async fn cli_clear_resets_cache() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -578,7 +559,7 @@ async fn cli_clear_resets_cache() {
 /// running the compiler directly. The compilation should still succeed.
 #[tokio::test]
 async fn cli_multi_file_compilation_runs_directly() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -702,7 +683,7 @@ async fn cli_multi_file_compilation_runs_directly() {
 /// C file, causing "not valid for C++" warnings or outright failures.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_binary_compiler_override_cpp_session_c_file() {
-    let clangpp = match find_clang() {
+    let clangpp = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };

@@ -22,24 +22,6 @@ const BARE_ITERATIONS: usize = 20; // bare clang is slow, fewer iterations neede
 
 // ─── Tool discovery ──────────────────────────────────────────────────────────
 
-fn find_clang() -> Option<PathBuf> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
-    let clang_path = PathBuf::from(&home)
-        .join(".clang-tool-chain")
-        .join("clang")
-        .join("win")
-        .join("x86_64")
-        .join("bin")
-        .join("clang++.exe");
-    if clang_path.exists() {
-        Some(clang_path)
-    } else {
-        None
-    }
-}
-
 fn find_sccache() -> Option<PathBuf> {
     for path in &[
         "sccache",
@@ -584,7 +566,7 @@ fn print_three_way(bare: &BenchResult, sccache: &BenchResult, zccache: &BenchRes
 #[tokio::test]
 #[ignore]
 async fn perf_full_benchmark() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             println!("SKIP: clang not found at ~/.clang-tool-chain");
@@ -639,7 +621,7 @@ async fn perf_full_benchmark() {
 #[tokio::test]
 #[ignore]
 async fn perf_sanity_check() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             println!("SKIP: clang not found");

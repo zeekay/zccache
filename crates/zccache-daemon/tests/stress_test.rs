@@ -8,7 +8,6 @@
 //! - Local header changes must invalidate cache
 //! - Edge cases in paths, empty files, etc.
 
-use std::path::PathBuf;
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
@@ -31,25 +30,6 @@ async fn start_daemon() -> (
         server.run(0).await.unwrap();
     });
     (endpoint, handle, shutdown)
-}
-
-/// Resolve the clang++ path from ~/.clang-tool-chain.
-fn find_clang() -> Option<PathBuf> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
-    let clang_path = PathBuf::from(&home)
-        .join(".clang-tool-chain")
-        .join("clang")
-        .join("win")
-        .join("x86_64")
-        .join("bin")
-        .join("clang++.exe");
-    if clang_path.exists() {
-        Some(clang_path)
-    } else {
-        None
-    }
 }
 
 /// Helper: start a session with a log file on an already-connected client.
@@ -110,7 +90,7 @@ async fn compile(
 /// -O0 vs -O2 produce different machine code — returning the wrong one is catastrophic.
 #[tokio::test]
 async fn adversarial_different_flags_different_cache_entries() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -231,7 +211,7 @@ int main() { return get() + get(); }
 /// Code compiled with -DNDEBUG vs -DDEBUG can have wildly different behavior.
 #[tokio::test]
 async fn adversarial_define_changes_invalidate_cache() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -301,7 +281,7 @@ int main() { return 1; }
 /// If a failed compilation is cached, subsequent fixes won't take effect.
 #[tokio::test]
 async fn adversarial_compile_errors_never_cached() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -366,7 +346,7 @@ async fn adversarial_compile_errors_never_cached() {
 /// No panics, no corrupted cache, all results consistent.
 #[tokio::test]
 async fn adversarial_concurrent_same_file() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -437,7 +417,7 @@ async fn adversarial_concurrent_same_file() {
 /// Verifies no cross-contamination between cache entries.
 #[tokio::test]
 async fn adversarial_concurrent_different_files() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -514,7 +494,7 @@ async fn adversarial_concurrent_different_files() {
 /// should share the in-memory cache.
 #[tokio::test]
 async fn adversarial_cross_session_cache_sharing() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -581,7 +561,7 @@ async fn adversarial_cross_session_cache_sharing() {
 /// Compile request with an invalid session ID must return an error, not panic.
 #[tokio::test]
 async fn adversarial_invalid_session_id() {
-    if find_clang().is_none() {
+    if zccache_test_support::find_clang().is_none() {
         return;
     }
 
@@ -638,7 +618,7 @@ async fn adversarial_invalid_session_id() {
 /// to the compiler directly without corrupting the cache.
 #[tokio::test]
 async fn adversarial_non_cacheable_passthrough() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -706,7 +686,7 @@ async fn adversarial_non_cacheable_passthrough() {
 /// Empty source file (valid C++) — edge case for hashing.
 #[tokio::test]
 async fn adversarial_empty_source_file() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -754,7 +734,7 @@ async fn adversarial_empty_source_file() {
 /// Source with warnings but no errors — should still be cached (exit code 0).
 #[tokio::test]
 async fn adversarial_warnings_still_cached() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -815,7 +795,7 @@ async fn adversarial_warnings_still_cached() {
 /// The -o flag path should not affect the cache key.
 #[tokio::test]
 async fn adversarial_output_path_does_not_affect_cache_key() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -873,7 +853,7 @@ async fn adversarial_output_path_does_not_affect_cache_key() {
 /// Cache should remain consistent throughout.
 #[tokio::test]
 async fn adversarial_rapid_recompile_cycle() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -928,7 +908,7 @@ async fn adversarial_rapid_recompile_cycle() {
 /// Source file with spaces in the filename — path handling edge case.
 #[tokio::test]
 async fn adversarial_spaces_in_filename() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -977,7 +957,7 @@ async fn adversarial_spaces_in_filename() {
 /// source should succeed and BE cached.
 #[tokio::test]
 async fn adversarial_werror_vs_no_werror() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
@@ -1061,7 +1041,7 @@ async fn adversarial_werror_vs_no_werror() {
 /// Without the fix, this test would fail because clang++ rejects `-std=c11`.
 #[tokio::test]
 async fn compiler_override_uses_wrapped_compiler() {
-    let clangpp = match find_clang() {
+    let clangpp = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };

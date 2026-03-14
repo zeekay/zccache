@@ -5,6 +5,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod parse_archiver;
 pub mod response_file;
 
 use std::path::PathBuf;
@@ -102,6 +103,7 @@ const FLAGS_WITH_VALUE: &[&str] = &[
     "-I",
     "-isystem",
     "-include",
+    "-include-pch",
     "-isysroot",
     "-target",
     "--target",
@@ -371,6 +373,24 @@ mod tests {
                 assert!(c.cache_relevant_args.contains(&"-Wall".to_string()));
             }
             _ => panic!("expected cacheable"),
+        }
+    }
+
+    #[test]
+    fn include_pch_flag_with_value() {
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-c", "foo.cpp", "-include-pch", "pch.h.pch", "-o", "foo.o"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                // PCH flag and its value are both in cache_relevant_args
+                assert!(c.cache_relevant_args.contains(&"-include-pch".to_string()));
+                assert!(c.cache_relevant_args.contains(&"pch.h.pch".to_string()));
+                // PCH path is NOT treated as a source file
+                assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 

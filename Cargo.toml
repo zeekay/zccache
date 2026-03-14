@@ -13,10 +13,11 @@ members = [
     "crates/zccache-daemon",
     "crates/zccache-cli",
     "crates/zccache-test-support",
+    "crates/zccache-ci",
 ]
 
 [workspace.package]
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"

@@ -57,13 +57,13 @@ uv run python ci/build_dist.py --skip-build
 
 ## Hooks (enforced automatically)
 
-All hooks are Python scripts in `ci/hooks/`, invoked via `uv run`:
+Hooks are in `ci/hooks/` (Python) and `crates/zccache-ci` (Rust), invoked via `uv run`:
 
 - **PreToolUse**: `ci/hooks/tool_guard.py` blocks bare Rust commands (must use `uv run`) and bare `python`/`pip` (must use `uv`)
 - **PostToolUse**: `ci/hooks/lint.py` auto-formats + runs clippy on edited .rs files
 - **PostToolUse**: `ci/hooks/readme_guard.py` errors if directory lacks README.md
 - **SessionStart**: `ci/hooks/check-on-start.py` captures git fingerprint
-- **Stop**: `ci/hooks/check-on-stop.py` runs full workspace lint + tests (skips if no changes)
+- **Stop**: `zccache-ci` (Rust binary) runs lint + unit tests in parallel (skips if no changes)
 
 ## Language Policy
 

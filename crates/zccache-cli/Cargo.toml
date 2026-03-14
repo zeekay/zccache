@@ -13,6 +13,7 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
 zccache-core = { path = "../zccache-core" }
+zccache-compiler = { path = "../zccache-compiler" }
 zccache-protocol = { path = "../zccache-protocol" }
 zccache-ipc = { path = "../zccache-ipc" }
 

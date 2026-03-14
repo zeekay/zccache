@@ -142,6 +142,15 @@ pub fn parse_compile_args(args: &[String], cwd: &Path) -> ParsedArgs {
             continue;
         }
 
+        // -include-pch <file> (precompiled header — must come BEFORE -include)
+        if arg == "-include-pch" {
+            if let Some(next) = args.get(i + 1) {
+                result.force_includes.push(resolve_path(next, cwd));
+                i += 2;
+                continue;
+            }
+        }
+
         // -include <file> (force include)
         if arg == "-include" {
             if let Some(next) = args.get(i + 1) {
@@ -420,6 +429,34 @@ mod tests {
         let parsed =
             parse_compile_args(&args(&["-include", "pch.h", "-c", "x.c"]), Path::new("/p"));
         assert_eq!(parsed.force_includes, vec![Path::new("/p/pch.h")]);
+    }
+
+    #[test]
+    fn include_pch_parsed() {
+        let parsed = parse_compile_args(
+            &args(&["-c", "foo.cpp", "-include-pch", "pch.h.pch"]),
+            Path::new("/p"),
+        );
+        assert_eq!(parsed.force_includes, vec![Path::new("/p/pch.h.pch")]);
+    }
+
+    #[test]
+    fn include_pch_and_include_both_parsed() {
+        let parsed = parse_compile_args(
+            &args(&[
+                "-include-pch",
+                "pch.h.pch",
+                "-include",
+                "extra.h",
+                "-c",
+                "foo.cpp",
+            ]),
+            Path::new("/p"),
+        );
+        assert_eq!(
+            parsed.force_includes,
+            vec![Path::new("/p/pch.h.pch"), Path::new("/p/extra.h")]
+        );
     }
 
     #[test]

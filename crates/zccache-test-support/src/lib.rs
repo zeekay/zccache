@@ -5,6 +5,113 @@
 
 use std::path::{Path, PathBuf};
 
+// ─── Tool discovery ─────────────────────────────────────────────────────────
+
+/// Ensure the clang-tool-chain bin directory is on PATH, then find a tool by name.
+///
+/// The clang-tool-chain installs compilers under `~/.clang-tool-chain/clang/{platform}/{arch}/bin/`.
+/// This function prepends that directory to PATH (once per process) so that
+/// `find_on_path("clang++")`, `find_on_path("ar")`, etc. work generically
+/// without hardcoding platform-specific paths in every test file.
+pub fn ensure_clang_tool_chain_on_path() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        if let Some(bin_dir) = clang_tool_chain_bin_dir() {
+            if bin_dir.is_dir() {
+                // Prepend to PATH
+                let path_var = std::env::var_os("PATH").unwrap_or_default();
+                let mut paths = vec![bin_dir];
+                paths.extend(std::env::split_paths(&path_var));
+                let new_path = std::env::join_paths(paths).unwrap();
+                std::env::set_var("PATH", &new_path);
+            }
+        }
+    });
+}
+
+/// Returns the clang-tool-chain bin directory for the current platform, if it exists.
+fn clang_tool_chain_bin_dir() -> Option<PathBuf> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+
+    let (platform, arch) = if cfg!(target_os = "windows") {
+        (
+            "win",
+            if cfg!(target_arch = "aarch64") {
+                "aarch64"
+            } else {
+                "x86_64"
+            },
+        )
+    } else if cfg!(target_os = "macos") {
+        (
+            "darwin",
+            if cfg!(target_arch = "aarch64") {
+                "aarch64"
+            } else {
+                "x86_64"
+            },
+        )
+    } else {
+        (
+            "linux",
+            if cfg!(target_arch = "aarch64") {
+                "aarch64"
+            } else {
+                "x86_64"
+            },
+        )
+    };
+
+    let dir = PathBuf::from(home)
+        .join(".clang-tool-chain")
+        .join("clang")
+        .join(platform)
+        .join(arch)
+        .join("bin");
+
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// Find a tool binary on PATH. Returns None if not found.
+///
+/// Call [`ensure_clang_tool_chain_on_path`] first to make clang-tool-chain
+/// binaries discoverable.
+pub fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        // On Windows, also try with .exe suffix
+        #[cfg(windows)]
+        if std::path::Path::new(name).extension().is_none() {
+            let with_exe = dir.join(format!("{name}.exe"));
+            if with_exe.is_file() {
+                return Some(with_exe);
+            }
+        }
+    }
+    None
+}
+
+/// Find clang++ via clang-tool-chain + PATH. Convenience wrapper.
+///
+/// Ensures clang-tool-chain is on PATH, then searches for `clang++`.
+pub fn find_clang() -> Option<PathBuf> {
+    ensure_clang_tool_chain_on_path();
+    find_on_path("clang++")
+}
+
+// ─── Temp directories ───────────────────────────────────────────────────────
+
 /// Create a temporary directory for test artifacts.
 ///
 /// The directory and its contents are deleted when the returned

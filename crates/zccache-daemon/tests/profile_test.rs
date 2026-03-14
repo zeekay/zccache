@@ -2,7 +2,6 @@
 //!
 //! Run with: uv run cargo test -p zccache-daemon --test profile_test -- --nocapture --ignored
 
-use std::path::PathBuf;
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
@@ -17,19 +16,6 @@ type ClientConn = zccache_ipc::IpcClientConnection;
 const FILE_COUNT: usize = 20;
 const WARM_ITERATIONS: usize = 50;
 const HEADER_COUNT: usize = 10;
-
-// ─── Tool discovery ──────────────────────────────────────────────────────────
-
-fn find_clang() -> Option<PathBuf> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
-    let candidates = [
-        PathBuf::from(&home).join(".clang-tool-chain/clang/win/x86_64/bin/clang++.exe"),
-        PathBuf::from(&home).join(".clang-tool-chain/clang/darwin/x86_64/bin/clang++"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
-}
 
 // ─── Daemon helpers ──────────────────────────────────────────────────────────
 
@@ -215,7 +201,7 @@ fn print_profile(profile: &zccache_daemon::ProfileSnapshot) {
 #[tokio::test]
 #[ignore]
 async fn profile_compile_phases() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             println!("SKIP: clang not found at ~/.clang-tool-chain");

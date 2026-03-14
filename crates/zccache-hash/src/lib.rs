@@ -3,6 +3,7 @@
 //! Provides blake3-based content hashing and cache key computation.
 
 pub mod cache_key;
+pub mod link_cache_key;
 
 use std::io::Read;
 use std::path::Path;

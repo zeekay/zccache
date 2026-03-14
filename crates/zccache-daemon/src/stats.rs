@@ -26,6 +26,14 @@ pub struct StatsCollector {
     bytes_read: AtomicU64,
     /// Total artifact bytes stored into cache.
     bytes_written: AtomicU64,
+    /// Total link/archive requests.
+    link_total: AtomicU64,
+    /// Link cache hits.
+    link_hits: AtomicU64,
+    /// Link cache misses.
+    link_misses: AtomicU64,
+    /// Non-cacheable link invocations.
+    link_non_cacheable: AtomicU64,
 }
 
 /// Snapshot of current stats values.
@@ -41,6 +49,10 @@ pub struct StatsSnapshot {
     pub miss_time_us: u64,
     pub bytes_read: u64,
     pub bytes_written: u64,
+    pub link_total: u64,
+    pub link_hits: u64,
+    pub link_misses: u64,
+    pub link_non_cacheable: u64,
 }
 
 impl StatsSnapshot {
@@ -73,6 +85,10 @@ impl StatsCollector {
             miss_time_us: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
+            link_total: AtomicU64::new(0),
+            link_hits: AtomicU64::new(0),
+            link_misses: AtomicU64::new(0),
+            link_non_cacheable: AtomicU64::new(0),
         }
     }
 
@@ -111,6 +127,26 @@ impl StatsCollector {
         self.sessions_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a link/archive request.
+    pub fn record_link(&self) {
+        self.link_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a link cache hit.
+    pub fn record_link_hit(&self) {
+        self.link_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a link cache miss.
+    pub fn record_link_miss(&self) {
+        self.link_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a non-cacheable link invocation.
+    pub fn record_link_non_cacheable(&self) {
+        self.link_non_cacheable.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Reset all counters to zero.
     pub fn reset(&self) {
         self.compilations.store(0, Ordering::Relaxed);
@@ -123,6 +159,10 @@ impl StatsCollector {
         self.miss_time_us.store(0, Ordering::Relaxed);
         self.bytes_read.store(0, Ordering::Relaxed);
         self.bytes_written.store(0, Ordering::Relaxed);
+        self.link_total.store(0, Ordering::Relaxed);
+        self.link_hits.store(0, Ordering::Relaxed);
+        self.link_misses.store(0, Ordering::Relaxed);
+        self.link_non_cacheable.store(0, Ordering::Relaxed);
     }
 
     /// Take a consistent snapshot of all counters.
@@ -139,6 +179,10 @@ impl StatsCollector {
             miss_time_us: self.miss_time_us.load(Ordering::Relaxed),
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
             bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            link_total: self.link_total.load(Ordering::Relaxed),
+            link_hits: self.link_hits.load(Ordering::Relaxed),
+            link_misses: self.link_misses.load(Ordering::Relaxed),
+            link_non_cacheable: self.link_non_cacheable.load(Ordering::Relaxed),
         }
     }
 }
@@ -460,6 +504,10 @@ mod tests {
                 miss_time_us: 0,
                 bytes_read: 0,
                 bytes_written: 0,
+                link_total: 0,
+                link_hits: 0,
+                link_misses: 0,
+                link_non_cacheable: 0,
             }
         );
     }

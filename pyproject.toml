@@ -1,6 +1,6 @@
 [project]
 name = "zccache"
-version = "1.0.3"
+version = "1.0.4"
 description = "A high-performance local compiler cache daemon"
 requires-python = ">=3.9"
 dependencies = []
@@ -12,6 +12,7 @@ rustfmt = "ci.trampoline:rustfmt"
 clippy-driver = "ci.trampoline:clippy_driver"
 run_zccache = "ci.trampoline:run_zccache"
 run_zccache_daemon = "ci.trampoline:run_zccache_daemon"
+check_on_stop = "ci.trampoline:check_on_stop"
 
 [build-system]
 requires = ["setuptools>=64"]

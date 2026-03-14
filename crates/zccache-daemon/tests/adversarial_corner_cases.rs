@@ -24,24 +24,6 @@ type ClientConn = zccache_ipc::IpcClientConnection;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn find_clang() -> Option<PathBuf> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
-    let clang_path = PathBuf::from(&home)
-        .join(".clang-tool-chain")
-        .join("clang")
-        .join("win")
-        .join("x86_64")
-        .join("bin")
-        .join("clang++.exe");
-    if clang_path.exists() {
-        Some(clang_path)
-    } else {
-        None
-    }
-}
-
 async fn start_daemon() -> (String, JoinHandle<()>, Arc<Notify>) {
     let endpoint = zccache_ipc::unique_test_endpoint();
     let mut server = DaemonServer::bind(&endpoint).unwrap();
@@ -125,7 +107,7 @@ struct TestHarness {
 
 impl TestHarness {
     async fn new() -> Option<Self> {
-        let clang = find_clang()?;
+        let clang = zccache_test_support::find_clang()?;
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("log.txt");
         let cwd = tmp.path().to_string_lossy().into_owned();
@@ -266,7 +248,7 @@ async fn corner_syntax_error_not_cached() {
 /// recompile → should hit cache.
 #[tokio::test]
 async fn corner_cache_survives_session_restart() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(c) => c,
         None => return,
     };
@@ -341,7 +323,7 @@ async fn corner_cache_survives_session_restart() {
 /// (depending on timing), but ALL must produce identical, valid .o files.
 #[tokio::test]
 async fn corner_thundering_herd_same_file() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(c) => c,
         None => return,
     };
@@ -427,7 +409,7 @@ async fn corner_thundering_herd_same_file() {
 /// Thundering herd after cache is warm: all sessions should hit.
 #[tokio::test]
 async fn corner_thundering_herd_all_warm() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(c) => c,
         None => return,
     };

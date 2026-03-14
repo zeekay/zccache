@@ -644,6 +644,111 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // rescan_all: Low entries promoted if filesystem matches
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn rescan_all_promotes_matching_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = create_file(&dir, "stable.c", "unchanged");
+
+        let cache = MetadataCache::new();
+        cache.lookup(&path).unwrap();
+
+        // Simulate overflow: downgrade to Low.
+        cache.downgrade_all();
+        assert_eq!(cache.get(&path).unwrap().confidence, Confidence::Low);
+
+        // Rescan: file unchanged → promoted back to High.
+        let promoted = cache.rescan_all();
+        assert_eq!(promoted, 1);
+        assert_eq!(cache.get(&path).unwrap().confidence, Confidence::High);
+    }
+
+    #[test]
+    fn rescan_all_leaves_changed_entries_low() {
+        let dir = TempDir::new().unwrap();
+        let path = create_file(&dir, "changed.c", "v1");
+
+        let cache = MetadataCache::new();
+        cache.lookup(&path).unwrap();
+        cache.downgrade_all();
+
+        sleep_for_mtime();
+        fs::write(&path, "v2 longer content").unwrap();
+
+        let promoted = cache.rescan_all();
+        assert_eq!(promoted, 0);
+        assert_eq!(cache.get(&path).unwrap().confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn rescan_all_skips_high_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = create_file(&dir, "high.c", "content");
+
+        let cache = MetadataCache::new();
+        cache.lookup(&path).unwrap();
+
+        // Entry is High — rescan should not count it.
+        let promoted = cache.rescan_all();
+        assert_eq!(promoted, 0);
+    }
+
+    #[test]
+    fn rescan_all_handles_removed_files() {
+        let dir = TempDir::new().unwrap();
+        let path = create_file(&dir, "gone.c", "bye");
+
+        let cache = MetadataCache::new();
+        cache.lookup(&path).unwrap();
+        cache.downgrade_all();
+
+        fs::remove_file(&path).unwrap();
+
+        let promoted = cache.rescan_all();
+        assert_eq!(promoted, 0);
+        assert_eq!(cache.get(&path).unwrap().confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn rescan_all_mixed_entries() {
+        let dir = TempDir::new().unwrap();
+        let path_unchanged = create_file(&dir, "same.c", "same");
+        let path_changed = create_file(&dir, "diff.c", "old");
+        let path_gone = create_file(&dir, "gone.c", "bye");
+
+        let cache = MetadataCache::new();
+        cache.lookup(&path_unchanged).unwrap();
+        cache.lookup(&path_changed).unwrap();
+        cache.lookup(&path_gone).unwrap();
+
+        cache.downgrade_all();
+
+        sleep_for_mtime();
+        fs::write(&path_changed, "new content").unwrap();
+        fs::remove_file(&path_gone).unwrap();
+
+        let promoted = cache.rescan_all();
+        assert_eq!(promoted, 1); // only path_unchanged
+        assert_eq!(
+            cache.get(&path_unchanged).unwrap().confidence,
+            Confidence::High
+        );
+        assert_eq!(
+            cache.get(&path_changed).unwrap().confidence,
+            Confidence::Low
+        );
+        assert_eq!(cache.get(&path_gone).unwrap().confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn rescan_all_empty_cache() {
+        let cache = MetadataCache::new();
+        assert_eq!(cache.rescan_all(), 0);
+    }
+
+    // ---------------------------------------------------------------
     // lookup: High confidence with cached hash returns it directly
     // ---------------------------------------------------------------
 

@@ -27,35 +27,6 @@ async fn start_daemon() -> (
     (endpoint, handle, shutdown)
 }
 
-fn find_compiler() -> Option<PathBuf> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
-    let custom = PathBuf::from(&home)
-        .join(".clang-tool-chain")
-        .join("clang")
-        .join("win")
-        .join("x86_64")
-        .join("bin")
-        .join("clang++.exe");
-    if custom.exists() {
-        return Some(custom);
-    }
-
-    let system = PathBuf::from("C:/Program Files/LLVM/bin/clang++.exe");
-    if system.exists() {
-        return Some(system);
-    }
-
-    if let Ok(output) = std::process::Command::new("g++").arg("--version").output() {
-        if output.status.success() {
-            return Some(PathBuf::from("g++"));
-        }
-    }
-
-    None
-}
-
 fn find_sccache() -> Option<PathBuf> {
     for path in &["sccache", "C:/tools/python13/Scripts/sccache.exe"] {
         let p = PathBuf::from(path);
@@ -362,7 +333,7 @@ fn print_speedup(label: &str, baseline: Duration, test: Duration) {
 #[tokio::test]
 #[ignore] // Run explicitly: uv run cargo test -p zccache-daemon --test perf_bench_test -- --nocapture --ignored
 async fn perf_warm_cache_zccache_vs_sccache() {
-    let compiler_path = match find_compiler() {
+    let compiler_path = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("SKIP: no C++ compiler found");

@@ -13,12 +13,14 @@
 
 pub mod ignore;
 pub mod notify_watcher;
+pub mod recovery;
 pub mod settle;
 
 use std::path::PathBuf;
 
 pub use ignore::IgnoreFilter;
 pub use notify_watcher::NotifyWatcher;
+pub use recovery::OverflowRecovery;
 pub use settle::{SettleBuffer, SettledEvent};
 
 /// Events produced by the file watcher.

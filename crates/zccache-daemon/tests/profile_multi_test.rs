@@ -2,7 +2,6 @@
 //!
 //! Run: uv run cargo test -p zccache-daemon --test profile_multi_test -- --nocapture --ignored
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use zccache_daemon::DaemonServer;
@@ -10,32 +9,6 @@ use zccache_protocol::{Request, Response};
 
 const NUM_FILES: usize = 50;
 const WARM_ITERS: usize = 10;
-
-fn find_compiler() -> Option<PathBuf> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
-    let custom = PathBuf::from(&home)
-        .join(".clang-tool-chain")
-        .join("clang")
-        .join("win")
-        .join("x86_64")
-        .join("bin")
-        .join("clang++.exe");
-    if custom.exists() {
-        return Some(custom);
-    }
-    let system = PathBuf::from("C:/Program Files/LLVM/bin/clang++.exe");
-    if system.exists() {
-        return Some(system);
-    }
-    if let Ok(output) = std::process::Command::new("g++").arg("--version").output() {
-        if output.status.success() {
-            return Some(PathBuf::from("g++"));
-        }
-    }
-    None
-}
 
 fn generate_project(dir: &std::path::Path) {
     let incdir = dir.join("include");
@@ -76,7 +49,7 @@ fn clean_objects(dir: &std::path::Path) {
 #[tokio::test]
 #[ignore]
 async fn profile_multi_file_warm_path() {
-    let compiler_path = match find_compiler() {
+    let compiler_path = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("SKIP: no C++ compiler found");

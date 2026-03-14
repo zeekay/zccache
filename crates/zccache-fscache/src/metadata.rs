@@ -89,6 +89,32 @@ impl MetadataCache {
         }
     }
 
+    /// Re-stat all Low-confidence entries and promote those whose
+    /// filesystem metadata `(mtime, size)` still matches.
+    ///
+    /// Designed for overflow recovery: after a watcher overflow downgrades
+    /// everything to Low, this method cheaply restores High confidence for
+    /// files that haven't actually changed — avoiding unnecessary re-hashing
+    /// on subsequent lookups.
+    ///
+    /// Returns the number of entries promoted back to High confidence.
+    pub fn rescan_all(&self) -> usize {
+        let mut promoted = 0;
+        for mut entry in self.entries.iter_mut() {
+            if entry.confidence != Confidence::Low {
+                continue;
+            }
+            if let Ok(fresh) = Self::stat_file(entry.key()) {
+                if fresh.mtime == entry.mtime && fresh.size == entry.size {
+                    entry.confidence = Confidence::High;
+                    entry.last_verified = Instant::now();
+                    promoted += 1;
+                }
+            }
+        }
+        promoted
+    }
+
     /// Remove a path from the cache.
     pub fn remove(&self, path: &Path) {
         self.entries.remove(path);

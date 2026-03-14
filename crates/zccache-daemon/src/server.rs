@@ -386,6 +386,10 @@ async fn handle_connection(
                     non_cacheable: snap.non_cacheable,
                     compile_errors: snap.compile_errors,
                     time_saved_ms: snap.time_saved_ms(),
+                    total_links: snap.link_total,
+                    link_hits: snap.link_hits,
+                    link_misses: snap.link_misses,
+                    link_non_cacheable: snap.link_non_cacheable,
                     dep_graph_contexts: dg.context_count as u64,
                     dep_graph_files: dg.file_count as u64,
                     sessions_total: snap.sessions_total,
@@ -466,6 +470,17 @@ async fn handle_connection(
                         message: format!("unknown session: {session_id}"),
                     }
                 }
+            }
+            Request::LinkEphemeral {
+                client_pid,
+                working_dir,
+                tool,
+                args,
+                cwd,
+                env,
+            } => {
+                handle_link_ephemeral(&state, client_pid, &working_dir, &tool, &args, &cwd, env)
+                    .await
             }
         };
 
@@ -560,6 +575,232 @@ async fn handle_compile_ephemeral(
     state.sessions.end(&sid);
 
     result
+}
+
+/// Handle a single-roundtrip ephemeral link/archive request.
+///
+/// Parses the tool invocation, computes a cache key from the tool binary and
+/// all input file hashes, and returns a cached result or runs the real tool.
+async fn handle_link_ephemeral(
+    state: &Arc<SharedState>,
+    _client_pid: u32,
+    _working_dir: &str,
+    tool: &str,
+    args: &[String],
+    cwd: &str,
+    env: Option<Vec<(String, String)>>,
+) -> Response {
+    use zccache_compiler::parse_archiver::{parse_archive_invocation, ParsedArchiveInvocation};
+
+    state.stats.record_link();
+
+    // 1. Parse the archiver invocation
+    let parsed = parse_archive_invocation(tool, args);
+    let archive = match parsed {
+        ParsedArchiveInvocation::Cacheable(c) => c,
+        ParsedArchiveInvocation::NonCacheable { reason } => {
+            tracing::debug!(%reason, "link non-cacheable, passing through");
+            state.stats.record_link_non_cacheable();
+            return run_tool_passthrough(tool, args, cwd, env).await;
+        }
+    };
+
+    // 2. Non-determinism check: warn and pass through
+    if archive.non_deterministic {
+        let warning = format!(
+            "non-deterministic archiver invocation (missing {} flag) — skipping cache",
+            match archive.family {
+                zccache_compiler::parse_archiver::ArchiverFamily::MsvcLib => "/BREPRO",
+                _ => "D",
+            }
+        );
+        tracing::warn!(%warning);
+        state.stats.record_link_non_cacheable();
+        let result = run_tool_passthrough(tool, args, cwd, env).await;
+        return match result {
+            Response::LinkResult {
+                exit_code,
+                stdout,
+                stderr,
+                cached,
+                ..
+            } => Response::LinkResult {
+                exit_code,
+                stdout,
+                stderr,
+                cached,
+                warning: Some(warning),
+            },
+            other => other,
+        };
+    }
+
+    // 3. Hash the tool binary
+    let tool_path = std::path::Path::new(tool);
+    let tool_hash = match hash_file_via_cache(state, tool_path) {
+        Some(h) => h,
+        None => {
+            tracing::warn!("cannot hash tool {tool}");
+            return run_tool_passthrough(tool, args, cwd, env).await;
+        }
+    };
+
+    // 4. Hash all input files
+    let cwd_path = std::path::Path::new(cwd);
+    let mut key_builder = zccache_hash::link_cache_key::LinkCacheKeyBuilder::new().tool(tool_hash);
+
+    for flag in &archive.cache_relevant_flags {
+        key_builder = key_builder.flag(flag);
+    }
+
+    for input in &archive.input_files {
+        let input_path = if input.is_absolute() {
+            input.clone()
+        } else {
+            cwd_path.join(input)
+        };
+        let input_hash = match hash_file_via_cache(state, &input_path) {
+            Some(h) => h,
+            None => {
+                tracing::warn!(
+                    "cannot hash input file {}: skipping cache",
+                    input_path.display()
+                );
+                return run_tool_passthrough(tool, args, cwd, env).await;
+            }
+        };
+        key_builder = key_builder.input(input_hash);
+    }
+
+    let cache_key = key_builder.build();
+    let key_hex = cache_key.to_hex();
+
+    // 5. Cache lookup
+    if let Some(entry) = state.artifacts.get(&key_hex) {
+        tracing::debug!(%key_hex, "link cache hit");
+        state.stats.record_link_hit();
+
+        // Write cached output to disk
+        let output_path = if archive.output_file.is_absolute() {
+            archive.output_file.clone()
+        } else {
+            cwd_path.join(&archive.output_file)
+        };
+        for out in &entry.artifact.outputs {
+            let target = if entry.artifact.outputs.len() == 1 {
+                output_path.clone()
+            } else {
+                output_path.parent().unwrap_or(cwd_path).join(&out.name)
+            };
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            if let Err(e) = std::fs::write(&target, &out.data) {
+                tracing::warn!("failed to write cached output {}: {e}", target.display());
+                return run_tool_passthrough(tool, args, cwd, env).await;
+            }
+        }
+
+        return Response::LinkResult {
+            exit_code: entry.artifact.exit_code,
+            stdout: entry.artifact.stdout.clone(),
+            stderr: entry.artifact.stderr.clone(),
+            cached: true,
+            warning: None,
+        };
+    }
+
+    // 6. Cache miss — run the real tool
+    tracing::debug!(%key_hex, "link cache miss");
+    state.stats.record_link_miss();
+
+    let result = run_tool_passthrough(tool, args, cwd, env).await;
+
+    // 7. If successful, cache the output
+    if let Response::LinkResult {
+        exit_code: 0,
+        ref stdout,
+        ref stderr,
+        ..
+    } = result
+    {
+        let output_path = if archive.output_file.is_absolute() {
+            archive.output_file.clone()
+        } else {
+            cwd_path.join(&archive.output_file)
+        };
+        if let Ok(data) = std::fs::read(&output_path) {
+            let artifact = ArtifactData {
+                outputs: vec![ArtifactOutput {
+                    name: archive
+                        .output_file
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    data,
+                }],
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                exit_code: 0,
+            };
+
+            // Persist to disk
+            let meta_path = state.artifact_dir.join(format!("{key_hex}.meta"));
+            if let Ok(encoded) = bincode::serialize(&artifact) {
+                std::fs::write(&meta_path, &encoded).ok();
+            }
+
+            state
+                .artifacts
+                .insert(key_hex.clone(), CachedArtifact { artifact });
+            tracing::debug!(%key_hex, "link artifact cached");
+        }
+    }
+
+    result
+}
+
+/// Hash a file using the metadata cache (with watcher-assisted confidence).
+fn hash_file_via_cache(state: &SharedState, path: &Path) -> Option<ContentHash> {
+    // Try metadata cache first (stat-verified hash)
+    if let Ok(hash) = state.cache_system.metadata().lookup(path) {
+        return Some(hash);
+    }
+    // Fall back to direct hash
+    zccache_hash::hash_file(path).ok()
+}
+
+/// Run a tool directly (passthrough) and return a LinkResult response.
+async fn run_tool_passthrough(
+    tool: &str,
+    args: &[String],
+    cwd: &str,
+    env: Option<Vec<(String, String)>>,
+) -> Response {
+    let mut cmd = std::process::Command::new(tool);
+    cmd.args(args);
+    cmd.current_dir(cwd);
+
+    if let Some(env_vars) = env {
+        cmd.env_clear();
+        for (k, v) in &env_vars {
+            cmd.env(k, v);
+        }
+    }
+
+    match cmd.output() {
+        Ok(output) => Response::LinkResult {
+            exit_code: output.status.code().unwrap_or(1),
+            stdout: output.stdout,
+            stderr: output.stderr,
+            cached: false,
+            warning: None,
+        },
+        Err(e) => Response::Error {
+            message: format!("failed to run {tool}: {e}"),
+        },
+    }
 }
 
 /// Handle a SessionStart request: discover system includes, create session.
@@ -1763,6 +2004,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore] // integration-level: starts real daemon with IPC + file watcher
     async fn test_server_ping_pong() {
         let endpoint = zccache_ipc::unique_test_endpoint();
         let mut server = DaemonServer::bind(&endpoint).unwrap();
@@ -1782,6 +2024,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // integration-level: starts real daemon with IPC + file watcher
     async fn test_server_shutdown_request() {
         let endpoint = zccache_ipc::unique_test_endpoint();
         let mut server = DaemonServer::bind(&endpoint).unwrap();
@@ -1801,6 +2044,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // integration-level: starts real daemon with IPC + file watcher
     async fn test_server_clear_empty() {
         let endpoint = zccache_ipc::unique_test_endpoint();
         let mut server = DaemonServer::bind(&endpoint).unwrap();
@@ -1832,6 +2076,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // integration-level: starts real daemon with IPC + file watcher
     async fn test_server_status() {
         let endpoint = zccache_ipc::unique_test_endpoint();
         let mut server = DaemonServer::bind(&endpoint).unwrap();

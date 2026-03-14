@@ -136,6 +136,16 @@ impl CacheSystem {
         self.journal.mark_overflow()
     }
 
+    /// Re-verify all cached entries after an overflow.
+    ///
+    /// Stats each Low-confidence entry and promotes it back to High
+    /// if the filesystem metadata still matches. Does NOT re-hash.
+    ///
+    /// Returns the number of entries promoted.
+    pub fn rescan_entries(&self) -> usize {
+        self.metadata.rescan_all()
+    }
+
     /// Clear all cached metadata and journal state.
     ///
     /// Returns the new overflow clock (all pre-clear clocks are invalidated).
@@ -404,6 +414,34 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn rescan_entries_after_overflow() {
+        let dir = TempDir::new().unwrap();
+        let path_a = create_file(&dir, "a.h", "aaa");
+        let path_b = create_file(&dir, "b.h", "bbb");
+
+        let cache = CacheSystem::new();
+        cache.lookup_since(&path_a, Clock::ZERO).unwrap();
+        cache.lookup_since(&path_b, Clock::ZERO).unwrap();
+
+        cache.apply_overflow();
+        assert_eq!(
+            cache.metadata().get(&path_a).unwrap().confidence,
+            Confidence::Low
+        );
+
+        let promoted = cache.rescan_entries();
+        assert_eq!(promoted, 2);
+        assert_eq!(
+            cache.metadata().get(&path_a).unwrap().confidence,
+            Confidence::High
+        );
+        assert_eq!(
+            cache.metadata().get(&path_b).unwrap().confidence,
+            Confidence::High
+        );
     }
 
     #[test]

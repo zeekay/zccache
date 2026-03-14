@@ -22,24 +22,6 @@ type ClientConn = zccache_ipc::IpcClientConnection;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn find_clang() -> Option<PathBuf> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
-    let clang_path = PathBuf::from(&home)
-        .join(".clang-tool-chain")
-        .join("clang")
-        .join("win")
-        .join("x86_64")
-        .join("bin")
-        .join("clang++.exe");
-    if clang_path.exists() {
-        Some(clang_path)
-    } else {
-        None
-    }
-}
-
 async fn start_daemon() -> (
     String,
     tokio::task::JoinHandle<()>,
@@ -129,7 +111,7 @@ struct TestHarness {
 
 impl TestHarness {
     async fn new() -> Option<Self> {
-        let clang = find_clang()?;
+        let clang = zccache_test_support::find_clang()?;
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("log.txt");
         let cwd = tmp.path().to_string_lossy().into_owned();

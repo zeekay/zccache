@@ -24,24 +24,6 @@ use zccache_test_support::{MesonProject, TestProject};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn find_clang() -> Option<PathBuf> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
-    let clang_path = PathBuf::from(&home)
-        .join(".clang-tool-chain")
-        .join("clang")
-        .join("win")
-        .join("x86_64")
-        .join("bin")
-        .join("clang++.exe");
-    if clang_path.exists() {
-        Some(clang_path)
-    } else {
-        None
-    }
-}
-
 fn find_cli_binary() -> PathBuf {
     let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_zccache-daemon"))
         .parent()
@@ -235,7 +217,7 @@ async fn build_all_ipc(
 ///   4. Verify output bytes are identical
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ninja_cold_then_warm_rebuild_cli() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("skipping: clang not found");
@@ -327,7 +309,7 @@ async fn ninja_cold_then_warm_rebuild_cli() {
 /// Cold build → warm rebuild via IPC session mode (no CLI binary needed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ninja_cold_then_warm_rebuild_ipc() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("skipping: clang not found");
@@ -392,7 +374,7 @@ async fn ninja_cold_then_warm_rebuild_ipc() {
 /// Persistent artifact test: cold build → verify .meta files on disk → restart → verify loaded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ninja_persistent_artifacts_survive_restart() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("skipping: clang not found");
@@ -473,7 +455,7 @@ async fn ninja_persistent_artifacts_survive_restart() {
 /// Header modification invalidates cache for all files that include it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ninja_header_change_invalidates_dependents() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("skipping: clang not found");
@@ -524,7 +506,7 @@ async fn ninja_header_change_invalidates_dependents() {
 /// Concurrent compilation: multiple files compiled "simultaneously" via IPC.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ninja_concurrent_cold_build() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("skipping: clang not found");
@@ -632,7 +614,7 @@ async fn ninja_concurrent_cold_build() {
 /// `zccache clear` resets the cache, forcing cold misses on next build.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ninja_clear_forces_cold_rebuild() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("skipping: clang not found");
@@ -696,7 +678,7 @@ async fn ninja_clear_forces_cold_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn stress_large_project_cold_warm() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("skipping: clang not found");
@@ -787,7 +769,7 @@ async fn stress_large_project_cold_warm() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn bench_medium_project_warm_iterations() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("skipping: clang not found");
@@ -900,7 +882,7 @@ fn find_ninja() -> Option<PathBuf> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn meson_ninja_cold_then_warm_rebuild() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("skipping: clang not found");
@@ -1015,7 +997,7 @@ async fn meson_ninja_cold_then_warm_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn meson_ninja_bench_warm_iterations() {
-    let clang = match find_clang() {
+    let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => {
             eprintln!("skipping: clang not found");

@@ -74,6 +74,7 @@ fn stop_daemon_and_wait(bin: &std::path::Path) {
 /// Before the fix, this test would hang indefinitely because the daemon
 /// inherited the pipe handles and never closed them.
 #[test]
+#[ignore] // Integration test — starts a real daemon. Run with `test --full`.
 fn start_completes_with_captured_pipes() {
     let bin = zccache_bin();
     stop_daemon_and_wait(&bin);
@@ -111,6 +112,7 @@ fn start_completes_with_captured_pipes() {
 /// the daemon simultaneously, they should all succeed (one spawns, others
 /// connect to the already-started daemon).
 #[test]
+#[ignore] // Integration test — starts a real daemon. Run with `test --full`.
 fn concurrent_starts_all_complete() {
     let bin = zccache_bin();
     stop_daemon_and_wait(&bin);

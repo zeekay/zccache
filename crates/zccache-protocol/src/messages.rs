@@ -78,6 +78,22 @@ pub enum Request {
         /// Client environment variables to pass to the compiler process.
         env: Option<Vec<(String, String)>>,
     },
+    /// Single-roundtrip ephemeral link/archive: used for `zccache ar ...` or
+    /// `zccache ld ...` in drop-in wrapper mode.
+    LinkEphemeral {
+        /// Client process ID.
+        client_pid: u32,
+        /// Client working directory.
+        working_dir: String,
+        /// Path to the linker/archiver tool (ar, ld, lib.exe, link.exe, etc.).
+        tool: String,
+        /// Tool arguments (e.g., ["rcs", "libfoo.a", "a.o", "b.o"]).
+        args: Vec<String>,
+        /// Working directory for the link operation.
+        cwd: String,
+        /// Client environment variables.
+        env: Option<Vec<(String, String)>>,
+    },
 }
 
 /// A response from daemon to client.
@@ -115,6 +131,19 @@ pub enum Response {
     SessionEnded {
         /// Per-session stats, if the session opted in to tracking.
         stats: Option<SessionStats>,
+    },
+    /// Result of a link/archive request.
+    LinkResult {
+        /// Tool exit code.
+        exit_code: i32,
+        /// Captured stdout.
+        stdout: Vec<u8>,
+        /// Captured stderr.
+        stderr: Vec<u8>,
+        /// Whether this was served from cache.
+        cached: bool,
+        /// Non-determinism warning (if tool invocation uses non-deterministic flags).
+        warning: Option<String>,
     },
     /// An error occurred processing the request.
     Error {
@@ -157,6 +186,14 @@ pub struct DaemonStatus {
     pub compile_errors: u64,
     /// Estimated wall-clock time saved in milliseconds.
     pub time_saved_ms: u64,
+    /// Total link/archive requests received.
+    pub total_links: u64,
+    /// Link cache hits.
+    pub link_hits: u64,
+    /// Link cache misses.
+    pub link_misses: u64,
+    /// Non-cacheable link invocations.
+    pub link_non_cacheable: u64,
     /// Number of compilation contexts in the dependency graph.
     pub dep_graph_contexts: u64,
     /// Number of tracked files in the dependency graph.
@@ -297,6 +334,10 @@ mod tests {
             non_cacheable: 15,
             compile_errors: 3,
             time_saved_ms: 750_000,
+            total_links: 50,
+            link_hits: 38,
+            link_misses: 10,
+            link_non_cacheable: 2,
             dep_graph_contexts: 892,
             dep_graph_files: 4201,
             sessions_total: 41,
@@ -381,6 +422,44 @@ mod tests {
             args: vec![],
             cwd: ".".to_string(),
             env: None,
+        });
+    }
+
+    #[test]
+    fn link_ephemeral_roundtrip() {
+        roundtrip(&Request::LinkEphemeral {
+            client_pid: 5555,
+            working_dir: "/home/user/project".to_string(),
+            tool: "/usr/bin/ar".to_string(),
+            args: vec!["rcs".into(), "libfoo.a".into(), "a.o".into(), "b.o".into()],
+            cwd: "/home/user/project/build".to_string(),
+            env: Some(vec![("PATH".into(), "/usr/bin".into())]),
+        });
+        roundtrip(&Request::LinkEphemeral {
+            client_pid: 1,
+            working_dir: ".".to_string(),
+            tool: "lib.exe".to_string(),
+            args: vec!["/OUT:foo.lib".into(), "a.obj".into()],
+            cwd: ".".to_string(),
+            env: None,
+        });
+    }
+
+    #[test]
+    fn link_result_roundtrip() {
+        roundtrip(&Response::LinkResult {
+            exit_code: 0,
+            stdout: vec![],
+            stderr: vec![],
+            cached: true,
+            warning: None,
+        });
+        roundtrip(&Response::LinkResult {
+            exit_code: 0,
+            stdout: vec![],
+            stderr: b"some warning".to_vec(),
+            cached: false,
+            warning: Some("non-deterministic: missing D flag".into()),
         });
     }
 

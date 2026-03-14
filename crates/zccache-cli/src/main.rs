@@ -254,6 +254,21 @@ async fn cmd_status(endpoint: &str) -> ExitCode {
             );
             println!("  Metadata:      {} entries", s.metadata_entries);
             println!();
+            if s.total_links > 0 {
+                println!();
+                let link_total = s.link_hits + s.link_misses;
+                let link_hit_rate = if link_total > 0 {
+                    format!("{:.1}%", s.link_hits as f64 / link_total as f64 * 100.0)
+                } else {
+                    "n/a".to_string()
+                };
+                println!(
+                    "  Links:         {} total ({} cached, {} cold, {} non-cacheable)",
+                    s.total_links, s.link_hits, s.link_misses, s.link_non_cacheable
+                );
+                println!("  Link hit rate: {link_hit_rate}");
+            }
+            println!();
             println!(
                 "  Sessions:      {} active / {} total",
                 s.sessions_active, s.sessions_total
@@ -458,23 +473,26 @@ fn cmd_crashes(clear: bool) -> ExitCode {
 
 // ─── Wrap (compiler wrapper) ───────────────────────────────────────────────
 
-/// Wrap a compiler invocation.
+/// Wrap a compiler or tool invocation.
 ///
-/// `args` is the full compiler command: ["clang++", "-c", "foo.cpp", "-o", "foo.o"]
+/// `args` is the full command: ["clang++", "-c", "foo.cpp", "-o", "foo.o"]
+/// or ["ar", "rcs", "libfoo.a", "a.o", "b.o"]
 ///
-/// If ZCCACHE_SESSION_ID is set, uses that session and sends the compiler
-/// as a per-request override. If unset, auto-creates an ephemeral session
-/// for this single compilation (drop-in mode).
+/// If the first arg is a known archiver (ar, llvm-ar, lib.exe), routes to
+/// the link/archive path. Otherwise, routes to the compile path.
+///
+/// If ZCCACHE_SESSION_ID is set, uses that session and sends the tool
+/// as a per-request override. If unset, auto-creates an ephemeral session.
 fn run_wrap(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: zccache <compiler> <args...>");
+        eprintln!("usage: zccache <compiler|tool> <args...>");
         return ExitCode::FAILURE;
     }
 
     // Normalize MSYS paths (e.g. /c/Users/... → C:\Users\...) on Windows,
     // then resolve to an absolute path so the daemon can find it.
-    let wrapped_compiler = resolve_compiler_path(&args[0]);
-    let compiler_args: Vec<String> = if args.len() > 1 {
+    let wrapped_tool = resolve_compiler_path(&args[0]);
+    let tool_args: Vec<String> = if args.len() > 1 {
         args[1..].to_vec()
     } else {
         Vec::new()
@@ -485,19 +503,29 @@ fn run_wrap(args: &[String]) -> ExitCode {
         .to_string_lossy()
         .into_owned();
 
-    // Capture the client's environment for the daemon to pass to the compiler.
     let client_env: Vec<(String, String)> = std::env::vars().collect();
-
     let endpoint = resolve_endpoint(None);
 
+    // Check if this is an archiver tool
+    if zccache_compiler::parse_archiver::is_archiver(&args[0]) {
+        return run_async(cmd_link_ephemeral(
+            &endpoint,
+            &wrapped_tool,
+            tool_args,
+            cwd,
+            client_env,
+        ));
+    }
+
+    // Otherwise, treat as a compiler invocation
     match std::env::var("ZCCACHE_SESSION_ID") {
         Ok(val) => match val.parse::<u64>() {
             Ok(session_id) => run_async(cmd_compile(
                 &endpoint,
                 session_id,
-                compiler_args,
+                tool_args,
                 cwd,
-                Some(wrapped_compiler),
+                Some(wrapped_tool),
                 client_env,
             )),
             Err(_) => {
@@ -509,8 +537,8 @@ fn run_wrap(args: &[String]) -> ExitCode {
             // No session — auto-create an ephemeral one for this compilation.
             run_async(cmd_compile_ephemeral(
                 &endpoint,
-                &wrapped_compiler,
-                compiler_args,
+                &wrapped_tool,
+                tool_args,
                 cwd,
                 client_env,
             ))
@@ -637,6 +665,69 @@ async fn cmd_compile_ephemeral(
             use std::io::Write;
             let _ = std::io::stdout().write_all(&stdout);
             let _ = std::io::stderr().write_all(&stderr);
+            ExitCode::from(exit_code as u8)
+        }
+        Some(zccache_protocol::Response::Error { message }) => {
+            eprintln!("zccache error: {message}");
+            ExitCode::FAILURE
+        }
+        other => {
+            eprintln!("unexpected response: {other:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Ephemeral link/archive: single-roundtrip for `zccache ar ...` etc.
+async fn cmd_link_ephemeral(
+    endpoint: &str,
+    tool: &str,
+    args: Vec<String>,
+    cwd: String,
+    client_env: Vec<(String, String)>,
+) -> ExitCode {
+    let mut conn = match connect(endpoint).await {
+        Ok(c) => c,
+        Err(_) => {
+            if let Err(e) = ensure_daemon(endpoint).await {
+                eprintln!("cannot start daemon at {endpoint}: {e}");
+                return ExitCode::FAILURE;
+            }
+            match connect(endpoint).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("cannot connect to daemon at {endpoint}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+
+    conn.send(&zccache_protocol::Request::LinkEphemeral {
+        client_pid: std::process::id(),
+        working_dir: cwd.clone(),
+        tool: tool.to_string(),
+        args,
+        cwd,
+        env: Some(client_env),
+    })
+    .await
+    .unwrap();
+
+    match conn.recv().await.unwrap() {
+        Some(zccache_protocol::Response::LinkResult {
+            exit_code,
+            stdout,
+            stderr,
+            warning,
+            ..
+        }) => {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(&stdout);
+            let _ = std::io::stderr().write_all(&stderr);
+            if let Some(w) = warning {
+                eprintln!("zccache warning: {w}");
+            }
             ExitCode::from(exit_code as u8)
         }
         Some(zccache_protocol::Response::Error { message }) => {
