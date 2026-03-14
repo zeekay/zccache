@@ -991,10 +991,25 @@ fn build_compile_context(
     cwd: &Path,
     system_includes: &[PathBuf],
 ) -> (CompileContext, UserDepFlags) {
-    // Parse the original args through depgraph's parser to get structured search paths
-    let parsed = zccache_depgraph::args::parse_compile_args(&compilation.original_args, cwd);
+    // Dispatch to the correct parser based on compiler family.
+    let parsed = match compilation.family {
+        zccache_compiler::CompilerFamily::Msvc => {
+            zccache_depgraph::msvc_args::parse_msvc_args(&compilation.original_args, cwd)
+        }
+        _ => zccache_depgraph::args::parse_gnu_args(&compilation.original_args, cwd),
+    };
     let dep_flags = parsed.dep_flags.clone();
     let mut ctx = CompileContext::from_parsed_args(&parsed);
+
+    // For multi-file compilations, the parsed source_file might be wrong
+    // (it picks the first source from original_args). Override with the
+    // correct per-unit source.
+    let source_path = if compilation.source_file.is_absolute() {
+        compilation.source_file.clone()
+    } else {
+        cwd.join(&compilation.source_file)
+    };
+    ctx.source_file = source_path;
 
     // Inject session's system includes
     for path in system_includes {
@@ -1098,13 +1113,16 @@ async fn handle_compile(
         }
         zccache_compiler::ParsedInvocation::MultiFile {
             compilations,
-            original_args: _,
+            original_args,
+            source_indices,
         } => {
             return handle_compile_multi(
                 Arc::clone(state_arc),
                 sid,
                 compiler,
                 compilations,
+                original_args,
+                source_indices,
                 cwd.to_path_buf(),
                 system_includes,
                 client_env,
@@ -1830,6 +1848,8 @@ async fn handle_compile_multi(
     sid: SessionId,
     compiler: PathBuf,
     compilations: Vec<zccache_compiler::CacheableCompilation>,
+    original_args: Vec<String>,
+    source_indices: Vec<usize>,
     cwd_path: PathBuf,
     system_includes: Vec<PathBuf>,
     client_env: Option<Vec<(String, String)>>,
@@ -1964,15 +1984,35 @@ async fn handle_compile_multi(
         ),
     );
 
-    // Build compiler args: -c <miss sources...> <shared flags>
-    // Inject -MD for depfile generation if compiler supports it.
+    // Build compiler args from original_args, removing hit source files by index.
+    // This preserves all original flags (including unknown ones) exactly as passed.
     let supports_depfile = compilations[0].family.supports_depfile();
-    let shared_flags = &compilations[0].cache_relevant_args;
-    let mut compiler_args: Vec<String> = vec!["-c".to_string()];
-    for src in &miss_sources {
-        compiler_args.push(src.to_string_lossy().into_owned());
-    }
-    compiler_args.extend(shared_flags.iter().cloned());
+    let hit_indices: HashSet<usize> = {
+        let miss_set: HashSet<&PathBuf> = miss_sources.iter().copied().collect();
+        source_indices
+            .iter()
+            .enumerate()
+            .filter_map(|(si_pos, &arg_idx)| {
+                let comp = &compilations[si_pos];
+                let abs_src = if comp.source_file.is_absolute() {
+                    comp.source_file.clone()
+                } else {
+                    cwd_path.join(&comp.source_file)
+                };
+                if !miss_set.contains(&abs_src) {
+                    Some(arg_idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let mut compiler_args: Vec<String> = original_args
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !hit_indices.contains(i))
+        .map(|(_, a)| a.clone())
+        .collect();
     if supports_depfile {
         compiler_args.push("-MD".to_string());
     }

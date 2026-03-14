@@ -104,6 +104,7 @@ fn integration_full_build_pipeline() {
         defines: vec!["NDEBUG".into()],
         flags: vec!["-std=c++17".into()],
         force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
     };
     let ctx_util = CompileContext {
         source_file: util_cpp.clone(),
@@ -111,6 +112,7 @@ fn integration_full_build_pipeline() {
         defines: vec!["NDEBUG".into()],
         flags: vec!["-std=c++17".into()],
         force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
     };
 
     let key_main = graph.register(ctx_main);
@@ -281,6 +283,7 @@ fn integration_shadow_detection_real_files() {
         defines: Vec::new(),
         flags: Vec::new(),
         force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
     };
     let key = graph.register(ctx);
 
@@ -341,6 +344,7 @@ fn integration_new_resolve_real_files() {
         defines: Vec::new(),
         flags: Vec::new(),
         force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
     };
     let key = graph.register(ctx);
 
@@ -412,6 +416,7 @@ End of search list.
         defines: Vec::new(),
         flags: vec!["-O2".into()],
         force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
     };
     let key = graph.register(ctx);
     mgr.add_context(&session_id, key);
@@ -590,6 +595,7 @@ fn stress_concurrent_register_scan_check() {
                     defines: vec![format!("THREAD={t}")],
                     flags: vec!["-O2".into()],
                     force_includes: Vec::new(),
+                    unknown_flags: Vec::new(),
                 };
 
                 let key = graph.register(ctx);
@@ -641,6 +647,7 @@ fn stress_concurrent_register_and_trim() {
                     defines: Vec::new(),
                     flags: Vec::new(),
                     force_includes: Vec::new(),
+                    unknown_flags: Vec::new(),
                 };
                 let key = graph.register(ctx);
 
@@ -698,6 +705,7 @@ fn stress_concurrent_shadow_detection() {
                     defines: Vec::new(),
                     flags: Vec::new(),
                     force_includes: Vec::new(),
+                    unknown_flags: Vec::new(),
                 };
                 let key = graph.register(ctx);
 
@@ -821,6 +829,7 @@ fn adversarial_circular_includes() {
         defines: Vec::new(),
         flags: Vec::new(),
         force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
     };
     let key = graph.register(ctx);
     graph.update(&key, scan, disk_hash_oracle());
@@ -897,6 +906,7 @@ fn adversarial_computed_include_propagates() {
         defines: Vec::new(),
         flags: Vec::new(),
         force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
     };
     let key = graph.register(ctx);
     graph.update(&key, scan, disk_hash_oracle());
@@ -936,6 +946,7 @@ fn adversarial_shared_header_many_contexts() {
             defines: vec![format!("FILE_ID={i}")],
             flags: Vec::new(),
             force_includes: Vec::new(),
+            unknown_flags: Vec::new(),
         };
         let key = graph.register(ctx);
 
@@ -992,6 +1003,7 @@ fn adversarial_rapid_state_transitions() {
         defines: Vec::new(),
         flags: Vec::new(),
         force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
     };
     let key = graph.register(ctx);
 
@@ -1048,6 +1060,7 @@ fn adversarial_no_includes() {
         defines: Vec::new(),
         flags: Vec::new(),
         force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
     };
     let key = graph.register(ctx);
 
@@ -1092,6 +1105,7 @@ fn adversarial_all_includes_unresolved() {
         defines: Vec::new(),
         flags: Vec::new(),
         force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
     };
     let key = graph.register(ctx);
 
@@ -1130,6 +1144,7 @@ fn adversarial_watch_set_large_graph() {
             defines: Vec::new(),
             flags: Vec::new(),
             force_includes: Vec::new(),
+            unknown_flags: Vec::new(),
         };
         let key = graph.register(ctx);
 
@@ -1175,6 +1190,7 @@ fn adversarial_trim_cleans_orphaned_files() {
         defines: Vec::new(),
         flags: Vec::new(),
         force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
     };
     let key = graph.register(ctx);
 
@@ -1240,6 +1256,7 @@ fn adversarial_deterministic_artifact_keys() {
         defines: vec!["NDEBUG".into()],
         flags: vec!["-O2".into()],
         force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
     };
     let key1 = graph1.register(ctx1);
     let scan1 = scanner::scan_recursive(&src, &search);
@@ -1253,6 +1270,7 @@ fn adversarial_deterministic_artifact_keys() {
         defines: vec!["NDEBUG".into()],
         flags: vec!["-O2".into()],
         force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
     };
     let key2 = graph2.register(ctx2);
     let scan2 = scanner::scan_recursive(&src, &search);

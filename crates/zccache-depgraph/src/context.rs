@@ -62,6 +62,9 @@ pub struct CompileContext {
     pub flags: Vec<String>,
     /// Force-included files (-include).
     pub force_includes: Vec<PathBuf>,
+    /// Sorted unknown flags — not recognized by the parser but still
+    /// affect compilation output, so they must be part of the cache key.
+    pub unknown_flags: Vec<String>,
 }
 
 impl CompileContext {
@@ -72,6 +75,8 @@ impl CompileContext {
         defines.sort();
         let mut flags = args.flags.clone();
         flags.sort();
+        let mut unknown_flags = args.unknown_flags.clone();
+        unknown_flags.sort();
 
         Self {
             source_file: args.source_file.clone(),
@@ -79,13 +84,14 @@ impl CompileContext {
             defines,
             flags,
             force_includes: args.force_includes.clone(),
+            unknown_flags,
         }
     }
 
     /// Compute the context key.
     ///
     /// Includes: source file path, include dirs (in order), sorted defines,
-    /// sorted flags, force includes.
+    /// sorted flags, unknown flags, force includes.
     #[must_use]
     pub fn context_key(&self) -> ContextKey {
         let mut hasher = blake3::Hasher::new();
@@ -140,6 +146,13 @@ impl CompileContext {
             hasher.update(b"\0");
         }
 
+        // Unknown flags — not recognized but still affect compilation.
+        hasher.update(b"unknown\0");
+        for flag in &self.unknown_flags {
+            hasher.update(flag.as_bytes());
+            hasher.update(b"\0");
+        }
+
         ContextKey(ContentHash::from_bytes(*hasher.finalize().as_bytes()))
     }
 }
@@ -190,6 +203,7 @@ mod tests {
             },
             flags: Vec::new(),
             force_includes: Vec::new(),
+            unknown_flags: Vec::new(),
         }
     }
 
@@ -294,10 +308,12 @@ mod tests {
             force_includes: Vec::new(),
             compiler: None,
             dep_flags: UserDepFlags::default(),
+            unknown_flags: vec!["--zzz".into(), "--aaa".into()],
         };
         let ctx = CompileContext::from_parsed_args(&args);
         assert_eq!(ctx.defines, vec!["AAA", "ZZZ"]);
         assert_eq!(ctx.flags, vec!["-O2", "-Wall"]);
+        assert_eq!(ctx.unknown_flags, vec!["--aaa", "--zzz"]);
     }
 
     #[test]
@@ -315,5 +331,35 @@ mod tests {
         let mut ctx2 = make_context("/src/a.c", &[], &[]);
         ctx2.force_includes = vec![PathBuf::from("/pch.h")];
         assert_ne!(ctx1.context_key(), ctx2.context_key());
+    }
+
+    #[test]
+    fn unknown_flags_affect_key() {
+        let ctx1 = make_context("/src/a.c", &[], &[]);
+        let mut ctx2 = make_context("/src/a.c", &[], &[]);
+        ctx2.unknown_flags = vec!["--deploy-dependencies".into()];
+        assert_ne!(
+            ctx1.context_key(),
+            ctx2.context_key(),
+            "unknown flags should affect context key"
+        );
+    }
+
+    #[test]
+    fn unknown_flags_order_irrelevant() {
+        let mut ctx1 = make_context("/src/a.c", &[], &[]);
+        ctx1.unknown_flags = vec!["--aaa".into(), "--bbb".into()];
+        let mut ctx2 = make_context("/src/a.c", &[], &[]);
+        ctx2.unknown_flags = vec!["--bbb".into(), "--aaa".into()];
+        // Both are sorted in make_context... but actually make_context doesn't sort unknown_flags.
+        // from_parsed_args sorts them. In the test helper we set them directly,
+        // so we need to sort manually for this test to be meaningful.
+        ctx1.unknown_flags.sort();
+        ctx2.unknown_flags.sort();
+        assert_eq!(
+            ctx1.context_key(),
+            ctx2.context_key(),
+            "unknown flag order should not affect context key"
+        );
     }
 }

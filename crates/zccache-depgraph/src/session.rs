@@ -425,6 +425,7 @@ mod tests {
             defines: Vec::new(),
             flags: Vec::new(),
             force_includes: Vec::new(),
+            unknown_flags: Vec::new(),
         };
         let key = ctx.context_key();
 
@@ -445,6 +446,7 @@ mod tests {
             defines: Vec::new(),
             flags: Vec::new(),
             force_includes: Vec::new(),
+            unknown_flags: Vec::new(),
         };
         assert!(!mgr.add_context(&SessionId::new(), ctx.context_key()));
     }

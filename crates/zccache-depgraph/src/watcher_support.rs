@@ -282,6 +282,7 @@ mod tests {
             defines: Vec::new(),
             flags: Vec::new(),
             force_includes: Vec::new(),
+            unknown_flags: Vec::new(),
         }
     }
 

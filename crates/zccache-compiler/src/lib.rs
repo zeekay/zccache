@@ -18,11 +18,13 @@ pub enum CompilerFamily {
     Gcc,
     /// Clang (clang, clang++)
     Clang,
-    // Future: Msvc, etc.
+    /// MSVC (cl.exe)
+    Msvc,
 }
 
 impl CompilerFamily {
     /// Whether this compiler supports `-MD -MF` for depfile generation.
+    /// MSVC uses `/showIncludes` instead.
     #[must_use]
     pub fn supports_depfile(&self) -> bool {
         matches!(self, CompilerFamily::Gcc | CompilerFamily::Clang)
@@ -35,12 +37,14 @@ pub enum ParsedInvocation {
     /// A cacheable compilation (single source to single object).
     Cacheable(CacheableCompilation),
     /// Multiple source files with `-c` — each is independently cacheable.
-    /// The shared flags are carried so cache misses can be batched into one compiler call.
     MultiFile {
         /// One entry per source file, each with its own output path.
         compilations: Vec<CacheableCompilation>,
         /// The original full argument list (for batched compiler invocation of misses).
         original_args: Vec<String>,
+        /// Indices of source files in `original_args`, so the daemon can filter
+        /// out cache-hit sources without reconstructing args.
+        source_indices: Vec<usize>,
     },
     /// A non-cacheable invocation (linking, preprocessing, etc.).
     NonCacheable {
@@ -60,11 +64,7 @@ pub struct CacheableCompilation {
     pub source_file: PathBuf,
     /// The output file path.
     pub output_file: PathBuf,
-    /// Arguments relevant to cache keying (optimization, defines, includes, etc.).
-    pub cache_relevant_args: Vec<String>,
-    /// Arguments relevant to compilation but not cache keying.
-    pub pass_through_args: Vec<String>,
-    /// The full original argument list (for fallback execution).
+    /// The full original argument list — always passed to the compiler as-is.
     pub original_args: Vec<String>,
 }
 
@@ -72,13 +72,16 @@ pub struct CacheableCompilation {
 const SOURCE_EXTENSIONS: &[&str] = &["c", "cc", "cpp", "cxx", "c++", "C", "m", "mm", "i", "ii"];
 
 /// Detect the compiler family from the compiler path.
-fn detect_family(compiler: &str) -> CompilerFamily {
+#[must_use]
+pub fn detect_family(compiler: &str) -> CompilerFamily {
     let name = std::path::Path::new(compiler)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(compiler);
     if name.contains("clang") {
         CompilerFamily::Clang
+    } else if name == "cl" {
+        CompilerFamily::Msvc
     } else {
         CompilerFamily::Gcc
     }
@@ -120,12 +123,14 @@ const FLAGS_WITH_VALUE: &[&str] = &[
 ///
 /// Returns a `ParsedInvocation` indicating whether the invocation is
 /// cacheable, and if so, extracts the relevant information.
+///
+/// Arg parsing is read-only analysis — it never modifies what goes to
+/// the compiler. The compiler always receives the exact original args.
 #[must_use]
 pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     let mut has_c_flag = false;
-    let mut source_files: Vec<String> = Vec::new();
+    let mut source_files: Vec<(String, usize)> = Vec::new();
     let mut output_file: Option<String> = None;
-    let mut cache_relevant_args = Vec::new();
     let mut header_mode = false;
 
     let mut i = 0;
@@ -161,38 +166,27 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             continue;
         }
 
-        // Flags that take a value in the next arg
+        // Flags that take a value in the next arg — skip both flag and value
         if let Some(&flag) = FLAGS_WITH_VALUE.iter().find(|&&f| f == arg.as_str()) {
-            if flag != "-o" {
-                cache_relevant_args.push(arg.clone());
-                i += 1;
-                if i < args.len() {
-                    // `-x c-header` or `-x c++-header` means the input is a
-                    // header file being compiled to a PCH — treat it like a
-                    // source file even though its extension isn't in
-                    // SOURCE_EXTENSIONS.
-                    if flag == "-x"
-                        && (args[i].starts_with("c-header") || args[i].starts_with("c++-header"))
-                    {
-                        header_mode = true;
-                    }
-                    cache_relevant_args.push(args[i].clone());
-                }
+            if flag == "-x"
+                && i + 1 < args.len()
+                && (args[i + 1].starts_with("c-header") || args[i + 1].starts_with("c++-header"))
+            {
+                header_mode = true;
             }
-            i += 1;
+            i += 2;
             continue;
         }
 
-        // Flags with = syntax (e.g., -std=c++17, --target=..., -D...)
+        // Any flag starting with - (including unknown flags) — skip
         if arg.starts_with('-') {
-            cache_relevant_args.push(arg.clone());
             i += 1;
             continue;
         }
 
-        // Positional arg — should be a source file
+        // Positional arg — source file candidate
         if is_source_file(arg) || header_mode {
-            source_files.push(arg.clone());
+            source_files.push((arg.clone(), i));
         }
 
         i += 1;
@@ -215,35 +209,32 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     // Multi-file: `-o` is invalid with `-c` and multiple sources (compiler rejects it),
     // so each source gets its default output name (stem.o).
     if source_files.len() > 1 {
+        let source_indices: Vec<usize> = source_files.iter().map(|(_, idx)| *idx).collect();
         let compilations = source_files
             .iter()
-            .map(|src| {
+            .map(|(src, _)| {
                 let stem = std::path::Path::new(src)
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("a");
-                // Each unit gets its own single-file args for correct context building.
-                let mut unit_args = vec!["-c".to_string(), src.clone()];
-                unit_args.extend(cache_relevant_args.iter().cloned());
                 CacheableCompilation {
                     compiler: PathBuf::from(compiler),
                     family,
                     source_file: PathBuf::from(src),
                     output_file: PathBuf::from(format!("{stem}.o")),
-                    cache_relevant_args: cache_relevant_args.clone(),
-                    pass_through_args: Vec::new(),
-                    original_args: unit_args,
+                    original_args: args.to_vec(),
                 }
             })
             .collect();
         return ParsedInvocation::MultiFile {
             compilations,
             original_args: args.to_vec(),
+            source_indices,
         };
     }
 
     // Single source file
-    let source = source_files.into_iter().next().unwrap();
+    let (source, _) = source_files.into_iter().next().unwrap();
     let output = output_file.unwrap_or_else(|| {
         let stem = std::path::Path::new(&source)
             .file_stem()
@@ -257,8 +248,6 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
         family,
         source_file: PathBuf::from(source),
         output_file: PathBuf::from(output),
-        cache_relevant_args,
-        pass_through_args: Vec::new(),
         original_args: args.to_vec(),
     })
 }
@@ -300,12 +289,17 @@ mod tests {
     fn multi_file_split() {
         let result = parse_invocation("gcc", &args(&["-c", "a.cpp", "b.cpp"]));
         match result {
-            ParsedInvocation::MultiFile { compilations, .. } => {
+            ParsedInvocation::MultiFile {
+                compilations,
+                source_indices,
+                ..
+            } => {
                 assert_eq!(compilations.len(), 2);
                 assert_eq!(compilations[0].source_file, PathBuf::from("a.cpp"));
                 assert_eq!(compilations[0].output_file, PathBuf::from("a.o"));
                 assert_eq!(compilations[1].source_file, PathBuf::from("b.cpp"));
                 assert_eq!(compilations[1].output_file, PathBuf::from("b.o"));
+                assert_eq!(source_indices, vec![1, 2]);
             }
             other => panic!("expected MultiFile, got: {other:?}"),
         }
@@ -318,23 +312,18 @@ mod tests {
             &args(&["-c", "-O2", "main.cpp", "-Wall", "util.cpp"]),
         );
         match result {
-            ParsedInvocation::MultiFile { compilations, .. } => {
+            ParsedInvocation::MultiFile {
+                compilations,
+                original_args,
+                source_indices,
+            } => {
                 assert_eq!(compilations.len(), 2);
                 assert_eq!(compilations[0].source_file, PathBuf::from("main.cpp"));
                 assert_eq!(compilations[1].source_file, PathBuf::from("util.cpp"));
-                // Shared flags are preserved on each compilation
-                assert!(compilations[0]
-                    .cache_relevant_args
-                    .contains(&"-O2".to_string()));
-                assert!(compilations[0]
-                    .cache_relevant_args
-                    .contains(&"-Wall".to_string()));
-                assert!(compilations[1]
-                    .cache_relevant_args
-                    .contains(&"-O2".to_string()));
-                assert!(compilations[1]
-                    .cache_relevant_args
-                    .contains(&"-Wall".to_string()));
+                // Flags are in original_args, not per-compilation
+                assert!(original_args.contains(&"-O2".to_string()));
+                assert!(original_args.contains(&"-Wall".to_string()));
+                assert_eq!(source_indices, vec![2, 4]);
             }
             other => panic!("expected MultiFile, got: {other:?}"),
         }
@@ -371,19 +360,35 @@ mod tests {
     }
 
     #[test]
-    fn cache_relevant_args_extracted() {
-        let result = parse_invocation(
-            "clang++",
-            &args(&["-c", "hello.cpp", "-O2", "-std=c++17", "-DNDEBUG", "-Wall"]),
-        );
+    fn original_args_preserved() {
+        let input = args(&["-c", "hello.cpp", "-O2", "-std=c++17", "-DNDEBUG", "-Wall"]);
+        let result = parse_invocation("clang++", &input);
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert!(c.cache_relevant_args.contains(&"-O2".to_string()));
-                assert!(c.cache_relevant_args.contains(&"-std=c++17".to_string()));
-                assert!(c.cache_relevant_args.contains(&"-DNDEBUG".to_string()));
-                assert!(c.cache_relevant_args.contains(&"-Wall".to_string()));
+                assert_eq!(c.original_args, input);
             }
             _ => panic!("expected cacheable"),
+        }
+    }
+
+    #[test]
+    fn unknown_flags_preserved_in_original_args() {
+        let input = args(&[
+            "-c",
+            "hello.cpp",
+            "--deploy-dependencies",
+            "--custom-flag=value",
+            "-o",
+            "hello.o",
+        ]);
+        let result = parse_invocation("clang++", &input);
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.original_args, input);
+                assert_eq!(c.source_file, PathBuf::from("hello.cpp"));
+                assert_eq!(c.output_file, PathBuf::from("hello.o"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
@@ -395,11 +400,11 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                // PCH flag and its value are both in cache_relevant_args
-                assert!(c.cache_relevant_args.contains(&"-include-pch".to_string()));
-                assert!(c.cache_relevant_args.contains(&"pch.h.pch".to_string()));
                 // PCH path is NOT treated as a source file
                 assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
+                // Original args preserved
+                assert!(c.original_args.contains(&"-include-pch".to_string()));
+                assert!(c.original_args.contains(&"pch.h.pch".to_string()));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -456,6 +461,12 @@ mod tests {
     }
 
     #[test]
+    fn detect_msvc_family() {
+        assert_eq!(detect_family("cl"), CompilerFamily::Msvc);
+        assert_eq!(detect_family("C:\\MSVC\\cl"), CompilerFamily::Msvc);
+    }
+
+    #[test]
     fn gcc_supports_depfile() {
         assert!(CompilerFamily::Gcc.supports_depfile());
     }
@@ -463,5 +474,10 @@ mod tests {
     #[test]
     fn clang_supports_depfile() {
         assert!(CompilerFamily::Clang.supports_depfile());
+    }
+
+    #[test]
+    fn msvc_no_depfile() {
+        assert!(!CompilerFamily::Msvc.supports_depfile());
     }
 }

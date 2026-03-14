@@ -1050,8 +1050,8 @@ fn integration_all_args_from_response_file() {
         zccache_compiler::ParsedInvocation::Cacheable(c) => {
             assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
             assert_eq!(c.output_file, PathBuf::from("foo.o"));
-            assert!(c.cache_relevant_args.contains(&"-O2".to_string()));
-            assert!(c.cache_relevant_args.contains(&"-Wall".to_string()));
+            assert!(c.original_args.contains(&"-O2".to_string()));
+            assert!(c.original_args.contains(&"-Wall".to_string()));
         }
         other => panic!("expected cacheable, got: {other:?}"),
     }
@@ -1129,9 +1129,9 @@ fn integration_nested_response_files_cacheable() {
         zccache_compiler::ParsedInvocation::Cacheable(c) => {
             assert_eq!(c.source_file, PathBuf::from("main.cpp"));
             assert_eq!(c.output_file, PathBuf::from("main.o"));
-            assert!(c.cache_relevant_args.contains(&"-O2".to_string()));
-            assert!(c.cache_relevant_args.contains(&"-Wall".to_string()));
-            assert!(c.cache_relevant_args.contains(&"-DNDEBUG".to_string()));
+            assert!(c.original_args.contains(&"-O2".to_string()));
+            assert!(c.original_args.contains(&"-Wall".to_string()));
+            assert!(c.original_args.contains(&"-DNDEBUG".to_string()));
         }
         other => panic!("expected cacheable, got: {other:?}"),
     }
@@ -1171,15 +1171,11 @@ fn integration_define_with_quoted_value_in_cache_key() {
     let expanded = expand_response_files(&args).unwrap();
     match zccache_compiler::parse_invocation("clang++", &expanded) {
         zccache_compiler::ParsedInvocation::Cacheable(c) => {
+            assert!(c.original_args.contains(&"-DVERSION=1.2.3".to_string()));
             assert!(c
-                .cache_relevant_args
-                .contains(&"-DVERSION=1.2.3".to_string()));
-            assert!(c
-                .cache_relevant_args
+                .original_args
                 .contains(&"-DBUILD_TYPE=Release".to_string()));
-            assert!(c
-                .cache_relevant_args
-                .contains(&"-DPATH=/usr/local".to_string()));
+            assert!(c.original_args.contains(&"-DPATH=/usr/local".to_string()));
         }
         other => panic!("expected cacheable, got: {other:?}"),
     }

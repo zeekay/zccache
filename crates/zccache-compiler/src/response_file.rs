@@ -421,9 +421,9 @@ mod tests {
             crate::ParsedInvocation::Cacheable(c) => {
                 assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
                 assert_eq!(c.output_file, PathBuf::from("foo.o"));
-                assert!(c.cache_relevant_args.contains(&"-O2".to_string()));
-                assert!(c.cache_relevant_args.contains(&"-Wall".to_string()));
-                assert!(c.cache_relevant_args.contains(&"-DNDEBUG".to_string()));
+                assert!(c.original_args.contains(&"-O2".to_string()));
+                assert!(c.original_args.contains(&"-Wall".to_string()));
+                assert!(c.original_args.contains(&"-DNDEBUG".to_string()));
             }
             _ => panic!("unexpected variant"),
         }

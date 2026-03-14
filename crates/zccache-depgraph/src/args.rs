@@ -38,13 +38,17 @@ pub struct ParsedArgs {
     pub compiler: Option<PathBuf>,
     /// Dependency generation flags detected in the user's args.
     pub dep_flags: UserDepFlags,
+    /// Flags not recognized by the parser. Sorted for deterministic hashing.
+    /// These are hashed into the context key to ensure unknown flags affect
+    /// cache invalidation.
+    pub unknown_flags: Vec<String>,
 }
 
-/// Parse compile arguments into structured form.
+/// Parse GNU/Clang-style compile arguments into structured form.
 ///
 /// `args` should be the arguments after the compiler executable.
 /// Relative paths are resolved against `cwd`.
-pub fn parse_compile_args(args: &[String], cwd: &Path) -> ParsedArgs {
+pub fn parse_gnu_args(args: &[String], cwd: &Path) -> ParsedArgs {
     let mut result = ParsedArgs {
         source_file: PathBuf::new(),
         output_file: None,
@@ -55,6 +59,7 @@ pub fn parse_compile_args(args: &[String], cwd: &Path) -> ParsedArgs {
         force_includes: Vec::new(),
         compiler: None,
         dep_flags: UserDepFlags::default(),
+        unknown_flags: Vec::new(),
     };
 
     let mut i = 0;
@@ -240,6 +245,9 @@ pub fn parse_compile_args(args: &[String], cwd: &Path) -> ParsedArgs {
         // Anything not starting with - is a source file candidate.
         if !arg.starts_with('-') {
             source_candidates.push(resolve_path(arg, cwd));
+        } else {
+            // Unrecognized flag — track for cache invalidation.
+            result.unknown_flags.push(arg.clone());
         }
 
         i += 1;
@@ -260,8 +268,14 @@ pub fn parse_compile_args(args: &[String], cwd: &Path) -> ParsedArgs {
     result.defines.sort();
     result.undefines.sort();
     result.flags.sort();
+    result.unknown_flags.sort();
 
     result
+}
+
+/// Backward-compatible alias for [`parse_gnu_args`].
+pub fn parse_compile_args(args: &[String], cwd: &Path) -> ParsedArgs {
+    parse_gnu_args(args, cwd)
 }
 
 /// Split a shell-style command string into arguments.
@@ -348,7 +362,7 @@ mod tests {
 
     #[test]
     fn basic_compile_command() {
-        let parsed = parse_compile_args(
+        let parsed = parse_gnu_args(
             &args(&["-c", "foo.c", "-o", "foo.o"]),
             Path::new("/project"),
         );
@@ -361,7 +375,7 @@ mod tests {
 
     #[test]
     fn include_dirs_preserved_in_order() {
-        let parsed = parse_compile_args(
+        let parsed = parse_gnu_args(
             &args(&["-I", "first", "-Isecond", "-I", "third", "-c", "x.c"]),
             Path::new("/p"),
         );
@@ -373,7 +387,7 @@ mod tests {
 
     #[test]
     fn isystem_and_iquote_and_idirafter() {
-        let parsed = parse_compile_args(
+        let parsed = parse_gnu_args(
             &args(&[
                 "-iquote",
                 "q",
@@ -393,7 +407,7 @@ mod tests {
 
     #[test]
     fn defines_extracted_and_sorted() {
-        let parsed = parse_compile_args(
+        let parsed = parse_gnu_args(
             &args(&["-DBAR=1", "-DFOO", "-D", "AAA=2", "-c", "x.c"]),
             Path::new("/p"),
         );
@@ -402,14 +416,13 @@ mod tests {
 
     #[test]
     fn undefines_extracted() {
-        let parsed =
-            parse_compile_args(&args(&["-UFOO", "-U", "BAR", "-c", "x.c"]), Path::new("/p"));
+        let parsed = parse_gnu_args(&args(&["-UFOO", "-U", "BAR", "-c", "x.c"]), Path::new("/p"));
         assert_eq!(parsed.undefines, vec!["BAR", "FOO"]);
     }
 
     #[test]
     fn flags_extracted_and_sorted() {
-        let parsed = parse_compile_args(
+        let parsed = parse_gnu_args(
             &args(&["-std=c++17", "-O2", "-fPIC", "-Wall", "-c", "x.cpp"]),
             Path::new("/p"),
         );
@@ -426,14 +439,13 @@ mod tests {
 
     #[test]
     fn force_include() {
-        let parsed =
-            parse_compile_args(&args(&["-include", "pch.h", "-c", "x.c"]), Path::new("/p"));
+        let parsed = parse_gnu_args(&args(&["-include", "pch.h", "-c", "x.c"]), Path::new("/p"));
         assert_eq!(parsed.force_includes, vec![Path::new("/p/pch.h")]);
     }
 
     #[test]
     fn include_pch_parsed() {
-        let parsed = parse_compile_args(
+        let parsed = parse_gnu_args(
             &args(&["-c", "foo.cpp", "-include-pch", "pch.h.pch"]),
             Path::new("/p"),
         );
@@ -442,7 +454,7 @@ mod tests {
 
     #[test]
     fn include_pch_and_include_both_parsed() {
-        let parsed = parse_compile_args(
+        let parsed = parse_gnu_args(
             &args(&[
                 "-include-pch",
                 "pch.h.pch",
@@ -461,7 +473,7 @@ mod tests {
 
     #[test]
     fn absolute_paths_not_prefixed() {
-        let parsed = parse_compile_args(
+        let parsed = parse_gnu_args(
             &args(&["-I", "/usr/include", "-c", "/src/foo.c"]),
             Path::new("/p"),
         );
@@ -471,7 +483,7 @@ mod tests {
 
     #[test]
     fn relative_paths_resolved_against_cwd() {
-        let parsed = parse_compile_args(
+        let parsed = parse_gnu_args(
             &args(&["-I", "../inc", "-c", "src/main.c"]),
             Path::new("/project/build"),
         );
@@ -484,7 +496,7 @@ mod tests {
 
     #[test]
     fn mf_and_mt_args_skipped() {
-        let parsed = parse_compile_args(
+        let parsed = parse_gnu_args(
             &args(&["-MMD", "-MF", "deps.d", "-MT", "foo.o", "-c", "x.c"]),
             Path::new("/p"),
         );
@@ -494,15 +506,53 @@ mod tests {
 
     #[test]
     fn source_file_by_extension() {
-        let parsed =
-            parse_compile_args(&args(&["-c", "main.cpp", "-o", "main.o"]), Path::new("/p"));
+        let parsed = parse_gnu_args(&args(&["-c", "main.cpp", "-o", "main.o"]), Path::new("/p"));
         assert_eq!(parsed.source_file, Path::new("/p/main.cpp"));
     }
 
     #[test]
     fn language_flag() {
-        let parsed = parse_compile_args(&args(&["-x", "c++", "-c", "foo.c"]), Path::new("/p"));
+        let parsed = parse_gnu_args(&args(&["-x", "c++", "-c", "foo.c"]), Path::new("/p"));
         assert!(parsed.flags.contains(&"-x c++".to_string()));
+    }
+
+    // ── unknown_flags tests ─────────────────────────────────────────
+
+    #[test]
+    fn unknown_flags_collected() {
+        let parsed = parse_gnu_args(
+            &args(&[
+                "-c",
+                "foo.c",
+                "--deploy-dependencies",
+                "--custom-flag=value",
+            ]),
+            Path::new("/p"),
+        );
+        assert!(parsed
+            .unknown_flags
+            .contains(&"--deploy-dependencies".to_string()));
+        assert!(parsed
+            .unknown_flags
+            .contains(&"--custom-flag=value".to_string()));
+    }
+
+    #[test]
+    fn unknown_flags_sorted() {
+        let parsed = parse_gnu_args(&args(&["-c", "foo.c", "--zzz", "--aaa"]), Path::new("/p"));
+        assert_eq!(
+            parsed.unknown_flags,
+            vec!["--aaa".to_string(), "--zzz".to_string()]
+        );
+    }
+
+    #[test]
+    fn known_flags_not_in_unknown() {
+        let parsed = parse_gnu_args(
+            &args(&["-c", "foo.c", "-O2", "-Wall", "-std=c++17"]),
+            Path::new("/p"),
+        );
+        assert!(parsed.unknown_flags.is_empty());
     }
 
     // ── split_command tests ──────────────────────────────────────────
@@ -539,20 +589,20 @@ mod tests {
 
     #[test]
     fn dep_flags_none_by_default() {
-        let parsed = parse_compile_args(&args(&["-c", "foo.c", "-O2"]), Path::new("/p"));
+        let parsed = parse_gnu_args(&args(&["-c", "foo.c", "-O2"]), Path::new("/p"));
         assert!(!parsed.dep_flags.has_md);
         assert!(parsed.dep_flags.mf_path.is_none());
     }
 
     #[test]
     fn dep_flags_md_detected() {
-        let parsed = parse_compile_args(&args(&["-MMD", "-c", "foo.c"]), Path::new("/p"));
+        let parsed = parse_gnu_args(&args(&["-MMD", "-c", "foo.c"]), Path::new("/p"));
         assert!(parsed.dep_flags.has_md);
     }
 
     #[test]
     fn dep_flags_mf_detected() {
-        let parsed = parse_compile_args(&args(&["-MF", "deps.d", "-c", "foo.c"]), Path::new("/p"));
+        let parsed = parse_gnu_args(&args(&["-MF", "deps.d", "-c", "foo.c"]), Path::new("/p"));
         assert_eq!(
             parsed.dep_flags.mf_path.as_deref(),
             Some(Path::new("/p/deps.d"))
@@ -561,7 +611,7 @@ mod tests {
 
     #[test]
     fn dep_flags_combined() {
-        let parsed = parse_compile_args(
+        let parsed = parse_gnu_args(
             &args(&["-MMD", "-MF", "custom.d", "-c", "foo.c"]),
             Path::new("/p"),
         );
