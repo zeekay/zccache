@@ -29,8 +29,8 @@ pub struct SessionStatsTracker {
     pub non_cacheable: u64,
     /// Compilations with non-zero exit.
     pub errors: u64,
-    /// Estimated time saved in microseconds.
-    pub time_saved_us: u64,
+    /// Estimated time saved in nanoseconds.
+    pub time_saved_ns: u64,
     /// Distinct source files compiled.
     pub sources: HashSet<PathBuf>,
     /// Artifact bytes served from cache.
@@ -64,7 +64,7 @@ impl SessionStatsTracker {
             misses: 0,
             non_cacheable: 0,
             errors: 0,
-            time_saved_us: 0,
+            time_saved_ns: 0,
             sources: HashSet::new(),
             bytes_read: 0,
             bytes_written: 0,
@@ -72,10 +72,10 @@ impl SessionStatsTracker {
     }
 
     /// Record a cache hit.
-    pub fn record_hit(&mut self, source: PathBuf, saved_us: u64, bytes: u64) {
+    pub fn record_hit(&mut self, source: PathBuf, saved_ns: u64, bytes: u64) {
         self.compilations += 1;
         self.hits += 1;
-        self.time_saved_us += saved_us;
+        self.time_saved_ns += saved_ns;
         self.sources.insert(source);
         self.bytes_read += bytes;
     }
@@ -109,7 +109,7 @@ impl SessionStatsTracker {
             misses: self.misses,
             non_cacheable: self.non_cacheable,
             errors: self.errors,
-            time_saved_ms: self.time_saved_us / 1000,
+            time_saved_ms: self.time_saved_ns / 1_000_000,
             unique_sources: self.sources.len() as u64,
             bytes_read: self.bytes_read,
             bytes_written: self.bytes_written,
@@ -571,11 +571,11 @@ mod tests {
     #[test]
     fn tracker_record_hit() {
         let mut t = SessionStatsTracker::new();
-        t.record_hit(PathBuf::from("/src/a.c"), 5000, 1024);
-        t.record_hit(PathBuf::from("/src/a.c"), 3000, 2048); // same source
+        t.record_hit(PathBuf::from("/src/a.c"), 5_000_000, 1024);
+        t.record_hit(PathBuf::from("/src/a.c"), 3_000_000, 2048); // same source
         assert_eq!(t.compilations, 2);
         assert_eq!(t.hits, 2);
-        assert_eq!(t.time_saved_us, 8000);
+        assert_eq!(t.time_saved_ns, 8_000_000);
         assert_eq!(t.bytes_read, 3072);
         assert_eq!(t.sources.len(), 1); // deduplicated
     }
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn tracker_finalize() {
         let mut t = SessionStatsTracker::new();
-        t.record_hit(PathBuf::from("/src/a.c"), 5_000, 1024);
+        t.record_hit(PathBuf::from("/src/a.c"), 5_000_000, 1024);
         t.record_miss(PathBuf::from("/src/b.c"), 2048);
         t.record_non_cacheable();
 
@@ -615,7 +615,7 @@ mod tests {
         assert_eq!(f.hits, 1);
         assert_eq!(f.misses, 1);
         assert_eq!(f.non_cacheable, 1);
-        assert_eq!(f.time_saved_ms, 5); // 5000us / 1000
+        assert_eq!(f.time_saved_ms, 5); // 5_000_000ns / 1_000_000
         assert_eq!(f.unique_sources, 2);
         assert_eq!(f.bytes_read, 1024);
         assert_eq!(f.bytes_written, 2048);

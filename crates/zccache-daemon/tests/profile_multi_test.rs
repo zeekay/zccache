@@ -265,57 +265,57 @@ async fn profile_multi_file_warm_path() {
     );
     eprintln!(
         "    build_context:    {:>6}us",
-        profile.avg_build_context_us
+        profile.avg_build_context_ns
     );
-    eprintln!("    hash_source:      {:>6}us", profile.avg_hash_source_us);
-    eprintln!("    hash_headers:     {:>6}us", profile.avg_hash_headers_us);
+    eprintln!("    hash_source:      {:>6}us", profile.avg_hash_source_ns);
+    eprintln!("    hash_headers:     {:>6}us", profile.avg_hash_headers_ns);
     eprintln!(
         "    depgraph_check:   {:>6}us",
-        profile.avg_depgraph_check_us
+        profile.avg_depgraph_check_ns
     );
     eprintln!(
         "    artifact_lookup:  {:>6}us",
-        profile.avg_artifact_lookup_us
+        profile.avg_artifact_lookup_ns
     );
-    eprintln!("    write_output:     {:>6}us", profile.avg_write_output_us);
-    eprintln!("    bookkeeping:      {:>6}us", profile.avg_bookkeeping_us);
+    eprintln!("    write_output:     {:>6}us", profile.avg_write_output_ns);
+    eprintln!("    bookkeeping:      {:>6}us", profile.avg_bookkeeping_ns);
     eprintln!("    ─────────────────────────");
-    eprintln!("    total_hit:        {:>6}us", profile.avg_total_hit_us);
+    eprintln!("    total_hit:        {:>6}us", profile.avg_total_hit_ns);
 
     // Breakdown as percentages
-    let total = profile.avg_total_hit_us.max(1) as f64;
+    let total = profile.avg_total_hit_ns.max(1) as f64;
     eprintln!("\n  Breakdown (% of total hit time):");
     eprintln!(
         "    build_context:    {:>5.1}%",
-        profile.avg_build_context_us as f64 / total * 100.0
+        profile.avg_build_context_ns as f64 / total * 100.0
     );
     eprintln!(
         "    hash_source:      {:>5.1}%",
-        profile.avg_hash_source_us as f64 / total * 100.0
+        profile.avg_hash_source_ns as f64 / total * 100.0
     );
     eprintln!(
         "    hash_headers:     {:>5.1}%",
-        profile.avg_hash_headers_us as f64 / total * 100.0
+        profile.avg_hash_headers_ns as f64 / total * 100.0
     );
     eprintln!(
         "    depgraph_check:   {:>5.1}%",
-        profile.avg_depgraph_check_us as f64 / total * 100.0
+        profile.avg_depgraph_check_ns as f64 / total * 100.0
     );
     eprintln!(
         "    artifact_lookup:  {:>5.1}%",
-        profile.avg_artifact_lookup_us as f64 / total * 100.0
+        profile.avg_artifact_lookup_ns as f64 / total * 100.0
     );
     eprintln!(
         "    write_output:     {:>5.1}%",
-        profile.avg_write_output_us as f64 / total * 100.0
+        profile.avg_write_output_ns as f64 / total * 100.0
     );
     eprintln!(
         "    bookkeeping:      {:>5.1}%",
-        profile.avg_bookkeeping_us as f64 / total * 100.0
+        profile.avg_bookkeeping_ns as f64 / total * 100.0
     );
 
     // IPC overhead estimate
-    let daemon_per_file_us = profile.avg_total_hit_us as f64;
+    let daemon_per_file_us = profile.avg_total_hit_ns as f64;
     let wall_per_file_single_us = single_med * 1000.0 / NUM_FILES as f64;
     let ipc_overhead_us = wall_per_file_single_us - daemon_per_file_us;
     eprintln!("\n  IPC overhead estimate (single-file mode):");
@@ -327,7 +327,7 @@ async fn profile_multi_file_warm_path() {
     );
 
     // Multi-file overhead estimate
-    let daemon_total_us = profile.avg_total_hit_us as f64 * NUM_FILES as f64;
+    let daemon_total_us = profile.avg_total_hit_ns as f64 * NUM_FILES as f64;
     let wall_multi_us = multi_med * 1000.0;
     let multi_overhead_us = wall_multi_us - daemon_total_us;
     eprintln!("\n  Multi-file overhead:");
@@ -343,53 +343,53 @@ async fn profile_multi_file_warm_path() {
         );
         eprintln!(
             "    compiler_exec:    {:>8}us ({:.1}ms)",
-            profile.avg_compiler_exec_us,
-            profile.avg_compiler_exec_us as f64 / 1000.0
+            profile.avg_compiler_exec_ns,
+            profile.avg_compiler_exec_ns as f64 / 1000.0
         );
         eprintln!(
             "    include_scan:     {:>8}us ({:.1}ms)",
-            profile.avg_include_scan_us,
-            profile.avg_include_scan_us as f64 / 1000.0
+            profile.avg_include_scan_ns,
+            profile.avg_include_scan_ns as f64 / 1000.0
         );
         eprintln!(
             "    hash_all:         {:>8}us ({:.1}ms)",
-            profile.avg_hash_all_us,
-            profile.avg_hash_all_us as f64 / 1000.0
+            profile.avg_hash_all_ns,
+            profile.avg_hash_all_ns as f64 / 1000.0
         );
         eprintln!(
             "    artifact_store:   {:>8}us ({:.1}ms)",
-            profile.avg_artifact_store_us,
-            profile.avg_artifact_store_us as f64 / 1000.0
+            profile.avg_artifact_store_ns,
+            profile.avg_artifact_store_ns as f64 / 1000.0
         );
         eprintln!("    ─────────────────────────");
         eprintln!(
             "    total_miss:       {:>8}us ({:.1}ms)",
-            profile.avg_total_miss_us,
-            profile.avg_total_miss_us as f64 / 1000.0
+            profile.avg_total_miss_ns,
+            profile.avg_total_miss_ns as f64 / 1000.0
         );
 
-        let miss_total = profile.avg_total_miss_us.max(1) as f64;
-        let accounted = (profile.avg_compiler_exec_us
-            + profile.avg_include_scan_us
-            + profile.avg_hash_all_us
-            + profile.avg_artifact_store_us) as f64;
+        let miss_total = profile.avg_total_miss_ns.max(1) as f64;
+        let accounted = (profile.avg_compiler_exec_ns
+            + profile.avg_include_scan_ns
+            + profile.avg_hash_all_ns
+            + profile.avg_artifact_store_ns) as f64;
         let unaccounted = miss_total - accounted;
         eprintln!("\n  Miss breakdown (% of total miss time):");
         eprintln!(
             "    compiler_exec:    {:>5.1}%",
-            profile.avg_compiler_exec_us as f64 / miss_total * 100.0
+            profile.avg_compiler_exec_ns as f64 / miss_total * 100.0
         );
         eprintln!(
             "    include_scan:     {:>5.1}%",
-            profile.avg_include_scan_us as f64 / miss_total * 100.0
+            profile.avg_include_scan_ns as f64 / miss_total * 100.0
         );
         eprintln!(
             "    hash_all:         {:>5.1}%",
-            profile.avg_hash_all_us as f64 / miss_total * 100.0
+            profile.avg_hash_all_ns as f64 / miss_total * 100.0
         );
         eprintln!(
             "    artifact_store:   {:>5.1}%",
-            profile.avg_artifact_store_us as f64 / miss_total * 100.0
+            profile.avg_artifact_store_ns as f64 / miss_total * 100.0
         );
         eprintln!(
             "    unaccounted:      {:>5.1}%  ({:.0}us — parse/context/read_output/watch/bookkeeping)",

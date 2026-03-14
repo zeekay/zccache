@@ -18,10 +18,10 @@ pub struct StatsCollector {
     compile_errors: AtomicU64,
     /// Total sessions created.
     sessions_total: AtomicU64,
-    /// Cumulative microseconds spent on cache hits.
-    hit_time_us: AtomicU64,
-    /// Cumulative microseconds spent on cache misses.
-    miss_time_us: AtomicU64,
+    /// Cumulative nanoseconds spent on cache hits.
+    hit_time_ns: AtomicU64,
+    /// Cumulative nanoseconds spent on cache misses.
+    miss_time_ns: AtomicU64,
     /// Total artifact bytes served from cache.
     bytes_read: AtomicU64,
     /// Total artifact bytes stored into cache.
@@ -45,8 +45,8 @@ pub struct StatsSnapshot {
     pub non_cacheable: u64,
     pub compile_errors: u64,
     pub sessions_total: u64,
-    pub hit_time_us: u64,
-    pub miss_time_us: u64,
+    pub hit_time_ns: u64,
+    pub miss_time_ns: u64,
     pub bytes_read: u64,
     pub bytes_written: u64,
     pub link_total: u64,
@@ -63,10 +63,10 @@ impl StatsSnapshot {
         if self.hits == 0 || self.misses == 0 {
             return 0;
         }
-        let avg_hit_us = self.hit_time_us / self.hits;
-        let avg_miss_us = self.miss_time_us / self.misses;
-        let saved_per_hit_us = avg_miss_us.saturating_sub(avg_hit_us);
-        (self.hits * saved_per_hit_us) / 1000
+        let avg_hit_ns = self.hit_time_ns / self.hits;
+        let avg_miss_ns = self.miss_time_ns / self.misses;
+        let saved_per_hit_ns = avg_miss_ns.saturating_sub(avg_hit_ns);
+        (self.hits * saved_per_hit_ns) / 1_000_000
     }
 }
 
@@ -81,8 +81,8 @@ impl StatsCollector {
             non_cacheable: AtomicU64::new(0),
             compile_errors: AtomicU64::new(0),
             sessions_total: AtomicU64::new(0),
-            hit_time_us: AtomicU64::new(0),
-            miss_time_us: AtomicU64::new(0),
+            hit_time_ns: AtomicU64::new(0),
+            miss_time_ns: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
             link_total: AtomicU64::new(0),
@@ -98,16 +98,16 @@ impl StatsCollector {
     }
 
     /// Record a cache hit with its latency.
-    pub fn record_hit(&self, latency_us: u64, artifact_bytes: u64) {
+    pub fn record_hit(&self, latency_ns: u64, artifact_bytes: u64) {
         self.hits.fetch_add(1, Ordering::Relaxed);
-        self.hit_time_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.hit_time_ns.fetch_add(latency_ns, Ordering::Relaxed);
         self.bytes_read.fetch_add(artifact_bytes, Ordering::Relaxed);
     }
 
     /// Record a cache miss with its latency.
-    pub fn record_miss(&self, latency_us: u64, artifact_bytes: u64) {
+    pub fn record_miss(&self, latency_ns: u64, artifact_bytes: u64) {
         self.misses.fetch_add(1, Ordering::Relaxed);
-        self.miss_time_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.miss_time_ns.fetch_add(latency_ns, Ordering::Relaxed);
         self.bytes_written
             .fetch_add(artifact_bytes, Ordering::Relaxed);
     }
@@ -155,8 +155,8 @@ impl StatsCollector {
         self.non_cacheable.store(0, Ordering::Relaxed);
         self.compile_errors.store(0, Ordering::Relaxed);
         self.sessions_total.store(0, Ordering::Relaxed);
-        self.hit_time_us.store(0, Ordering::Relaxed);
-        self.miss_time_us.store(0, Ordering::Relaxed);
+        self.hit_time_ns.store(0, Ordering::Relaxed);
+        self.miss_time_ns.store(0, Ordering::Relaxed);
         self.bytes_read.store(0, Ordering::Relaxed);
         self.bytes_written.store(0, Ordering::Relaxed);
         self.link_total.store(0, Ordering::Relaxed);
@@ -175,8 +175,8 @@ impl StatsCollector {
             non_cacheable: self.non_cacheable.load(Ordering::Relaxed),
             compile_errors: self.compile_errors.load(Ordering::Relaxed),
             sessions_total: self.sessions_total.load(Ordering::Relaxed),
-            hit_time_us: self.hit_time_us.load(Ordering::Relaxed),
-            miss_time_us: self.miss_time_us.load(Ordering::Relaxed),
+            hit_time_ns: self.hit_time_ns.load(Ordering::Relaxed),
+            miss_time_ns: self.miss_time_ns.load(Ordering::Relaxed),
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
             bytes_written: self.bytes_written.load(Ordering::Relaxed),
             link_total: self.link_total.load(Ordering::Relaxed),
@@ -197,39 +197,39 @@ impl Default for StatsCollector {
 
 /// Accumulated timing for each phase of the compile hot path.
 ///
-/// All values are in microseconds. Thread-safe via atomics.
+/// All values are in nanoseconds. Thread-safe via atomics.
 pub struct PhaseProfiler {
     /// Number of profiled requests.
     pub count: AtomicU64,
     /// Parse compiler invocation args.
-    pub parse_args_us: AtomicU64,
+    pub parse_args_ns: AtomicU64,
     /// Build compile context + register with depgraph.
-    pub build_context_us: AtomicU64,
+    pub build_context_ns: AtomicU64,
     /// Hash source file via metadata cache.
-    pub hash_source_us: AtomicU64,
+    pub hash_source_ns: AtomicU64,
     /// Hash all known headers via metadata cache.
-    pub hash_headers_us: AtomicU64,
+    pub hash_headers_ns: AtomicU64,
     /// Check depgraph for cache verdict.
-    pub depgraph_check_us: AtomicU64,
+    pub depgraph_check_ns: AtomicU64,
     /// Artifact lookup (in-memory HashMap).
-    pub artifact_lookup_us: AtomicU64,
+    pub artifact_lookup_ns: AtomicU64,
     /// Write cached outputs to disk.
-    pub write_output_us: AtomicU64,
+    pub write_output_ns: AtomicU64,
     /// Record stats + session bookkeeping.
-    pub bookkeeping_us: AtomicU64,
+    pub bookkeeping_ns: AtomicU64,
     /// Total wall clock for the full hit path.
-    pub total_hit_us: AtomicU64,
+    pub total_hit_ns: AtomicU64,
     // Miss path
     /// Run the actual compiler (miss path).
-    pub compiler_exec_us: AtomicU64,
+    pub compiler_exec_ns: AtomicU64,
     /// Scan includes (miss path).
-    pub include_scan_us: AtomicU64,
+    pub include_scan_ns: AtomicU64,
     /// Hash all files for artifact key (miss path).
-    pub hash_all_us: AtomicU64,
+    pub hash_all_ns: AtomicU64,
     /// Store artifact (miss path).
-    pub artifact_store_us: AtomicU64,
+    pub artifact_store_ns: AtomicU64,
     /// Total wall clock for the full miss path.
-    pub total_miss_us: AtomicU64,
+    pub total_miss_ns: AtomicU64,
     /// Number of profiled misses.
     pub miss_count: AtomicU64,
 }
@@ -239,20 +239,20 @@ impl PhaseProfiler {
     pub fn new() -> Self {
         Self {
             count: AtomicU64::new(0),
-            parse_args_us: AtomicU64::new(0),
-            build_context_us: AtomicU64::new(0),
-            hash_source_us: AtomicU64::new(0),
-            hash_headers_us: AtomicU64::new(0),
-            depgraph_check_us: AtomicU64::new(0),
-            artifact_lookup_us: AtomicU64::new(0),
-            write_output_us: AtomicU64::new(0),
-            bookkeeping_us: AtomicU64::new(0),
-            total_hit_us: AtomicU64::new(0),
-            compiler_exec_us: AtomicU64::new(0),
-            include_scan_us: AtomicU64::new(0),
-            hash_all_us: AtomicU64::new(0),
-            artifact_store_us: AtomicU64::new(0),
-            total_miss_us: AtomicU64::new(0),
+            parse_args_ns: AtomicU64::new(0),
+            build_context_ns: AtomicU64::new(0),
+            hash_source_ns: AtomicU64::new(0),
+            hash_headers_ns: AtomicU64::new(0),
+            depgraph_check_ns: AtomicU64::new(0),
+            artifact_lookup_ns: AtomicU64::new(0),
+            write_output_ns: AtomicU64::new(0),
+            bookkeeping_ns: AtomicU64::new(0),
+            total_hit_ns: AtomicU64::new(0),
+            compiler_exec_ns: AtomicU64::new(0),
+            include_scan_ns: AtomicU64::new(0),
+            hash_all_ns: AtomicU64::new(0),
+            artifact_store_ns: AtomicU64::new(0),
+            total_miss_ns: AtomicU64::new(0),
             miss_count: AtomicU64::new(0),
         }
     }
@@ -260,58 +260,58 @@ impl PhaseProfiler {
     /// Record timing for one cache-hit compile.
     pub fn record_hit(&self, phases: &HitPhases) {
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.parse_args_us
-            .fetch_add(phases.parse_args_us, Ordering::Relaxed);
-        self.build_context_us
-            .fetch_add(phases.build_context_us, Ordering::Relaxed);
-        self.hash_source_us
-            .fetch_add(phases.hash_source_us, Ordering::Relaxed);
-        self.hash_headers_us
-            .fetch_add(phases.hash_headers_us, Ordering::Relaxed);
-        self.depgraph_check_us
-            .fetch_add(phases.depgraph_check_us, Ordering::Relaxed);
-        self.artifact_lookup_us
-            .fetch_add(phases.artifact_lookup_us, Ordering::Relaxed);
-        self.write_output_us
-            .fetch_add(phases.write_output_us, Ordering::Relaxed);
-        self.bookkeeping_us
-            .fetch_add(phases.bookkeeping_us, Ordering::Relaxed);
-        self.total_hit_us
-            .fetch_add(phases.total_us, Ordering::Relaxed);
+        self.parse_args_ns
+            .fetch_add(phases.parse_args_ns, Ordering::Relaxed);
+        self.build_context_ns
+            .fetch_add(phases.build_context_ns, Ordering::Relaxed);
+        self.hash_source_ns
+            .fetch_add(phases.hash_source_ns, Ordering::Relaxed);
+        self.hash_headers_ns
+            .fetch_add(phases.hash_headers_ns, Ordering::Relaxed);
+        self.depgraph_check_ns
+            .fetch_add(phases.depgraph_check_ns, Ordering::Relaxed);
+        self.artifact_lookup_ns
+            .fetch_add(phases.artifact_lookup_ns, Ordering::Relaxed);
+        self.write_output_ns
+            .fetch_add(phases.write_output_ns, Ordering::Relaxed);
+        self.bookkeeping_ns
+            .fetch_add(phases.bookkeeping_ns, Ordering::Relaxed);
+        self.total_hit_ns
+            .fetch_add(phases.total_ns, Ordering::Relaxed);
     }
 
     /// Record timing for one cache-miss compile.
     pub fn record_miss(&self, phases: &MissPhases) {
         self.miss_count.fetch_add(1, Ordering::Relaxed);
-        self.compiler_exec_us
-            .fetch_add(phases.compiler_exec_us, Ordering::Relaxed);
-        self.include_scan_us
-            .fetch_add(phases.include_scan_us, Ordering::Relaxed);
-        self.hash_all_us
-            .fetch_add(phases.hash_all_us, Ordering::Relaxed);
-        self.artifact_store_us
-            .fetch_add(phases.artifact_store_us, Ordering::Relaxed);
-        self.total_miss_us
-            .fetch_add(phases.total_us, Ordering::Relaxed);
+        self.compiler_exec_ns
+            .fetch_add(phases.compiler_exec_ns, Ordering::Relaxed);
+        self.include_scan_ns
+            .fetch_add(phases.include_scan_ns, Ordering::Relaxed);
+        self.hash_all_ns
+            .fetch_add(phases.hash_all_ns, Ordering::Relaxed);
+        self.artifact_store_ns
+            .fetch_add(phases.artifact_store_ns, Ordering::Relaxed);
+        self.total_miss_ns
+            .fetch_add(phases.total_ns, Ordering::Relaxed);
     }
 
     /// Reset all phase counters to zero.
     pub fn reset(&self) {
         self.count.store(0, Ordering::Relaxed);
-        self.parse_args_us.store(0, Ordering::Relaxed);
-        self.build_context_us.store(0, Ordering::Relaxed);
-        self.hash_source_us.store(0, Ordering::Relaxed);
-        self.hash_headers_us.store(0, Ordering::Relaxed);
-        self.depgraph_check_us.store(0, Ordering::Relaxed);
-        self.artifact_lookup_us.store(0, Ordering::Relaxed);
-        self.write_output_us.store(0, Ordering::Relaxed);
-        self.bookkeeping_us.store(0, Ordering::Relaxed);
-        self.total_hit_us.store(0, Ordering::Relaxed);
-        self.compiler_exec_us.store(0, Ordering::Relaxed);
-        self.include_scan_us.store(0, Ordering::Relaxed);
-        self.hash_all_us.store(0, Ordering::Relaxed);
-        self.artifact_store_us.store(0, Ordering::Relaxed);
-        self.total_miss_us.store(0, Ordering::Relaxed);
+        self.parse_args_ns.store(0, Ordering::Relaxed);
+        self.build_context_ns.store(0, Ordering::Relaxed);
+        self.hash_source_ns.store(0, Ordering::Relaxed);
+        self.hash_headers_ns.store(0, Ordering::Relaxed);
+        self.depgraph_check_ns.store(0, Ordering::Relaxed);
+        self.artifact_lookup_ns.store(0, Ordering::Relaxed);
+        self.write_output_ns.store(0, Ordering::Relaxed);
+        self.bookkeeping_ns.store(0, Ordering::Relaxed);
+        self.total_hit_ns.store(0, Ordering::Relaxed);
+        self.compiler_exec_ns.store(0, Ordering::Relaxed);
+        self.include_scan_ns.store(0, Ordering::Relaxed);
+        self.hash_all_ns.store(0, Ordering::Relaxed);
+        self.artifact_store_ns.store(0, Ordering::Relaxed);
+        self.total_miss_ns.store(0, Ordering::Relaxed);
         self.miss_count.store(0, Ordering::Relaxed);
     }
 
@@ -323,20 +323,20 @@ impl PhaseProfiler {
         ProfileSnapshot {
             hit_count: self.count.load(Ordering::Relaxed),
             miss_count: self.miss_count.load(Ordering::Relaxed),
-            avg_parse_args_us: self.parse_args_us.load(Ordering::Relaxed) / n,
-            avg_build_context_us: self.build_context_us.load(Ordering::Relaxed) / n,
-            avg_hash_source_us: self.hash_source_us.load(Ordering::Relaxed) / n,
-            avg_hash_headers_us: self.hash_headers_us.load(Ordering::Relaxed) / n,
-            avg_depgraph_check_us: self.depgraph_check_us.load(Ordering::Relaxed) / n,
-            avg_artifact_lookup_us: self.artifact_lookup_us.load(Ordering::Relaxed) / n,
-            avg_write_output_us: self.write_output_us.load(Ordering::Relaxed) / n,
-            avg_bookkeeping_us: self.bookkeeping_us.load(Ordering::Relaxed) / n,
-            avg_total_hit_us: self.total_hit_us.load(Ordering::Relaxed) / n,
-            avg_compiler_exec_us: self.compiler_exec_us.load(Ordering::Relaxed) / mn,
-            avg_include_scan_us: self.include_scan_us.load(Ordering::Relaxed) / mn,
-            avg_hash_all_us: self.hash_all_us.load(Ordering::Relaxed) / mn,
-            avg_artifact_store_us: self.artifact_store_us.load(Ordering::Relaxed) / mn,
-            avg_total_miss_us: self.total_miss_us.load(Ordering::Relaxed) / mn,
+            avg_parse_args_ns: self.parse_args_ns.load(Ordering::Relaxed) / n,
+            avg_build_context_ns: self.build_context_ns.load(Ordering::Relaxed) / n,
+            avg_hash_source_ns: self.hash_source_ns.load(Ordering::Relaxed) / n,
+            avg_hash_headers_ns: self.hash_headers_ns.load(Ordering::Relaxed) / n,
+            avg_depgraph_check_ns: self.depgraph_check_ns.load(Ordering::Relaxed) / n,
+            avg_artifact_lookup_ns: self.artifact_lookup_ns.load(Ordering::Relaxed) / n,
+            avg_write_output_ns: self.write_output_ns.load(Ordering::Relaxed) / n,
+            avg_bookkeeping_ns: self.bookkeeping_ns.load(Ordering::Relaxed) / n,
+            avg_total_hit_ns: self.total_hit_ns.load(Ordering::Relaxed) / n,
+            avg_compiler_exec_ns: self.compiler_exec_ns.load(Ordering::Relaxed) / mn,
+            avg_include_scan_ns: self.include_scan_ns.load(Ordering::Relaxed) / mn,
+            avg_hash_all_ns: self.hash_all_ns.load(Ordering::Relaxed) / mn,
+            avg_artifact_store_ns: self.artifact_store_ns.load(Ordering::Relaxed) / mn,
+            avg_total_miss_ns: self.total_miss_ns.load(Ordering::Relaxed) / mn,
         }
     }
 }
@@ -349,24 +349,24 @@ impl Default for PhaseProfiler {
 
 /// Timing data for one cache-hit compile request.
 pub struct HitPhases {
-    pub parse_args_us: u64,
-    pub build_context_us: u64,
-    pub hash_source_us: u64,
-    pub hash_headers_us: u64,
-    pub depgraph_check_us: u64,
-    pub artifact_lookup_us: u64,
-    pub write_output_us: u64,
-    pub bookkeeping_us: u64,
-    pub total_us: u64,
+    pub parse_args_ns: u64,
+    pub build_context_ns: u64,
+    pub hash_source_ns: u64,
+    pub hash_headers_ns: u64,
+    pub depgraph_check_ns: u64,
+    pub artifact_lookup_ns: u64,
+    pub write_output_ns: u64,
+    pub bookkeeping_ns: u64,
+    pub total_ns: u64,
 }
 
 /// Timing data for one cache-miss compile request.
 pub struct MissPhases {
-    pub compiler_exec_us: u64,
-    pub include_scan_us: u64,
-    pub hash_all_us: u64,
-    pub artifact_store_us: u64,
-    pub total_us: u64,
+    pub compiler_exec_ns: u64,
+    pub include_scan_ns: u64,
+    pub hash_all_ns: u64,
+    pub artifact_store_ns: u64,
+    pub total_ns: u64,
 }
 
 /// Averaged profile snapshot.
@@ -374,20 +374,20 @@ pub struct MissPhases {
 pub struct ProfileSnapshot {
     pub hit_count: u64,
     pub miss_count: u64,
-    pub avg_parse_args_us: u64,
-    pub avg_build_context_us: u64,
-    pub avg_hash_source_us: u64,
-    pub avg_hash_headers_us: u64,
-    pub avg_depgraph_check_us: u64,
-    pub avg_artifact_lookup_us: u64,
-    pub avg_write_output_us: u64,
-    pub avg_bookkeeping_us: u64,
-    pub avg_total_hit_us: u64,
-    pub avg_compiler_exec_us: u64,
-    pub avg_include_scan_us: u64,
-    pub avg_hash_all_us: u64,
-    pub avg_artifact_store_us: u64,
-    pub avg_total_miss_us: u64,
+    pub avg_parse_args_ns: u64,
+    pub avg_build_context_ns: u64,
+    pub avg_hash_source_ns: u64,
+    pub avg_hash_headers_ns: u64,
+    pub avg_depgraph_check_ns: u64,
+    pub avg_artifact_lookup_ns: u64,
+    pub avg_write_output_ns: u64,
+    pub avg_bookkeeping_ns: u64,
+    pub avg_total_hit_ns: u64,
+    pub avg_compiler_exec_ns: u64,
+    pub avg_include_scan_ns: u64,
+    pub avg_hash_all_ns: u64,
+    pub avg_artifact_store_ns: u64,
+    pub avg_total_miss_ns: u64,
 }
 
 #[cfg(test)]
@@ -416,7 +416,7 @@ mod tests {
         let s = c.snapshot();
         assert_eq!(s.compilations, 1);
         assert_eq!(s.hits, 1);
-        assert_eq!(s.hit_time_us, 500);
+        assert_eq!(s.hit_time_ns, 500);
         assert_eq!(s.bytes_read, 1024);
     }
 
@@ -428,7 +428,7 @@ mod tests {
         let s = c.snapshot();
         assert_eq!(s.compilations, 1);
         assert_eq!(s.misses, 1);
-        assert_eq!(s.miss_time_us, 50_000);
+        assert_eq!(s.miss_time_ns, 50_000);
         assert_eq!(s.bytes_written, 2048);
     }
 
@@ -455,16 +455,16 @@ mod tests {
     #[test]
     fn time_saved_ms_calculation() {
         let c = StatsCollector::new();
-        // 10 hits at 1ms each, 5 misses at 100ms each
+        // 10 hits at 1ms each (1_000_000ns), 5 misses at 100ms each (100_000_000ns)
         for _ in 0..10 {
-            c.record_hit(1_000, 0);
+            c.record_hit(1_000_000, 0);
         }
         for _ in 0..5 {
-            c.record_miss(100_000, 0);
+            c.record_miss(100_000_000, 0);
         }
         let s = c.snapshot();
-        // avg_hit = 1000us, avg_miss = 100000us, saved_per_hit = 99000us
-        // total_saved = 10 * 99000 / 1000 = 990ms
+        // avg_hit = 1000000ns, avg_miss = 100000000ns, saved_per_hit = 99000000ns
+        // total_saved = 10 * 99000000 / 1_000_000 = 990ms
         assert_eq!(s.time_saved_ms(), 990);
     }
 
@@ -500,8 +500,8 @@ mod tests {
                 non_cacheable: 0,
                 compile_errors: 0,
                 sessions_total: 0,
-                hit_time_us: 0,
-                miss_time_us: 0,
+                hit_time_ns: 0,
+                miss_time_ns: 0,
                 bytes_read: 0,
                 bytes_written: 0,
                 link_total: 0,
@@ -516,22 +516,22 @@ mod tests {
     fn profiler_reset_clears_all_counters() {
         let p = PhaseProfiler::new();
         p.record_hit(&HitPhases {
-            parse_args_us: 100,
-            build_context_us: 200,
-            hash_source_us: 300,
-            hash_headers_us: 400,
-            depgraph_check_us: 500,
-            artifact_lookup_us: 600,
-            write_output_us: 700,
-            bookkeeping_us: 800,
-            total_us: 3600,
+            parse_args_ns: 100,
+            build_context_ns: 200,
+            hash_source_ns: 300,
+            hash_headers_ns: 400,
+            depgraph_check_ns: 500,
+            artifact_lookup_ns: 600,
+            write_output_ns: 700,
+            bookkeeping_ns: 800,
+            total_ns: 3600,
         });
         p.record_miss(&MissPhases {
-            compiler_exec_us: 1000,
-            include_scan_us: 2000,
-            hash_all_us: 3000,
-            artifact_store_us: 4000,
-            total_us: 10000,
+            compiler_exec_ns: 1000,
+            include_scan_ns: 2000,
+            hash_all_ns: 3000,
+            artifact_store_ns: 4000,
+            total_ns: 10000,
         });
 
         p.reset();
@@ -566,7 +566,7 @@ mod tests {
         let s = c.snapshot();
         assert_eq!(s.compilations, 1000);
         assert_eq!(s.hits, 1000);
-        assert_eq!(s.hit_time_us, 100_000);
+        assert_eq!(s.hit_time_ns, 100_000);
         assert_eq!(s.bytes_read, 10_000);
     }
 }

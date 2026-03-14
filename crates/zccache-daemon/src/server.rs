@@ -1088,7 +1088,7 @@ async fn handle_compile(
             .await;
         }
     };
-    let parse_args_us = t0.elapsed().as_micros() as u64;
+    let parse_args_ns = t0.elapsed().as_nanos() as u64;
 
     let cwd_path = PathBuf::from(cwd);
     let source_path = if compilation.source_file.is_absolute() {
@@ -1106,7 +1106,7 @@ async fn handle_compile(
     let t1 = std::time::Instant::now();
     let (ctx, dep_flags) = build_compile_context(&compilation, &cwd_path, &system_includes);
     let context_key = state.dep_graph.register(ctx.clone());
-    let build_context_us = t1.elapsed().as_micros() as u64;
+    let build_context_ns = t1.elapsed().as_nanos() as u64;
 
     // ── Ultra-fast path: clock-based skip ────────────────────────────
     // If the watcher is active and the journal clock hasn't advanced since
@@ -1119,7 +1119,7 @@ async fn handle_compile(
                 let artifact_key_hex = &entry.artifact_key_hex;
                 let t5 = std::time::Instant::now();
                 let cached = state.artifacts.get(artifact_key_hex).map(|r| r.clone());
-                let artifact_lookup_us = t5.elapsed().as_micros() as u64;
+                let artifact_lookup_ns = t5.elapsed().as_nanos() as u64;
 
                 if let Some(cached) = cached {
                     let t6 = std::time::Instant::now();
@@ -1139,20 +1139,27 @@ async fn handle_compile(
                             };
                         }
                     }
-                    let write_output_us = t6.elapsed().as_micros() as u64;
+                    let write_output_ns = t6.elapsed().as_nanos() as u64;
+
+                    // Watch output dir + force-invalidate so downstream
+                    // consumers (link cache) see the change.
+                    if let Some(out_dir) = output_path.parent() {
+                        watch_directory(state, out_dir).await;
+                    }
+                    state.cache_system.apply_changes(vec![output_path.clone()]);
 
                     let t7 = std::time::Instant::now();
-                    let latency_us = compile_start.elapsed().as_micros() as u64;
+                    let latency_ns = compile_start.elapsed().as_nanos() as u64;
                     let artifact_bytes: u64 = cached
                         .artifact
                         .outputs
                         .iter()
                         .map(|o| o.data.len() as u64)
                         .sum();
-                    state.stats.record_hit(latency_us, artifact_bytes);
+                    state.stats.record_hit(latency_ns, artifact_bytes);
                     let src = source_path.clone();
                     record_session_stat(&state.sessions, &sid, move |t| {
-                        t.record_hit(src, latency_us, artifact_bytes);
+                        t.record_hit(src, latency_ns, artifact_bytes);
                     });
                     write_session_log(
                         &state.sessions,
@@ -1163,19 +1170,19 @@ async fn handle_compile(
                             output_path.display()
                         ),
                     );
-                    let bookkeeping_us = t7.elapsed().as_micros() as u64;
+                    let bookkeeping_ns = t7.elapsed().as_nanos() as u64;
 
-                    let total_us = compile_start.elapsed().as_micros() as u64;
+                    let total_ns = compile_start.elapsed().as_nanos() as u64;
                     state.profiler.record_hit(&HitPhases {
-                        parse_args_us,
-                        build_context_us,
-                        hash_source_us: 0,
-                        hash_headers_us: 0,
-                        depgraph_check_us: 0,
-                        artifact_lookup_us,
-                        write_output_us,
-                        bookkeeping_us,
-                        total_us,
+                        parse_args_ns,
+                        build_context_ns,
+                        hash_source_ns: 0,
+                        hash_headers_ns: 0,
+                        depgraph_check_ns: 0,
+                        artifact_lookup_ns,
+                        write_output_ns,
+                        bookkeeping_ns,
+                        total_ns,
                     });
 
                     return Response::CompileResult {
@@ -1208,7 +1215,7 @@ async fn handle_compile(
                 .await;
         }
     }
-    let hash_source_us = t2.elapsed().as_micros() as u64;
+    let hash_source_ns = t2.elapsed().as_nanos() as u64;
 
     // ── Phase: hash headers ──────────────────────────────────────────
     let t3 = std::time::Instant::now();
@@ -1228,7 +1235,7 @@ async fn handle_compile(
             }
         }
     }
-    let hash_headers_us = t3.elapsed().as_micros() as u64;
+    let hash_headers_ns = t3.elapsed().as_nanos() as u64;
 
     // ── Phase: depgraph check ────────────────────────────────────────
     let t4 = std::time::Instant::now();
@@ -1239,7 +1246,7 @@ async fn handle_compile(
             .dep_graph
             .check_diagnostic(&context_key, is_fresh, get_hash)
     };
-    let depgraph_check_us = t4.elapsed().as_micros() as u64;
+    let depgraph_check_ns = t4.elapsed().as_nanos() as u64;
     write_session_log(
         &state.sessions,
         &sid,
@@ -1264,7 +1271,7 @@ async fn handle_compile(
             let t5 = std::time::Instant::now();
             let artifact_key_hex = artifact_key.hash().to_hex();
             let cached = state.artifacts.get(&artifact_key_hex).map(|r| r.clone());
-            let artifact_lookup_us = t5.elapsed().as_micros() as u64;
+            let artifact_lookup_ns = t5.elapsed().as_nanos() as u64;
 
             if let Some(cached) = cached {
                 // ── Phase: write output ──────────────────────────────
@@ -1285,21 +1292,28 @@ async fn handle_compile(
                         };
                     }
                 }
-                let write_output_us = t6.elapsed().as_micros() as u64;
+                let write_output_ns = t6.elapsed().as_nanos() as u64;
+
+                // Watch output dir + force-invalidate so downstream
+                // consumers (link cache) see the change.
+                if let Some(out_dir) = output_path.parent() {
+                    watch_directory(state, out_dir).await;
+                }
+                state.cache_system.apply_changes(vec![output_path.clone()]);
 
                 // ── Phase: bookkeeping ───────────────────────────────
                 let t7 = std::time::Instant::now();
-                let latency_us = compile_start.elapsed().as_micros() as u64;
+                let latency_ns = compile_start.elapsed().as_nanos() as u64;
                 let artifact_bytes: u64 = cached
                     .artifact
                     .outputs
                     .iter()
                     .map(|o| o.data.len() as u64)
                     .sum();
-                state.stats.record_hit(latency_us, artifact_bytes);
+                state.stats.record_hit(latency_ns, artifact_bytes);
                 let src = source_path.clone();
                 record_session_stat(&state.sessions, &sid, move |t| {
-                    t.record_hit(src, latency_us, artifact_bytes);
+                    t.record_hit(src, latency_ns, artifact_bytes);
                 });
                 write_session_log(
                     &state.sessions,
@@ -1310,7 +1324,7 @@ async fn handle_compile(
                         output_path.display()
                     ),
                 );
-                let bookkeeping_us = t7.elapsed().as_micros() as u64;
+                let bookkeeping_ns = t7.elapsed().as_nanos() as u64;
 
                 // Populate fast-hit cache for future requests
                 let current_clock = state.cache_system.current_clock();
@@ -1324,17 +1338,17 @@ async fn handle_compile(
                 );
 
                 // Record phase profile
-                let total_us = compile_start.elapsed().as_micros() as u64;
+                let total_ns = compile_start.elapsed().as_nanos() as u64;
                 state.profiler.record_hit(&HitPhases {
-                    parse_args_us,
-                    build_context_us,
-                    hash_source_us,
-                    hash_headers_us,
-                    depgraph_check_us,
-                    artifact_lookup_us,
-                    write_output_us,
-                    bookkeeping_us,
-                    total_us,
+                    parse_args_ns,
+                    build_context_ns,
+                    hash_source_ns,
+                    hash_headers_ns,
+                    depgraph_check_ns,
+                    artifact_lookup_ns,
+                    write_output_ns,
+                    bookkeeping_ns,
+                    total_ns,
                 });
 
                 return Response::CompileResult {
@@ -1398,7 +1412,7 @@ async fn handle_compile(
             };
         }
     };
-    let compiler_exec_us = t_exec.elapsed().as_micros() as u64;
+    let compiler_exec_ns = t_exec.elapsed().as_nanos() as u64;
 
     let exit_code = output.status.code().unwrap_or(-1);
 
@@ -1458,7 +1472,7 @@ async fn handle_compile(
                 zccache_depgraph::scanner::scan_recursive(&source_path, &ctx.include_search)
             }
         };
-        let include_scan_us = t_scan.elapsed().as_micros() as u64;
+        let include_scan_ns = t_scan.elapsed().as_nanos() as u64;
 
         // Register scanned paths for zero-syscall fast path on future hits.
         let tracked_paths: Vec<PathBuf> = std::iter::once(source_path.clone())
@@ -1466,11 +1480,16 @@ async fn handle_compile(
             .collect();
         state.cache_system.register_tracked(&tracked_paths);
 
-        // Watch parent directories of discovered headers so watcher events
-        // keep the journal accurate and enable the zero-syscall fast path.
+        // Watch parent directories of source file AND discovered headers so
+        // watcher events keep the journal accurate and enable the zero-syscall
+        // fast path. Without watching the source dir, edits to the source file
+        // won't advance the clock and the fast_hit_cache serves stale artifacts.
         {
-            let header_dirs: Vec<PathBuf> = {
+            let dep_dirs: Vec<PathBuf> = {
                 let mut dirs = HashSet::new();
+                if let Some(parent) = source_path.parent() {
+                    dirs.insert(parent.to_path_buf());
+                }
                 for header in &scan_result.resolved {
                     if let Some(parent) = header.parent() {
                         dirs.insert(parent.to_path_buf());
@@ -1478,7 +1497,7 @@ async fn handle_compile(
                 }
                 dirs.into_iter().collect()
             };
-            watch_directories(state, &header_dirs).await;
+            watch_directories(state, &dep_dirs).await;
         }
 
         // ── Phase: hash all files ────────────────────────────────────
@@ -1492,7 +1511,7 @@ async fn handle_compile(
                 hash_map.insert(header.clone(), h);
             }
         }
-        let hash_all_us = t_hash.elapsed().as_micros() as u64;
+        let hash_all_ns = t_hash.elapsed().as_nanos() as u64;
 
         // ── Phase: store artifact ────────────────────────────────────
         let t_store = std::time::Instant::now();
@@ -1540,23 +1559,30 @@ async fn handle_compile(
                 .artifacts
                 .insert(artifact_key_hex, CachedArtifact { artifact });
 
-            let latency_us = compile_start.elapsed().as_micros() as u64;
-            state.stats.record_miss(latency_us, artifact_bytes);
+            let latency_ns = compile_start.elapsed().as_nanos() as u64;
+            state.stats.record_miss(latency_ns, artifact_bytes);
             let src = source_path.clone();
             record_session_stat(&state.sessions, &sid, move |t| {
                 t.record_miss(src, artifact_bytes);
             });
         }
-        let artifact_store_us = t_store.elapsed().as_micros() as u64;
+        // Watch output dir + force-invalidate so downstream consumers
+        // (link cache) see the freshly compiled output.
+        if let Some(out_dir) = output_path.parent() {
+            watch_directory(state, out_dir).await;
+        }
+        state.cache_system.apply_changes(vec![output_path.clone()]);
+
+        let artifact_store_ns = t_store.elapsed().as_nanos() as u64;
 
         // Record miss phase profile
-        let total_us = compile_start.elapsed().as_micros() as u64;
+        let total_ns = compile_start.elapsed().as_nanos() as u64;
         state.profiler.record_miss(&MissPhases {
-            compiler_exec_us,
-            include_scan_us,
-            hash_all_us,
-            artifact_store_us,
-            total_us,
+            compiler_exec_ns,
+            include_scan_ns,
+            hash_all_ns,
+            artifact_store_ns,
+            total_ns,
         });
     }
 
@@ -1698,17 +1724,17 @@ fn check_unit_cache(
             state.stats.record_hit(0, artifact_bytes);
 
             // Profile output (write_output is now deferred, so 0)
-            let total_us = t0.elapsed().as_micros() as u64;
+            let total_ns = t0.elapsed().as_nanos() as u64;
             state.profiler.record_hit(&HitPhases {
-                parse_args_us: 0,
-                build_context_us: t_ctx.as_micros() as u64,
-                hash_source_us: (t_hash_source - t_register).as_micros() as u64,
-                hash_headers_us: (t_hash_headers - t_hash_source).as_micros() as u64,
-                depgraph_check_us: (t_depgraph - t_hash_headers).as_micros() as u64,
-                artifact_lookup_us: (t_lookup - t_depgraph).as_micros() as u64,
-                write_output_us: 0,
-                bookkeeping_us: 0,
-                total_us,
+                parse_args_ns: 0,
+                build_context_ns: t_ctx.as_nanos() as u64,
+                hash_source_ns: (t_hash_source - t_register).as_nanos() as u64,
+                hash_headers_ns: (t_hash_headers - t_hash_source).as_nanos() as u64,
+                depgraph_check_ns: (t_depgraph - t_hash_headers).as_nanos() as u64,
+                artifact_lookup_ns: (t_lookup - t_depgraph).as_nanos() as u64,
+                write_output_ns: 0,
+                bookkeeping_ns: 0,
+                total_ns,
             });
 
             return UnitCacheResult::Hit {
@@ -1822,6 +1848,27 @@ async fn handle_compile_multi(
             });
         }
         while write_set.join_next().await.is_some() {}
+    }
+
+    // Watch output dirs + force-invalidate for all outputs so
+    // downstream consumers (link cache) see the written artifacts.
+    {
+        let mut output_dirs = HashSet::new();
+        let mut output_paths = Vec::new();
+        for comp in &compilations {
+            let out = if comp.output_file.is_absolute() {
+                comp.output_file.clone()
+            } else {
+                cwd_path.join(&comp.output_file)
+            };
+            if let Some(parent) = out.parent() {
+                output_dirs.insert(parent.to_path_buf());
+            }
+            output_paths.push(out);
+        }
+        let dirs: Vec<PathBuf> = output_dirs.into_iter().collect();
+        watch_directories(&state, &dirs).await;
+        state.cache_system.apply_changes(output_paths);
     }
 
     let miss_sources: Vec<&PathBuf> = unit_results
@@ -1956,10 +2003,13 @@ async fn handle_compile_multi(
             .collect();
         state.cache_system.register_tracked(&tracked_paths);
 
-        // Watch parent directories of discovered headers.
+        // Watch parent directories of source file AND discovered headers.
         {
-            let header_dirs: Vec<PathBuf> = {
+            let dep_dirs: Vec<PathBuf> = {
                 let mut dirs = HashSet::new();
+                if let Some(parent) = source_path.parent() {
+                    dirs.insert(parent.to_path_buf());
+                }
                 for header in &scan_result.resolved {
                     if let Some(parent) = header.parent() {
                         dirs.insert(parent.to_path_buf());
@@ -1967,7 +2017,7 @@ async fn handle_compile_multi(
                 }
                 dirs.into_iter().collect()
             };
-            watch_directories(&state, &header_dirs).await;
+            watch_directories(&state, &dep_dirs).await;
         }
 
         // Hash all files

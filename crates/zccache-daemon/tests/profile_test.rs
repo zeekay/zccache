@@ -121,20 +121,20 @@ fn print_profile(profile: &zccache_daemon::ProfileSnapshot) {
         println!("  {dash}");
 
         let phases = [
-            ("parse_args", profile.avg_parse_args_us),
-            ("build_context + register", profile.avg_build_context_us),
-            ("hash_source (metadata cache)", profile.avg_hash_source_us),
-            ("hash_headers (metadata cache)", profile.avg_hash_headers_us),
-            ("depgraph_check", profile.avg_depgraph_check_us),
+            ("parse_args", profile.avg_parse_args_ns),
+            ("build_context + register", profile.avg_build_context_ns),
+            ("hash_source (metadata cache)", profile.avg_hash_source_ns),
+            ("hash_headers (metadata cache)", profile.avg_hash_headers_ns),
+            ("depgraph_check", profile.avg_depgraph_check_ns),
             (
                 "artifact_lookup (Mutex<HashMap>)",
-                profile.avg_artifact_lookup_us,
+                profile.avg_artifact_lookup_ns,
             ),
-            ("write_output (fs::write)", profile.avg_write_output_us),
-            ("bookkeeping (stats + log)", profile.avg_bookkeeping_us),
+            ("write_output (fs::write)", profile.avg_write_output_ns),
+            ("bookkeeping (stats + log)", profile.avg_bookkeeping_ns),
         ];
 
-        let total = profile.avg_total_hit_us.max(1);
+        let total = profile.avg_total_hit_ns.max(1);
         let mut accounted = 0u64;
         for (name, us) in &phases {
             let pct = (*us as f64 / total as f64) * 100.0;
@@ -160,16 +160,16 @@ fn print_profile(profile: &zccache_daemon::ProfileSnapshot) {
         println!("  {dash}");
 
         let miss_phases = [
-            ("compiler_exec (clang)", profile.avg_compiler_exec_us),
-            ("include_scan (recursive)", profile.avg_include_scan_us),
-            ("hash_all_files", profile.avg_hash_all_us),
+            ("compiler_exec (clang)", profile.avg_compiler_exec_ns),
+            ("include_scan (recursive)", profile.avg_include_scan_ns),
+            ("hash_all_files", profile.avg_hash_all_ns),
             (
                 "artifact_store (depgraph + HashMap)",
-                profile.avg_artifact_store_us,
+                profile.avg_artifact_store_ns,
             ),
         ];
 
-        let total = profile.avg_total_miss_us.max(1);
+        let total = profile.avg_total_miss_ns.max(1);
         let mut accounted = 0u64;
         for (name, us) in &miss_phases {
             let pct = (*us as f64 / total as f64) * 100.0;

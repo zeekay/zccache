@@ -78,6 +78,10 @@ Hooks are in `ci/hooks/` (Python) and `crates/zccache-ci` (Rust), invoked via `u
 - Comprehensive tests over comprehensive docs. Tests are executable documentation.
 - Test real behavior: use `tempfile` for filesystem tests, not mocks. Test the contract, not the implementation.
 
+## Conventions
+
+- **Timing: always use nanoseconds.** All internal timing fields, variables, and phase profiling use `_ns` suffix and `as_nanos()`. Display code converts to human-readable units (ns/us/ms/s). Never use `as_micros()`.
+
 ## Core Principles
 
 - Simplicity first. Minimal code impact. No over-engineering.
