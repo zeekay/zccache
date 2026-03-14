@@ -22,8 +22,16 @@ use std::process::ExitCode;
 #[derive(Debug, Parser)]
 #[command(name = "zccache", version, about)]
 struct Cli {
+    /// Clear the entire artifact cache (same as `zccache clear`).
+    #[arg(long)]
+    clear: bool,
+
+    /// Show daemon and cache statistics (same as `zccache status`).
+    #[arg(long)]
+    show_stats: bool,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -48,11 +56,23 @@ enum Commands {
         /// IPC endpoint (default: platform-specific).
         #[arg(long)]
         endpoint: Option<String>,
+        /// Enable per-session hit/miss statistics tracking.
+        #[arg(long)]
+        stats: bool,
     },
     /// End a build session.
     #[command(name = "session-end")]
     SessionEnd {
         /// Session ID to end.
+        session_id: String,
+        /// IPC endpoint (default: platform-specific).
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
+    /// Query stats for an active session (without ending it).
+    #[command(name = "session-stats")]
+    SessionStatsCmd {
+        /// Session ID to query.
         session_id: String,
         /// IPC endpoint (default: platform-specific).
         #[arg(long)]
@@ -87,6 +107,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "inspect",
     "session-start",
     "session-end",
+    "session-stats",
     "crashes",
     "help",
     "--help",
@@ -98,9 +119,12 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
-    // Auto-detect: if first arg isn't a known subcommand, enter wrap mode.
+    // Auto-detect: if first arg isn't a known subcommand or a --flag, enter wrap mode.
     // e.g., `zccache clang++ -c foo.cpp -o foo.o`
-    if args.len() > 1 && !KNOWN_SUBCOMMANDS.contains(&args[1].as_str()) {
+    if args.len() > 1
+        && !KNOWN_SUBCOMMANDS.contains(&args[1].as_str())
+        && !args[1].starts_with("--")
+    {
         return run_wrap(&args[1..]);
     }
 
@@ -108,7 +132,27 @@ fn main() -> ExitCode {
 
     init_tracing();
 
-    match cli.command {
+    // Handle top-level flags (sccache-compatible)
+    if cli.clear {
+        let endpoint = resolve_endpoint(None);
+        return run_async(cmd_clear(&endpoint));
+    }
+    if cli.show_stats {
+        let endpoint = resolve_endpoint(None);
+        return run_async(cmd_status(&endpoint));
+    }
+
+    let command = match cli.command {
+        Some(cmd) => cmd,
+        None => {
+            // No subcommand and no flag — show help.
+            use clap::CommandFactory;
+            Cli::command().print_help().ok();
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match command {
         Commands::Start => {
             let endpoint = resolve_endpoint(None);
             run_async(cmd_start(&endpoint))
@@ -125,7 +169,12 @@ fn main() -> ExitCode {
             let endpoint = resolve_endpoint(None);
             run_async(cmd_clear(&endpoint))
         }
-        Commands::SessionStart { cwd, log, endpoint } => {
+        Commands::SessionStart {
+            cwd,
+            log,
+            endpoint,
+            stats,
+        } => {
             let endpoint = resolve_endpoint(endpoint.as_deref());
             let cwd = cwd
                 .map(PathBuf::from)
@@ -138,7 +187,7 @@ fn main() -> ExitCode {
                     std::env::current_dir().unwrap_or_default().join(p)
                 }
             });
-            run_async(cmd_session_start(&endpoint, &cwd, log.as_deref()))
+            run_async(cmd_session_start(&endpoint, &cwd, log.as_deref(), stats))
         }
         Commands::SessionEnd {
             session_id,
@@ -146,6 +195,13 @@ fn main() -> ExitCode {
         } => {
             let endpoint = resolve_endpoint(endpoint.as_deref());
             run_async(cmd_session_end(&endpoint, session_id))
+        }
+        Commands::SessionStatsCmd {
+            session_id,
+            endpoint,
+        } => {
+            let endpoint = resolve_endpoint(endpoint.as_deref());
+            run_async(cmd_session_stats(&endpoint, session_id))
         }
         Commands::Wrap { args } => run_wrap(&args),
         Commands::Inspect { key } => {
@@ -315,7 +371,12 @@ async fn cmd_clear(endpoint: &str) -> ExitCode {
     }
 }
 
-async fn cmd_session_start(endpoint: &str, cwd: &Path, log: Option<&Path>) -> ExitCode {
+async fn cmd_session_start(
+    endpoint: &str,
+    cwd: &Path,
+    log: Option<&Path>,
+    track_stats: bool,
+) -> ExitCode {
     if let Err(e) = ensure_daemon(endpoint).await {
         eprintln!("cannot start daemon at {endpoint}: {e}");
         return ExitCode::FAILURE;
@@ -333,7 +394,7 @@ async fn cmd_session_start(endpoint: &str, cwd: &Path, log: Option<&Path>) -> Ex
         client_pid: std::process::id(),
         working_dir: cwd.to_path_buf(),
         log_file: log.map(Path::to_path_buf),
-        track_stats: false,
+        track_stats,
     })
     .await
     .unwrap();
@@ -404,6 +465,58 @@ async fn cmd_session_end(endpoint: &str, session_id: String) -> ExitCode {
         }
         Some(zccache_protocol::Response::Error { message }) => {
             eprintln!("session-end failed: {message}");
+            ExitCode::FAILURE
+        }
+        other => {
+            eprintln!("unexpected response: {other:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn cmd_session_stats(endpoint: &str, session_id: String) -> ExitCode {
+    let mut conn = match connect(endpoint).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cannot connect to daemon at {endpoint}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    conn.send(&zccache_protocol::Request::SessionStats {
+        session_id: session_id.clone(),
+    })
+    .await
+    .unwrap();
+
+    match conn.recv().await.unwrap() {
+        Some(zccache_protocol::Response::SessionStatsResult { stats }) => {
+            if let Some(s) = stats {
+                let total = s.hits + s.misses;
+                let hit_rate = if total > 0 {
+                    format!("{:.1}%", s.hits as f64 / total as f64 * 100.0)
+                } else {
+                    "n/a".to_string()
+                };
+                eprintln!(
+                    "Session {session_id} (active, {})",
+                    format_duration_ms(s.duration_ms)
+                );
+                eprintln!(
+                    "  {} compilations: {} hits, {} misses, {} non-cacheable",
+                    s.compilations, s.hits, s.misses, s.non_cacheable
+                );
+                eprintln!("  Hit rate: {hit_rate}");
+                if s.time_saved_ms > 0 {
+                    eprintln!("  Time saved: ~{}", format_duration_ms(s.time_saved_ms));
+                }
+            } else {
+                eprintln!("Session {session_id}: stats tracking not enabled");
+            }
+            ExitCode::SUCCESS
+        }
+        Some(zccache_protocol::Response::Error { message }) => {
+            eprintln!("session-stats failed: {message}");
             ExitCode::FAILURE
         }
         other => {

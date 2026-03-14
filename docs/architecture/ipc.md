@@ -47,6 +47,12 @@ per invocation.
 1. Connect and send `Request::Compile` with the existing session ID.
 2. Read `Response::CompileResult`, relay output, exit.
 
+**CLI side (session lifecycle):**
+1. `zccache session-start [--stats] [--log FILE]` → `Request::SessionStart` → `Response::SessionStarted { session_id }`.
+2. Build system sets `ZCCACHE_SESSION_ID=<uuid>`. Each compiler invocation sends `Request::Compile`.
+3. `zccache session-stats <id>` → `Request::SessionStats` → `Response::SessionStatsResult`. Non-destructive; session stays active. Returns `Option<SessionStats>` (`None` if `--stats` was not used at start).
+4. `zccache session-end <id>` → `Request::SessionEnd` → `Response::SessionEnded { stats }`. Removes the session.
+
 **Daemon side:**
 1. Acquire lock file (write PID).
 2. Bind transport listener.

@@ -55,6 +55,11 @@ pub enum Request {
         /// Session ID to end (UUID string).
         session_id: String,
     },
+    /// Query per-session statistics without ending the session.
+    SessionStats {
+        /// Session ID to query (UUID string).
+        session_id: String,
+    },
     /// Clear all caches (artifacts, metadata, dep graph).
     Clear,
     /// Single-roundtrip ephemeral compile: session start + compile + session end
@@ -124,6 +129,11 @@ pub enum Response {
     /// Session ended successfully.
     SessionEnded {
         /// Per-session stats, if the session opted in to tracking.
+        stats: Option<SessionStats>,
+    },
+    /// Mid-session statistics snapshot.
+    SessionStatsResult {
+        /// Per-session stats, if the session exists and opted in to tracking.
         stats: Option<SessionStats>,
     },
     /// Result of a link/archive request.
@@ -457,6 +467,31 @@ mod tests {
             cached: false,
             warning: Some("non-deterministic: missing D flag".into()),
         });
+    }
+
+    #[test]
+    fn session_stats_request_roundtrip() {
+        roundtrip(&Request::SessionStats {
+            session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+        });
+    }
+
+    #[test]
+    fn session_stats_result_roundtrip() {
+        let stats = SessionStats {
+            duration_ms: 5000,
+            compilations: 10,
+            hits: 7,
+            misses: 2,
+            non_cacheable: 1,
+            errors: 0,
+            time_saved_ms: 3000,
+            unique_sources: 9,
+            bytes_read: 50_000,
+            bytes_written: 20_000,
+        };
+        roundtrip(&Response::SessionStatsResult { stats: Some(stats) });
+        roundtrip(&Response::SessionStatsResult { stats: None });
     }
 
     #[test]

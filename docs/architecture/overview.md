@@ -65,6 +65,10 @@ zccache intercepts C/C++ compiler invocations, computes a deterministic cache ke
 
 **Binary names:** `zccache-cc`, `zccache-c++`, `zccache-gcc`, `zccache-g++`, `zccache-clang`, `zccache-clang++`. Also invokable as `zccache wrap -- <compiler> <args...>`.
 
+**Top-level flags (sccache-compatible):** `--clear` (wipe cache), `--show-stats` (print status).
+
+**Session commands:** `session-start [--stats] [--log FILE]`, `session-stats <id>` (mid-build query), `session-end <id>` (finalize).
+
 ### 2.2 Daemon Core
 
 **Responsibility:** Lifecycle management. Starts, shuts down, handles signals.
@@ -123,13 +127,12 @@ enum Request {
     Shutdown,
     Status,
     Clear,
-    SessionStart { client_pid, working_dir, compiler, log_file, track_stats },
+    SessionStart { client_pid, working_dir, log_file, track_stats },
     Compile { session_id, args, cwd, compiler, env },
     SessionEnd { session_id },
-    // Single-roundtrip ephemeral compile (drop-in wrapper mode).
-    // Combines SessionStart + Compile + SessionEnd into one message,
-    // saving 2 IPC roundtrips per invocation.
+    SessionStats { session_id },           // query mid-session stats (non-destructive)
     CompileEphemeral { client_pid, working_dir, compiler, args, cwd, env },
+    LinkEphemeral { client_pid, working_dir, tool, args, cwd, env },
 }
 
 enum Response {
@@ -137,9 +140,11 @@ enum Response {
     ShuttingDown,
     Status(DaemonStatus),
     Cleared { artifacts_removed, metadata_cleared, ... },
-    SessionStarted { session_id, system_includes },
+    SessionStarted { session_id },
     CompileResult { exit_code, stdout, stderr, cached },
-    SessionEnded { stats },
+    SessionEnded { stats: Option<SessionStats> },
+    SessionStatsResult { stats: Option<SessionStats> },  // mid-session snapshot
+    LinkResult { exit_code, stdout, stderr, cached, warning },
     Error { message },
 }
 ```

@@ -390,6 +390,23 @@ def main() -> None:
     repo = detect_repo()
     log(f"Publishing {name} {version} from {repo}")
 
+    # Step 0: Fail fast if repo has uncommitted or unpushed changes.
+    # GH Actions builds from the remote branch, so local-only changes
+    # produce binaries with stale version strings baked in.
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if dirty:
+        log(f"ERROR: Working tree is dirty. Commit and push before publishing.\n{dirty}")
+        sys.exit(1)
+
+    local_sha = run_capture(["git", "rev-parse", "HEAD"])
+    remote_sha = run_capture(["git", "rev-parse", "@{u}"])
+    if local_sha != remote_sha:
+        log(f"ERROR: Local HEAD ({local_sha[:12]}) differs from remote ({remote_sha[:12]}). Push before publishing.")
+        sys.exit(1)
+
     # Step 1: Fail fast if version exists
     check_pypi_version(name, version)
 

@@ -484,6 +484,35 @@ async fn handle_connection(
                 )
                 .await
             }
+            Request::SessionStats { session_id } => match session_id.parse::<SessionId>() {
+                Ok(sid) => {
+                    if let Some(session) = state.sessions.get(&sid) {
+                        let stats = session.stats_tracker.as_ref().map(|tracker| {
+                            let f = tracker.finalize(session.created_at);
+                            zccache_protocol::SessionStats {
+                                duration_ms: f.duration_ms,
+                                compilations: f.compilations,
+                                hits: f.hits,
+                                misses: f.misses,
+                                non_cacheable: f.non_cacheable,
+                                errors: f.errors,
+                                time_saved_ms: f.time_saved_ms,
+                                unique_sources: f.unique_sources,
+                                bytes_read: f.bytes_read,
+                                bytes_written: f.bytes_written,
+                            }
+                        });
+                        Response::SessionStatsResult { stats }
+                    } else {
+                        Response::Error {
+                            message: format!("unknown session: {session_id}"),
+                        }
+                    }
+                }
+                Err(_) => Response::Error {
+                    message: format!("invalid session ID: {session_id}"),
+                },
+            },
             Request::SessionEnd { session_id } => match session_id.parse::<SessionId>() {
                 Ok(sid) => {
                     if let Some(session) = state.sessions.end(&sid) {
@@ -1623,13 +1652,23 @@ async fn handle_compile(
             // Persist outputs to on-disk cache for hardlink optimization.
             for (i, out) in artifact.outputs.iter().enumerate() {
                 let cache_path = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                let _ = std::fs::write(&cache_path, &out.data);
+                if let Err(e) = std::fs::write(&cache_path, &out.data) {
+                    tracing::warn!(
+                        path = %cache_path.display(),
+                        "failed to persist artifact output: {e}"
+                    );
+                }
             }
 
             // Persist .meta sidecar so artifacts survive daemon restarts.
             let meta_path = state.artifact_dir.join(format!("{artifact_key_hex}.meta"));
             if let Ok(meta_bytes) = bincode::serialize(&artifact) {
-                let _ = std::fs::write(&meta_path, &meta_bytes);
+                if let Err(e) = std::fs::write(&meta_path, &meta_bytes) {
+                    tracing::warn!(
+                        path = %meta_path.display(),
+                        "failed to persist artifact meta: {e}"
+                    );
+                }
             }
 
             let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
@@ -2158,13 +2197,23 @@ async fn handle_compile_multi(
             let artifact_key_hex = artifact_key.hash().to_hex();
             for (i, out) in artifact.outputs.iter().enumerate() {
                 let cache_path = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                let _ = std::fs::write(&cache_path, &out.data);
+                if let Err(e) = std::fs::write(&cache_path, &out.data) {
+                    tracing::warn!(
+                        path = %cache_path.display(),
+                        "failed to persist artifact output: {e}"
+                    );
+                }
             }
 
             // Persist .meta sidecar so artifacts survive daemon restarts.
             let meta_path = state.artifact_dir.join(format!("{artifact_key_hex}.meta"));
             if let Ok(meta_bytes) = bincode::serialize(&artifact) {
-                let _ = std::fs::write(&meta_path, &meta_bytes);
+                if let Err(e) = std::fs::write(&meta_path, &meta_bytes) {
+                    tracing::warn!(
+                        path = %meta_path.display(),
+                        "failed to persist artifact meta: {e}"
+                    );
+                }
             }
 
             let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();

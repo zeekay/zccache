@@ -51,6 +51,16 @@ via hardlinks in under a second.
 `CompileEphemeral` message that combines session creation, compilation, and
 session teardown — eliminating 2 of 3 IPC roundtrips per invocation.
 
+**Session stats:** Track hit rates per-build with `--stats`:
+
+```bash
+eval $(zccache session-start --stats --log build.log)
+export ZCCACHE_SESSION_ID=...
+# ... build runs ...
+zccache session-stats $ZCCACHE_SESSION_ID   # query mid-build
+zccache session-end $ZCCACHE_SESSION_ID     # final stats
+```
+
 **Persistent cache:** Artifacts are stored in `~/.cache/zccache/artifacts/`
 (or `%LOCALAPPDATA%\zccache\artifacts\` on Windows) and survive daemon
 restarts. No need to re-warm the cache after a reboot.
