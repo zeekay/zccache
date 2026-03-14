@@ -221,7 +221,12 @@ async fn cmd_status(endpoint: &str) -> ExitCode {
             };
 
             println!(
-                "zccache daemon ({}) — uptime {}",
+                "zccache daemon v{} ({}) — uptime {}",
+                if s.version.is_empty() {
+                    "unknown"
+                } else {
+                    &s.version
+                },
                 endpoint,
                 format_uptime(s.uptime_secs)
             );
@@ -626,24 +631,16 @@ async fn cmd_compile_ephemeral(
     cwd: String,
     client_env: Vec<(String, String)>,
 ) -> ExitCode {
-    // Try to connect directly first (fast path — avoids a throwaway connection
-    // that ensure_daemon would make). Only fall back to ensure_daemon if the
-    // fast connect fails.
+    // Ensure daemon is running and version-compatible.
+    if let Err(e) = ensure_daemon(endpoint).await {
+        eprintln!("cannot start daemon at {endpoint}: {e}");
+        return ExitCode::FAILURE;
+    }
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
-        Err(_) => {
-            // Daemon not running — start it and connect
-            if let Err(e) = ensure_daemon(endpoint).await {
-                eprintln!("cannot start daemon at {endpoint}: {e}");
-                return ExitCode::FAILURE;
-            }
-            match connect(endpoint).await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("cannot connect to daemon at {endpoint}: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
+        Err(e) => {
+            eprintln!("cannot connect to daemon at {endpoint}: {e}");
+            return ExitCode::FAILURE;
         }
     };
 
@@ -689,20 +686,15 @@ async fn cmd_link_ephemeral(
     cwd: String,
     client_env: Vec<(String, String)>,
 ) -> ExitCode {
+    if let Err(e) = ensure_daemon(endpoint).await {
+        eprintln!("cannot start daemon at {endpoint}: {e}");
+        return ExitCode::FAILURE;
+    }
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
-        Err(_) => {
-            if let Err(e) = ensure_daemon(endpoint).await {
-                eprintln!("cannot start daemon at {endpoint}: {e}");
-                return ExitCode::FAILURE;
-            }
-            match connect(endpoint).await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("cannot connect to daemon at {endpoint}: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
+        Err(e) => {
+            eprintln!("cannot connect to daemon at {endpoint}: {e}");
+            return ExitCode::FAILURE;
         }
     };
 
@@ -746,15 +738,69 @@ async fn cmd_link_ephemeral(
 
 // ─── Daemon auto-start ─────────────────────────────────────────────────────
 
+/// Check if the running daemon is outdated and restart it if needed.
+///
+/// Sends a Status request to get the daemon's version. If the daemon version
+/// is older than the CLI version, shuts it down so `ensure_daemon` can spawn
+/// a new one.
+///
+/// Returns `true` if the daemon was restarted (caller should reconnect).
+async fn check_daemon_version(endpoint: &str) -> bool {
+    let mut conn = match connect(endpoint).await {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    if conn.send(&zccache_protocol::Request::Status).await.is_err() {
+        return false;
+    }
+
+    match conn.recv().await {
+        Ok(Some(zccache_protocol::Response::Status(status))) => {
+            // Only restart if the CLI is strictly newer than the daemon.
+            let dominated = if status.version.is_empty() {
+                true // Pre-version daemon, always upgrade.
+            } else {
+                version_less_than(&status.version, zccache_core::VERSION)
+            };
+            if !dominated {
+                return false; // Daemon is same version or newer, no restart.
+            }
+            eprintln!(
+                "daemon version {} is older than CLI version {} — restarting",
+                if status.version.is_empty() {
+                    "unknown"
+                } else {
+                    &status.version
+                },
+                zccache_core::VERSION
+            );
+            let _ = conn.send(&zccache_protocol::Request::Shutdown).await;
+            let _ = conn.recv::<zccache_protocol::Response>().await; // Wait for ShuttingDown ack.
+                                                                     // Give the daemon a moment to release the socket/pipe.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Ensure the daemon is running. If not, spawn it and wait for it to accept.
 ///
 /// Handles concurrent calls gracefully: when multiple processes race to start
 /// the daemon, only one wins the bind. The losers detect this and connect to
 /// the winning daemon instead of failing.
+///
+/// If a running daemon has an older version than this CLI, it is stopped and
+/// a new one is spawned.
 async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
     // Fast path: try to connect
     if connect(endpoint).await.is_ok() {
-        return Ok(());
+        // Check version — restart if stale.
+        if !check_daemon_version(endpoint).await {
+            return Ok(()); // Version matches, we're good.
+        }
+        // Daemon was shut down, fall through to spawn a new one.
     }
 
     // Check lock file for a running daemon we just can't reach yet
@@ -1002,6 +1048,22 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+/// Semver less-than: returns true if `a < b` by comparing major.minor.patch
+/// numerically. Falls back to lexicographic comparison if parsing fails.
+fn version_less_than(a: &str, b: &str) -> bool {
+    fn parse(v: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = v.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        Some((major, minor, patch))
+    }
+    match (parse(a), parse(b)) {
+        (Some(a), Some(b)) => a < b,
+        _ => a < b,
     }
 }
 

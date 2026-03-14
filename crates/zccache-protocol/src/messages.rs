@@ -159,6 +159,9 @@ pub enum Response {
 /// Daemon status information.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonStatus {
+    /// Daemon version (e.g. "1.0.8"). Used by CLI to detect stale daemons.
+    #[serde(default)]
+    pub version: String,
     /// Number of artifacts in cache.
     pub artifact_count: u64,
     /// Total size of cached artifacts in bytes.
@@ -317,6 +320,7 @@ mod tests {
     #[test]
     fn daemon_status_expanded_roundtrip() {
         let status = DaemonStatus {
+            version: env!("CARGO_PKG_VERSION").to_string(),
             artifact_count: 892,
             cache_size_bytes: 147_000_000,
             metadata_entries: 5430,
@@ -484,5 +488,40 @@ mod tests {
         roundtrip(&Response::Error {
             message: "test".into(),
         });
+    }
+
+    #[test]
+    fn daemon_status_version_field_roundtrips() {
+        let with_version = DaemonStatus {
+            version: "1.2.3".to_string(),
+            artifact_count: 0,
+            cache_size_bytes: 0,
+            metadata_entries: 0,
+            uptime_secs: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            total_compilations: 0,
+            non_cacheable: 0,
+            compile_errors: 0,
+            time_saved_ms: 0,
+            total_links: 0,
+            link_hits: 0,
+            link_misses: 0,
+            link_non_cacheable: 0,
+            dep_graph_contexts: 0,
+            dep_graph_files: 0,
+            sessions_total: 0,
+            sessions_active: 0,
+            cache_dir: String::new(),
+        };
+        roundtrip(&with_version);
+    }
+
+    /// Verify that `#[serde(default)]` on `version` produces an empty string
+    /// when the field is default-constructed (as an older daemon would omit it).
+    #[test]
+    fn daemon_status_version_default_is_empty() {
+        let default_version: String = Default::default();
+        assert_eq!(default_version, "");
     }
 }

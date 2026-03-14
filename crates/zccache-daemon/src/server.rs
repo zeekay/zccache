@@ -424,6 +424,7 @@ async fn handle_connection(
                     .sum();
                 let metadata_entries = state.cache_system.metadata().len() as u64;
                 Response::Status(zccache_protocol::DaemonStatus {
+                    version: zccache_core::VERSION.to_string(),
                     artifact_count,
                     cache_size_bytes,
                     metadata_entries,
