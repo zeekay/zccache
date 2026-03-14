@@ -2,6 +2,7 @@
 name = "zccache"
 version = "1.0.13"
 description = "A high-performance local compiler cache daemon"
+readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
 
