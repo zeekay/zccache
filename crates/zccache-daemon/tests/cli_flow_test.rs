@@ -1,17 +1,42 @@
-//! Integration test: full CLI session flow.
+//! Integration test: CLI binary end-to-end tests.
 //!
-//! Tests the production workflow:
-//!   session-start → set ZCCACHE_SESSION_ID → wrap compile → session-end
+//! These tests spawn the actual `zccache` binary as a subprocess,
+//! exercising the full CLI → IPC → daemon pipeline.
 //!
-//! Uses the daemon directly via IPC (same protocol the CLI uses).
+//! IPC-based session flow tests live in `server.rs` unit tests.
+
+use std::sync::Once;
 
 use zccache_daemon::DaemonServer;
-use zccache_protocol::{Request, Response};
+
+/// Build the CLI binary once across all tests (avoids Cargo lock contention).
+static BUILD_CLI_ONCE: Once = Once::new();
+
+fn ensure_cli_built() {
+    BUILD_CLI_ONCE.call_once(|| {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "-p", "zccache-cli"])
+            .status()
+            .expect("failed to run cargo build");
+        assert!(status.success(), "cargo build -p zccache-cli failed");
+    });
+}
+
+fn cli_binary_path() -> std::path::PathBuf {
+    ensure_cli_built();
+    let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_zccache-daemon"))
+        .parent()
+        .unwrap();
+    if cfg!(windows) {
+        bin_dir.join("zccache.exe")
+    } else {
+        bin_dir.join("zccache")
+    }
+}
 
 /// Parse `session_id` from the CLI's one-line JSON output:
 /// `{"session_id":1,"started_at":1710000000}`
 fn parse_session_id_from_json(json: &str) -> String {
-    // Minimal parse — avoid adding serde_json as a dev-dependency.
     let key = "\"session_id\":";
     let start = json.find(key).expect("missing session_id in JSON") + key.len();
     let rest = &json[start..];
@@ -33,189 +58,8 @@ async fn start_daemon() -> (
     (endpoint, handle, shutdown)
 }
 
-/// Test the full session lifecycle: start → compile → compile (cached) → end.
-/// This mirrors exactly what the CLI does in production.
-#[tokio::test]
-async fn cli_session_lifecycle() {
-    let clang = match zccache_test_support::find_clang() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let tmp = tempfile::tempdir().unwrap();
-    let src = tmp.path().join("hello.cpp");
-    let obj = tmp.path().join("hello.o");
-    let log = tmp.path().join("session.log");
-    let cwd = tmp.path().to_string_lossy().into_owned();
-
-    std::fs::write(
-        &src,
-        "#include <stdio.h>\nint main() { printf(\"hello\\n\"); return 0; }\n",
-    )
-    .unwrap();
-
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
-    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-
-    // ── Step 1: session-start (what `zccache session-start` does) ──
-    client
-        .send(&Request::SessionStart {
-            client_pid: std::process::id(),
-            working_dir: cwd.clone().into(),
-            log_file: Some(log.to_string_lossy().into_owned().into()),
-            track_stats: false,
-        })
-        .await
-        .unwrap();
-
-    let session_id = match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id }) => session_id,
-        other => panic!("expected SessionStarted, got: {other:?}"),
-    };
-
-    // At this point, the build system would:
-    //   export ZCCACHE_SESSION_ID=<session_id>
-    //   export CXX="zccache"  (or CMAKE_CXX_COMPILER_LAUNCHER=zccache)
-
-    // ── Step 2: first compile (cache miss) ──
-    // This is what `zccache clang++ -c hello.cpp -o hello.o` does.
-    // The CLI strips args[0] (compiler) and sends args[1..] as Compile.
-    client
-        .send(&Request::Compile {
-            session_id: session_id.clone(),
-            args: vec![
-                "-c".to_string(),
-                src.to_string_lossy().into_owned(),
-                "-o".to_string(),
-                obj.to_string_lossy().into_owned(),
-            ],
-            cwd: cwd.clone().into(),
-            compiler: clang.to_string_lossy().into_owned().into(),
-            env: None,
-        })
-        .await
-        .unwrap();
-
-    match client.recv().await.unwrap() {
-        Some(Response::CompileResult {
-            exit_code, cached, ..
-        }) => {
-            assert_eq!(exit_code, 0, "first compile should succeed");
-            assert!(!cached, "first compile should be a miss");
-        }
-        other => panic!("expected CompileResult, got: {other:?}"),
-    }
-
-    assert!(obj.exists(), ".o should exist after first compile");
-    let obj_data = std::fs::read(&obj).unwrap();
-
-    // ── Step 3: second compile (cache hit) ──
-    std::fs::remove_file(&obj).unwrap();
-
-    client
-        .send(&Request::Compile {
-            session_id: session_id.clone(),
-            args: vec![
-                "-c".to_string(),
-                src.to_string_lossy().into_owned(),
-                "-o".to_string(),
-                obj.to_string_lossy().into_owned(),
-            ],
-            cwd: cwd.clone().into(),
-            compiler: clang.to_string_lossy().into_owned().into(),
-            env: None,
-        })
-        .await
-        .unwrap();
-
-    match client.recv().await.unwrap() {
-        Some(Response::CompileResult {
-            exit_code, cached, ..
-        }) => {
-            assert_eq!(exit_code, 0, "cached compile should succeed");
-            assert!(cached, "second compile should be a hit");
-        }
-        other => panic!("expected CompileResult, got: {other:?}"),
-    }
-
-    assert!(obj.exists(), ".o should exist after cached compile");
-    let cached_data = std::fs::read(&obj).unwrap();
-    assert_eq!(obj_data.len(), cached_data.len(), "cached .o should match");
-
-    // ── Step 4: session-end (what `zccache session-end <id>` does) ──
-    client
-        .send(&Request::SessionEnd {
-            session_id: session_id.clone(),
-        })
-        .await
-        .unwrap();
-
-    match client.recv().await.unwrap() {
-        Some(Response::SessionEnded { .. }) => {}
-        other => panic!("expected SessionEnded, got: {other:?}"),
-    }
-
-    // Session is now ended — compile with that session should fail
-    client
-        .send(&Request::Compile {
-            session_id,
-            args: vec!["-c".to_string(), src.to_string_lossy().into_owned()],
-            cwd: cwd.clone().into(),
-            compiler: clang.to_string_lossy().into_owned().into(),
-            env: None,
-        })
-        .await
-        .unwrap();
-
-    match client.recv().await.unwrap() {
-        Some(Response::Error { message }) => {
-            assert!(
-                message.contains("unknown session"),
-                "should report unknown session after end: {message}"
-            );
-        }
-        other => panic!("expected Error after session-end, got: {other:?}"),
-    }
-
-    // ── Verify log ──
-    let log_text = std::fs::read_to_string(&log).unwrap();
-    assert!(log_text.contains("[MISS]"), "log should show miss");
-    assert!(log_text.contains("[HIT]"), "log should show hit");
-
-    shutdown.notify_one();
-    server_handle.await.unwrap();
-}
-
-/// Test that ending a nonexistent session returns an error.
-#[tokio::test]
-async fn cli_session_end_invalid_id() {
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
-    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-
-    client
-        .send(&Request::SessionEnd {
-            session_id: 999999.to_string(),
-        })
-        .await
-        .unwrap();
-
-    match client.recv().await.unwrap() {
-        Some(Response::Error { message }) => {
-            assert!(
-                message.contains("unknown session") || message.contains("invalid session"),
-                "expected session error, got: {message}"
-            );
-        }
-        other => panic!("expected Error, got: {other:?}"),
-    }
-
-    shutdown.notify_one();
-    server_handle.await.unwrap();
-}
-
 /// Test the actual CLI binary end-to-end using subprocess.
-/// This runs `zccache session-start`, captures the session ID,
-/// then runs `zccache session-end`.
+/// Runs `zccache session-start`, compiles (miss + hit), then `zccache session-end`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_binary_session_round_trip() {
     let clang = match zccache_test_support::find_clang() {
@@ -233,23 +77,7 @@ async fn cli_binary_session_round_trip() {
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
 
-    // Ensure the CLI binary is built and up-to-date with the current protocol.
-    // The dev-dependency on zccache-cli only ensures the library is compiled,
-    // not the binary target. An explicit build guarantees the binary matches.
-    let build_status = std::process::Command::new("cargo")
-        .args(["build", "-p", "zccache-cli"])
-        .status()
-        .expect("failed to run cargo build");
-    assert!(build_status.success(), "cargo build -p zccache-cli failed");
-
-    let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_zccache-daemon"))
-        .parent()
-        .unwrap();
-    let cli_binary = if cfg!(windows) {
-        bin_dir.join("zccache.exe")
-    } else {
-        bin_dir.join("zccache")
-    };
+    let cli_binary = cli_binary_path();
     assert!(
         cli_binary.exists(),
         "zccache binary not found at {}",
@@ -279,7 +107,6 @@ async fn cli_binary_session_round_trip() {
     let session_json = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let session_id_str = parse_session_id_from_json(&session_json);
 
-    // Pre-compute string args for the compiler invocation
     let clang_str = clang.to_string_lossy().into_owned();
     let src_str = src.to_string_lossy().into_owned();
     let obj_str = obj.to_string_lossy().into_owned();
@@ -356,21 +183,7 @@ async fn cli_binary_ephemeral_session() {
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
 
-    // Ensure CLI binary is up-to-date
-    let build_status = std::process::Command::new("cargo")
-        .args(["build", "-p", "zccache-cli"])
-        .status()
-        .expect("failed to run cargo build");
-    assert!(build_status.success(), "cargo build -p zccache-cli failed");
-
-    let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_zccache-daemon"))
-        .parent()
-        .unwrap();
-    let cli_binary = if cfg!(windows) {
-        bin_dir.join("zccache.exe")
-    } else {
-        bin_dir.join("zccache")
-    };
+    let cli_binary = cli_binary_path();
 
     let clang_str = clang.to_string_lossy().into_owned();
     let src_str = src.to_string_lossy().into_owned();
@@ -408,279 +221,6 @@ async fn cli_binary_ephemeral_session() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(obj.exists(), ".o should exist after second compile");
-
-    shutdown.notify_one();
-    server_handle.await.unwrap();
-}
-
-/// Test that `Request::Clear` actually resets the cache:
-/// session-start → compile (miss) → compile (hit) → clear → compile (miss again).
-#[tokio::test]
-async fn cli_clear_resets_cache() {
-    let clang = match zccache_test_support::find_clang() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let tmp = tempfile::tempdir().unwrap();
-    let src = tmp.path().join("clear_test.cpp");
-    let obj = tmp.path().join("clear_test.o");
-    let cwd = tmp.path().to_string_lossy().into_owned();
-
-    std::fs::write(&src, "int main() { return 0; }\n").unwrap();
-
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
-    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-
-    // Start session
-    client
-        .send(&Request::SessionStart {
-            client_pid: std::process::id(),
-            working_dir: cwd.clone().into(),
-            log_file: None,
-            track_stats: false,
-        })
-        .await
-        .unwrap();
-
-    let session_id = match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id }) => session_id,
-        other => panic!("expected SessionStarted, got: {other:?}"),
-    };
-
-    let compile_args = vec![
-        "-c".to_string(),
-        src.to_string_lossy().into_owned(),
-        "-o".to_string(),
-        obj.to_string_lossy().into_owned(),
-    ];
-
-    // First compile → miss
-    client
-        .send(&Request::Compile {
-            session_id: session_id.clone(),
-            args: compile_args.clone(),
-            cwd: cwd.clone().into(),
-            compiler: clang.to_string_lossy().into_owned().into(),
-            env: None,
-        })
-        .await
-        .unwrap();
-
-    match client.recv().await.unwrap() {
-        Some(Response::CompileResult {
-            exit_code, cached, ..
-        }) => {
-            assert_eq!(exit_code, 0);
-            assert!(!cached, "first compile should be a miss");
-        }
-        other => panic!("expected CompileResult, got: {other:?}"),
-    }
-
-    // Second compile → hit
-    std::fs::remove_file(&obj).unwrap();
-    client
-        .send(&Request::Compile {
-            session_id: session_id.clone(),
-            args: compile_args.clone(),
-            cwd: cwd.clone().into(),
-            compiler: clang.to_string_lossy().into_owned().into(),
-            env: None,
-        })
-        .await
-        .unwrap();
-
-    match client.recv().await.unwrap() {
-        Some(Response::CompileResult {
-            exit_code, cached, ..
-        }) => {
-            assert_eq!(exit_code, 0);
-            assert!(cached, "second compile should be a hit");
-        }
-        other => panic!("expected CompileResult, got: {other:?}"),
-    }
-
-    // Clear the cache
-    client.send(&Request::Clear).await.unwrap();
-    match client.recv().await.unwrap() {
-        Some(Response::Cleared {
-            artifacts_removed, ..
-        }) => {
-            assert!(
-                artifacts_removed > 0,
-                "should have cleared at least one artifact"
-            );
-        }
-        other => panic!("expected Cleared, got: {other:?}"),
-    }
-
-    // End old session and start a new one (old session's context was cleared)
-    client
-        .send(&Request::SessionEnd { session_id })
-        .await
-        .unwrap();
-    let _: Option<Response> = client.recv().await.unwrap();
-
-    client
-        .send(&Request::SessionStart {
-            client_pid: std::process::id(),
-            working_dir: cwd.clone().into(),
-            log_file: None,
-            track_stats: false,
-        })
-        .await
-        .unwrap();
-
-    let session_id2 = match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id }) => session_id,
-        other => panic!("expected SessionStarted, got: {other:?}"),
-    };
-
-    // Compile again → should be a miss (cache was cleared)
-    std::fs::remove_file(&obj).unwrap();
-    client
-        .send(&Request::Compile {
-            session_id: session_id2,
-            args: compile_args,
-            cwd: cwd.into(),
-            compiler: clang.to_string_lossy().into_owned().into(),
-            env: None,
-        })
-        .await
-        .unwrap();
-
-    match client.recv().await.unwrap() {
-        Some(Response::CompileResult {
-            exit_code, cached, ..
-        }) => {
-            assert_eq!(exit_code, 0);
-            assert!(!cached, "compile after clear should be a miss");
-        }
-        other => panic!("expected CompileResult, got: {other:?}"),
-    }
-
-    shutdown.notify_one();
-    server_handle.await.unwrap();
-}
-
-/// Test that multi-file compilations work through the daemon.
-///
-/// When multiple source files are passed (e.g., `clang++ -c a.cpp b.cpp`),
-/// the parser marks this as non-cacheable and the daemon falls back to
-/// running the compiler directly. The compilation should still succeed.
-#[tokio::test]
-async fn cli_multi_file_compilation_runs_directly() {
-    let clang = match zccache_test_support::find_clang() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let tmp = tempfile::tempdir().unwrap();
-    let src_a = tmp.path().join("multi_a.cpp");
-    let src_b = tmp.path().join("multi_b.cpp");
-    let cwd = tmp.path().to_string_lossy().into_owned();
-
-    // Two source files — each must produce its own .o
-    std::fs::write(&src_a, "int foo() { return 1; }\n").unwrap();
-    std::fs::write(&src_b, "int bar() { return 2; }\n").unwrap();
-
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
-    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-
-    // Start session
-    client
-        .send(&Request::SessionStart {
-            client_pid: std::process::id(),
-            working_dir: cwd.clone().into(),
-            log_file: None,
-            track_stats: true,
-        })
-        .await
-        .unwrap();
-
-    let session_id = match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id }) => session_id,
-        other => panic!("expected SessionStarted, got: {other:?}"),
-    };
-
-    // First compile: multi-file → both are cache misses
-    let multi_args = vec![
-        "-c".to_string(),
-        src_a.to_string_lossy().into_owned(),
-        src_b.to_string_lossy().into_owned(),
-    ];
-    client
-        .send(&Request::Compile {
-            session_id: session_id.clone(),
-            args: multi_args.clone(),
-            cwd: cwd.clone().into(),
-            compiler: clang.to_string_lossy().into_owned().into(),
-            env: None,
-        })
-        .await
-        .unwrap();
-
-    match client.recv().await.unwrap() {
-        Some(Response::CompileResult {
-            exit_code, cached, ..
-        }) => {
-            assert_eq!(exit_code, 0, "multi-file compile should succeed");
-            assert!(!cached, "first multi-file compile should be a miss");
-        }
-        other => panic!("expected CompileResult, got: {other:?}"),
-    }
-
-    // Verify both .o files were produced
-    let obj_a = tmp.path().join("multi_a.o");
-    let obj_b = tmp.path().join("multi_b.o");
-    assert!(obj_a.exists(), "multi_a.o should exist");
-    assert!(obj_b.exists(), "multi_b.o should exist");
-
-    // Second compile: same files → should be all cache hits
-    client
-        .send(&Request::Compile {
-            session_id: session_id.clone(),
-            args: multi_args,
-            cwd: cwd.clone().into(),
-            compiler: clang.to_string_lossy().into_owned().into(),
-            env: None,
-        })
-        .await
-        .unwrap();
-
-    match client.recv().await.unwrap() {
-        Some(Response::CompileResult {
-            exit_code, cached, ..
-        }) => {
-            assert_eq!(exit_code, 0, "second multi-file compile should succeed");
-            assert!(cached, "second multi-file compile should be all cache hits");
-        }
-        other => panic!("expected CompileResult, got: {other:?}"),
-    }
-
-    // End session and verify stats show misses from first compile, hits from second
-    client
-        .send(&Request::SessionEnd { session_id })
-        .await
-        .unwrap();
-
-    match client.recv().await.unwrap() {
-        Some(Response::SessionEnded { stats }) => {
-            if let Some(s) = stats {
-                assert!(
-                    s.misses >= 2,
-                    "first multi-file compile should have 2 misses, got: {}",
-                    s.misses
-                );
-                assert!(
-                    s.hits >= 2,
-                    "second multi-file compile should have 2 hits, got: {}",
-                    s.hits
-                );
-            }
-        }
-        other => panic!("expected SessionEnded, got: {other:?}"),
-    }
 
     shutdown.notify_one();
     server_handle.await.unwrap();
@@ -726,21 +266,7 @@ async fn cli_binary_compiler_override_cpp_session_c_file() {
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
 
-    // Ensure CLI binary is up-to-date
-    let build_status = std::process::Command::new("cargo")
-        .args(["build", "-p", "zccache-cli"])
-        .status()
-        .expect("failed to run cargo build");
-    assert!(build_status.success());
-
-    let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_zccache-daemon"))
-        .parent()
-        .unwrap();
-    let cli_binary = if cfg!(windows) {
-        bin_dir.join("zccache.exe")
-    } else {
-        bin_dir.join("zccache")
-    };
+    let cli_binary = cli_binary_path();
 
     // Start session (compiler-agnostic now)
     let output = std::process::Command::new(&cli_binary)

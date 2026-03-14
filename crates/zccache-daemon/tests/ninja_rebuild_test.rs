@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use zccache_daemon::DaemonServer;
@@ -24,7 +24,18 @@ use zccache_test_support::{MesonProject, TestProject};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Build the debug CLI binary once across all tests (avoids Cargo lock contention).
+static BUILD_DEBUG_CLI: Once = Once::new();
+
 fn find_cli_binary() -> PathBuf {
+    BUILD_DEBUG_CLI.call_once(|| {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "-p", "zccache-cli"])
+            .status()
+            .expect("failed to run cargo build");
+        assert!(status.success(), "cargo build -p zccache-cli failed");
+    });
+
     let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_zccache-daemon"))
         .parent()
         .unwrap();
@@ -35,15 +46,20 @@ fn find_cli_binary() -> PathBuf {
     }
 }
 
-/// Build + find the release CLI binary. Release is critical for meson tests
-/// because meson probes the compiler ~12 times during setup — each invocation
-/// goes through the zccache wrapper, so debug overhead (~1.5s/call) dominates.
+/// Build the release CLI binary once across all tests.
+/// Release is critical for meson tests because meson probes the compiler ~12
+/// times during setup — each invocation goes through the zccache wrapper, so
+/// debug overhead (~1.5s/call) dominates.
+static BUILD_RELEASE_CLI: Once = Once::new();
+
 fn build_and_find_release_cli() -> PathBuf {
-    let build_status = std::process::Command::new("cargo")
-        .args(["build", "--release", "-p", "zccache-cli"])
-        .status()
-        .expect("failed to run cargo build --release");
-    assert!(build_status.success(), "cargo build --release failed");
+    BUILD_RELEASE_CLI.call_once(|| {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", "zccache-cli"])
+            .status()
+            .expect("failed to run cargo build --release");
+        assert!(status.success(), "cargo build --release failed");
+    });
 
     // Release binary is in target/release/, not target/debug/
     let debug_dir = std::path::Path::new(env!("CARGO_BIN_EXE_zccache-daemon"))
@@ -226,12 +242,6 @@ async fn ninja_cold_then_warm_rebuild_cli() {
         }
     };
 
-    // Ensure CLI binary is built
-    let build_status = std::process::Command::new("cargo")
-        .args(["build", "-p", "zccache-cli"])
-        .status()
-        .expect("failed to run cargo build");
-    assert!(build_status.success(), "cargo build failed");
     let cli = find_cli_binary();
 
     let project = TestProject::integration();

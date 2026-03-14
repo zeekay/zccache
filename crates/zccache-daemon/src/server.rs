@@ -2223,16 +2223,20 @@ async fn run_compiler_direct(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    #[ignore] // integration-level: starts real daemon with IPC + file watcher
-    async fn test_server_ping_pong() {
+    async fn start_daemon() -> (String, tokio::task::JoinHandle<()>, Arc<Notify>) {
         let endpoint = zccache_ipc::unique_test_endpoint();
         let mut server = DaemonServer::bind(&endpoint).unwrap();
         let shutdown = server.shutdown_handle();
-
-        let server_task = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             server.run(0).await.unwrap();
         });
+        (endpoint, handle, shutdown)
+    }
+
+    #[tokio::test]
+    #[ignore] // integration-level: starts real daemon with IPC + file watcher
+    async fn test_server_ping_pong() {
+        let (endpoint, server_task, shutdown) = start_daemon().await;
 
         let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
         client.send(&Request::Ping).await.unwrap();
@@ -2246,13 +2250,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // integration-level: starts real daemon with IPC + file watcher
     async fn test_server_shutdown_request() {
-        let endpoint = zccache_ipc::unique_test_endpoint();
-        let mut server = DaemonServer::bind(&endpoint).unwrap();
-        let shutdown = server.shutdown_handle();
-
-        let server_task = tokio::spawn(async move {
-            server.run(0).await.unwrap();
-        });
+        let (endpoint, server_task, shutdown) = start_daemon().await;
 
         let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
         client.send(&Request::Shutdown).await.unwrap();
@@ -2266,13 +2264,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // integration-level: starts real daemon with IPC + file watcher
     async fn test_server_clear_empty() {
-        let endpoint = zccache_ipc::unique_test_endpoint();
-        let mut server = DaemonServer::bind(&endpoint).unwrap();
-        let shutdown = server.shutdown_handle();
-
-        let server_task = tokio::spawn(async move {
-            server.run(0).await.unwrap();
-        });
+        let (endpoint, server_task, shutdown) = start_daemon().await;
 
         let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
         client.send(&Request::Clear).await.unwrap();
@@ -2298,13 +2290,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // integration-level: starts real daemon with IPC + file watcher
     async fn test_server_status() {
-        let endpoint = zccache_ipc::unique_test_endpoint();
-        let mut server = DaemonServer::bind(&endpoint).unwrap();
-        let shutdown = server.shutdown_handle();
-
-        let server_task = tokio::spawn(async move {
-            server.run(0).await.unwrap();
-        });
+        let (endpoint, server_task, shutdown) = start_daemon().await;
 
         let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
         client.send(&Request::Status).await.unwrap();
@@ -2313,5 +2299,447 @@ mod tests {
 
         shutdown.notify_one();
         server_task.await.unwrap();
+    }
+
+    // ── CLI session flow tests (IPC-based) ──────────────────────────────
+
+    /// Full session lifecycle: start → compile (miss) → compile (hit) → end.
+    #[tokio::test]
+    async fn cli_session_lifecycle() {
+        let clang = match zccache_test_support::find_clang() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("hello.cpp");
+        let obj = tmp.path().join("hello.o");
+        let log = tmp.path().join("session.log");
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        std::fs::write(
+            &src,
+            "#include <stdio.h>\nint main() { printf(\"hello\\n\"); return 0; }\n",
+        )
+        .unwrap();
+
+        let (endpoint, server_handle, shutdown) = start_daemon().await;
+        let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+
+        // session-start
+        client
+            .send(&Request::SessionStart {
+                client_pid: std::process::id(),
+                working_dir: cwd.clone().into(),
+                log_file: Some(log.to_string_lossy().into_owned().into()),
+                track_stats: false,
+            })
+            .await
+            .unwrap();
+
+        let session_id = match client.recv().await.unwrap() {
+            Some(Response::SessionStarted { session_id }) => session_id,
+            other => panic!("expected SessionStarted, got: {other:?}"),
+        };
+
+        // first compile (cache miss)
+        client
+            .send(&Request::Compile {
+                session_id: session_id.clone(),
+                args: vec![
+                    "-c".to_string(),
+                    src.to_string_lossy().into_owned(),
+                    "-o".to_string(),
+                    obj.to_string_lossy().into_owned(),
+                ],
+                cwd: cwd.clone().into(),
+                compiler: clang.to_string_lossy().into_owned().into(),
+                env: None,
+            })
+            .await
+            .unwrap();
+
+        match client.recv().await.unwrap() {
+            Some(Response::CompileResult {
+                exit_code, cached, ..
+            }) => {
+                assert_eq!(exit_code, 0, "first compile should succeed");
+                assert!(!cached, "first compile should be a miss");
+            }
+            other => panic!("expected CompileResult, got: {other:?}"),
+        }
+
+        assert!(obj.exists(), ".o should exist after first compile");
+        let obj_data = std::fs::read(&obj).unwrap();
+
+        // second compile (cache hit)
+        std::fs::remove_file(&obj).unwrap();
+
+        client
+            .send(&Request::Compile {
+                session_id: session_id.clone(),
+                args: vec![
+                    "-c".to_string(),
+                    src.to_string_lossy().into_owned(),
+                    "-o".to_string(),
+                    obj.to_string_lossy().into_owned(),
+                ],
+                cwd: cwd.clone().into(),
+                compiler: clang.to_string_lossy().into_owned().into(),
+                env: None,
+            })
+            .await
+            .unwrap();
+
+        match client.recv().await.unwrap() {
+            Some(Response::CompileResult {
+                exit_code, cached, ..
+            }) => {
+                assert_eq!(exit_code, 0, "cached compile should succeed");
+                assert!(cached, "second compile should be a hit");
+            }
+            other => panic!("expected CompileResult, got: {other:?}"),
+        }
+
+        assert!(obj.exists(), ".o should exist after cached compile");
+        let cached_data = std::fs::read(&obj).unwrap();
+        assert_eq!(obj_data.len(), cached_data.len(), "cached .o should match");
+
+        // session-end
+        client
+            .send(&Request::SessionEnd {
+                session_id: session_id.clone(),
+            })
+            .await
+            .unwrap();
+
+        match client.recv().await.unwrap() {
+            Some(Response::SessionEnded { .. }) => {}
+            other => panic!("expected SessionEnded, got: {other:?}"),
+        }
+
+        // compile after session-end should fail
+        client
+            .send(&Request::Compile {
+                session_id,
+                args: vec!["-c".to_string(), src.to_string_lossy().into_owned()],
+                cwd: cwd.clone().into(),
+                compiler: clang.to_string_lossy().into_owned().into(),
+                env: None,
+            })
+            .await
+            .unwrap();
+
+        match client.recv().await.unwrap() {
+            Some(Response::Error { message }) => {
+                assert!(
+                    message.contains("unknown session"),
+                    "should report unknown session after end: {message}"
+                );
+            }
+            other => panic!("expected Error after session-end, got: {other:?}"),
+        }
+
+        // verify log
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert!(log_text.contains("[MISS]"), "log should show miss");
+        assert!(log_text.contains("[HIT]"), "log should show hit");
+
+        shutdown.notify_one();
+        server_handle.await.unwrap();
+    }
+
+    /// Ending a nonexistent session returns an error.
+    #[tokio::test]
+    async fn cli_session_end_invalid_id() {
+        let (endpoint, server_handle, shutdown) = start_daemon().await;
+        let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+
+        client
+            .send(&Request::SessionEnd {
+                session_id: 999999.to_string(),
+            })
+            .await
+            .unwrap();
+
+        match client.recv().await.unwrap() {
+            Some(Response::Error { message }) => {
+                assert!(
+                    message.contains("unknown session") || message.contains("invalid session"),
+                    "expected session error, got: {message}"
+                );
+            }
+            other => panic!("expected Error, got: {other:?}"),
+        }
+
+        shutdown.notify_one();
+        server_handle.await.unwrap();
+    }
+
+    /// Cache clear resets: miss → hit → clear → miss again.
+    #[tokio::test]
+    async fn cli_clear_resets_cache() {
+        let clang = match zccache_test_support::find_clang() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("clear_test.cpp");
+        let obj = tmp.path().join("clear_test.o");
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        std::fs::write(&src, "int main() { return 0; }\n").unwrap();
+
+        let (endpoint, server_handle, shutdown) = start_daemon().await;
+        let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+
+        // Start session
+        client
+            .send(&Request::SessionStart {
+                client_pid: std::process::id(),
+                working_dir: cwd.clone().into(),
+                log_file: None,
+                track_stats: false,
+            })
+            .await
+            .unwrap();
+
+        let session_id = match client.recv().await.unwrap() {
+            Some(Response::SessionStarted { session_id }) => session_id,
+            other => panic!("expected SessionStarted, got: {other:?}"),
+        };
+
+        let compile_args = vec![
+            "-c".to_string(),
+            src.to_string_lossy().into_owned(),
+            "-o".to_string(),
+            obj.to_string_lossy().into_owned(),
+        ];
+
+        // First compile → miss
+        client
+            .send(&Request::Compile {
+                session_id: session_id.clone(),
+                args: compile_args.clone(),
+                cwd: cwd.clone().into(),
+                compiler: clang.to_string_lossy().into_owned().into(),
+                env: None,
+            })
+            .await
+            .unwrap();
+
+        match client.recv().await.unwrap() {
+            Some(Response::CompileResult {
+                exit_code, cached, ..
+            }) => {
+                assert_eq!(exit_code, 0);
+                assert!(!cached, "first compile should be a miss");
+            }
+            other => panic!("expected CompileResult, got: {other:?}"),
+        }
+
+        // Second compile → hit
+        std::fs::remove_file(&obj).unwrap();
+        client
+            .send(&Request::Compile {
+                session_id: session_id.clone(),
+                args: compile_args.clone(),
+                cwd: cwd.clone().into(),
+                compiler: clang.to_string_lossy().into_owned().into(),
+                env: None,
+            })
+            .await
+            .unwrap();
+
+        match client.recv().await.unwrap() {
+            Some(Response::CompileResult {
+                exit_code, cached, ..
+            }) => {
+                assert_eq!(exit_code, 0);
+                assert!(cached, "second compile should be a hit");
+            }
+            other => panic!("expected CompileResult, got: {other:?}"),
+        }
+
+        // Clear the cache
+        client.send(&Request::Clear).await.unwrap();
+        match client.recv().await.unwrap() {
+            Some(Response::Cleared {
+                artifacts_removed, ..
+            }) => {
+                assert!(
+                    artifacts_removed > 0,
+                    "should have cleared at least one artifact"
+                );
+            }
+            other => panic!("expected Cleared, got: {other:?}"),
+        }
+
+        // End old session and start a new one
+        client
+            .send(&Request::SessionEnd { session_id })
+            .await
+            .unwrap();
+        let _: Option<Response> = client.recv().await.unwrap();
+
+        client
+            .send(&Request::SessionStart {
+                client_pid: std::process::id(),
+                working_dir: cwd.clone().into(),
+                log_file: None,
+                track_stats: false,
+            })
+            .await
+            .unwrap();
+
+        let session_id2 = match client.recv().await.unwrap() {
+            Some(Response::SessionStarted { session_id }) => session_id,
+            other => panic!("expected SessionStarted, got: {other:?}"),
+        };
+
+        // Compile again → should be a miss (cache was cleared)
+        std::fs::remove_file(&obj).unwrap();
+        client
+            .send(&Request::Compile {
+                session_id: session_id2,
+                args: compile_args,
+                cwd: cwd.into(),
+                compiler: clang.to_string_lossy().into_owned().into(),
+                env: None,
+            })
+            .await
+            .unwrap();
+
+        match client.recv().await.unwrap() {
+            Some(Response::CompileResult {
+                exit_code, cached, ..
+            }) => {
+                assert_eq!(exit_code, 0);
+                assert!(!cached, "compile after clear should be a miss");
+            }
+            other => panic!("expected CompileResult, got: {other:?}"),
+        }
+
+        shutdown.notify_one();
+        server_handle.await.unwrap();
+    }
+
+    /// Multi-file compilations fall back to running the compiler directly.
+    #[tokio::test]
+    async fn cli_multi_file_compilation_runs_directly() {
+        let clang = match zccache_test_support::find_clang() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src_a = tmp.path().join("multi_a.cpp");
+        let src_b = tmp.path().join("multi_b.cpp");
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        std::fs::write(&src_a, "int foo() { return 1; }\n").unwrap();
+        std::fs::write(&src_b, "int bar() { return 2; }\n").unwrap();
+
+        let (endpoint, server_handle, shutdown) = start_daemon().await;
+        let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+
+        // Start session
+        client
+            .send(&Request::SessionStart {
+                client_pid: std::process::id(),
+                working_dir: cwd.clone().into(),
+                log_file: None,
+                track_stats: true,
+            })
+            .await
+            .unwrap();
+
+        let session_id = match client.recv().await.unwrap() {
+            Some(Response::SessionStarted { session_id }) => session_id,
+            other => panic!("expected SessionStarted, got: {other:?}"),
+        };
+
+        // First compile: multi-file → both are cache misses
+        let multi_args = vec![
+            "-c".to_string(),
+            src_a.to_string_lossy().into_owned(),
+            src_b.to_string_lossy().into_owned(),
+        ];
+        client
+            .send(&Request::Compile {
+                session_id: session_id.clone(),
+                args: multi_args.clone(),
+                cwd: cwd.clone().into(),
+                compiler: clang.to_string_lossy().into_owned().into(),
+                env: None,
+            })
+            .await
+            .unwrap();
+
+        match client.recv().await.unwrap() {
+            Some(Response::CompileResult {
+                exit_code, cached, ..
+            }) => {
+                assert_eq!(exit_code, 0, "multi-file compile should succeed");
+                assert!(!cached, "first multi-file compile should be a miss");
+            }
+            other => panic!("expected CompileResult, got: {other:?}"),
+        }
+
+        // Verify both .o files were produced
+        let obj_a = tmp.path().join("multi_a.o");
+        let obj_b = tmp.path().join("multi_b.o");
+        assert!(obj_a.exists(), "multi_a.o should exist");
+        assert!(obj_b.exists(), "multi_b.o should exist");
+
+        // Second compile: same files → should be all cache hits
+        client
+            .send(&Request::Compile {
+                session_id: session_id.clone(),
+                args: multi_args,
+                cwd: cwd.clone().into(),
+                compiler: clang.to_string_lossy().into_owned().into(),
+                env: None,
+            })
+            .await
+            .unwrap();
+
+        match client.recv().await.unwrap() {
+            Some(Response::CompileResult {
+                exit_code, cached, ..
+            }) => {
+                assert_eq!(exit_code, 0, "second multi-file compile should succeed");
+                assert!(cached, "second multi-file compile should be all cache hits");
+            }
+            other => panic!("expected CompileResult, got: {other:?}"),
+        }
+
+        // End session and verify stats
+        client
+            .send(&Request::SessionEnd { session_id })
+            .await
+            .unwrap();
+
+        match client.recv().await.unwrap() {
+            Some(Response::SessionEnded { stats }) => {
+                if let Some(s) = stats {
+                    assert!(
+                        s.misses >= 2,
+                        "first multi-file compile should have 2 misses, got: {}",
+                        s.misses
+                    );
+                    assert!(
+                        s.hits >= 2,
+                        "second multi-file compile should have 2 hits, got: {}",
+                        s.hits
+                    );
+                }
+            }
+            other => panic!("expected SessionEnded, got: {other:?}"),
+        }
+
+        shutdown.notify_one();
+        server_handle.await.unwrap();
     }
 }
