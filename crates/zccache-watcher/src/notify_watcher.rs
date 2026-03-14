@@ -64,14 +64,18 @@ impl NotifyWatcher {
         Ok((Self { watcher }, rx))
     }
 
-    /// Start watching a directory recursively.
+    /// Start watching a single directory (non-recursive).
+    ///
+    /// Callers are responsible for enumerating subdirectories and watching
+    /// each one individually. This avoids platform-level recursive watches
+    /// that can hit OS limits or produce degenerate behaviour on large trees.
     ///
     /// # Errors
     ///
     /// Returns an error if the path cannot be watched.
     pub fn watch(&mut self, path: &Path) -> zccache_core::Result<()> {
         self.watcher
-            .watch(path, RecursiveMode::Recursive)
+            .watch(path, RecursiveMode::NonRecursive)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(())
     }
@@ -91,6 +95,14 @@ impl NotifyWatcher {
 
 /// Convert a `notify::Event` into zero or more `WatchEvent`s.
 fn convert_event(ignore: &IgnoreFilter, event: &Event) -> Vec<WatchEvent> {
+    // Detect overflow/rescan events from inotify (Q_OVERFLOW) and
+    // FSEvents (MUST_SCAN_SUBDIRS). These have EventKind::Other with
+    // Flag::Rescan and empty paths — the path loop below would produce
+    // nothing, silently swallowing the overflow.
+    if event.need_rescan() {
+        return vec![WatchEvent::Overflow];
+    }
+
     // Handle rename with both paths present.
     if matches!(
         event.kind,
@@ -411,6 +423,33 @@ mod tests {
         let (watcher, _rx) = NotifyWatcher::new(ignore).unwrap();
         let debug = format!("{watcher:?}");
         assert!(debug.contains("NotifyWatcher"));
+    }
+
+    #[test]
+    fn rescan_flag_produces_overflow() {
+        use notify::event::Flag;
+
+        let filter = test_filter();
+        // inotify Q_OVERFLOW and FSEvents MUST_SCAN_SUBDIRS produce
+        // EventKind::Other with Flag::Rescan and empty paths.
+        let event = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        let result = convert_event(&filter, &event);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], WatchEvent::Overflow));
+    }
+
+    #[test]
+    fn rescan_flag_with_paths_still_produces_overflow() {
+        use notify::event::Flag;
+
+        let filter = test_filter();
+        // Even if a rescan event carries paths, we still treat it as overflow
+        // because the semantics are "everything may have changed".
+        let mut event = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        event.paths = vec![PathBuf::from("src/main.rs")];
+        let result = convert_event(&filter, &event);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], WatchEvent::Overflow));
     }
 
     #[test]

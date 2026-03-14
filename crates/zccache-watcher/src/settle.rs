@@ -84,7 +84,12 @@ impl SettleBuffer {
             };
 
             // Handle overflow immediately — don't wait for settle.
-            if matches!(event, WatchEvent::Overflow) {
+            // WatchEvent::Error is also treated as overflow because on Windows,
+            // ReadDirectoryChangesW buffer overflow and watcher death arrive as
+            // errors from the notify crate, not as distinct overflow events.
+            // Treating errors as overflow is conservative but correct: it forces
+            // a full re-stat of all cached entries on the next access.
+            if matches!(event, WatchEvent::Overflow | WatchEvent::Error(_)) {
                 pending.clear();
                 let _ = tx.send(SettledEvent::Overflow);
                 continue;
@@ -95,7 +100,7 @@ impl SettleBuffer {
             // Coalesce: keep reading until the settle window elapses with no new events.
             loop {
                 match tokio::time::timeout(self.settle_window, rx.recv()).await {
-                    Ok(Some(WatchEvent::Overflow)) => {
+                    Ok(Some(WatchEvent::Overflow | WatchEvent::Error(_))) => {
                         pending.clear();
                         let _ = tx.send(SettledEvent::Overflow);
                         break;
@@ -352,7 +357,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn error_events_are_ignored() {
+    async fn error_events_trigger_overflow() {
+        // On Windows, ReadDirectoryChangesW buffer overflow and watcher death
+        // arrive as errors from the notify crate. We treat them as overflow to
+        // force a full re-stat of all cached entries.
         let (raw_tx, raw_rx) = mpsc::unbounded_channel();
         let (settled_tx, mut settled_rx) = mpsc::unbounded_channel();
 
@@ -369,14 +377,9 @@ mod tests {
             .unwrap();
         drop(raw_tx);
 
+        // Error should trigger overflow, discarding the pending Modified event.
         let event = settled_rx.recv().await.unwrap();
-        match event {
-            SettledEvent::Batch { changed, removed } => {
-                assert_eq!(changed.len(), 1);
-                assert!(removed.is_empty());
-            }
-            SettledEvent::Overflow => panic!("expected batch"),
-        }
+        assert!(matches!(event, SettledEvent::Overflow));
 
         handle.await.unwrap();
     }
@@ -514,9 +517,6 @@ mod tests {
                 from: PathBuf::from("old.c"),
                 to: PathBuf::from("renamed.c"),
             })
-            .unwrap();
-        raw_tx
-            .send(WatchEvent::Error("ignored".to_string()))
             .unwrap();
         drop(raw_tx);
 

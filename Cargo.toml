@@ -39,6 +39,12 @@ memmap2 = "0.9"
 tempfile = "3"
 bytes = "1"
 
+# Vendored notify with fixes for Windows ReadDirectoryChangesW:
+# 1. Detect buffer overflow (bytes_written == 0) and report as error
+# 2. Report start_read failure (watcher silently dying) as error
+[patch.crates-io]
+notify = { path = "vendor/notify" }
+
 # Note: workspace.lints requires Rust 1.74+. If your toolchain is older,
 # these are ignored. Lint configuration is also enforced via CI clippy flags.
 #

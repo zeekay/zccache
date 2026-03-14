@@ -312,6 +312,8 @@ async fn watch_directories(state: &SharedState, dirs: &[PathBuf]) {
     }
 
     // Single lock acquisition: filter already-watched and register new ones.
+    // Each directory here is the exact parent of a source/header file from
+    // depfile scanning — no need to walk children or parents.
     let mut watched = state.watched_dirs.lock().await;
     let new_dirs: Vec<PathBuf> = canonical
         .into_iter()

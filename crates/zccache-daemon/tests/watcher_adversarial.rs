@@ -272,7 +272,9 @@ async fn watcher_touch_same_content_hits() {
 // Does the system stay correct for files inside and outside the watched tree?
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// File 5 levels deep in nested subdirectory → watcher detects change (recursive mode).
+/// File 5 levels deep in nested subdirectory → watcher detects change.
+/// With non-recursive watches, each directory in the include path is watched
+/// individually (discovered via depfile scanning on the first compile).
 #[tokio::test]
 async fn deeply_nested_dir_watched() {
     let mut h = match TestHarness::new().await {
