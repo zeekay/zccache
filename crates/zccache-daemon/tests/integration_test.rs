@@ -357,12 +357,12 @@ int main() {
     eprintln!("=== session log ===\n{log_contents}");
 
     assert!(
-        log_contents.contains("cache miss"),
-        "log should contain 'cache miss' for first compile"
+        log_contents.contains("[MISS]"),
+        "log should contain '[MISS]' for first compile"
     );
     assert!(
-        log_contents.contains("cache hit"),
-        "log should contain 'cache hit' for second compile"
+        log_contents.contains("[HIT]"),
+        "log should contain '[HIT]' for second compile"
     );
 
     shutdown.notify_one();

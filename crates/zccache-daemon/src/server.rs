@@ -16,6 +16,7 @@ use zccache_ipc::{IpcConnection, IpcListener};
 use zccache_protocol::{ArtifactData, ArtifactOutput, Request, Response};
 use zccache_watcher::{NotifyWatcher, SettleBuffer, SettledEvent};
 
+use crate::event_log::{CompileEvent, CompileOutcome, EventLogger};
 use crate::stats::{HitPhases, MissPhases, PhaseProfiler, StatsCollector};
 
 /// Cached result of a verified cache hit, enabling zero-hash fast path.
@@ -79,6 +80,8 @@ struct SharedState {
     /// Whether the file watcher is active. Fast-hit cache is only used when
     /// the watcher is running, since we rely on it for change detection.
     watcher_active: AtomicBool,
+    /// Event logger — writes to daemon.log via lock-free channel + background thread.
+    event_logger: EventLogger,
 }
 
 /// The daemon server that listens for IPC connections.
@@ -162,6 +165,11 @@ impl DaemonServer {
                 },
                 fast_hit_cache: DashMap::new(),
                 watcher_active: AtomicBool::new(false),
+                event_logger: EventLogger::new(
+                    zccache_core::config::log_dir(),
+                    10 * 1024 * 1024, // 10 MB
+                    5,
+                ),
             }),
         })
     }
@@ -184,6 +192,7 @@ impl DaemonServer {
     /// seconds with no client activity. Pass 0 to disable.
     pub async fn run(&mut self, idle_timeout_secs: u64) -> Result<(), zccache_ipc::IpcError> {
         tracing::info!("daemon server running");
+        self.state.event_logger.log_daemon_event("daemon started");
 
         self.start_watcher_pipeline().await;
 
@@ -205,6 +214,33 @@ impl DaemonServer {
             });
         }
 
+        // Session reaper: clean up sessions whose owner process has died
+        // and sessions that have been idle longer than the timeout.
+        {
+            let state = Arc::clone(&self.state);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    let dead = state
+                        .sessions
+                        .cleanup_dead_pids(zccache_ipc::is_process_alive);
+                    for session in &dead {
+                        state.event_logger.log_daemon_event(&format!(
+                            "reaped dead session {} (pid {})",
+                            session.id, session.client_pid
+                        ));
+                    }
+                    let expired = state.sessions.cleanup_expired();
+                    for session in &expired {
+                        state.event_logger.log_daemon_event(&format!(
+                            "expired idle session {} (pid {})",
+                            session.id, session.client_pid
+                        ));
+                    }
+                }
+            });
+        }
+
         loop {
             tokio::select! {
                 result = self.listener.accept() => {
@@ -218,6 +254,7 @@ impl DaemonServer {
                 }
                 () = self.shutdown.notified() => {
                     tracing::info!("daemon server shutting down");
+                    self.state.event_logger.log_daemon_event("daemon shutting down");
                     // Drop the watcher to stop the OS thread and close channels.
                     // The settle buffer and consumer tasks will exit when their
                     // input channels close.
@@ -884,22 +921,6 @@ fn record_session_stat(
     });
 }
 
-/// Write a log line to the session's log file (if configured).
-fn write_session_log(sessions: &SessionManager, session_id: &SessionId, message: &str) {
-    if let Some(session) = sessions.get(session_id) {
-        if let Some(ref log_path) = session.log_file {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_path)
-            {
-                let _ = writeln!(f, "{message}");
-            }
-        }
-    }
-}
-
 /// Hash a file using the CacheSystem's metadata cache.
 ///
 /// This stat-verifies the file, hashes if needed (with TOCTOU protection),
@@ -1002,9 +1023,17 @@ async fn handle_compile(
         zccache_compiler::ParsedInvocation::NonCacheable { reason } => {
             state.stats.record_non_cacheable();
             record_session_stat(&state.sessions, &sid, |t| t.record_non_cacheable());
-            write_session_log(&state.sessions, &sid, &format!("non-cacheable: {reason}"));
-            return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid, &client_env)
-                .await;
+            return run_compiler_direct(
+                state,
+                &compiler,
+                args,
+                cwd,
+                &sid,
+                &client_env,
+                compile_start,
+                Some(&reason),
+            )
+            .await;
         }
         zccache_compiler::ParsedInvocation::MultiFile {
             compilations,
@@ -1088,14 +1117,18 @@ async fn handle_compile(
                     record_session_stat(&state.sessions, &sid, move |t| {
                         t.record_hit(src, latency_us, artifact_bytes);
                     });
-                    write_session_log(
+                    state.event_logger.log_event(
                         &state.sessions,
-                        &sid,
-                        &format!(
-                            "cache hit (fast): {} -> {}",
-                            source_path.display(),
-                            output_path.display()
-                        ),
+                        &CompileEvent {
+                            session_id: Some(session_id),
+                            compiler: compiler.to_str().unwrap_or(""),
+                            args,
+                            cwd,
+                            exit_code: cached.artifact.exit_code,
+                            outcome: CompileOutcome::HitFast,
+                            latency: compile_start.elapsed(),
+                            reason: None,
+                        },
                     );
                     let bookkeeping_us = t7.elapsed().as_micros() as u64;
 
@@ -1133,13 +1166,22 @@ async fn handle_compile(
             hash_map.insert(source_path.clone(), h);
         }
         Err(e) => {
-            write_session_log(
+            state.event_logger.log_diagnostic(
                 &state.sessions,
                 &sid,
-                &format!("cache key error: {e}, falling back to direct compile"),
+                &format!("cache_key_error: {e}, falling back to direct compile"),
             );
-            return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid, &client_env)
-                .await;
+            return run_compiler_direct(
+                state,
+                &compiler,
+                args,
+                cwd,
+                &sid,
+                &client_env,
+                compile_start,
+                Some("cache-key-error"),
+            )
+            .await;
         }
     }
     let hash_source_us = t2.elapsed().as_micros() as u64;
@@ -1153,10 +1195,10 @@ async fn handle_compile(
                     hash_map.insert(header.clone(), h);
                 }
                 Err(e) => {
-                    write_session_log(
+                    state.event_logger.log_diagnostic(
                         &state.sessions,
                         &sid,
-                        &format!("[DIAG] header_hash_fail: {} error={e}", header.display()),
+                        &format!("header_hash_fail: {} error={e}", header.display()),
                     );
                 }
             }
@@ -1174,11 +1216,11 @@ async fn handle_compile(
             .check_diagnostic(&context_key, is_fresh, get_hash)
     };
     let depgraph_check_us = t4.elapsed().as_micros() as u64;
-    write_session_log(
+    state.event_logger.log_diagnostic(
         &state.sessions,
         &sid,
         &format!(
-            "[DIAG] depgraph_check: {} -> {} verdict={} reason={}",
+            "depgraph_check: {} -> {} verdict={} reason={}",
             source_path.display(),
             output_path.display(),
             match &verdict {
@@ -1235,14 +1277,18 @@ async fn handle_compile(
                 record_session_stat(&state.sessions, &sid, move |t| {
                     t.record_hit(src, latency_us, artifact_bytes);
                 });
-                write_session_log(
+                state.event_logger.log_event(
                     &state.sessions,
-                    &sid,
-                    &format!(
-                        "cache hit: {} -> {}",
-                        source_path.display(),
-                        output_path.display()
-                    ),
+                    &CompileEvent {
+                        session_id: Some(session_id),
+                        compiler: compiler.to_str().unwrap_or(""),
+                        args,
+                        cwd,
+                        exit_code: cached.artifact.exit_code,
+                        outcome: CompileOutcome::Hit,
+                        latency: compile_start.elapsed(),
+                        reason: None,
+                    },
                 );
                 let bookkeeping_us = t7.elapsed().as_micros() as u64;
 
@@ -1279,10 +1325,10 @@ async fn handle_compile(
                 };
             }
             // Artifact key computed but no artifact stored yet — fall through to compile
-            write_session_log(
+            state.event_logger.log_diagnostic(
                 &state.sessions,
                 &sid,
-                &format!("[DIAG] artifact_not_found: key={artifact_key_hex}"),
+                &format!("artifact_not_found: key={artifact_key_hex}"),
             );
         }
         zccache_depgraph::CacheVerdict::Cold
@@ -1296,14 +1342,18 @@ async fn handle_compile(
     state.fast_hit_cache.remove(&context_key);
 
     // Cache miss — run the compiler
-    write_session_log(
+    state.event_logger.log_event(
         &state.sessions,
-        &sid,
-        &format!(
-            "cache miss: {} -> {} (reason: {diag_reason})",
-            source_path.display(),
-            output_path.display()
-        ),
+        &CompileEvent {
+            session_id: Some(session_id),
+            compiler: compiler.to_str().unwrap_or(""),
+            args,
+            cwd,
+            exit_code: 0,
+            outcome: CompileOutcome::Miss,
+            latency: compile_start.elapsed(),
+            reason: Some(&diag_reason),
+        },
     );
 
     // ── Phase: compiler exec (with depfile injection) ────────────────
@@ -1373,13 +1423,10 @@ async fn handle_compile(
                     }
                     Err(e) => {
                         tracing::warn!("depfile parse failed, falling back to scanner: {e}");
-                        write_session_log(
+                        state.event_logger.log_diagnostic(
                             &state.sessions,
                             &sid,
-                            &format!(
-                                "[DIAG] depfile_parse_fail: path={} error={e}",
-                                path.display()
-                            ),
+                            &format!("depfile_parse_fail: path={} error={e}", path.display()),
                         );
                         if matches!(depfile_strategy, DepfileStrategy::Injected { .. }) {
                             let _ = std::fs::remove_file(path);
@@ -1434,11 +1481,11 @@ async fn handle_compile(
         let include_count = scan_result.resolved.len();
         if let Some(artifact_key) = state.dep_graph.update(&context_key, scan_result, get_hash) {
             let artifact_key_hex = artifact_key.hash().to_hex();
-            write_session_log(
+            state.event_logger.log_diagnostic(
                 &state.sessions,
                 &sid,
                 &format!(
-                    "[DIAG] update: {} artifact_key={} includes={include_count}",
+                    "update: {} artifact_key={} includes={include_count}",
                     source_path.display(),
                     &artifact_key_hex[..8],
                 ),
@@ -1729,7 +1776,7 @@ async fn handle_compile_multi(
                 });
             }
             UnitCacheResult::Miss { source_path, .. } => {
-                write_session_log(
+                state.event_logger.log_diagnostic(
                     &state.sessions,
                     &sid,
                     &format!("multi-file cache miss: {}", source_path.display()),
@@ -1775,7 +1822,7 @@ async fn handle_compile_multi(
         };
     }
 
-    write_session_log(
+    state.event_logger.log_diagnostic(
         &state.sessions,
         &sid,
         &format!(
@@ -1967,13 +2014,16 @@ async fn handle_compile_multi(
 }
 
 /// Run the compiler directly without caching.
+#[allow(clippy::too_many_arguments)]
 async fn run_compiler_direct(
+    state: &SharedState,
     compiler: &PathBuf,
     args: &[String],
     cwd: &str,
-    sessions: &SessionManager,
     sid: &SessionId,
     client_env: &Option<Vec<(String, String)>>,
+    compile_start: std::time::Instant,
+    reason: Option<&str>,
 ) -> Response {
     let mut cmd = tokio::process::Command::new(compiler);
     cmd.args(args).current_dir(cwd);
@@ -1983,10 +2033,18 @@ async fn run_compiler_direct(
     match result {
         Ok(output) => {
             let exit_code = output.status.code().unwrap_or(-1);
-            write_session_log(
-                sessions,
-                sid,
-                &format!("direct compile: exit_code={exit_code}"),
+            state.event_logger.log_event(
+                &state.sessions,
+                &CompileEvent {
+                    session_id: Some(sid.value()),
+                    compiler: compiler.to_str().unwrap_or(""),
+                    args,
+                    cwd,
+                    exit_code,
+                    outcome: CompileOutcome::Direct,
+                    latency: compile_start.elapsed(),
+                    reason,
+                },
             );
             Response::CompileResult {
                 exit_code,

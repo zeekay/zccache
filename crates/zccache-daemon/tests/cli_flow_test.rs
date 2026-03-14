@@ -8,6 +8,17 @@
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
+/// Parse `session_id` from the CLI's one-line JSON output:
+/// `{"session_id":1,"started_at":1710000000}`
+fn parse_session_id_from_json(json: &str) -> String {
+    // Minimal parse — avoid adding serde_json as a dev-dependency.
+    let key = "\"session_id\":";
+    let start = json.find(key).expect("missing session_id in JSON") + key.len();
+    let rest = &json[start..];
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    rest[..end].trim().to_string()
+}
+
 async fn start_daemon() -> (
     String,
     tokio::task::JoinHandle<()>,
@@ -167,8 +178,8 @@ async fn cli_session_lifecycle() {
 
     // ── Verify log ──
     let log_text = std::fs::read_to_string(&log).unwrap();
-    assert!(log_text.contains("cache miss"), "log should show miss");
-    assert!(log_text.contains("cache hit"), "log should show hit");
+    assert!(log_text.contains("[MISS]"), "log should show miss");
+    assert!(log_text.contains("[HIT]"), "log should show hit");
 
     shutdown.notify_one();
     server_handle.await.unwrap();
@@ -261,10 +272,8 @@ async fn cli_binary_session_round_trip() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let session_id_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let _session_id: u64 = session_id_str
-        .parse()
-        .unwrap_or_else(|_| panic!("invalid session ID: {session_id_str:?}"));
+    let session_json = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let session_id_str = parse_session_id_from_json(&session_json);
 
     // Pre-compute string args for the compiler invocation
     let clang_str = clang.to_string_lossy().into_owned();
@@ -318,8 +327,8 @@ async fn cli_binary_session_round_trip() {
 
     // Verify log shows miss then hit
     let log_text = std::fs::read_to_string(&log).unwrap();
-    assert!(log_text.contains("cache miss"), "log should show miss");
-    assert!(log_text.contains("cache hit"), "log should show hit");
+    assert!(log_text.contains("[MISS]"), "log should show miss");
+    assert!(log_text.contains("[HIT]"), "log should show hit");
 
     shutdown.notify_one();
     server_handle.await.unwrap();
@@ -750,7 +759,8 @@ async fn cli_binary_compiler_override_cpp_session_c_file() {
         "session-start failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let session_id_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let session_json = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let session_id_str = parse_session_id_from_json(&session_json);
 
     // Wrap clang (C compiler) to compile a .c file with -std=c11.
     // The bug: without the fix, the daemon would invoke clang++ instead of clang.

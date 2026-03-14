@@ -547,8 +547,8 @@ async fn adversarial_cross_session_cache_sharing() {
     // Log files should reflect the different sessions
     let log1_text = std::fs::read_to_string(&log1).unwrap();
     let log2_text = std::fs::read_to_string(&log2).unwrap();
-    assert!(log1_text.contains("cache miss"));
-    assert!(log2_text.contains("cache hit"));
+    assert!(log1_text.contains("[MISS]"));
+    assert!(log2_text.contains("[HIT]"));
 
     shutdown.notify_one();
     server_handle.await.unwrap();
@@ -671,13 +671,10 @@ async fn adversarial_non_cacheable_passthrough() {
 
     let log_text = std::fs::read_to_string(&log).unwrap();
     assert!(
-        log_text.contains("non-cacheable"),
-        "log should mention non-cacheable"
+        log_text.contains("[DIRECT]"),
+        "log should mention direct (non-cacheable)"
     );
-    assert!(
-        log_text.contains("cache miss"),
-        "log should mention cache miss"
-    );
+    assert!(log_text.contains("[MISS]"), "log should mention miss");
 
     shutdown.notify_one();
     server_handle.await.unwrap();
@@ -896,8 +893,8 @@ async fn adversarial_rapid_recompile_cycle() {
 
     // Log should have 1 miss + 20 hits
     let log_text = std::fs::read_to_string(&log).unwrap();
-    let miss_count = log_text.matches("cache miss").count();
-    let hit_count = log_text.matches("cache hit").count();
+    let miss_count = log_text.matches("[MISS]").count();
+    let hit_count = log_text.matches("[HIT]").count() + log_text.matches("[HIT_FAST]").count();
     assert_eq!(miss_count, 1, "expected exactly 1 miss");
     assert_eq!(hit_count, 20, "expected exactly 20 hits");
 

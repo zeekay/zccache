@@ -275,15 +275,16 @@ def main() -> None:
 
     # Create a session (zccache requires ZCCACHE_SESSION_ID)
     session_result = subprocess.run(
-        [ZCCACHE, "session-start", "--compiler", CLANG],
+        [ZCCACHE, "session-start", "--compiler", CLANG, "--pid", str(os.getpid())],
         capture_output=True, text=True,
     )
-    session_id = session_result.stdout.strip()
     if session_result.returncode != 0:
         log(f"  session-start failed: {session_result.stderr}")
-        # Try stderr too
-        session_id = session_result.stderr.strip().split()[-1] if session_result.stderr else ""
-    log(f"  Session ID: {session_id}")
+        sys.exit(1)
+    import json
+    session_info = json.loads(session_result.stdout.strip())
+    session_id = str(session_info["session_id"])
+    log(f"  Session ID: {session_id} (started at {session_info['started_at']})")
     zccache_env = {"ZCCACHE_SESSION_ID": session_id}
 
     zccache_cmd = [ZCCACHE, CLANG] + flags_with_rsp

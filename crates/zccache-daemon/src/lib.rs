@@ -6,8 +6,10 @@
 #![allow(clippy::missing_errors_doc)]
 
 pub mod crash;
+pub mod event_log;
 pub mod server;
 pub mod stats;
 
+pub use event_log::EventLogger;
 pub use server::DaemonServer;
 pub use stats::{PhaseProfiler, ProfileSnapshot, StatsCollector};

@@ -70,6 +70,12 @@ pub fn crash_dump_dir() -> PathBuf {
     default_cache_dir().join("crashes")
 }
 
+/// Returns the directory for daemon log files.
+#[must_use]
+pub fn log_dir() -> PathBuf {
+    default_cache_dir().join("logs")
+}
+
 fn dirs_fallback() -> PathBuf {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -92,5 +98,18 @@ mod tests {
         let cache = default_cache_dir();
         let crashes = crash_dump_dir();
         assert!(crashes.starts_with(&cache));
+    }
+
+    #[test]
+    fn log_dir_ends_with_logs() {
+        let dir = log_dir();
+        assert!(dir.ends_with("logs"));
+    }
+
+    #[test]
+    fn log_dir_is_under_cache_dir() {
+        let cache = default_cache_dir();
+        let logs = log_dir();
+        assert!(logs.starts_with(&cache));
     }
 }
