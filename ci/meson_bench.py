@@ -36,6 +36,21 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def resolve_msys2_path(p: Path) -> Path:
+    r"""Convert MSYS2/Cygwin-style paths (e.g. /c/Users/...) to native Windows paths.
+
+    When running under MSYS2/Git Bash, the shell expands ~ to /c/Users/...
+    but Python's pathlib on Windows doesn't understand that mount format.
+    On Windows, Path('/c/Users/...') becomes '\\c\\Users\\...' so we check
+    both separators.
+    """
+    s = str(p)
+    for sep in ("/", "\\"):
+        if len(s) >= 3 and s[0] == sep and s[1].isalpha() and s[2] == sep:
+            return Path(f"{s[1].upper()}:{s[2:]}")
+    return p
+
+
 def resolve_tools(project_dir: Path) -> dict[str, str]:
     """Discover tool paths from the project directory and system."""
     tools: dict[str, str] = {}
@@ -184,12 +199,18 @@ def run_scenario(
     native_file: Path,
     clear_fn,
     ninja_jobs: int | None = None,
+    build_dir_name: str | None = None,
 ) -> dict[str, float]:
     """Run a single benchmark scenario.
 
     Returns dict with setup_s, build_s, total_s.
     """
-    build_dir = project_dir / ".build" / f"bench-{name}"
+    # Use a stable build dir name so cold/warm pairs share the same include
+    # paths.  Meson generates relative -I flags resolved against the build dir;
+    # different dir names produce different absolute paths and cause spurious
+    # cache misses in tools that key on include paths (like zccache).
+    dir_name = build_dir_name or f"bench-{name}"
+    build_dir = project_dir / ".build" / dir_name
     log(f"\n{'='*60}")
     log(f"  Scenario: {name}")
     log(f"  Build dir: {build_dir}")
@@ -256,7 +277,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    project_dir = args.project_dir.expanduser().resolve()
+    project_dir = resolve_msys2_path(args.project_dir.expanduser()).resolve()
     if not (project_dir / "meson.build").exists():
         log(f"ERROR: {project_dir} does not contain meson.build")
         sys.exit(1)
@@ -294,22 +315,25 @@ def main() -> None:
     native_zccache = tmpdir / "native_zccache.ini"
     write_native_file(native_zccache, c, cpp, ar, wrapper=zccache)
 
-    # Map scenario names to their config
+    # Map scenario names to (native_file, clear_fn, build_dir_name).
+    # Cold/warm pairs share a build dir so meson's relative -I flags resolve
+    # to the same absolute paths, giving the cache tool a fair shot.
     scenario_config = {
-        "bare": (native_bare, noop_clear),
-        "sccache-cold": (native_sccache, clear_sccache),
-        "sccache-warm": (native_sccache, noop_clear),
-        "zccache-cold": (native_zccache, clear_zccache),
-        "zccache-warm": (native_zccache, ensure_zccache_daemon),
+        "bare": (native_bare, noop_clear, "bench-bare"),
+        "sccache-cold": (native_sccache, clear_sccache, "bench-sccache"),
+        "sccache-warm": (native_sccache, noop_clear, "bench-sccache"),
+        "zccache-cold": (native_zccache, clear_zccache, "bench-zccache"),
+        "zccache-warm": (native_zccache, ensure_zccache_daemon, "bench-zccache"),
     }
 
     # Run scenarios in order
     results: dict[str, dict[str, float]] = {}
     for name in scenarios:
-        native_file, clear_fn = scenario_config[name]
+        native_file, clear_fn, build_dir_name = scenario_config[name]
         results[name] = run_scenario(
             name, project_dir, tools, native_file, clear_fn,
             ninja_jobs=args.jobs,
+            build_dir_name=build_dir_name,
         )
 
     # Cleanup temp dir
@@ -346,10 +370,14 @@ def main() -> None:
 
     # Cleanup build dirs
     log("\nCleaning up benchmark build dirs...")
+    cleaned = set()
     for name in scenarios:
-        build_dir = project_dir / ".build" / f"bench-{name}"
-        if build_dir.exists():
-            shutil.rmtree(build_dir, ignore_errors=True)
+        _, _, dir_name = scenario_config[name]
+        if dir_name not in cleaned:
+            build_dir = project_dir / ".build" / dir_name
+            if build_dir.exists():
+                shutil.rmtree(build_dir, ignore_errors=True)
+            cleaned.add(dir_name)
     log("Done.")
 
 
