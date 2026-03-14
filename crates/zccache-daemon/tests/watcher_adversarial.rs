@@ -45,8 +45,8 @@ async fn start_session(
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: cwd.to_string(),
-            log_file: Some(log_file.to_string()),
+            working_dir: cwd.to_string().into(),
+            log_file: Some(log_file.to_string().into()),
             track_stats: false,
         })
         .await
@@ -69,8 +69,8 @@ async fn compile_and_read(
         .send(&Request::Compile {
             session_id: session_id.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
-            cwd: cwd.to_string(),
-            compiler: compiler.to_string(),
+            cwd: cwd.to_string().into(),
+            compiler: compiler.to_string().into(),
             env: None,
         })
         .await
@@ -217,6 +217,7 @@ impl TestHarness {
 
 /// Edit header file, wait for watcher, recompile → cache miss.
 #[tokio::test]
+#[ignore] // integration: spawns clang + watcher settle delays, run with --full
 async fn watcher_header_edit_detected() {
     let mut h = match TestHarness::new().await {
         Some(h) => h,
@@ -252,6 +253,7 @@ async fn watcher_header_edit_detected() {
 /// compile_with_retry to handle this, and only check `cached=true` (not byte
 /// equality of the .o, since intermediate misses produce new COFF timestamps).
 #[tokio::test]
+#[ignore] // integration: spawns clang + 1100ms sleep, run with --full
 async fn watcher_touch_same_content_hits() {
     let mut h = match TestHarness::new().await {
         Some(h) => h,
@@ -287,6 +289,7 @@ async fn watcher_touch_same_content_hits() {
 /// With non-recursive watches, each directory in the include path is watched
 /// individually (discovered via depfile scanning on the first compile).
 #[tokio::test]
+#[ignore] // integration: spawns clang + watcher settle delays, run with --full
 async fn deeply_nested_dir_watched() {
     let mut h = match TestHarness::new().await {
         Some(h) => h,
@@ -322,6 +325,7 @@ async fn deeply_nested_dir_watched() {
 /// Create and immediately delete a file within the settle window → no crash,
 /// daemon remains functional.
 #[tokio::test]
+#[ignore] // integration: spawns clang + watcher settle delays, run with --full
 async fn rapid_create_delete_no_crash() {
     let mut h = match TestHarness::new().await {
         Some(h) => h,
@@ -357,6 +361,7 @@ async fn rapid_create_delete_no_crash() {
 /// Two sessions watching the same directory. Edit a header → both sessions see
 /// the invalidation. Second session gets a cache hit from first session's recompile.
 #[tokio::test]
+#[ignore] // integration: spawns clang + multi-session watcher, run with --full
 async fn two_sessions_same_dir_share_watcher() {
     let mut h = match TestHarness::new().await {
         Some(h) => h,

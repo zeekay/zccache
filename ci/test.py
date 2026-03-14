@@ -5,8 +5,9 @@
 """Run workspace tests.
 
 Usage:
-    uv run test                          # unit tests only
-    uv run test --full                   # unit + stress + integration tests
+    uv run test                          # unit tests only (fast, no compiler needed)
+    uv run test --integration            # integration tests only (need clang)
+    uv run test --full                   # unit + integration + stress tests
     uv run test -p zccache-hash          # single crate
     uv run test -p zccache-hash -- name  # single test by name
 """
@@ -23,8 +24,11 @@ def main():
 
     args = sys.argv[1:]
     full = "--full" in args
+    integration = "--integration" in args
     if full:
         args.remove("--full")
+    if integration:
+        args.remove("--integration")
 
     # Split on "--" to separate cargo args from test-binary args.
     if "--" in args:
@@ -42,6 +46,8 @@ def main():
     cmd += ["--"]
     if full:
         cmd += ["--include-ignored"]
+    elif integration:
+        cmd += ["--ignored"]
     cmd += test_args
 
     result = subprocess.run(

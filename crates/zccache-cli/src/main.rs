@@ -15,6 +15,7 @@
 //!    it to the daemon via the session from ZCCACHE_SESSION_ID.
 
 use clap::{Parser, Subcommand};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// zccache -- fast local compiler cache.
@@ -126,22 +127,15 @@ fn main() -> ExitCode {
         }
         Commands::SessionStart { cwd, log, endpoint } => {
             let endpoint = resolve_endpoint(endpoint.as_deref());
-            let cwd = cwd.unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-            });
+            let cwd = cwd
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let log = log.map(|p| {
-                let path = std::path::Path::new(&p);
+                let path = Path::new(&p);
                 if path.is_absolute() {
-                    p.to_string()
+                    PathBuf::from(p)
                 } else {
-                    std::env::current_dir()
-                        .unwrap_or_default()
-                        .join(p)
-                        .to_string_lossy()
-                        .into_owned()
+                    std::env::current_dir().unwrap_or_default().join(p)
                 }
             });
             run_async(cmd_session_start(&endpoint, &cwd, log.as_deref()))
@@ -230,8 +224,8 @@ async fn cmd_status(endpoint: &str) -> ExitCode {
                 endpoint,
                 format_uptime(s.uptime_secs)
             );
-            if !s.cache_dir.is_empty() {
-                println!("cache dir: {}", s.cache_dir);
+            if !s.cache_dir.as_os_str().is_empty() {
+                println!("cache dir: {}", s.cache_dir.display());
             }
             println!();
             println!(
@@ -321,7 +315,7 @@ async fn cmd_clear(endpoint: &str) -> ExitCode {
     }
 }
 
-async fn cmd_session_start(endpoint: &str, cwd: &str, log: Option<&str>) -> ExitCode {
+async fn cmd_session_start(endpoint: &str, cwd: &Path, log: Option<&Path>) -> ExitCode {
     if let Err(e) = ensure_daemon(endpoint).await {
         eprintln!("cannot start daemon at {endpoint}: {e}");
         return ExitCode::FAILURE;
@@ -337,8 +331,8 @@ async fn cmd_session_start(endpoint: &str, cwd: &str, log: Option<&str>) -> Exit
 
     conn.send(&zccache_protocol::Request::SessionStart {
         client_pid: std::process::id(),
-        working_dir: cwd.to_string(),
-        log_file: log.map(String::from),
+        working_dir: cwd.to_path_buf(),
+        log_file: log.map(Path::to_path_buf),
         track_stats: false,
     })
     .await
@@ -493,7 +487,7 @@ fn run_passthrough(args: &[String]) -> ExitCode {
     {
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(e) => {
-            eprintln!("zccache: failed to run {resolved}: {e}");
+            eprintln!("zccache: failed to run {}: {e}", resolved.display());
             ExitCode::FAILURE
         }
     }
@@ -529,10 +523,7 @@ fn run_wrap(args: &[String]) -> ExitCode {
         Vec::new()
     };
 
-    let cwd = std::env::current_dir()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
+    let cwd = std::env::current_dir().unwrap_or_default();
 
     let client_env: Vec<(String, String)> = std::env::vars().collect();
     let endpoint = resolve_endpoint(None);
@@ -581,19 +572,19 @@ fn run_wrap(args: &[String]) -> ExitCode {
 
 /// Resolve a compiler name/path to an absolute path.
 /// Normalizes MSYS paths on Windows, then searches PATH if not already absolute.
-fn resolve_compiler_path(compiler: &str) -> String {
+fn resolve_compiler_path(compiler: &str) -> PathBuf {
     let normalized = zccache_core::path::normalize_msys_path(compiler);
-    let path = std::path::Path::new(&normalized);
+    let path = Path::new(&normalized);
 
     // Already absolute — return as-is.
     if path.is_absolute() {
-        return normalized;
+        return PathBuf::from(normalized);
     }
 
     // Search PATH for the compiler.
     match which_on_path(&normalized) {
-        Some(abs) => abs.to_string_lossy().into_owned(),
-        None => normalized, // Let the daemon report the error.
+        Some(abs) => abs,
+        None => PathBuf::from(normalized), // Let the daemon report the error.
     }
 }
 
@@ -601,8 +592,8 @@ async fn cmd_compile(
     endpoint: &str,
     session_id: &str,
     args: Vec<String>,
-    cwd: String,
-    compiler: String,
+    cwd: PathBuf,
+    compiler: PathBuf,
     client_env: Vec<(String, String)>,
 ) -> ExitCode {
     let mut conn = match connect(endpoint).await {
@@ -651,9 +642,9 @@ async fn cmd_compile(
 /// in one IPC message). Used when ZCCACHE_SESSION_ID is not set (drop-in mode).
 async fn cmd_compile_ephemeral(
     endpoint: &str,
-    compiler: &str,
+    compiler: &Path,
     args: Vec<String>,
-    cwd: String,
+    cwd: PathBuf,
     client_env: Vec<(String, String)>,
 ) -> ExitCode {
     // Ensure daemon is running and version-compatible.
@@ -672,7 +663,7 @@ async fn cmd_compile_ephemeral(
     conn.send(&zccache_protocol::Request::CompileEphemeral {
         client_pid: std::process::id(),
         working_dir: cwd.clone(),
-        compiler: compiler.to_string(),
+        compiler: compiler.to_path_buf(),
         args,
         cwd,
         env: Some(client_env),
@@ -706,9 +697,9 @@ async fn cmd_compile_ephemeral(
 /// Ephemeral link/archive: single-roundtrip for `zccache ar ...` etc.
 async fn cmd_link_ephemeral(
     endpoint: &str,
-    tool: &str,
+    tool: &Path,
     args: Vec<String>,
-    cwd: String,
+    cwd: PathBuf,
     client_env: Vec<(String, String)>,
 ) -> ExitCode {
     if let Err(e) = ensure_daemon(endpoint).await {
@@ -726,7 +717,7 @@ async fn cmd_link_ephemeral(
     conn.send(&zccache_protocol::Request::LinkEphemeral {
         client_pid: std::process::id(),
         working_dir: cwd.clone(),
-        tool: tool.to_string(),
+        tool: tool.to_path_buf(),
         args,
         cwd,
         env: Some(client_env),

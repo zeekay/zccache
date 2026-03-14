@@ -61,8 +61,8 @@ async fn cli_session_lifecycle() {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: cwd.clone(),
-            log_file: Some(log.to_string_lossy().into_owned()),
+            working_dir: cwd.clone().into(),
+            log_file: Some(log.to_string_lossy().into_owned().into()),
             track_stats: false,
         })
         .await
@@ -89,8 +89,8 @@ async fn cli_session_lifecycle() {
                 "-o".to_string(),
                 obj.to_string_lossy().into_owned(),
             ],
-            cwd: cwd.clone(),
-            compiler: clang.to_string_lossy().into_owned(),
+            cwd: cwd.clone().into(),
+            compiler: clang.to_string_lossy().into_owned().into(),
             env: None,
         })
         .await
@@ -121,8 +121,8 @@ async fn cli_session_lifecycle() {
                 "-o".to_string(),
                 obj.to_string_lossy().into_owned(),
             ],
-            cwd: cwd.clone(),
-            compiler: clang.to_string_lossy().into_owned(),
+            cwd: cwd.clone().into(),
+            compiler: clang.to_string_lossy().into_owned().into(),
             env: None,
         })
         .await
@@ -160,8 +160,8 @@ async fn cli_session_lifecycle() {
         .send(&Request::Compile {
             session_id,
             args: vec!["-c".to_string(), src.to_string_lossy().into_owned()],
-            cwd: cwd.clone(),
-            compiler: clang.to_string_lossy().into_owned(),
+            cwd: cwd.clone().into(),
+            compiler: clang.to_string_lossy().into_owned().into(),
             env: None,
         })
         .await
@@ -436,7 +436,7 @@ async fn cli_clear_resets_cache() {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: cwd.clone(),
+            working_dir: cwd.clone().into(),
             log_file: None,
             track_stats: false,
         })
@@ -460,8 +460,8 @@ async fn cli_clear_resets_cache() {
         .send(&Request::Compile {
             session_id: session_id.clone(),
             args: compile_args.clone(),
-            cwd: cwd.clone(),
-            compiler: clang.to_string_lossy().into_owned(),
+            cwd: cwd.clone().into(),
+            compiler: clang.to_string_lossy().into_owned().into(),
             env: None,
         })
         .await
@@ -483,8 +483,8 @@ async fn cli_clear_resets_cache() {
         .send(&Request::Compile {
             session_id: session_id.clone(),
             args: compile_args.clone(),
-            cwd: cwd.clone(),
-            compiler: clang.to_string_lossy().into_owned(),
+            cwd: cwd.clone().into(),
+            compiler: clang.to_string_lossy().into_owned().into(),
             env: None,
         })
         .await
@@ -524,7 +524,7 @@ async fn cli_clear_resets_cache() {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: cwd.clone(),
+            working_dir: cwd.clone().into(),
             log_file: None,
             track_stats: false,
         })
@@ -542,8 +542,8 @@ async fn cli_clear_resets_cache() {
         .send(&Request::Compile {
             session_id: session_id2,
             args: compile_args,
-            cwd,
-            compiler: clang.to_string_lossy().into_owned(),
+            cwd: cwd.into(),
+            compiler: clang.to_string_lossy().into_owned().into(),
             env: None,
         })
         .await
@@ -591,7 +591,7 @@ async fn cli_multi_file_compilation_runs_directly() {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: cwd.clone(),
+            working_dir: cwd.clone().into(),
             log_file: None,
             track_stats: true,
         })
@@ -613,8 +613,8 @@ async fn cli_multi_file_compilation_runs_directly() {
         .send(&Request::Compile {
             session_id: session_id.clone(),
             args: multi_args.clone(),
-            cwd: cwd.clone(),
-            compiler: clang.to_string_lossy().into_owned(),
+            cwd: cwd.clone().into(),
+            compiler: clang.to_string_lossy().into_owned().into(),
             env: None,
         })
         .await
@@ -641,8 +641,8 @@ async fn cli_multi_file_compilation_runs_directly() {
         .send(&Request::Compile {
             session_id: session_id.clone(),
             args: multi_args,
-            cwd: cwd.clone(),
-            compiler: clang.to_string_lossy().into_owned(),
+            cwd: cwd.clone().into(),
+            compiler: clang.to_string_lossy().into_owned().into(),
             env: None,
         })
         .await

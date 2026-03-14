@@ -152,7 +152,7 @@ async fn build_all_ipc(
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: cwd.clone(),
+            working_dir: cwd.clone().into(),
             log_file: None,
             track_stats: true,
         })
@@ -176,8 +176,8 @@ async fn build_all_ipc(
             .send(&Request::Compile {
                 session_id: session_id.clone(),
                 args,
-                cwd: cwd.clone(),
-                compiler: compiler.clone(),
+                cwd: cwd.clone().into(),
+                compiler: compiler.clone().into(),
                 env: None,
             })
             .await
@@ -216,6 +216,7 @@ async fn build_all_ipc(
 ///   3. Rebuild: same commands → all cache hits
 ///   4. Verify output bytes are identical
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore] // integration: spawns clang 30+ times, run with --full
 async fn ninja_cold_then_warm_rebuild_cli() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -308,6 +309,7 @@ async fn ninja_cold_then_warm_rebuild_cli() {
 
 /// Cold build → warm rebuild via IPC session mode (no CLI binary needed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore] // integration: spawns clang 30+ times, run with --full
 async fn ninja_cold_then_warm_rebuild_ipc() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -373,6 +375,7 @@ async fn ninja_cold_then_warm_rebuild_ipc() {
 
 /// Persistent artifact test: cold build → verify .meta files on disk → restart → verify loaded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore] // integration: spawns clang 30+ times, run with --full
 async fn ninja_persistent_artifacts_survive_restart() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -454,6 +457,7 @@ async fn ninja_persistent_artifacts_survive_restart() {
 
 /// Header modification invalidates cache for all files that include it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore] // integration: spawns clang 30+ times, run with --full
 async fn ninja_header_change_invalidates_dependents() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -505,6 +509,7 @@ async fn ninja_header_change_invalidates_dependents() {
 
 /// Concurrent compilation: multiple files compiled "simultaneously" via IPC.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore] // integration: spawns clang 30+ times concurrently, run with --full
 async fn ninja_concurrent_cold_build() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -532,7 +537,7 @@ async fn ninja_concurrent_cold_build() {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: root.to_string_lossy().into_owned(),
+            working_dir: root.to_string_lossy().into_owned().into(),
             log_file: None,
             track_stats: false,
         })
@@ -563,8 +568,8 @@ async fn ninja_concurrent_cold_build() {
             conn.send(&Request::Compile {
                 session_id: sid,
                 args,
-                cwd,
-                compiler: comp,
+                cwd: cwd.into(),
+                compiler: comp.into(),
                 env: None,
             })
             .await
@@ -615,6 +620,7 @@ async fn ninja_concurrent_cold_build() {
 
 /// `zccache clear` resets the cache, forcing cold misses on next build.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore] // integration: spawns clang 30+ times, run with --full
 async fn ninja_clear_forces_cold_rebuild() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,

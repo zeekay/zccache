@@ -443,9 +443,7 @@ async fn handle_connection(
                     dep_graph_files: dg.file_count as u64,
                     sessions_total: snap.sessions_total,
                     sessions_active: state.sessions.active_count() as u64,
-                    cache_dir: zccache_core::config::default_cache_dir()
-                        .to_string_lossy()
-                        .into_owned(),
+                    cache_dir: zccache_core::config::default_cache_dir(),
                 })
             }
             Request::Lookup { .. } => Response::LookupResult(zccache_protocol::LookupResult::Miss),
@@ -591,10 +589,10 @@ async fn handle_clear(state: &SharedState) -> Response {
 async fn handle_compile_ephemeral(
     state: &Arc<SharedState>,
     client_pid: u32,
-    working_dir: &str,
-    compiler: &str,
+    working_dir: &Path,
+    compiler: &Path,
     args: &[String],
-    cwd: &str,
+    cwd: &Path,
     env: Option<Vec<(String, String)>>,
 ) -> Response {
     // 1. Start ephemeral session (inline, no IPC roundtrip)
@@ -628,10 +626,10 @@ async fn handle_compile_ephemeral(
 async fn handle_link_ephemeral(
     state: &Arc<SharedState>,
     _client_pid: u32,
-    _working_dir: &str,
-    tool: &str,
+    _working_dir: &Path,
+    tool: &Path,
     args: &[String],
-    cwd: &str,
+    cwd: &Path,
     env: Option<Vec<(String, String)>>,
 ) -> Response {
     use zccache_compiler::parse_archiver::{parse_archive_invocation, ParsedArchiveInvocation};
@@ -649,7 +647,7 @@ async fn handle_link_ephemeral(
         non_determinism_hint: String,
     }
 
-    let parsed_tool = match parse_archive_invocation(tool, args) {
+    let parsed_tool = match parse_archive_invocation(tool.to_str().unwrap_or(""), args) {
         ParsedArchiveInvocation::Cacheable(c) => ParsedTool {
             non_determinism_hint: match c.family {
                 zccache_compiler::parse_archiver::ArchiverFamily::MsvcLib => "/BREPRO".to_string(),
@@ -663,7 +661,7 @@ async fn handle_link_ephemeral(
         },
         ParsedArchiveInvocation::NonCacheable { reason: ar_reason } => {
             // Try linker parser
-            match parse_linker_invocation(tool, args) {
+            match parse_linker_invocation(tool.to_str().unwrap_or(""), args) {
                 ParsedLinkerInvocation::Cacheable(c) => ParsedTool {
                     non_determinism_hint: match c.family {
                         zccache_compiler::parse_linker::LinkerFamily::MsvcLink => {
@@ -709,7 +707,7 @@ async fn handle_link_ephemeral(
     let tool_hash = match hash_file_via_cache(state, tool_path) {
         Some(h) => h,
         None => {
-            tracing::warn!("cannot hash tool {tool}");
+            tracing::warn!("cannot hash tool {}", tool.display());
             return run_tool_passthrough(tool, args, cwd, env).await;
         }
     };
@@ -883,9 +881,9 @@ fn hash_file_via_cache(state: &SharedState, path: &Path) -> Option<ContentHash> 
 
 /// Run a tool directly (passthrough) and return a LinkResult response.
 async fn run_tool_passthrough(
-    tool: &str,
+    tool: &Path,
     args: &[String],
-    cwd: &str,
+    cwd: &Path,
     env: Option<Vec<(String, String)>>,
 ) -> Response {
     let mut cmd = std::process::Command::new(tool);
@@ -908,7 +906,7 @@ async fn run_tool_passthrough(
             warning: None,
         },
         Err(e) => Response::Error {
-            message: format!("failed to run {tool}: {e}"),
+            message: format!("failed to run {}: {e}", tool.display()),
         },
     }
 }
@@ -917,21 +915,21 @@ async fn run_tool_passthrough(
 async fn handle_session_start(
     state: &SharedState,
     client_pid: u32,
-    working_dir: &str,
-    log_file: Option<String>,
+    working_dir: &Path,
+    log_file: Option<PathBuf>,
     track_stats: bool,
 ) -> Response {
     let session_config = zccache_depgraph::SessionConfig {
         client_pid,
-        working_dir: PathBuf::from(working_dir),
-        log_file: log_file.map(PathBuf::from),
+        working_dir: working_dir.to_path_buf(),
+        log_file,
         track_stats,
     };
 
     let session_id = state.sessions.create(session_config);
 
     // Watch the working directory for file changes.
-    watch_directory(state, &PathBuf::from(working_dir)).await;
+    watch_directory(state, working_dir).await;
 
     Response::SessionStarted {
         session_id: session_id.to_string(),
@@ -1031,8 +1029,8 @@ async fn handle_compile(
     state_arc: &Arc<SharedState>,
     session_id: &str,
     args: &[String],
-    cwd: &str,
-    compiler_path: &str,
+    cwd: &Path,
+    compiler_path: &Path,
     client_env: Option<Vec<(String, String)>>,
 ) -> Response {
     let state = state_arc.as_ref();
@@ -1058,7 +1056,7 @@ async fn handle_compile(
         };
     }
 
-    let compiler = PathBuf::from(compiler_path);
+    let compiler = compiler_path.to_path_buf();
 
     // Discover system includes for this compiler (cached per compiler path)
     let system_includes = {
@@ -1107,7 +1105,7 @@ async fn handle_compile(
                 sid,
                 compiler,
                 compilations,
-                cwd.to_string(),
+                cwd.to_path_buf(),
                 system_includes,
                 client_env,
             )
@@ -1116,7 +1114,7 @@ async fn handle_compile(
     };
     let parse_args_ns = t0.elapsed().as_nanos() as u64;
 
-    let cwd_path = PathBuf::from(cwd);
+    let cwd_path = cwd.to_path_buf();
     let source_path = if compilation.source_file.is_absolute() {
         compilation.source_file.clone()
     } else {
@@ -1832,11 +1830,10 @@ async fn handle_compile_multi(
     sid: SessionId,
     compiler: PathBuf,
     compilations: Vec<zccache_compiler::CacheableCompilation>,
-    cwd: String,
+    cwd_path: PathBuf,
     system_includes: Vec<PathBuf>,
     client_env: Option<Vec<(String, String)>>,
 ) -> Response {
-    let cwd_path = PathBuf::from(&cwd);
     let snap_clock = state.cache_system.current_clock();
     let mut all_stdout = Vec::new();
     let mut all_stderr = Vec::new();
@@ -1981,7 +1978,7 @@ async fn handle_compile_multi(
     }
 
     let mut cmd = tokio::process::Command::new(&compiler);
-    cmd.args(&compiler_args).current_dir(&cwd);
+    cmd.args(&compiler_args).current_dir(&cwd_path);
     apply_client_env(&mut cmd, &client_env);
     let result = cmd.output().await;
 
@@ -2155,7 +2152,7 @@ async fn handle_compile_multi(
 async fn run_compiler_direct(
     compiler: &PathBuf,
     args: &[String],
-    cwd: &str,
+    cwd: &Path,
     sessions: &SessionManager,
     sid: &SessionId,
     client_env: &Option<Vec<(String, String)>>,

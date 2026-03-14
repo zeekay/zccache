@@ -13,8 +13,9 @@ zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md 
 ## Commands
 
 ```bash
-uv run test                 # unit tests only
-uv run test --full          # unit + stress + integration tests
+uv run test                 # unit tests only (fast, no compiler needed)
+uv run test --integration   # integration tests only (need clang on PATH)
+uv run test --full          # unit + integration + stress + perf tests
 uv run test -p <crate> -- <test_name>
 uv run cargo check --workspace --all-targets
 uv run cargo clippy --workspace --all-targets -- -D warnings

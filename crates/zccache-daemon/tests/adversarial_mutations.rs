@@ -45,8 +45,8 @@ async fn start_session(
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: cwd.to_string(),
-            log_file: Some(log_file.to_string()),
+            working_dir: cwd.to_string().into(),
+            log_file: Some(log_file.to_string().into()),
             track_stats: false,
         })
         .await
@@ -68,8 +68,8 @@ async fn compile(
         .send(&Request::Compile {
             session_id: session_id.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
-            cwd: cwd.to_string(),
-            compiler: compiler.to_string(),
+            cwd: cwd.to_string().into(),
+            compiler: compiler.to_string().into(),
             env: None,
         })
         .await
@@ -182,6 +182,7 @@ impl TestHarness {
 /// Touch source (change mtime, same content) → cache should still HIT
 /// because content hash is unchanged after rehash.
 #[tokio::test]
+#[ignore] // integration: spawns clang + 1100ms sleep, run with --full
 async fn mutation_touch_source_no_invalidation() {
     let mut h = match TestHarness::new().await {
         Some(h) => h,
@@ -215,6 +216,7 @@ async fn mutation_touch_source_no_invalidation() {
 /// Delete source, recreate with SAME content → should still hit
 /// (content hash is the same).
 #[tokio::test]
+#[ignore] // integration: spawns clang + 1100ms sleep, run with --full
 async fn mutation_delete_recreate_same_content() {
     let mut h = match TestHarness::new().await {
         Some(h) => h,
@@ -244,6 +246,7 @@ async fn mutation_delete_recreate_same_content() {
 
 /// Add a brand new source file to the project → should not affect existing caches.
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn mutation_add_new_file_no_interference() {
     let mut h = match TestHarness::new().await {
         Some(h) => h,
@@ -277,6 +280,7 @@ async fn mutation_add_new_file_no_interference() {
 
 /// Same source, different -I include paths → different cache entries.
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn mutation_include_path_creates_different_cache_entry() {
     let mut h = match TestHarness::new().await {
         Some(h) => h,
@@ -369,6 +373,7 @@ async fn mutation_include_path_creates_different_cache_entry() {
 
 /// Add -D flag → different cache entry. Remove -D → original entry.
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn mutation_define_flag_toggle() {
     let mut h = match TestHarness::new().await {
         Some(h) => h,

@@ -41,8 +41,8 @@ async fn start_session(
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: cwd.to_string(),
-            log_file: Some(log_file.to_string()),
+            working_dir: cwd.to_string().into(),
+            log_file: Some(log_file.to_string().into()),
             track_stats: false,
         })
         .await
@@ -66,8 +66,8 @@ async fn compile(
         .send(&Request::Compile {
             session_id: session_id.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
-            cwd: cwd.to_string(),
-            compiler: compiler.to_string(),
+            cwd: cwd.to_string().into(),
+            compiler: compiler.to_string().into(),
             env: None,
         })
         .await
@@ -86,6 +86,7 @@ async fn compile(
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn adversarial_different_flags_different_cache_entries() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -197,6 +198,7 @@ async fn adversarial_different_flags_different_cache_entries() {
 }
 
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn adversarial_define_changes_invalidate_cache() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -256,6 +258,7 @@ async fn adversarial_define_changes_invalidate_cache() {
 }
 
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn adversarial_compile_errors_never_cached() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -315,6 +318,7 @@ async fn adversarial_compile_errors_never_cached() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[ignore] // integration: spawns clang 8x concurrently, run with --full
 async fn adversarial_concurrent_same_file() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -373,6 +377,7 @@ async fn adversarial_concurrent_same_file() {
 }
 
 #[tokio::test]
+#[ignore] // integration: spawns clang 10x concurrently, run with --full
 async fn adversarial_concurrent_different_files() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -437,6 +442,7 @@ async fn adversarial_concurrent_different_files() {
 }
 
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn adversarial_cross_session_cache_sharing() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -496,6 +502,7 @@ async fn adversarial_cross_session_cache_sharing() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[ignore] // integration: requires clang on PATH, run with --full
 async fn adversarial_invalid_session_id() {
     if zccache_test_support::find_clang().is_none() {
         return;
@@ -516,8 +523,8 @@ async fn adversarial_invalid_session_id() {
                 "-o".into(),
                 "out.o".into(),
             ],
-            cwd,
-            compiler: "/usr/bin/clang".to_string(),
+            cwd: cwd.into(),
+            compiler: "/usr/bin/clang".to_string().into(),
             env: None,
         })
         .await
@@ -540,6 +547,7 @@ async fn adversarial_invalid_session_id() {
 }
 
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn adversarial_non_cacheable_passthrough() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -560,8 +568,8 @@ async fn adversarial_non_cacheable_passthrough() {
         .send(&Request::Compile {
             session_id: sid.clone(),
             args: vec!["-E".into(), src.to_string_lossy().into_owned()],
-            cwd: cwd.clone(),
-            compiler: comp.clone(),
+            cwd: cwd.clone().into(),
+            compiler: comp.clone().into(),
             env: None,
         })
         .await
@@ -597,6 +605,7 @@ async fn adversarial_non_cacheable_passthrough() {
 }
 
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn adversarial_empty_source_file() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -639,6 +648,7 @@ async fn adversarial_empty_source_file() {
 }
 
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn adversarial_warnings_still_cached() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -693,6 +703,7 @@ async fn adversarial_warnings_still_cached() {
 }
 
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn adversarial_output_path_does_not_affect_cache_key() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -741,6 +752,7 @@ async fn adversarial_output_path_does_not_affect_cache_key() {
 }
 
 #[tokio::test]
+#[ignore] // integration: spawns clang 20x, run with --full
 async fn adversarial_rapid_recompile_cycle() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -788,6 +800,7 @@ async fn adversarial_rapid_recompile_cycle() {
 }
 
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn adversarial_spaces_in_filename() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -829,6 +842,7 @@ async fn adversarial_spaces_in_filename() {
 }
 
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn adversarial_werror_vs_no_werror() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -906,6 +920,7 @@ async fn adversarial_werror_vs_no_werror() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn compiler_override_uses_wrapped_compiler() {
     let clangpp = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -942,8 +957,8 @@ async fn compiler_override_uses_wrapped_compiler() {
                 "-o".into(),
                 obj.to_string_lossy().into_owned(),
             ],
-            cwd: cwd.clone(),
-            compiler: clang.to_string_lossy().into_owned(),
+            cwd: cwd.clone().into(),
+            compiler: clang.to_string_lossy().into_owned().into(),
             env: None,
         })
         .await

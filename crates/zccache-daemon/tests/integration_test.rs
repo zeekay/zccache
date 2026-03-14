@@ -64,10 +64,7 @@ async fn test_session_start_with_nonexistent_compiler() {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: std::env::current_dir()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
+            working_dir: std::env::current_dir().unwrap(),
             log_file: None,
             track_stats: false,
         })
@@ -84,11 +81,8 @@ async fn test_session_start_with_nonexistent_compiler() {
         .send(&Request::Compile {
             session_id: session_id.clone(),
             args: vec!["-c".to_string(), "dummy.cpp".to_string()],
-            cwd: std::env::current_dir()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            compiler: "/nonexistent/compiler".to_string(),
+            cwd: std::env::current_dir().unwrap(),
+            compiler: "/nonexistent/compiler".to_string().into(),
             env: None,
         })
         .await
@@ -124,10 +118,7 @@ async fn test_session_start_with_clang_toolchain() {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: std::env::current_dir()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
+            working_dir: std::env::current_dir().unwrap(),
             log_file: None,
             track_stats: false,
         })
@@ -152,10 +143,7 @@ async fn test_session_start_with_clang_toolchain() {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: std::env::current_dir()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
+            working_dir: std::env::current_dir().unwrap(),
             log_file: None,
             track_stats: false,
         })
@@ -197,10 +185,7 @@ async fn test_full_client_flow() {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: std::env::current_dir()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
+            working_dir: std::env::current_dir().unwrap(),
             log_file: None,
             track_stats: false,
         })
@@ -264,8 +249,8 @@ int main() {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned(),
-            log_file: Some(log_file.to_string_lossy().into_owned()),
+            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+            log_file: Some(log_file.to_string_lossy().into_owned().into()),
             track_stats: false,
         })
         .await
@@ -288,8 +273,8 @@ int main() {
                 "-o".to_string(),
                 output_obj.to_string_lossy().into_owned(),
             ],
-            cwd: tmp.path().to_string_lossy().into_owned(),
-            compiler: compiler_str.clone(),
+            cwd: tmp.path().to_string_lossy().into_owned().into(),
+            compiler: compiler_str.clone().into(),
             env: None,
         })
         .await
@@ -325,8 +310,8 @@ int main() {
                 "-o".to_string(),
                 output_obj.to_string_lossy().into_owned(),
             ],
-            cwd: tmp.path().to_string_lossy().into_owned(),
-            compiler: compiler_str,
+            cwd: tmp.path().to_string_lossy().into_owned().into(),
+            compiler: compiler_str.into(),
             env: None,
         })
         .await

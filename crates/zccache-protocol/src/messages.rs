@@ -1,6 +1,7 @@
 //! Protocol message definitions.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// A request from client to daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -28,9 +29,9 @@ pub enum Request {
         /// Client process ID.
         client_pid: u32,
         /// Client working directory.
-        working_dir: String,
+        working_dir: PathBuf,
         /// Optional path to a log file for this session.
-        log_file: Option<String>,
+        log_file: Option<PathBuf>,
         /// Whether to track per-session statistics.
         track_stats: bool,
     },
@@ -41,9 +42,9 @@ pub enum Request {
         /// Compiler arguments (e.g., ["-c", "hello.cpp", "-o", "hello.o"]).
         args: Vec<String>,
         /// Working directory for the compilation.
-        cwd: String,
+        cwd: PathBuf,
         /// Path to the compiler executable (required).
-        compiler: String,
+        compiler: PathBuf,
         /// Client environment variables to pass to the compiler process.
         /// If `None`, the daemon's own environment is inherited (backward compat).
         /// If `Some`, the compiler process uses exactly these env vars.
@@ -63,13 +64,13 @@ pub enum Request {
         /// Client process ID.
         client_pid: u32,
         /// Client working directory.
-        working_dir: String,
+        working_dir: PathBuf,
         /// Path to the compiler executable.
-        compiler: String,
+        compiler: PathBuf,
         /// Compiler arguments (e.g., ["-c", "hello.cpp", "-o", "hello.o"]).
         args: Vec<String>,
         /// Working directory for the compilation.
-        cwd: String,
+        cwd: PathBuf,
         /// Client environment variables to pass to the compiler process.
         env: Option<Vec<(String, String)>>,
     },
@@ -79,13 +80,13 @@ pub enum Request {
         /// Client process ID.
         client_pid: u32,
         /// Client working directory.
-        working_dir: String,
+        working_dir: PathBuf,
         /// Path to the linker/archiver tool (ar, ld, lib.exe, link.exe, etc.).
-        tool: String,
+        tool: PathBuf,
         /// Tool arguments (e.g., ["rcs", "libfoo.a", "a.o", "b.o"]).
         args: Vec<String>,
         /// Working directory for the link operation.
-        cwd: String,
+        cwd: PathBuf,
         /// Client environment variables.
         env: Option<Vec<(String, String)>>,
     },
@@ -199,7 +200,7 @@ pub struct DaemonStatus {
     /// Currently active sessions.
     pub sessions_active: u64,
     /// Path to the cache directory.
-    pub cache_dir: String,
+    pub cache_dir: PathBuf,
 }
 
 /// Result of a cache lookup.
@@ -339,7 +340,7 @@ mod tests {
             dep_graph_files: 4201,
             sessions_total: 41,
             sessions_active: 3,
-            cache_dir: "/home/user/.cache/zccache".to_string(),
+            cache_dir: PathBuf::from("/home/user/.cache/zccache"),
         };
         roundtrip(&status);
     }
@@ -348,7 +349,7 @@ mod tests {
     fn session_start_with_track_stats_roundtrip() {
         let req = Request::SessionStart {
             client_pid: 1234,
-            working_dir: "/home/user/project".to_string(),
+            working_dir: PathBuf::from("/home/user/project"),
             log_file: None,
             track_stats: true,
         };
@@ -356,7 +357,7 @@ mod tests {
 
         let req_no_stats = Request::SessionStart {
             client_pid: 1234,
-            working_dir: "/home/user/project".to_string(),
+            working_dir: PathBuf::from("/home/user/project"),
             log_file: None,
             track_stats: false,
         };
@@ -403,19 +404,19 @@ mod tests {
     fn compile_ephemeral_roundtrip() {
         roundtrip(&Request::CompileEphemeral {
             client_pid: 9876,
-            working_dir: "/home/user/project".to_string(),
-            compiler: "/usr/bin/clang++".to_string(),
+            working_dir: PathBuf::from("/home/user/project"),
+            compiler: PathBuf::from("/usr/bin/clang++"),
             args: vec!["-c".into(), "main.cpp".into(), "-o".into(), "main.o".into()],
-            cwd: "/home/user/project/build".to_string(),
+            cwd: PathBuf::from("/home/user/project/build"),
             env: Some(vec![("PATH".into(), "/usr/bin".into())]),
         });
         // Also test with env = None
         roundtrip(&Request::CompileEphemeral {
             client_pid: 1,
-            working_dir: ".".to_string(),
-            compiler: "gcc".to_string(),
+            working_dir: PathBuf::from("."),
+            compiler: PathBuf::from("gcc"),
             args: vec![],
-            cwd: ".".to_string(),
+            cwd: PathBuf::from("."),
             env: None,
         });
     }
@@ -424,18 +425,18 @@ mod tests {
     fn link_ephemeral_roundtrip() {
         roundtrip(&Request::LinkEphemeral {
             client_pid: 5555,
-            working_dir: "/home/user/project".to_string(),
-            tool: "/usr/bin/ar".to_string(),
+            working_dir: PathBuf::from("/home/user/project"),
+            tool: PathBuf::from("/usr/bin/ar"),
             args: vec!["rcs".into(), "libfoo.a".into(), "a.o".into(), "b.o".into()],
-            cwd: "/home/user/project/build".to_string(),
+            cwd: PathBuf::from("/home/user/project/build"),
             env: Some(vec![("PATH".into(), "/usr/bin".into())]),
         });
         roundtrip(&Request::LinkEphemeral {
             client_pid: 1,
-            working_dir: ".".to_string(),
-            tool: "lib.exe".to_string(),
+            working_dir: PathBuf::from("."),
+            tool: PathBuf::from("lib.exe"),
             args: vec!["/OUT:foo.lib".into(), "a.obj".into()],
-            cwd: ".".to_string(),
+            cwd: PathBuf::from("."),
             env: None,
         });
     }
@@ -469,8 +470,8 @@ mod tests {
         roundtrip(&Request::Compile {
             session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
             args: vec!["-c".into(), "foo.c".into()],
-            cwd: "/tmp".into(),
-            compiler: "/usr/bin/gcc".into(),
+            cwd: PathBuf::from("/tmp"),
+            compiler: PathBuf::from("/usr/bin/gcc"),
             env: None,
         });
     }
@@ -512,7 +513,7 @@ mod tests {
             dep_graph_files: 0,
             sessions_total: 0,
             sessions_active: 0,
-            cache_dir: String::new(),
+            cache_dir: PathBuf::new(),
         };
         roundtrip(&with_version);
     }

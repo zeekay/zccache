@@ -151,7 +151,7 @@ async fn zccache_compile_single(
                     "-std=c++17".into(),
                 ],
                 cwd: cwd.into(),
-                compiler: compiler.to_string(),
+                compiler: compiler.to_string().into(),
                 env: None,
             })
             .await
@@ -184,7 +184,7 @@ async fn zccache_compile_multi(
             session_id: session_id.to_string(),
             args,
             cwd: cwd.into(),
-            compiler: compiler.to_string(),
+            compiler: compiler.to_string().into(),
             env: None,
         })
         .await
@@ -509,7 +509,7 @@ async fn perf_warm_cache_zccache_vs_sccache() {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: zc_cwd.clone(),
+            working_dir: zc_cwd.clone().into(),
             log_file: None,
             track_stats: true,
         })

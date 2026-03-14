@@ -43,8 +43,8 @@ async fn start_session(
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: cwd.to_string(),
-            log_file: Some(log_file.to_string()),
+            working_dir: cwd.to_string().into(),
+            log_file: Some(log_file.to_string().into()),
             track_stats: false,
         })
         .await
@@ -66,8 +66,8 @@ async fn compile(
         .send(&Request::Compile {
             session_id: session_id.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
-            cwd: cwd.to_string(),
-            compiler: compiler.to_string(),
+            cwd: cwd.to_string().into(),
+            compiler: compiler.to_string().into(),
             env: None,
         })
         .await
@@ -180,6 +180,7 @@ impl TestHarness {
 /// Missing header → compile fails. Create header → compile succeeds.
 /// The failure must not be served from cache.
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn corner_failed_compile_not_cached_then_header_appears() {
     let mut h = match TestHarness::new().await {
         Some(h) => h,
@@ -223,6 +224,7 @@ async fn corner_failed_compile_not_cached_then_header_appears() {
 /// Compile error from syntax error → fix source → must succeed.
 /// Verifies compile errors are never cached regardless of cause.
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn corner_syntax_error_not_cached() {
     let mut h = match TestHarness::new().await {
         Some(h) => h,
@@ -254,6 +256,7 @@ async fn corner_syntax_error_not_cached() {
 /// Compile in session A, end session A, start new session B on same daemon,
 /// recompile → should hit cache.
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn corner_cache_survives_session_restart() {
     let clang = match zccache_test_support::find_clang() {
         Some(c) => c,
@@ -331,6 +334,7 @@ async fn corner_cache_survives_session_restart() {
 /// At most 1 should be a miss; the rest should either hit or also miss
 /// (depending on timing), but ALL must produce identical, valid .o files.
 #[tokio::test]
+#[ignore] // integration: spawns clang 4x concurrently, run with --full
 async fn corner_thundering_herd_same_file() {
     let clang = match zccache_test_support::find_clang() {
         Some(c) => c,
@@ -418,6 +422,7 @@ async fn corner_thundering_herd_same_file() {
 
 /// Thundering herd after cache is warm: all sessions should hit.
 #[tokio::test]
+#[ignore] // integration: spawns clang 4x concurrently, run with --full
 async fn corner_thundering_herd_all_warm() {
     let clang = match zccache_test_support::find_clang() {
         Some(c) => c,

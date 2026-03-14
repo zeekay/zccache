@@ -30,8 +30,8 @@ async fn start_session(client: &mut ClientConn, cwd: &str, log_file: &str) -> St
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: cwd.to_string(),
-            log_file: Some(log_file.to_string()),
+            working_dir: cwd.to_string().into(),
+            log_file: Some(log_file.to_string().into()),
             track_stats: false,
         })
         .await
@@ -53,8 +53,8 @@ async fn compile_raw(
         .send(&Request::Compile {
             session_id: session_id.to_string(),
             args,
-            cwd: cwd.to_string(),
-            compiler: compiler.to_string(),
+            cwd: cwd.to_string().into(),
+            compiler: compiler.to_string().into(),
             env: None,
         })
         .await
@@ -80,6 +80,7 @@ async fn compile_raw(
 /// 4. Modify header → regenerate PCH through daemon (content changes, daemon invalidates output)
 /// 5. Compile with new PCH → cache miss (PCH content hash changed)
 #[tokio::test]
+#[ignore] // integration: spawns clang + watcher sleeps, run with --full
 async fn pch_usage_is_cacheable() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -277,6 +278,7 @@ async fn pch_usage_is_cacheable() {
 
 /// Test: PCH generation via daemon is cacheable — second generation is a cache hit.
 #[tokio::test]
+#[ignore] // integration: spawns clang, run with --full
 async fn pch_generation_is_cacheable() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,

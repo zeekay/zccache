@@ -90,7 +90,7 @@ async fn profile_multi_file_warm_path() {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: cwd.clone(),
+            working_dir: cwd.clone().into(),
             log_file: None,
             track_stats: true,
         })
@@ -117,8 +117,8 @@ async fn profile_multi_file_warm_path() {
                     "-O2".into(),
                     "-std=c++17".into(),
                 ],
-                cwd: cwd.clone(),
-                compiler: compiler.clone(),
+                cwd: cwd.clone().into(),
+                compiler: compiler.clone().into(),
                 env: None,
             })
             .await
@@ -146,8 +146,8 @@ async fn profile_multi_file_warm_path() {
             .send(&Request::Compile {
                 session_id: session_id.clone(),
                 args: multi_args.clone(),
-                cwd: cwd.clone(),
-                compiler: compiler.clone(),
+                cwd: cwd.clone().into(),
+                compiler: compiler.clone().into(),
                 env: None,
             })
             .await
@@ -190,8 +190,8 @@ async fn profile_multi_file_warm_path() {
                         "-O2".into(),
                         "-std=c++17".into(),
                     ],
-                    cwd: cwd.clone(),
-                    compiler: compiler.clone(),
+                    cwd: cwd.clone().into(),
+                    compiler: compiler.clone().into(),
                     env: None,
                 })
                 .await

@@ -23,7 +23,7 @@ async fn start_session(client: &mut ClientConn, _clang: &std::path::Path, cwd: &
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: cwd.to_string(),
+            working_dir: cwd.to_string().into(),
             log_file: None,
             track_stats: true,
         })
@@ -46,8 +46,8 @@ async fn compile(
         .send(&Request::Compile {
             session_id: session_id.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
-            cwd: cwd.to_string(),
-            compiler: compiler.to_string(),
+            cwd: cwd.to_string().into(),
+            compiler: compiler.to_string().into(),
             env: None,
         })
         .await
