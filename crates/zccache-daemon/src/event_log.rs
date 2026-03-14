@@ -17,6 +17,24 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use zccache_depgraph::{SessionId, SessionManager};
 
+/// Open a file in append mode with sharing flags that allow deletion on Windows.
+///
+/// On Windows, Rust's default `OpenOptions` uses `FILE_SHARE_READ | FILE_SHARE_WRITE`
+/// but omits `FILE_SHARE_DELETE`, which prevents any other process from deleting or
+/// renaming the file while a handle is open. This helper adds `FILE_SHARE_DELETE`
+/// so log files remain deletable at any time.
+fn open_append(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ (0x1) | FILE_SHARE_WRITE (0x2) | FILE_SHARE_DELETE (0x4)
+        opts.share_mode(0x1 | 0x2 | 0x4);
+    }
+    opts.open(path)
+}
+
 // ─── Public types ───────────────────────────────────────────────────────────
 
 /// Outcome of a compilation or direct passthrough.
@@ -103,10 +121,7 @@ impl EventLogger {
         fs::create_dir_all(&log_dir)?;
         let log_path = log_dir.join("daemon.log");
         let current_size = log_path.metadata().map(|m| m.len()).unwrap_or(0);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
+        let file = open_append(&log_path)?;
 
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -226,7 +241,7 @@ impl LogWriter {
             self.log_file = dummy;
         }
         let _ = fs::rename(&log_path, &rotated);
-        if let Ok(new_file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        if let Ok(new_file) = open_append(&log_path) {
             self.log_file = new_file;
         }
         self.current_size = 0;
@@ -350,7 +365,7 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 
 /// Write a single line to a file (append mode). Best-effort, errors ignored.
 fn write_to_file(path: &Path, line: &str) {
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = open_append(path) {
         let _ = writeln!(f, "{line}");
     }
 }
