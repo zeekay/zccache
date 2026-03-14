@@ -68,9 +68,28 @@ async fn test_session_start_with_nonexistent_compiler() {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
-            compiler: "/nonexistent/compiler".to_string(),
             log_file: None,
             track_stats: false,
+        })
+        .await
+        .unwrap();
+
+    let session_id = match client.recv().await.unwrap() {
+        Some(Response::SessionStarted { session_id }) => session_id,
+        other => panic!("expected SessionStarted, got: {other:?}"),
+    };
+
+    // Now try to compile with a nonexistent compiler
+    client
+        .send(&Request::Compile {
+            session_id: session_id.clone(),
+            args: vec!["-c".to_string(), "dummy.cpp".to_string()],
+            cwd: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            compiler: "/nonexistent/compiler".to_string(),
+            env: None,
         })
         .await
         .unwrap();
@@ -79,8 +98,8 @@ async fn test_session_start_with_nonexistent_compiler() {
     match resp {
         Some(Response::Error { message }) => {
             assert!(
-                message.contains("not found"),
-                "expected 'not found' in error: {message}"
+                message.contains("not found") || message.contains("failed to run compiler"),
+                "expected compiler error in: {message}"
             );
         }
         other => panic!("expected Error response, got: {other:?}"),
@@ -90,17 +109,14 @@ async fn test_session_start_with_nonexistent_compiler() {
     server_handle.await.unwrap();
 }
 
-/// The main TDD target: client connects to daemon, starts a session
-/// with the real clang toolchain, and the daemon discovers system includes.
+/// The main TDD target: client connects to daemon, starts a session,
+/// and receives a UUID session ID.
 #[tokio::test]
 async fn test_session_start_with_clang_toolchain() {
-    let clang_path = match zccache_test_support::find_clang() {
-        Some(p) => p,
-        None => {
-            eprintln!("skipping test: clang not found");
-            return;
-        }
-    };
+    if zccache_test_support::find_clang().is_none() {
+        eprintln!("skipping test: clang not found");
+        return;
+    }
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
 
@@ -112,7 +128,6 @@ async fn test_session_start_with_clang_toolchain() {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
-            compiler: clang_path.to_string_lossy().into_owned(),
             log_file: None,
             track_stats: false,
         })
@@ -120,27 +135,18 @@ async fn test_session_start_with_clang_toolchain() {
         .unwrap();
 
     let resp: Option<Response> = client.recv().await.unwrap();
-    match resp {
-        Some(Response::SessionStarted {
-            session_id,
-            system_includes,
-        }) => {
-            // Session ID should be valid (starting from 0)
+    let session_id = match resp {
+        Some(Response::SessionStarted { session_id }) => {
+            // Session ID should be a valid UUID string
             eprintln!("session_id: {session_id}");
-            assert!(session_id < 1000, "session ID looks reasonable");
-
-            // Clang should discover at least some system include paths
-            eprintln!("system_includes ({}):", system_includes.len());
-            for inc in &system_includes {
-                eprintln!("  {inc}");
-            }
             assert!(
-                !system_includes.is_empty(),
-                "clang should discover system include paths"
+                !session_id.is_empty(),
+                "session ID should be a non-empty UUID string"
             );
+            session_id
         }
         other => panic!("expected SessionStarted, got: {other:?}"),
-    }
+    };
 
     // Second session should get a different ID
     client
@@ -150,7 +156,6 @@ async fn test_session_start_with_clang_toolchain() {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
-            compiler: clang_path.to_string_lossy().into_owned(),
             log_file: None,
             track_stats: false,
         })
@@ -162,7 +167,7 @@ async fn test_session_start_with_clang_toolchain() {
         Some(Response::SessionStarted {
             session_id: id2, ..
         }) => {
-            assert!(id2 >= 1, "second session should have incremented ID");
+            assert_ne!(id2, session_id, "second session should have a different ID");
         }
         other => panic!("expected SessionStarted for second session, got: {other:?}"),
     }
@@ -174,13 +179,10 @@ async fn test_session_start_with_clang_toolchain() {
 /// Test the full flow: ping → session start → status → shutdown.
 #[tokio::test]
 async fn test_full_client_flow() {
-    let clang_path = match zccache_test_support::find_clang() {
-        Some(p) => p,
-        None => {
-            eprintln!("skipping test: clang not found");
-            return;
-        }
-    };
+    if zccache_test_support::find_clang().is_none() {
+        eprintln!("skipping test: clang not found");
+        return;
+    }
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
 
@@ -199,7 +201,6 @@ async fn test_full_client_flow() {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
-            compiler: clang_path.to_string_lossy().into_owned(),
             log_file: None,
             track_stats: false,
         })
@@ -264,7 +265,6 @@ int main() {
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: tmp.path().to_string_lossy().into_owned(),
-            compiler: clang_path.to_string_lossy().into_owned(),
             log_file: Some(log_file.to_string_lossy().into_owned()),
             track_stats: false,
         })
@@ -276,10 +276,12 @@ int main() {
         other => panic!("expected SessionStarted, got: {other:?}"),
     };
 
+    let compiler_str = clang_path.to_string_lossy().into_owned();
+
     // First compile — should be a cache miss
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.clone(),
             args: vec![
                 "-c".to_string(),
                 hello_cpp.to_string_lossy().into_owned(),
@@ -287,7 +289,7 @@ int main() {
                 output_obj.to_string_lossy().into_owned(),
             ],
             cwd: tmp.path().to_string_lossy().into_owned(),
-            compiler: None,
+            compiler: compiler_str.clone(),
             env: None,
         })
         .await
@@ -316,7 +318,7 @@ int main() {
     // Second compile — should be a cache hit
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.clone(),
             args: vec![
                 "-c".to_string(),
                 hello_cpp.to_string_lossy().into_owned(),
@@ -324,7 +326,7 @@ int main() {
                 output_obj.to_string_lossy().into_owned(),
             ],
             cwd: tmp.path().to_string_lossy().into_owned(),
-            compiler: None,
+            compiler: compiler_str,
             env: None,
         })
         .await

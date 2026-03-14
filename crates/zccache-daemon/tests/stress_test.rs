@@ -26,53 +26,52 @@ async fn start_daemon() -> (
     let endpoint = zccache_ipc::unique_test_endpoint();
     let mut server = DaemonServer::bind(&endpoint).unwrap();
     let shutdown = server.shutdown_handle();
-    let handle = tokio::spawn(async move {
-        server.run(0).await.unwrap();
-    });
+    let handle = tokio::spawn(async move { server.run(0).await.unwrap() });
     (endpoint, handle, shutdown)
 }
 
-/// Helper: start a session with a log file on an already-connected client.
+/// Helper: start a session. Returns (session_id, compiler_string).
 async fn start_session(
     client: &mut ClientConn,
     clang: &std::path::Path,
     cwd: &str,
     log_file: &str,
-) -> u64 {
+) -> (String, String) {
+    let compiler_str = clang.to_string_lossy().into_owned();
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: cwd.to_string(),
-            compiler: clang.to_string_lossy().into_owned(),
             log_file: Some(log_file.to_string()),
             track_stats: false,
         })
         .await
         .unwrap();
-    match client.recv().await.unwrap() {
+    let session_id = match client.recv().await.unwrap() {
         Some(Response::SessionStarted { session_id, .. }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
-    }
+    };
+    (session_id, compiler_str)
 }
 
 /// Helper: send a compile request, return (exit_code, cached).
 async fn compile(
     client: &mut ClientConn,
-    session_id: u64,
+    session_id: &str,
+    compiler: &str,
     args: &[&str],
     cwd: &str,
 ) -> (i32, bool) {
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_string(),
-            compiler: None,
+            compiler: compiler.to_string(),
             env: None,
         })
         .await
         .unwrap();
-
     match client.recv().await.unwrap() {
         Some(Response::CompileResult {
             exit_code, cached, ..
@@ -86,39 +85,31 @@ async fn compile(
 // CORRECTNESS ATTACKS
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Different compiler flags MUST produce different cache entries.
-/// -O0 vs -O2 produce different machine code — returning the wrong one is catastrophic.
 #[tokio::test]
 async fn adversarial_different_flags_different_cache_entries() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("flags.cpp");
     let obj = tmp.path().join("flags.o");
     let log = tmp.path().join("log.txt");
     let cwd = tmp.path().to_string_lossy().into_owned();
-
     std::fs::write(
         &src,
-        r#"
-static int x = 0;
-int get() { return x++; }
-int main() { return get() + get(); }
-"#,
+        "static int x=0;\nint get(){return x++;}\nint main(){return get()+get();}\n",
     )
     .unwrap();
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
+    let (sid, comp) = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
 
-    // Compile with -O0
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &[
             "-c",
             &src.to_string_lossy(),
@@ -129,14 +120,14 @@ int main() { return get() + get(); }
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(!cached);
+    assert_eq!(ec, 0);
+    assert!(!c);
     let obj_o0 = std::fs::read(&obj).unwrap();
 
-    // Compile with -O2 — MUST NOT return the -O0 cached result
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &[
             "-c",
             &src.to_string_lossy(),
@@ -147,21 +138,19 @@ int main() { return get() + get(); }
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(!cached, "-O2 compile MUST NOT hit the -O0 cache entry");
+    assert_eq!(ec, 0);
+    assert!(!c, "-O2 compile MUST NOT hit the -O0 cache entry");
     let obj_o2 = std::fs::read(&obj).unwrap();
-
-    // Different optimization levels should produce different object files
     assert_ne!(
         obj_o0, obj_o2,
         "-O0 and -O2 should produce different .o files"
     );
 
-    // Now recompile -O0 — should hit the original -O0 cache
     std::fs::remove_file(&obj).unwrap();
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &[
             "-c",
             &src.to_string_lossy(),
@@ -172,19 +161,19 @@ int main() { return get() + get(); }
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(cached, "-O0 recompile should be a cache hit");
+    assert_eq!(ec, 0);
+    assert!(c, "-O0 recompile should be a cache hit");
     assert_eq!(
         std::fs::read(&obj).unwrap(),
         obj_o0,
         "cached -O0 must match original"
     );
 
-    // And -O2 should also hit its cache
     std::fs::remove_file(&obj).unwrap();
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &[
             "-c",
             &src.to_string_lossy(),
@@ -195,8 +184,8 @@ int main() { return get() + get(); }
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(cached, "-O2 recompile should be a cache hit");
+    assert_eq!(ec, 0);
+    assert!(c, "-O2 recompile should be a cache hit");
     assert_eq!(
         std::fs::read(&obj).unwrap(),
         obj_o2,
@@ -207,53 +196,43 @@ int main() { return get() + get(); }
     server_handle.await.unwrap();
 }
 
-/// -D preprocessor defines MUST produce different cache entries.
-/// Code compiled with -DNDEBUG vs -DDEBUG can have wildly different behavior.
 #[tokio::test]
 async fn adversarial_define_changes_invalidate_cache() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("defines.cpp");
     let obj = tmp.path().join("defines.o");
     let log = tmp.path().join("log.txt");
     let cwd = tmp.path().to_string_lossy().into_owned();
-
     std::fs::write(
         &src,
-        r#"
-#ifdef RETURN_ZERO
-int main() { return 0; }
-#else
-int main() { return 1; }
-#endif
-"#,
+        "#ifdef RETURN_ZERO\nint main(){return 0;}\n#else\nint main(){return 1;}\n#endif\n",
     )
     .unwrap();
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
+    let (sid, comp) = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
 
-    // Without define
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(!cached);
+    assert_eq!(ec, 0);
+    assert!(!c);
     let obj_no_define = std::fs::read(&obj).unwrap();
 
-    // With -DRETURN_ZERO — MUST NOT hit cache
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &[
             "-c",
             &src.to_string_lossy(),
@@ -264,10 +243,9 @@ int main() { return 1; }
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(!cached, "-DRETURN_ZERO MUST be a cache miss");
+    assert_eq!(ec, 0);
+    assert!(!c, "-DRETURN_ZERO MUST be a cache miss");
     let obj_with_define = std::fs::read(&obj).unwrap();
-
     assert_ne!(
         obj_no_define, obj_with_define,
         "different defines must produce different .o"
@@ -277,62 +255,56 @@ int main() { return 1; }
     server_handle.await.unwrap();
 }
 
-/// Compile errors MUST NOT be cached.
-/// If a failed compilation is cached, subsequent fixes won't take effect.
 #[tokio::test]
 async fn adversarial_compile_errors_never_cached() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("errors.cpp");
     let obj = tmp.path().join("errors.o");
     let log = tmp.path().join("log.txt");
     let cwd = tmp.path().to_string_lossy().into_owned();
-
-    // Broken source
     std::fs::write(&src, "int main() { SYNTAX ERROR HERE }\n").unwrap();
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
+    let (sid, comp) = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
 
-    // First compile — should fail
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
         &cwd,
     )
     .await;
-    assert_ne!(exit_code, 0, "broken source should fail to compile");
-    assert!(!cached, "failed compile must not be cached");
+    assert_ne!(ec, 0);
+    assert!(!c, "failed compile must not be cached");
 
-    // Compile again — must NOT get a cache hit for the error
-    let (exit_code2, cached2) = compile(
+    let (ec2, c2) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
         &cwd,
     )
     .await;
-    assert_ne!(exit_code2, 0, "still broken, should still fail");
-    assert!(!cached2, "failed compile must NEVER be returned from cache");
+    assert_ne!(ec2, 0);
+    assert!(!c2, "failed compile must NEVER be returned from cache");
 
-    // Now fix the source
     std::fs::write(&src, "int main() { return 0; }\n").unwrap();
-
-    let (exit_code3, cached3) = compile(
+    let (ec3, c3) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
         &cwd,
     )
     .await;
-    assert_eq!(exit_code3, 0, "fixed source should compile successfully");
-    assert!(!cached3, "new source should be a cache miss");
+    assert_eq!(ec3, 0);
+    assert!(!c3, "new source should be a cache miss");
 
     shutdown.notify_one();
     server_handle.await.unwrap();
@@ -342,22 +314,18 @@ async fn adversarial_compile_errors_never_cached() {
 // CONCURRENCY ATTACKS
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Slam the daemon with many concurrent compiles of the same file.
-/// No panics, no corrupted cache, all results consistent.
 #[tokio::test]
 async fn adversarial_concurrent_same_file() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("concurrent.cpp");
     std::fs::write(&src, "int main() { return 0; }\n").unwrap();
     let cwd = tmp.path().to_string_lossy().into_owned();
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
-
     let mut handles = Vec::new();
     for i in 0..8 {
         let ep = endpoint.clone();
@@ -368,38 +336,30 @@ async fn adversarial_concurrent_same_file() {
         std::fs::create_dir_all(&out_dir).unwrap();
         let obj = out_dir.join("concurrent.o");
         let log = out_dir.join("log.txt");
-
         handles.push(tokio::spawn(async move {
             let mut client = zccache_ipc::connect(&ep).await.unwrap();
-            let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
-
-            let (exit_code, _cached) = compile(
+            let (sid, comp) =
+                start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
+            let (ec, _c) = compile(
                 &mut client,
-                sid,
+                &sid,
+                &comp,
                 &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
                 &cwd,
             )
             .await;
-            assert_eq!(exit_code, 0, "concurrent compile {i} should succeed");
+            assert_eq!(ec, 0, "concurrent compile {i} should succeed");
             assert!(obj.exists(), "output should exist for compile {i}");
-
-            // Read the .o — all should be identical
             std::fs::read(&obj).unwrap()
         }));
     }
-
     let mut results = Vec::new();
     for h in handles {
         results.push(h.await.unwrap());
     }
-
-    // All compiles succeeded (returned data). COFF timestamps may differ
-    // between independent compiler invocations, so we verify all produced
-    // non-empty .o files of the same size (same source, same flags).
     for (i, obj) in results.iter().enumerate() {
         assert!(!obj.is_empty(), "concurrent compile {i} produced empty .o");
     }
-    // All cached results should be the same size as the first
     let first_len = results[0].len();
     for (i, obj) in results.iter().enumerate().skip(1) {
         assert_eq!(
@@ -408,25 +368,19 @@ async fn adversarial_concurrent_same_file() {
             "concurrent compile {i} produced .o of different size than compile 0"
         );
     }
-
     shutdown.notify_one();
     server_handle.await.unwrap();
 }
 
-/// Many concurrent compiles of DIFFERENT files.
-/// Verifies no cross-contamination between cache entries.
 #[tokio::test]
 async fn adversarial_concurrent_different_files() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().to_string_lossy().into_owned();
-
     let (endpoint, server_handle, shutdown) = start_daemon().await;
-
     let n = 10;
     let mut handles = Vec::new();
     for i in 0..n {
@@ -436,69 +390,58 @@ async fn adversarial_concurrent_different_files() {
         let src = tmp.path().join(format!("file{i}.cpp"));
         let obj = tmp.path().join(format!("file{i}.o"));
         let log = tmp.path().join(format!("log{i}.txt"));
-        // Each file returns a different value
         std::fs::write(&src, format!("int main() {{ return {i}; }}\n")).unwrap();
-
         handles.push(tokio::spawn(async move {
             let mut client = zccache_ipc::connect(&ep).await.unwrap();
-            let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
-
-            // First compile — miss
-            let (exit_code, cached) = compile(
+            let (sid, comp) =
+                start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
+            let (ec, c) = compile(
                 &mut client,
-                sid,
+                &sid,
+                &comp,
                 &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
                 &cwd,
             )
             .await;
-            assert_eq!(exit_code, 0);
-            assert!(!cached, "first compile of file{i} should be a miss");
+            assert_eq!(ec, 0);
+            assert!(!c, "first compile of file{i} should be a miss");
             let obj_data = std::fs::read(&obj).unwrap();
-
-            // Delete and recompile — hit
             std::fs::remove_file(&obj).unwrap();
-            let (exit_code, cached) = compile(
+            let (ec, c) = compile(
                 &mut client,
-                sid,
+                &sid,
+                &comp,
                 &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
                 &cwd,
             )
             .await;
-            assert_eq!(exit_code, 0);
-            assert!(cached, "second compile of file{i} should be a hit");
+            assert_eq!(ec, 0);
+            assert!(c, "second compile of file{i} should be a hit");
             let obj_data2 = std::fs::read(&obj).unwrap();
             assert_eq!(obj_data, obj_data2, "cached .o for file{i} must match");
-
             obj_data
         }));
     }
-
     let mut results = Vec::new();
     for h in handles {
         results.push(h.await.unwrap());
     }
-
-    // All files have different return values → all object files should differ
     for i in 1..results.len() {
         assert_ne!(
             results[0], results[i],
             "file0 and file{i} should produce different .o (different source)"
         );
     }
-
     shutdown.notify_one();
     server_handle.await.unwrap();
 }
 
-/// Cross-session cache sharing: two different sessions with the same compiler
-/// should share the in-memory cache.
 #[tokio::test]
 async fn adversarial_cross_session_cache_sharing() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("shared.cpp");
     let obj1 = tmp.path().join("shared1.o");
@@ -506,49 +449,43 @@ async fn adversarial_cross_session_cache_sharing() {
     let log1 = tmp.path().join("log1.txt");
     let log2 = tmp.path().join("log2.txt");
     let cwd = tmp.path().to_string_lossy().into_owned();
-
     std::fs::write(&src, "int main() { return 7; }\n").unwrap();
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
-
-    // Session 1: compile and cache
     let mut client1 = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid1 = start_session(&mut client1, &clang, &cwd, &log1.to_string_lossy()).await;
-
-    let (exit_code, cached) = compile(
+    let (sid1, comp1) = start_session(&mut client1, &clang, &cwd, &log1.to_string_lossy()).await;
+    let (ec, c) = compile(
         &mut client1,
-        sid1,
+        &sid1,
+        &comp1,
         &["-c", &src.to_string_lossy(), "-o", &obj1.to_string_lossy()],
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(!cached, "session 1 first compile should be a miss");
+    assert_eq!(ec, 0);
+    assert!(!c, "session 1 first compile should be a miss");
     let obj1_data = std::fs::read(&obj1).unwrap();
 
-    // Session 2: same source, same flags — should hit session 1's cache
     let mut client2 = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid2 = start_session(&mut client2, &clang, &cwd, &log2.to_string_lossy()).await;
+    let (sid2, comp2) = start_session(&mut client2, &clang, &cwd, &log2.to_string_lossy()).await;
     assert_ne!(sid1, sid2, "sessions should have different IDs");
-
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client2,
-        sid2,
+        &sid2,
+        &comp2,
         &["-c", &src.to_string_lossy(), "-o", &obj2.to_string_lossy()],
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(cached, "session 2 should hit session 1's cached result");
-    let obj2_data = std::fs::read(&obj2).unwrap();
-
-    assert_eq!(obj1_data, obj2_data, "cross-session cached .o must match");
-
-    // Log files should reflect the different sessions
-    let log1_text = std::fs::read_to_string(&log1).unwrap();
-    let log2_text = std::fs::read_to_string(&log2).unwrap();
-    assert!(log1_text.contains("[MISS]"));
-    assert!(log2_text.contains("[HIT]"));
+    assert_eq!(ec, 0);
+    assert!(c, "session 2 should hit session 1's cached result");
+    assert_eq!(
+        obj1_data,
+        std::fs::read(&obj2).unwrap(),
+        "cross-session cached .o must match"
+    );
+    assert!(std::fs::read_to_string(&log1).unwrap().contains("[MISS]"));
+    assert!(std::fs::read_to_string(&log2).unwrap().contains("[HIT]"));
 
     shutdown.notify_one();
     server_handle.await.unwrap();
@@ -558,97 +495,78 @@ async fn adversarial_cross_session_cache_sharing() {
 // EDGE CASES
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Compile request with an invalid session ID must return an error, not panic.
 #[tokio::test]
 async fn adversarial_invalid_session_id() {
     if zccache_test_support::find_clang().is_none() {
         return;
     }
-
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("invalid_session.cpp");
     std::fs::write(&src, "int main() { return 0; }\n").unwrap();
     let cwd = tmp.path().to_string_lossy().into_owned();
-
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
 
-    // Don't create a session — just send a compile with a bogus session ID
     client
         .send(&Request::Compile {
-            session_id: 999999,
+            session_id: 999999.to_string(),
             args: vec![
-                "-c".to_string(),
+                "-c".into(),
                 src.to_string_lossy().into_owned(),
-                "-o".to_string(),
-                "out.o".to_string(),
+                "-o".into(),
+                "out.o".into(),
             ],
             cwd,
-            compiler: None,
+            compiler: "/usr/bin/clang".to_string(),
             env: None,
         })
         .await
         .unwrap();
-
-    let resp: Option<Response> = client.recv().await.unwrap();
-    match resp {
-        Some(Response::Error { message }) => {
-            assert!(
-                message.contains("unknown session"),
-                "error should mention unknown session: {message}"
-            );
-        }
+    match client.recv().await.unwrap() {
+        Some(Response::Error { message }) => assert!(
+            message.contains("unknown session") || message.contains("invalid session"),
+            "error should mention session error: {message}"
+        ),
         other => panic!("expected Error for invalid session, got: {other:?}"),
     }
-
-    // Server should still be alive
     client.send(&Request::Ping).await.unwrap();
-    let resp: Option<Response> = client.recv().await.unwrap();
     assert_eq!(
-        resp,
+        client.recv().await.unwrap(),
         Some(Response::Pong),
         "server should survive bad requests"
     );
-
     shutdown.notify_one();
     server_handle.await.unwrap();
 }
 
-/// Non-cacheable invocations (linking, preprocessing) should pass through
-/// to the compiler directly without corrupting the cache.
 #[tokio::test]
 async fn adversarial_non_cacheable_passthrough() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("passthrough.cpp");
     let obj = tmp.path().join("passthrough.o");
     let log = tmp.path().join("log.txt");
     let cwd = tmp.path().to_string_lossy().into_owned();
-
     std::fs::write(&src, "#include <stdio.h>\nint main() { return 0; }\n").unwrap();
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
+    let (sid, comp) = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
 
-    // Preprocessing only (-E) — non-cacheable
     client
         .send(&Request::Compile {
-            session_id: sid,
-            args: vec!["-E".to_string(), src.to_string_lossy().into_owned()],
+            session_id: sid.clone(),
+            args: vec!["-E".into(), src.to_string_lossy().into_owned()],
             cwd: cwd.clone(),
-            compiler: None,
+            compiler: comp.clone(),
             env: None,
         })
         .await
         .unwrap();
-
-    let resp: Option<Response> = client.recv().await.unwrap();
-    match resp {
+    match client.recv().await.unwrap() {
         Some(Response::CompileResult {
             exit_code, cached, ..
         }) => {
@@ -658,101 +576,89 @@ async fn adversarial_non_cacheable_passthrough() {
         other => panic!("expected CompileResult, got: {other:?}"),
     }
 
-    // Now do a normal cacheable compile — should not be contaminated
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(!cached, "first real compile should be a miss");
-
+    assert_eq!(ec, 0);
+    assert!(!c, "first real compile should be a miss");
     let log_text = std::fs::read_to_string(&log).unwrap();
     assert!(
         log_text.contains("[DIRECT]"),
         "log should mention direct (non-cacheable)"
     );
     assert!(log_text.contains("[MISS]"), "log should mention miss");
-
     shutdown.notify_one();
     server_handle.await.unwrap();
 }
 
-/// Empty source file (valid C++) — edge case for hashing.
 #[tokio::test]
 async fn adversarial_empty_source_file() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
     let tmp = tempfile::tempdir().unwrap();
-    // An empty .cpp is valid C++ (no main required for -c)
     let src = tmp.path().join("empty.cpp");
     let obj = tmp.path().join("empty.o");
     let log = tmp.path().join("log.txt");
     let cwd = tmp.path().to_string_lossy().into_owned();
-
     std::fs::write(&src, "").unwrap();
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
+    let (sid, comp) = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
 
-    // Should compile (empty TU is valid)
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0, "empty source should compile");
-    assert!(!cached);
-
-    // Second compile should hit cache
+    assert_eq!(ec, 0, "empty source should compile");
+    assert!(!c);
     std::fs::remove_file(&obj).unwrap();
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(cached, "empty source recompile should hit cache");
-
+    assert_eq!(ec, 0);
+    assert!(c, "empty source recompile should hit cache");
     shutdown.notify_one();
     server_handle.await.unwrap();
 }
 
-/// Source with warnings but no errors — should still be cached (exit code 0).
 #[tokio::test]
 async fn adversarial_warnings_still_cached() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("warnings.cpp");
     let obj = tmp.path().join("warnings.o");
     let log = tmp.path().join("log.txt");
     let cwd = tmp.path().to_string_lossy().into_owned();
-
-    // Unused variable produces a warning
     std::fs::write(&src, "int main() { int unused_var = 42; return 0; }\n").unwrap();
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
+    let (sid, comp) = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
 
-    // Compile with -Wall to trigger warning
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &[
             "-c",
             &src.to_string_lossy(),
@@ -763,14 +669,13 @@ async fn adversarial_warnings_still_cached() {
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0, "warnings shouldn't cause compile failure");
-    assert!(!cached);
-
-    // Second compile should hit cache despite warnings
+    assert_eq!(ec, 0);
+    assert!(!c);
     std::fs::remove_file(&obj).unwrap();
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &[
             "-c",
             &src.to_string_lossy(),
@@ -781,201 +686,169 @@ async fn adversarial_warnings_still_cached() {
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(cached, "warnings-only compilation should still be cached");
-
+    assert_eq!(ec, 0);
+    assert!(c, "warnings-only compilation should still be cached");
     shutdown.notify_one();
     server_handle.await.unwrap();
 }
 
-/// Same source, different output path — should share cache.
-/// The -o flag path should not affect the cache key.
 #[tokio::test]
 async fn adversarial_output_path_does_not_affect_cache_key() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("output_path.cpp");
     let obj_a = tmp.path().join("a.o");
     let obj_b = tmp.path().join("b.o");
     let log = tmp.path().join("log.txt");
     let cwd = tmp.path().to_string_lossy().into_owned();
-
     std::fs::write(&src, "int main() { return 0; }\n").unwrap();
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
+    let (sid, comp) = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
 
-    // Compile to a.o — cache miss
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &["-c", &src.to_string_lossy(), "-o", &obj_a.to_string_lossy()],
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(!cached);
+    assert_eq!(ec, 0);
+    assert!(!c);
     let data_a = std::fs::read(&obj_a).unwrap();
-
-    // Compile to b.o — same source, same flags. Should be a cache hit.
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &["-c", &src.to_string_lossy(), "-o", &obj_b.to_string_lossy()],
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(
-        cached,
-        "same source to different output path should hit cache"
-    );
-    let data_b = std::fs::read(&obj_b).unwrap();
-
+    assert_eq!(ec, 0);
+    assert!(c, "same source to different output path should hit cache");
     assert_eq!(
-        data_a, data_b,
+        data_a,
+        std::fs::read(&obj_b).unwrap(),
         "cached .o should be identical regardless of output path"
     );
-
     shutdown.notify_one();
     server_handle.await.unwrap();
 }
 
-/// Rapid fire: compile → delete → compile → delete ... many times.
-/// Cache should remain consistent throughout.
 #[tokio::test]
 async fn adversarial_rapid_recompile_cycle() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("rapid.cpp");
     let obj = tmp.path().join("rapid.o");
     let log = tmp.path().join("log.txt");
     let cwd = tmp.path().to_string_lossy().into_owned();
-
     std::fs::write(&src, "int main() { return 0; }\n").unwrap();
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
-
-    // Own the strings so they live long enough for the borrow in args_owned
+    let (sid, comp) = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
     let src_str = src.to_string_lossy().into_owned();
     let obj_str = obj.to_string_lossy().into_owned();
     let args_owned: Vec<&str> = vec!["-c", &src_str, "-o", &obj_str];
 
-    // First compile — miss
-    let (exit_code, cached) = compile(&mut client, sid, &args_owned, &cwd).await;
-    assert_eq!(exit_code, 0);
-    assert!(!cached);
+    let (ec, c) = compile(&mut client, &sid, &comp, &args_owned, &cwd).await;
+    assert_eq!(ec, 0);
+    assert!(!c);
     let reference_obj = std::fs::read(&obj).unwrap();
-
-    // 20 rapid cycles of delete + recompile — all should be cache hits
     for i in 0..20 {
         std::fs::remove_file(&obj).unwrap();
-        let (exit_code, cached) = compile(&mut client, sid, &args_owned, &cwd).await;
-        assert_eq!(exit_code, 0, "rapid cycle {i} should succeed");
-        assert!(cached, "rapid cycle {i} should be a cache hit");
-        let data = std::fs::read(&obj).unwrap();
+        let (ec, c) = compile(&mut client, &sid, &comp, &args_owned, &cwd).await;
+        assert_eq!(ec, 0, "rapid cycle {i} should succeed");
+        assert!(c, "rapid cycle {i} should be a cache hit");
         assert_eq!(
-            data, reference_obj,
+            std::fs::read(&obj).unwrap(),
+            reference_obj,
             "rapid cycle {i} .o should match reference"
         );
     }
-
-    // Log should have 1 miss + 20 hits
     let log_text = std::fs::read_to_string(&log).unwrap();
-    let miss_count = log_text.matches("[MISS]").count();
+    assert_eq!(
+        log_text.matches("[MISS]").count(),
+        1,
+        "expected exactly 1 miss"
+    );
     let hit_count = log_text.matches("[HIT]").count() + log_text.matches("[HIT_FAST]").count();
-    assert_eq!(miss_count, 1, "expected exactly 1 miss");
     assert_eq!(hit_count, 20, "expected exactly 20 hits");
-
     shutdown.notify_one();
     server_handle.await.unwrap();
 }
 
-/// Source file with spaces in the filename — path handling edge case.
 #[tokio::test]
 async fn adversarial_spaces_in_filename() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("hello world.cpp");
     let obj = tmp.path().join("hello world.o");
     let log = tmp.path().join("log.txt");
     let cwd = tmp.path().to_string_lossy().into_owned();
-
     std::fs::write(&src, "int main() { return 0; }\n").unwrap();
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
-
-    // First compile
-    let (exit_code, cached) = compile(
+    let (sid, comp) = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0, "file with spaces should compile");
-    assert!(!cached);
-
-    // Second compile — cache hit
+    assert_eq!(ec, 0, "file with spaces should compile");
+    assert!(!c);
     std::fs::remove_file(&obj).unwrap();
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &["-c", &src.to_string_lossy(), "-o", &obj.to_string_lossy()],
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(cached, "recompile of file with spaces should hit cache");
-
+    assert_eq!(ec, 0);
+    assert!(c, "recompile of file with spaces should hit cache");
     shutdown.notify_one();
     server_handle.await.unwrap();
 }
 
-/// Werror turns warnings into errors — different exit code path.
-/// -Werror compile should fail and NOT be cached. Without -Werror, same
-/// source should succeed and BE cached.
 #[tokio::test]
 async fn adversarial_werror_vs_no_werror() {
     let clang = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("werror.cpp");
     let obj = tmp.path().join("werror.o");
     let log = tmp.path().join("log.txt");
     let cwd = tmp.path().to_string_lossy().into_owned();
-
-    // Unused variable — warning with -Wall
     std::fs::write(&src, "int main() { int x = 0; return 0; }\n").unwrap();
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
+    let (sid, comp) = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
 
-    // With -Werror: should fail (warning → error)
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &[
             "-c",
             &src.to_string_lossy(),
@@ -987,13 +860,13 @@ async fn adversarial_werror_vs_no_werror() {
         &cwd,
     )
     .await;
-    assert_ne!(exit_code, 0, "-Werror should cause compile failure");
-    assert!(!cached, "failed -Werror compile must not be cached");
+    assert_ne!(ec, 0, "-Werror should cause compile failure");
+    assert!(!c, "failed -Werror compile must not be cached");
 
-    // Without -Werror: should succeed
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &[
             "-c",
             &src.to_string_lossy(),
@@ -1004,14 +877,14 @@ async fn adversarial_werror_vs_no_werror() {
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0, "without -Werror should succeed");
-    assert!(!cached, "different flags = different cache key = miss");
+    assert_eq!(ec, 0, "without -Werror should succeed");
+    assert!(!c, "different flags = different cache key = miss");
 
-    // Recompile without -Werror — should hit cache
     std::fs::remove_file(&obj).unwrap();
-    let (exit_code, cached) = compile(
+    let (ec, c) = compile(
         &mut client,
-        sid,
+        &sid,
+        &comp,
         &[
             "-c",
             &src.to_string_lossy(),
@@ -1022,9 +895,8 @@ async fn adversarial_werror_vs_no_werror() {
         &cwd,
     )
     .await;
-    assert_eq!(exit_code, 0);
-    assert!(cached, "-Wall recompile (no -Werror) should hit cache");
-
+    assert_eq!(ec, 0);
+    assert!(c, "-Wall recompile (no -Werror) should hit cache");
     shutdown.notify_one();
     server_handle.await.unwrap();
 }
@@ -1033,17 +905,12 @@ async fn adversarial_werror_vs_no_werror() {
 // COMPILER OVERRIDE
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Session started with clang++ (C++ compiler), but wrapping clang (C compiler).
-/// The per-request compiler override must be used, not the session compiler.
-/// Without the fix, this test would fail because clang++ rejects `-std=c11`.
 #[tokio::test]
 async fn compiler_override_uses_wrapped_compiler() {
     let clangpp = match zccache_test_support::find_clang() {
         Some(p) => p,
         None => return,
     };
-
-    // Derive clang (C compiler) from clang++ path.
     let clang = clangpp
         .parent()
         .unwrap()
@@ -1058,37 +925,25 @@ async fn compiler_override_uses_wrapped_compiler() {
     let obj = tmp.path().join("test.o");
     let log = tmp.path().join("log.txt");
     let cwd = tmp.path().to_string_lossy().into_owned();
-
-    // C code with -std=c11 flag — invalid for C++ compilers.
-    std::fs::write(
-        &src,
-        "struct Point { int x; int y; };\n\
-         int main(void) {\n\
-         \tstruct Point p = { .x = 1, .y = 2 };\n\
-         \treturn p.x + p.y - 3;\n\
-         }\n",
-    )
-    .unwrap();
+    std::fs::write(&src, "struct Point { int x; int y; };\nint main(void) {\n\tstruct Point p = { .x = 1, .y = 2 };\n\treturn p.x + p.y - 3;\n}\n").unwrap();
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+    let (sid, _clangpp_compiler) =
+        start_session(&mut client, &clangpp, &cwd, &log.to_string_lossy()).await;
 
-    // Start session with clang++ (C++ compiler)
-    let sid = start_session(&mut client, &clangpp, &cwd, &log.to_string_lossy()).await;
-
-    // Compile a .c file with -std=c11, overriding the compiler to clang (C compiler).
     client
         .send(&Request::Compile {
-            session_id: sid,
+            session_id: sid.clone(),
             args: vec![
-                "-c".to_string(),
-                "-std=c11".to_string(),
+                "-c".into(),
+                "-std=c11".into(),
                 src.to_string_lossy().into_owned(),
-                "-o".to_string(),
+                "-o".into(),
                 obj.to_string_lossy().into_owned(),
             ],
             cwd: cwd.clone(),
-            compiler: Some(clang.to_string_lossy().into_owned()),
+            compiler: clang.to_string_lossy().into_owned(),
             env: None,
         })
         .await
@@ -1113,13 +968,11 @@ async fn compiler_override_uses_wrapped_compiler() {
             );
         }
         Some(Response::Error { message }) => {
-            panic!("compile error (compiler override not working?): {message}");
+            panic!("compile error (compiler override not working?): {message}")
         }
         other => panic!("expected CompileResult, got: {other:?}"),
     }
-
     assert!(obj.exists(), "object file should be produced");
-
     shutdown.notify_one();
     server_handle.await.unwrap();
 }

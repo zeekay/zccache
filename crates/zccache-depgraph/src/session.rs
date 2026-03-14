@@ -9,7 +9,6 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -123,27 +122,35 @@ impl Default for SessionStatsTracker {
     }
 }
 
-/// Unique identifier for a session.
+/// Unique identifier for a session (UUID v4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SessionId(u64);
+pub struct SessionId(uuid::Uuid);
 
 impl SessionId {
-    /// Get the raw numeric value.
+    /// Create a new random session ID.
     #[must_use]
-    pub fn value(&self) -> u64 {
-        self.0
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
     }
+}
 
-    /// Reconstruct a `SessionId` from a raw u64 value.
-    #[must_use]
-    pub fn from_raw(raw: u64) -> Self {
-        Self(raw)
+impl Default for SessionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::str::FromStr for SessionId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(uuid::Uuid::parse_str(s)?))
     }
 }
 
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "session-{}", self.0)
+        write!(f, "{}", self.0)
     }
 }
 
@@ -154,10 +161,6 @@ pub struct SessionConfig {
     pub client_pid: u32,
     /// Working directory of the client.
     pub working_dir: PathBuf,
-    /// Compiler path for this session.
-    pub compiler: PathBuf,
-    /// Discovered system include paths for this compiler.
-    pub system_includes: Vec<PathBuf>,
     /// Optional log file path for session-scoped logging.
     pub log_file: Option<PathBuf>,
     /// Whether to track per-session statistics.
@@ -173,10 +176,6 @@ pub struct Session {
     pub client_pid: u32,
     /// Client's working directory.
     pub working_dir: PathBuf,
-    /// Compiler executable for this session.
-    pub compiler: PathBuf,
-    /// System include paths discovered for this compiler.
-    pub system_includes: Vec<PathBuf>,
     /// Optional log file path for session-scoped logging.
     pub log_file: Option<PathBuf>,
     /// Context keys registered by this session.
@@ -195,7 +194,6 @@ pub struct Session {
 /// clients are connected and clean up expired sessions.
 pub struct SessionManager {
     sessions: DashMap<SessionId, Session>,
-    next_id: AtomicU64,
     idle_timeout: Duration,
 }
 
@@ -205,14 +203,13 @@ impl SessionManager {
     pub fn new(idle_timeout: Duration) -> Self {
         Self {
             sessions: DashMap::new(),
-            next_id: AtomicU64::new(1),
             idle_timeout,
         }
     }
 
     /// Create a new session. Returns the session ID.
     pub fn create(&self, config: SessionConfig) -> SessionId {
-        let id = SessionId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let id = SessionId::new();
         let now = Instant::now();
 
         let stats_tracker = if config.track_stats {
@@ -225,8 +222,6 @@ impl SessionManager {
             id,
             client_pid: config.client_pid,
             working_dir: config.working_dir,
-            compiler: config.compiler,
-            system_includes: config.system_includes,
             log_file: config.log_file,
             context_keys: HashSet::new(),
             created_at: now,
@@ -270,18 +265,6 @@ impl SessionManager {
     #[must_use]
     pub fn get(&self, id: &SessionId) -> Option<Session> {
         self.sessions.get(id).map(|s| s.clone())
-    }
-
-    /// Get a session's system include paths.
-    #[must_use]
-    pub fn system_includes(&self, id: &SessionId) -> Option<Vec<PathBuf>> {
-        self.sessions.get(id).map(|s| s.system_includes.clone())
-    }
-
-    /// Get a session's compiler path.
-    #[must_use]
-    pub fn compiler(&self, id: &SessionId) -> Option<PathBuf> {
-        self.sessions.get(id).map(|s| s.compiler.clone())
     }
 
     /// Get a session's working directory.
@@ -374,8 +357,6 @@ mod tests {
         SessionConfig {
             client_pid: 1234,
             working_dir: PathBuf::from("/home/user/project"),
-            compiler: PathBuf::from("/usr/bin/g++"),
-            system_includes: vec![PathBuf::from("/usr/include")],
             log_file: None,
             track_stats: false,
         }
@@ -394,7 +375,18 @@ mod tests {
         let mgr = SessionManager::new(Duration::from_secs(900));
         let id = mgr.create(test_config());
         let display = format!("{id}");
-        assert!(display.starts_with("session-"));
+        // UUID format: 8-4-4-4-12 hex digits
+        assert_eq!(display.len(), 36);
+        assert!(display.contains('-'));
+    }
+
+    #[test]
+    fn session_id_roundtrip() {
+        use std::str::FromStr;
+        let id = SessionId::new();
+        let s = id.to_string();
+        let parsed = SessionId::from_str(&s).unwrap();
+        assert_eq!(id, parsed);
     }
 
     #[test]
@@ -411,7 +403,7 @@ mod tests {
     #[test]
     fn end_nonexistent_returns_none() {
         let mgr = SessionManager::new(Duration::from_secs(900));
-        assert!(mgr.end(&SessionId(999)).is_none());
+        assert!(mgr.end(&SessionId::new()).is_none());
     }
 
     #[test]
@@ -419,7 +411,7 @@ mod tests {
         let mgr = SessionManager::new(Duration::from_secs(900));
         let id = mgr.create(test_config());
         assert!(mgr.touch(&id));
-        assert!(!mgr.touch(&SessionId(999)));
+        assert!(!mgr.touch(&SessionId::new()));
     }
 
     #[test]
@@ -454,15 +446,7 @@ mod tests {
             flags: Vec::new(),
             force_includes: Vec::new(),
         };
-        assert!(!mgr.add_context(&SessionId(999), ctx.context_key()));
-    }
-
-    #[test]
-    fn system_includes_accessor() {
-        let mgr = SessionManager::new(Duration::from_secs(900));
-        let id = mgr.create(test_config());
-        let includes = mgr.system_includes(&id).unwrap();
-        assert_eq!(includes, vec![PathBuf::from("/usr/include")]);
+        assert!(!mgr.add_context(&SessionId::new(), ctx.context_key()));
     }
 
     #[test]
@@ -515,7 +499,7 @@ mod tests {
         let mgr = SessionManager::new(Duration::from_secs(900));
         let id = mgr.create(test_config());
         assert!(mgr.exists(&id));
-        assert!(!mgr.exists(&SessionId(999)));
+        assert!(!mgr.exists(&SessionId::new()));
     }
 
     #[test]

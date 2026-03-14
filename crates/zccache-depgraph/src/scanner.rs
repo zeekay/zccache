@@ -395,8 +395,17 @@ fn normalize(path: &Path) -> PathBuf {
 
 fn try_normalize(path: &Path) -> Option<PathBuf> {
     // Use canonicalize which resolves symlinks and produces an absolute path.
-    // On Windows this gives UNC paths (\\?\...) but that's fine for our use.
-    path.canonicalize().ok()
+    // On Windows, canonicalize produces \\?\ extended-length paths which must
+    // be stripped to match the watcher's path format for journal lookups.
+    let p = path.canonicalize().ok()?;
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return Some(PathBuf::from(stripped));
+        }
+    }
+    Some(p)
 }
 
 #[cfg(test)]

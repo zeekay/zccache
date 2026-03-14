@@ -80,38 +80,40 @@ async fn start_daemon() -> (
 
 async fn start_session(
     client: &mut ClientConn,
-    clang: &std::path::Path,
+    _clang: &std::path::Path,
     cwd: &str,
     log_file: &str,
-) -> u64 {
+) -> (String, String) {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: cwd.to_string(),
-            compiler: clang.to_string_lossy().into_owned(),
             log_file: Some(log_file.to_string()),
             track_stats: false,
         })
         .await
         .unwrap();
-    match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id, .. }) => session_id,
+    let session_id = match client.recv().await.unwrap() {
+        Some(Response::SessionStarted { session_id }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
-    }
+    };
+    let compiler = _clang.to_string_lossy().into_owned();
+    (session_id, compiler)
 }
 
 async fn compile(
     client: &mut ClientConn,
-    session_id: u64,
+    session_id: &str,
+    compiler: &str,
     args: &[&str],
     cwd: &str,
 ) -> (i32, bool) {
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_string(),
-            compiler: None,
+            compiler: compiler.to_string(),
             env: None,
         })
         .await
@@ -370,7 +372,7 @@ async fn bench_zccache(
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, clang, &cwd, &log.to_string_lossy()).await;
+    let (sid, compiler) = start_session(&mut client, clang, &cwd, &log.to_string_lossy()).await;
 
     let mut cold_ms = Vec::new();
     let mut warm_ms = Vec::new();
@@ -381,7 +383,14 @@ async fn bench_zccache(
         let obj = format!("file_{i}.o");
 
         let start = Instant::now();
-        let (exit_code, cached) = compile(&mut client, sid, &["-c", &src, "-o", &obj], &cwd).await;
+        let (exit_code, cached) = compile(
+            &mut client,
+            &sid,
+            &compiler,
+            &["-c", &src, "-o", &obj],
+            &cwd,
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert_eq!(exit_code, 0, "zccache cold failed for {src}");
@@ -402,8 +411,14 @@ async fn bench_zccache(
             let _ = std::fs::remove_file(src_dir.join(&obj));
 
             let start = Instant::now();
-            let (exit_code, cached) =
-                compile(&mut client, sid, &["-c", &src, "-o", &obj], &cwd).await;
+            let (exit_code, cached) = compile(
+                &mut client,
+                &sid,
+                &compiler,
+                &["-c", &src, "-o", &obj],
+                &cwd,
+            )
+            .await;
             let elapsed = start.elapsed();
 
             assert_eq!(exit_code, 0, "zccache warm failed for {src}");
@@ -680,11 +695,13 @@ async fn perf_sanity_check() {
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
-    let sid = start_session(&mut client, &clang, &zcc_cwd, &log.to_string_lossy()).await;
+    let (sid, compiler) =
+        start_session(&mut client, &clang, &zcc_cwd, &log.to_string_lossy()).await;
 
     let (exit_code, cached) = compile(
         &mut client,
-        sid,
+        &sid,
+        &compiler,
         &["-c", "file_0.cpp", "-o", "file_0.o"],
         &zcc_cwd,
     )
@@ -695,7 +712,8 @@ async fn perf_sanity_check() {
     std::fs::remove_file(zcc_tmp.path().join("file_0.o")).unwrap();
     let (exit_code, cached) = compile(
         &mut client,
-        sid,
+        &sid,
+        &compiler,
         &["-c", "file_0.cpp", "-o", "file_0.o"],
         &zcc_cwd,
     )

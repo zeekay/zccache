@@ -38,9 +38,6 @@ enum Commands {
     /// Start a build session. Prints session ID to stdout.
     #[command(name = "session-start")]
     SessionStart {
-        /// Path to the compiler executable.
-        #[arg(long)]
-        compiler: String,
         /// Working directory (defaults to current dir).
         #[arg(long)]
         cwd: Option<String>,
@@ -55,7 +52,7 @@ enum Commands {
     #[command(name = "session-end")]
     SessionEnd {
         /// Session ID to end.
-        session_id: u64,
+        session_id: String,
         /// IPC endpoint (default: platform-specific).
         #[arg(long)]
         endpoint: Option<String>,
@@ -127,26 +124,27 @@ fn main() -> ExitCode {
             let endpoint = resolve_endpoint(None);
             run_async(cmd_clear(&endpoint))
         }
-        Commands::SessionStart {
-            compiler,
-            cwd,
-            log,
-            endpoint,
-        } => {
+        Commands::SessionStart { cwd, log, endpoint } => {
             let endpoint = resolve_endpoint(endpoint.as_deref());
-            let compiler = zccache_core::path::normalize_msys_path(&compiler);
             let cwd = cwd.unwrap_or_else(|| {
                 std::env::current_dir()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned()
             });
-            run_async(cmd_session_start(
-                &endpoint,
-                &compiler,
-                &cwd,
-                log.as_deref(),
-            ))
+            let log = log.map(|p| {
+                let path = std::path::Path::new(&p);
+                if path.is_absolute() {
+                    p.to_string()
+                } else {
+                    std::env::current_dir()
+                        .unwrap_or_default()
+                        .join(p)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            });
+            run_async(cmd_session_start(&endpoint, &cwd, log.as_deref()))
         }
         Commands::SessionEnd {
             session_id,
@@ -318,12 +316,7 @@ async fn cmd_clear(endpoint: &str) -> ExitCode {
     }
 }
 
-async fn cmd_session_start(
-    endpoint: &str,
-    compiler: &str,
-    cwd: &str,
-    log: Option<&str>,
-) -> ExitCode {
+async fn cmd_session_start(endpoint: &str, cwd: &str, log: Option<&str>) -> ExitCode {
     if let Err(e) = ensure_daemon(endpoint).await {
         eprintln!("cannot start daemon at {endpoint}: {e}");
         return ExitCode::FAILURE;
@@ -340,7 +333,6 @@ async fn cmd_session_start(
     conn.send(&zccache_protocol::Request::SessionStart {
         client_pid: std::process::id(),
         working_dir: cwd.to_string(),
-        compiler: compiler.to_string(),
         log_file: log.map(String::from),
         track_stats: false,
     })
@@ -348,15 +340,15 @@ async fn cmd_session_start(
     .unwrap();
 
     match conn.recv().await.unwrap() {
-        Some(zccache_protocol::Response::SessionStarted { session_id, .. }) => {
+        Some(zccache_protocol::Response::SessionStarted { session_id }) => {
             // One-line JSON so scripts can parse both the session ID and start time:
-            //   result=$(zccache session-start --compiler /path/to/clang++)
+            //   result=$(zccache session-start)
             let started_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
             println!(
-                r#"{{"session_id":{},"started_at":{}}}"#,
+                r#"{{"session_id":"{}","started_at":{}}}"#,
                 session_id, started_at
             );
             ExitCode::SUCCESS
@@ -372,7 +364,7 @@ async fn cmd_session_start(
     }
 }
 
-async fn cmd_session_end(endpoint: &str, session_id: u64) -> ExitCode {
+async fn cmd_session_end(endpoint: &str, session_id: String) -> ExitCode {
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
         Err(e) => {
@@ -381,9 +373,11 @@ async fn cmd_session_end(endpoint: &str, session_id: u64) -> ExitCode {
         }
     };
 
-    conn.send(&zccache_protocol::Request::SessionEnd { session_id })
-        .await
-        .unwrap();
+    conn.send(&zccache_protocol::Request::SessionEnd {
+        session_id: session_id.clone(),
+    })
+    .await
+    .unwrap();
 
     match conn.recv().await.unwrap() {
         Some(zccache_protocol::Response::SessionEnded { stats }) => {
@@ -528,20 +522,20 @@ fn run_wrap(args: &[String]) -> ExitCode {
 
     // Otherwise, treat as a compiler invocation
     match std::env::var("ZCCACHE_SESSION_ID") {
-        Ok(val) => match val.parse::<u64>() {
-            Ok(session_id) => run_async(cmd_compile(
+        Ok(session_id) => {
+            if session_id.is_empty() {
+                eprintln!("ZCCACHE_SESSION_ID is empty");
+                return ExitCode::FAILURE;
+            }
+            run_async(cmd_compile(
                 &endpoint,
-                session_id,
+                &session_id,
                 tool_args,
                 cwd,
-                Some(wrapped_tool),
+                wrapped_tool,
                 client_env,
-            )),
-            Err(_) => {
-                eprintln!("ZCCACHE_SESSION_ID={val:?} is not a valid u64");
-                ExitCode::FAILURE
-            }
-        },
+            ))
+        }
         Err(_) => {
             // No session — auto-create an ephemeral one for this compilation.
             run_async(cmd_compile_ephemeral(
@@ -575,10 +569,10 @@ fn resolve_compiler_path(compiler: &str) -> String {
 
 async fn cmd_compile(
     endpoint: &str,
-    session_id: u64,
+    session_id: &str,
     args: Vec<String>,
     cwd: String,
-    compiler: Option<String>,
+    compiler: String,
     client_env: Vec<(String, String)>,
 ) -> ExitCode {
     let mut conn = match connect(endpoint).await {
@@ -590,7 +584,7 @@ async fn cmd_compile(
     };
 
     conn.send(&zccache_protocol::Request::Compile {
-        session_id,
+        session_id: session_id.to_string(),
         args,
         cwd,
         compiler,

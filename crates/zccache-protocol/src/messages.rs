@@ -29,8 +29,6 @@ pub enum Request {
         client_pid: u32,
         /// Client working directory.
         working_dir: String,
-        /// Path to the compiler executable.
-        compiler: String,
         /// Optional path to a log file for this session.
         log_file: Option<String>,
         /// Whether to track per-session statistics.
@@ -38,17 +36,14 @@ pub enum Request {
     },
     /// Compile a source file within an existing session.
     Compile {
-        /// Session ID from a prior SessionStart.
-        session_id: u64,
+        /// Session ID from a prior SessionStart (UUID string).
+        session_id: String,
         /// Compiler arguments (e.g., ["-c", "hello.cpp", "-o", "hello.o"]).
         args: Vec<String>,
         /// Working directory for the compilation.
         cwd: String,
-        /// Override the session compiler for this compilation.
-        /// Used by `zccache wrap` when the wrapped compiler differs from
-        /// the session compiler (e.g., session started with g++ but wrapping gcc).
-        /// If `None`, uses the session's compiler.
-        compiler: Option<String>,
+        /// Path to the compiler executable (required).
+        compiler: String,
         /// Client environment variables to pass to the compiler process.
         /// If `None`, the daemon's own environment is inherited (backward compat).
         /// If `Some`, the compiler process uses exactly these env vars.
@@ -56,8 +51,8 @@ pub enum Request {
     },
     /// End a session.
     SessionEnd {
-        /// Session ID to end.
-        session_id: u64,
+        /// Session ID to end (UUID string).
+        session_id: String,
     },
     /// Clear all caches (artifacts, metadata, dep graph).
     Clear,
@@ -111,10 +106,8 @@ pub enum Response {
     StoreResult(StoreResult),
     /// Session successfully started.
     SessionStarted {
-        /// Assigned session ID.
-        session_id: u64,
-        /// System include paths discovered for the compiler.
-        system_includes: Vec<String>,
+        /// Assigned session ID (UUID string).
+        session_id: String,
     },
     /// Result of a compilation request.
     CompileResult {
@@ -352,7 +345,6 @@ mod tests {
         let req = Request::SessionStart {
             client_pid: 1234,
             working_dir: "/home/user/project".to_string(),
-            compiler: "/usr/bin/g++".to_string(),
             log_file: None,
             track_stats: true,
         };
@@ -361,7 +353,6 @@ mod tests {
         let req_no_stats = Request::SessionStart {
             client_pid: 1234,
             working_dir: "/home/user/project".to_string(),
-            compiler: "/usr/bin/g++".to_string(),
             log_file: None,
             track_stats: false,
         };
@@ -468,12 +459,14 @@ mod tests {
         roundtrip(&Request::Ping);
         roundtrip(&Request::Shutdown);
         roundtrip(&Request::Status);
-        roundtrip(&Request::SessionEnd { session_id: 42 });
+        roundtrip(&Request::SessionEnd {
+            session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+        });
         roundtrip(&Request::Compile {
-            session_id: 1,
+            session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
             args: vec!["-c".into(), "foo.c".into()],
             cwd: "/tmp".into(),
-            compiler: None,
+            compiler: "/usr/bin/gcc".into(),
             env: None,
         });
     }

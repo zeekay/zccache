@@ -49,7 +49,7 @@ impl std::fmt::Display for CompileOutcome {
 
 /// A structured compilation event to log.
 pub struct CompileEvent<'a> {
-    pub session_id: Option<u64>,
+    pub session_id: Option<&'a str>,
     pub compiler: &'a str,
     pub args: &'a [String],
     pub cwd: &'a str,
@@ -136,9 +136,9 @@ impl EventLogger {
     pub fn log_event(&self, sessions: &SessionManager, event: &CompileEvent<'_>) {
         let line = format_event(event);
         let session_log_path = event.session_id.and_then(|id| {
-            sessions
-                .get(&SessionId::from_raw(id))
-                .and_then(|s| s.log_file.clone())
+            id.parse::<SessionId>()
+                .ok()
+                .and_then(|sid| sessions.get(&sid).and_then(|s| s.log_file.clone()))
         });
         self.send(line, session_log_path);
     }
@@ -285,8 +285,7 @@ fn format_event(event: &CompileEvent<'_>) -> String {
 /// Format a diagnostic message into a log line.
 fn format_diagnostic(session_id: &SessionId, message: &str) -> String {
     let ts = format_timestamp(SystemTime::now());
-    let sid_raw = session_id.value();
-    format!("[{ts}] [DIAG] [s{sid_raw}] {message}")
+    format!("[{ts}] [DIAG] [s{session_id}] {message}")
 }
 
 /// Format a command line: compiler binary name + args.
@@ -370,7 +369,7 @@ mod tests {
     #[test]
     fn test_format_event_hit() {
         let event = CompileEvent {
-            session_id: Some(42),
+            session_id: Some("42"),
             compiler: "/usr/bin/clang++",
             args: &[
                 "-c".to_string(),
@@ -487,14 +486,13 @@ mod tests {
         let sid = sessions.create(zccache_depgraph::SessionConfig {
             client_pid: 42,
             working_dir: PathBuf::from("/test"),
-            compiler: PathBuf::from("/usr/bin/clang++"),
-            system_includes: vec![],
             log_file: Some(session_log.to_path_buf()),
             track_stats: false,
         });
+        let sid_str = sid.to_string();
 
         let event = CompileEvent {
-            session_id: Some(sid.value()),
+            session_id: Some(&sid_str),
             compiler: "/usr/bin/clang++",
             args: &["-c".to_string(), "test.cpp".to_string()],
             cwd: "/test",

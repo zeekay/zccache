@@ -91,14 +91,13 @@ async fn profile_multi_file_warm_path() {
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: cwd.clone(),
-            compiler: compiler.clone(),
             log_file: None,
             track_stats: true,
         })
         .await
         .unwrap();
     let session_id = match client.recv::<Response>().await.unwrap() {
-        Some(Response::SessionStarted { session_id, .. }) => session_id,
+        Some(Response::SessionStarted { session_id }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
     };
 
@@ -108,7 +107,7 @@ async fn profile_multi_file_warm_path() {
     for src in &sources {
         client
             .send(&Request::Compile {
-                session_id,
+                session_id: session_id.clone(),
                 args: vec![
                     "-c".into(),
                     src.clone(),
@@ -119,7 +118,7 @@ async fn profile_multi_file_warm_path() {
                     "-std=c++17".into(),
                 ],
                 cwd: cwd.clone(),
-                compiler: Some(compiler.clone()),
+                compiler: compiler.clone(),
                 env: None,
             })
             .await
@@ -145,10 +144,10 @@ async fn profile_multi_file_warm_path() {
         let t = Instant::now();
         client
             .send(&Request::Compile {
-                session_id,
+                session_id: session_id.clone(),
                 args: multi_args.clone(),
                 cwd: cwd.clone(),
-                compiler: Some(compiler.clone()),
+                compiler: compiler.clone(),
                 env: None,
             })
             .await
@@ -181,7 +180,7 @@ async fn profile_multi_file_warm_path() {
         for src in &sources {
             client
                 .send(&Request::Compile {
-                    session_id,
+                    session_id: session_id.clone(),
                     args: vec![
                         "-c".into(),
                         src.clone(),
@@ -192,7 +191,7 @@ async fn profile_multi_file_warm_path() {
                         "-std=c++17".into(),
                     ],
                     cwd: cwd.clone(),
-                    compiler: Some(compiler.clone()),
+                    compiler: compiler.clone(),
                     env: None,
                 })
                 .await
@@ -216,7 +215,9 @@ async fn profile_multi_file_warm_path() {
 
     // End session
     client
-        .send(&Request::SessionEnd { session_id })
+        .send(&Request::SessionEnd {
+            session_id: session_id.clone(),
+        })
         .await
         .unwrap();
     let _ = client.recv::<Response>().await;

@@ -126,6 +126,7 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     let mut source_files: Vec<String> = Vec::new();
     let mut output_file: Option<String> = None;
     let mut cache_relevant_args = Vec::new();
+    let mut header_mode = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -166,6 +167,15 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
                 cache_relevant_args.push(arg.clone());
                 i += 1;
                 if i < args.len() {
+                    // `-x c-header` or `-x c++-header` means the input is a
+                    // header file being compiled to a PCH — treat it like a
+                    // source file even though its extension isn't in
+                    // SOURCE_EXTENSIONS.
+                    if flag == "-x"
+                        && (args[i].starts_with("c-header") || args[i].starts_with("c++-header"))
+                    {
+                        header_mode = true;
+                    }
                     cache_relevant_args.push(args[i].clone());
                 }
             }
@@ -181,7 +191,7 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
         }
 
         // Positional arg — should be a source file
-        if is_source_file(arg) {
+        if is_source_file(arg) || header_mode {
             source_files.push(arg.clone());
         }
 
@@ -393,6 +403,48 @@ mod tests {
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn pch_generation_cpp_header_is_cacheable() {
+        // `clang -x c++-header -c pch.h -o pch.h.pch` should be cacheable
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-header", "-c", "pch.h", "-o", "pch.h.pch"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("pch.h"));
+                assert_eq!(c.output_file, PathBuf::from("pch.h.pch"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pch_generation_c_header_is_cacheable() {
+        // `gcc -x c-header -c stdafx.h -o stdafx.h.gch` should be cacheable
+        let result = parse_invocation(
+            "gcc",
+            &args(&["-x", "c-header", "-c", "stdafx.h", "-o", "stdafx.h.gch"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("stdafx.h"));
+                assert_eq!(c.output_file, PathBuf::from("stdafx.h.gch"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_without_x_flag_is_not_source() {
+        // Without `-x c++-header`, a .h file should NOT be recognized as a source
+        let result = parse_invocation("clang++", &args(&["-c", "pch.h"]));
+        assert!(
+            matches!(result, ParsedInvocation::NonCacheable { .. }),
+            "bare .h without -x header mode should be non-cacheable"
+        );
     }
 
     #[test]

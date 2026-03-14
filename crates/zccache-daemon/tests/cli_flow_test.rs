@@ -16,7 +16,7 @@ fn parse_session_id_from_json(json: &str) -> String {
     let start = json.find(key).expect("missing session_id in JSON") + key.len();
     let rest = &json[start..];
     let end = rest.find([',', '}']).unwrap_or(rest.len());
-    rest[..end].trim().to_string()
+    rest[..end].trim().trim_matches('"').to_string()
 }
 
 async fn start_daemon() -> (
@@ -62,7 +62,6 @@ async fn cli_session_lifecycle() {
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: cwd.clone(),
-            compiler: clang.to_string_lossy().into_owned(),
             log_file: Some(log.to_string_lossy().into_owned()),
             track_stats: false,
         })
@@ -70,7 +69,7 @@ async fn cli_session_lifecycle() {
         .unwrap();
 
     let session_id = match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id, .. }) => session_id,
+        Some(Response::SessionStarted { session_id }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
     };
 
@@ -83,7 +82,7 @@ async fn cli_session_lifecycle() {
     // The CLI strips args[0] (compiler) and sends args[1..] as Compile.
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.clone(),
             args: vec![
                 "-c".to_string(),
                 src.to_string_lossy().into_owned(),
@@ -91,7 +90,7 @@ async fn cli_session_lifecycle() {
                 obj.to_string_lossy().into_owned(),
             ],
             cwd: cwd.clone(),
-            compiler: None,
+            compiler: clang.to_string_lossy().into_owned(),
             env: None,
         })
         .await
@@ -115,7 +114,7 @@ async fn cli_session_lifecycle() {
 
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.clone(),
             args: vec![
                 "-c".to_string(),
                 src.to_string_lossy().into_owned(),
@@ -123,7 +122,7 @@ async fn cli_session_lifecycle() {
                 obj.to_string_lossy().into_owned(),
             ],
             cwd: cwd.clone(),
-            compiler: None,
+            compiler: clang.to_string_lossy().into_owned(),
             env: None,
         })
         .await
@@ -145,7 +144,9 @@ async fn cli_session_lifecycle() {
 
     // ── Step 4: session-end (what `zccache session-end <id>` does) ──
     client
-        .send(&Request::SessionEnd { session_id })
+        .send(&Request::SessionEnd {
+            session_id: session_id.clone(),
+        })
         .await
         .unwrap();
 
@@ -160,7 +161,7 @@ async fn cli_session_lifecycle() {
             session_id,
             args: vec!["-c".to_string(), src.to_string_lossy().into_owned()],
             cwd: cwd.clone(),
-            compiler: None,
+            compiler: clang.to_string_lossy().into_owned(),
             env: None,
         })
         .await
@@ -192,13 +193,18 @@ async fn cli_session_end_invalid_id() {
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
 
     client
-        .send(&Request::SessionEnd { session_id: 999999 })
+        .send(&Request::SessionEnd {
+            session_id: 999999.to_string(),
+        })
         .await
         .unwrap();
 
     match client.recv().await.unwrap() {
         Some(Response::Error { message }) => {
-            assert!(message.contains("unknown session"));
+            assert!(
+                message.contains("unknown session") || message.contains("invalid session"),
+                "expected session error, got: {message}"
+            );
         }
         other => panic!("expected Error, got: {other:?}"),
     }
@@ -254,8 +260,6 @@ async fn cli_binary_session_round_trip() {
     let output = std::process::Command::new(&cli_binary)
         .args([
             "session-start",
-            "--compiler",
-            &clang.to_string_lossy(),
             "--cwd",
             &cwd,
             "--log",
@@ -433,7 +437,6 @@ async fn cli_clear_resets_cache() {
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: cwd.clone(),
-            compiler: clang.to_string_lossy().into_owned(),
             log_file: None,
             track_stats: false,
         })
@@ -441,7 +444,7 @@ async fn cli_clear_resets_cache() {
         .unwrap();
 
     let session_id = match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id, .. }) => session_id,
+        Some(Response::SessionStarted { session_id }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
     };
 
@@ -455,10 +458,10 @@ async fn cli_clear_resets_cache() {
     // First compile → miss
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.clone(),
             args: compile_args.clone(),
             cwd: cwd.clone(),
-            compiler: None,
+            compiler: clang.to_string_lossy().into_owned(),
             env: None,
         })
         .await
@@ -478,10 +481,10 @@ async fn cli_clear_resets_cache() {
     std::fs::remove_file(&obj).unwrap();
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.clone(),
             args: compile_args.clone(),
             cwd: cwd.clone(),
-            compiler: None,
+            compiler: clang.to_string_lossy().into_owned(),
             env: None,
         })
         .await
@@ -522,7 +525,6 @@ async fn cli_clear_resets_cache() {
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: cwd.clone(),
-            compiler: clang.to_string_lossy().into_owned(),
             log_file: None,
             track_stats: false,
         })
@@ -530,7 +532,7 @@ async fn cli_clear_resets_cache() {
         .unwrap();
 
     let session_id2 = match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id, .. }) => session_id,
+        Some(Response::SessionStarted { session_id }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
     };
 
@@ -541,7 +543,7 @@ async fn cli_clear_resets_cache() {
             session_id: session_id2,
             args: compile_args,
             cwd,
-            compiler: None,
+            compiler: clang.to_string_lossy().into_owned(),
             env: None,
         })
         .await
@@ -590,7 +592,6 @@ async fn cli_multi_file_compilation_runs_directly() {
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: cwd.clone(),
-            compiler: clang.to_string_lossy().into_owned(),
             log_file: None,
             track_stats: true,
         })
@@ -598,7 +599,7 @@ async fn cli_multi_file_compilation_runs_directly() {
         .unwrap();
 
     let session_id = match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id, .. }) => session_id,
+        Some(Response::SessionStarted { session_id }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
     };
 
@@ -610,10 +611,10 @@ async fn cli_multi_file_compilation_runs_directly() {
     ];
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.clone(),
             args: multi_args.clone(),
             cwd: cwd.clone(),
-            compiler: None,
+            compiler: clang.to_string_lossy().into_owned(),
             env: None,
         })
         .await
@@ -638,10 +639,10 @@ async fn cli_multi_file_compilation_runs_directly() {
     // Second compile: same files → should be all cache hits
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.clone(),
             args: multi_args,
             cwd: cwd.clone(),
-            compiler: None,
+            compiler: clang.to_string_lossy().into_owned(),
             env: None,
         })
         .await
@@ -741,17 +742,9 @@ async fn cli_binary_compiler_override_cpp_session_c_file() {
         bin_dir.join("zccache")
     };
 
-    // Start session with clang++ (C++ compiler)
+    // Start session (compiler-agnostic now)
     let output = std::process::Command::new(&cli_binary)
-        .args([
-            "session-start",
-            "--compiler",
-            &clangpp.to_string_lossy(),
-            "--cwd",
-            &cwd,
-            "--endpoint",
-            &endpoint,
-        ])
+        .args(["session-start", "--cwd", &cwd, "--endpoint", &endpoint])
         .output()
         .unwrap();
     assert!(

@@ -263,6 +263,35 @@ impl DaemonServer {
                                 removed = removed.len(),
                                 "watcher batch applied"
                             );
+                            // On Windows, notify reports paths with \\?\
+                            // extended-length prefix but the rest of the
+                            // codebase uses plain paths. Strip the prefix
+                            // so journal/metadata lookups match.
+                            #[cfg(windows)]
+                            let (changed, removed) = {
+                                let strip = |paths: Vec<PathBuf>| -> Vec<PathBuf> {
+                                    paths
+                                        .into_iter()
+                                        .map(|p| {
+                                            let s = p.to_string_lossy();
+                                            if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                                                PathBuf::from(stripped)
+                                            } else {
+                                                p
+                                            }
+                                        })
+                                        .collect()
+                                };
+                                (strip(changed), strip(removed))
+                            };
+                            #[cfg(debug_assertions)]
+                            for p in changed.iter().chain(removed.iter()) {
+                                debug_assert!(
+                                    !p.to_string_lossy().starts_with(r"\\?\"),
+                                    "watcher path must not have \\\\?\\ prefix: {}",
+                                    p.display()
+                                );
+                            }
                             state
                                 .cache_system
                                 .apply_changes_with_removals(changed, removed);
@@ -296,10 +325,27 @@ async fn watch_directories(state: &SharedState, dirs: &[PathBuf]) {
     }
 
     // Canonicalize all paths (filesystem work, no lock needed).
+    // On Windows, canonicalize() produces \\?\ extended-length paths which
+    // don't match the paths reported by notify's ReadDirectoryChangesW.
+    // Strip the prefix so watched paths match event paths.
     let canonical: Vec<PathBuf> = dirs
         .iter()
         .filter_map(|dir| match dir.canonicalize() {
-            Ok(p) => Some(p),
+            Ok(p) => {
+                #[cfg(windows)]
+                {
+                    let s = p.to_string_lossy();
+                    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                        Some(PathBuf::from(stripped))
+                    } else {
+                        Some(p)
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    Some(p)
+                }
+            }
             Err(e) => {
                 tracing::debug!("cannot canonicalize {}: {e}", dir.display());
                 None
@@ -407,20 +453,11 @@ async fn handle_connection(
             Request::SessionStart {
                 client_pid,
                 working_dir,
-                compiler,
                 log_file,
                 track_stats,
             } => {
                 state.stats.record_session();
-                handle_session_start(
-                    &state,
-                    client_pid,
-                    &working_dir,
-                    &compiler,
-                    log_file,
-                    track_stats,
-                )
-                .await
+                handle_session_start(&state, client_pid, &working_dir, log_file, track_stats).await
             }
             Request::Compile {
                 session_id,
@@ -428,7 +465,7 @@ async fn handle_connection(
                 cwd,
                 compiler,
                 env,
-            } => handle_compile(&state, session_id, &args, &cwd, compiler.as_deref(), env).await,
+            } => handle_compile(&state, &session_id, &args, &cwd, &compiler, env).await,
             Request::CompileEphemeral {
                 client_pid,
                 working_dir,
@@ -448,31 +485,35 @@ async fn handle_connection(
                 )
                 .await
             }
-            Request::SessionEnd { session_id } => {
-                let sid = SessionId::from_raw(session_id);
-                if let Some(session) = state.sessions.end(&sid) {
-                    let stats = session.stats_tracker.map(|tracker| {
-                        let f = tracker.finalize(session.created_at);
-                        zccache_protocol::SessionStats {
-                            duration_ms: f.duration_ms,
-                            compilations: f.compilations,
-                            hits: f.hits,
-                            misses: f.misses,
-                            non_cacheable: f.non_cacheable,
-                            errors: f.errors,
-                            time_saved_ms: f.time_saved_ms,
-                            unique_sources: f.unique_sources,
-                            bytes_read: f.bytes_read,
-                            bytes_written: f.bytes_written,
+            Request::SessionEnd { session_id } => match session_id.parse::<SessionId>() {
+                Ok(sid) => {
+                    if let Some(session) = state.sessions.end(&sid) {
+                        let stats = session.stats_tracker.map(|tracker| {
+                            let f = tracker.finalize(session.created_at);
+                            zccache_protocol::SessionStats {
+                                duration_ms: f.duration_ms,
+                                compilations: f.compilations,
+                                hits: f.hits,
+                                misses: f.misses,
+                                non_cacheable: f.non_cacheable,
+                                errors: f.errors,
+                                time_saved_ms: f.time_saved_ms,
+                                unique_sources: f.unique_sources,
+                                bytes_read: f.bytes_read,
+                                bytes_written: f.bytes_written,
+                            }
+                        });
+                        Response::SessionEnded { stats }
+                    } else {
+                        Response::Error {
+                            message: format!("unknown session: {session_id}"),
                         }
-                    });
-                    Response::SessionEnded { stats }
-                } else {
-                    Response::Error {
-                        message: format!("unknown session: {session_id}"),
                     }
                 }
-            }
+                Err(_) => Response::Error {
+                    message: format!("invalid session ID: {session_id}"),
+                },
+            },
             Request::LinkEphemeral {
                 client_pid,
                 working_dir,
@@ -557,8 +598,7 @@ async fn handle_compile_ephemeral(
 ) -> Response {
     // 1. Start ephemeral session (inline, no IPC roundtrip)
     state.stats.record_session();
-    let session_resp =
-        handle_session_start(state, client_pid, working_dir, compiler, None, false).await;
+    let session_resp = handle_session_start(state, client_pid, working_dir, None, false).await;
     let session_id = match session_resp {
         Response::SessionStarted { session_id, .. } => session_id,
         Response::Error { message } => return Response::Error { message },
@@ -569,12 +609,13 @@ async fn handle_compile_ephemeral(
         }
     };
 
-    // 2. Compile (no compiler override — session compiler IS the wrapped compiler)
-    let result = handle_compile(state, session_id, args, cwd, None, env).await;
+    // 2. Compile — pass the compiler from the ephemeral request
+    let result = handle_compile(state, &session_id, args, cwd, compiler, env).await;
 
     // 3. End session (best-effort, no response needed)
-    let sid = SessionId::from_raw(session_id);
-    state.sessions.end(&sid);
+    if let Ok(sid) = session_id.parse::<SessionId>() {
+        state.sessions.end(&sid);
+    }
 
     result
 }
@@ -871,50 +912,17 @@ async fn run_tool_passthrough(
     }
 }
 
-/// Handle a SessionStart request: discover system includes, create session.
+/// Handle a SessionStart request: create session, watch working directory.
 async fn handle_session_start(
     state: &SharedState,
     client_pid: u32,
     working_dir: &str,
-    compiler: &str,
     log_file: Option<String>,
     track_stats: bool,
 ) -> Response {
-    let compiler_path = PathBuf::from(compiler);
-
-    // Check if compiler exists
-    if !compiler_path.exists() {
-        return Response::Error {
-            message: format!("compiler not found: {compiler}"),
-        };
-    }
-
-    // Discover system includes (cached per compiler path)
-    let system_includes = {
-        let mut cache = state.system_includes.lock().await;
-        cache
-            .get_or_discover(&compiler_path, |compiler| {
-                let args = zccache_depgraph::discovery_args();
-                let output = std::process::Command::new(compiler).args(&args).output();
-                match output {
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        zccache_depgraph::parse_system_include_output(&stderr)
-                    }
-                    Err(e) => {
-                        tracing::warn!("failed to run compiler for include discovery: {e}");
-                        Vec::new()
-                    }
-                }
-            })
-            .to_vec()
-    };
-
     let session_config = zccache_depgraph::SessionConfig {
         client_pid,
         working_dir: PathBuf::from(working_dir),
-        compiler: compiler_path,
-        system_includes: system_includes.clone(),
         log_file: log_file.map(PathBuf::from),
         track_stats,
     };
@@ -924,16 +932,8 @@ async fn handle_session_start(
     // Watch the working directory for file changes.
     watch_directory(state, &PathBuf::from(working_dir)).await;
 
-    // Watch system include directories so the journal can track header changes
-    // and enable the zero-syscall fast path for system headers.
-    watch_directories(state, &system_includes).await;
-
     Response::SessionStarted {
-        session_id: session_id.value(),
-        system_includes: system_includes
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
+        session_id: session_id.to_string(),
     }
 }
 
@@ -975,6 +975,11 @@ fn write_session_log(sessions: &SessionManager, session_id: &SessionId, message:
 /// `clock` should be snapped once at the start of each compile request so all
 /// files in a single compilation see a consistent journal clock.
 fn hash_file(cache_system: &CacheSystem, path: &Path, clock: Clock) -> Result<ContentHash, String> {
+    debug_assert!(
+        !path.to_string_lossy().starts_with(r"\\?\"),
+        "path must not have \\\\?\\ prefix: {}",
+        path.display()
+    );
     cache_system
         .lookup_since(path, clock)
         .map(|r| r.hash)
@@ -1023,40 +1028,60 @@ fn write_cached_output(out_path: &Path, cache_file: &Path, data: &[u8]) -> std::
 /// Handle a Compile request: parse args, check depgraph, run compiler or return cached.
 async fn handle_compile(
     state_arc: &Arc<SharedState>,
-    session_id: u64,
+    session_id: &str,
     args: &[String],
     cwd: &str,
-    compiler_override: Option<&str>,
+    compiler_path: &str,
     client_env: Option<Vec<(String, String)>>,
 ) -> Response {
     let state = state_arc.as_ref();
     let compile_start = std::time::Instant::now();
-    let sid = SessionId::from_raw(session_id);
+    let sid = match session_id.parse::<SessionId>() {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::Error {
+                message: format!("invalid session ID: {session_id}"),
+            };
+        }
+    };
     // Snap the journal clock once so all file hashes in this request see a
     // consistent view (avoids per-file current_clock() syscalls).
     let snap_clock = state.cache_system.current_clock();
 
     state.stats.record_compilation();
 
-    // Look up session
-    let (session_compiler, system_includes) = match (
-        state.sessions.compiler(&sid),
-        state.sessions.system_includes(&sid),
-    ) {
-        (Some(c), Some(si)) => (c, si),
-        _ => {
-            return Response::Error {
-                message: format!("unknown session: {session_id}"),
-            };
-        }
+    // Verify session exists
+    if !state.sessions.exists(&sid) {
+        return Response::Error {
+            message: format!("unknown session: {session_id}"),
+        };
+    }
+
+    let compiler = PathBuf::from(compiler_path);
+
+    // Discover system includes for this compiler (cached per compiler path)
+    let system_includes = {
+        let mut cache = state.system_includes.lock().await;
+        cache
+            .get_or_discover(&compiler, |c| {
+                let disc_args = zccache_depgraph::discovery_args();
+                let output = std::process::Command::new(c).args(&disc_args).output();
+                match output {
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        zccache_depgraph::parse_system_include_output(&stderr)
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to run compiler for include discovery: {e}");
+                        Vec::new()
+                    }
+                }
+            })
+            .to_vec()
     };
 
-    // Use per-request compiler override if provided (e.g., `wrap gcc` on a g++ session),
-    // otherwise fall back to the session compiler.
-    let compiler = match compiler_override {
-        Some(path) => PathBuf::from(path),
-        None => session_compiler,
-    };
+    // Watch system include directories
+    watch_directories(state, &system_includes).await;
 
     state.sessions.touch(&sid);
 
@@ -1235,12 +1260,28 @@ async fn handle_compile(
             }
         }
     }
+    // Hash force-included files (PCH, -include) so their content
+    // is part of the artifact key.
+    for fi in &ctx.force_includes {
+        match hash_file(&state.cache_system, fi, snap_clock) {
+            Ok(h) => {
+                hash_map.insert(fi.clone(), h);
+            }
+            Err(e) => {
+                write_session_log(
+                    &state.sessions,
+                    &sid,
+                    &format!("[DIAG] force_include_hash_fail: {} error={e}", fi.display()),
+                );
+            }
+        }
+    }
     let hash_headers_ns = t3.elapsed().as_nanos() as u64;
 
     // ── Phase: depgraph check ────────────────────────────────────────
     let t4 = std::time::Instant::now();
     let (verdict, diag_reason) = {
-        let is_fresh = |_: &Path| true;
+        let is_fresh = |p: &Path| !state.cache_system.journal().changed_since(p, snap_clock);
         let get_hash = |p: &Path| hash_map.get(p).copied();
         state
             .dep_graph
@@ -1423,6 +1464,12 @@ async fn handle_compile(
 
     // Only cache successful compilations
     if exit_code == 0 {
+        // The compiler just wrote the output file. Invalidate it in the
+        // cache system so any compilation that depends on this output
+        // (e.g. via -include-pch) sees the change immediately — no need
+        // to wait for a watcher event.
+        state.cache_system.apply_changes(vec![output_path.clone()]);
+
         // Read the output file
         let output_data = match std::fs::read(&output_path) {
             Ok(data) => data,
@@ -1477,6 +1524,7 @@ async fn handle_compile(
         // Register scanned paths for zero-syscall fast path on future hits.
         let tracked_paths: Vec<PathBuf> = std::iter::once(source_path.clone())
             .chain(scan_result.resolved.iter().cloned())
+            .chain(ctx.force_includes.iter().cloned())
             .collect();
         state.cache_system.register_tracked(&tracked_paths);
 
@@ -1495,6 +1543,12 @@ async fn handle_compile(
                         dirs.insert(parent.to_path_buf());
                     }
                 }
+                // Also watch force-include parent dirs (PCH files, etc.).
+                for fi in &ctx.force_includes {
+                    if let Some(parent) = fi.parent() {
+                        dirs.insert(parent.to_path_buf());
+                    }
+                }
                 dirs.into_iter().collect()
             };
             watch_directories(state, &dep_dirs).await;
@@ -1509,6 +1563,13 @@ async fn handle_compile(
         for header in &scan_result.resolved {
             if let Ok(h) = hash_file(&state.cache_system, header, snap_clock) {
                 hash_map.insert(header.clone(), h);
+            }
+        }
+        // Hash force-included files (PCH, -include) so their content
+        // is part of the artifact key.
+        for fi in &ctx.force_includes {
+            if let Ok(h) = hash_file(&state.cache_system, fi, snap_clock) {
+                hash_map.insert(fi.clone(), h);
             }
         }
         let hash_all_ns = t_hash.elapsed().as_nanos() as u64;
@@ -1682,11 +1743,18 @@ fn check_unit_cache(
             }
         }
     }
+    // Hash force-included files (PCH, -include) so their content
+    // is part of the artifact key.
+    for fi in &ctx.force_includes {
+        if let Ok(h) = hash_file(&state.cache_system, fi, snap_clock) {
+            hash_map.insert(fi.clone(), h);
+        }
+    }
     let t_hash_headers = t0.elapsed();
 
     // Depgraph check
     let verdict = {
-        let is_fresh = |_: &Path| true;
+        let is_fresh = |p: &Path| !state.cache_system.journal().changed_since(p, snap_clock);
         let get_hash = |p: &Path| hash_map.get(p).copied();
         state.dep_graph.check(&context_key, is_fresh, get_hash)
     };

@@ -34,12 +34,16 @@ async fn start_daemon() -> (String, JoinHandle<()>, Arc<Notify>) {
     (endpoint, handle, shutdown)
 }
 
-async fn start_session(client: &mut ClientConn, clang: &Path, cwd: &str, log_file: &str) -> u64 {
+async fn start_session(
+    client: &mut ClientConn,
+    _clang: &Path,
+    cwd: &str,
+    log_file: &str,
+) -> String {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: cwd.to_string(),
-            compiler: clang.to_string_lossy().into_owned(),
             log_file: Some(log_file.to_string()),
             track_stats: false,
         })
@@ -53,16 +57,17 @@ async fn start_session(client: &mut ClientConn, clang: &Path, cwd: &str, log_fil
 
 async fn compile(
     client: &mut ClientConn,
-    session_id: u64,
+    session_id: &str,
+    compiler: &str,
     args: &[&str],
     cwd: &str,
 ) -> (i32, bool) {
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_string(),
-            compiler: None,
+            compiler: compiler.to_string(),
             env: None,
         })
         .await
@@ -79,12 +84,13 @@ async fn compile(
 
 async fn compile_and_read(
     client: &mut ClientConn,
-    session_id: u64,
+    session_id: &str,
+    compiler: &str,
     args: &[&str],
     cwd: &str,
     obj_path: &Path,
 ) -> (i32, bool, Vec<u8>) {
-    let (exit_code, cached) = compile(client, session_id, args, cwd).await;
+    let (exit_code, cached) = compile(client, session_id, compiler, args, cwd).await;
     let obj_data = if obj_path.exists() {
         std::fs::read(obj_path).unwrap()
     } else {
@@ -94,7 +100,6 @@ async fn compile_and_read(
 }
 
 struct TestHarness {
-    #[expect(dead_code)]
     clang: PathBuf,
     tmp: tempfile::TempDir,
     #[expect(dead_code)]
@@ -102,7 +107,7 @@ struct TestHarness {
     server_handle: JoinHandle<()>,
     shutdown: Arc<Notify>,
     client: ClientConn,
-    session_id: u64,
+    session_id: String,
 }
 
 impl TestHarness {
@@ -147,9 +152,11 @@ impl TestHarness {
     async fn compile_file_read(&mut self, src: &str, obj: &str) -> (i32, bool, Vec<u8>) {
         let obj_path = self.path(obj);
         let cwd = self.cwd();
+        let compiler = self.clang.to_string_lossy().into_owned();
         compile_and_read(
             &mut self.client,
-            self.session_id,
+            &self.session_id,
+            &compiler,
             &["-c", src, "-o", obj],
             &cwd,
             &obj_path,
@@ -270,7 +277,8 @@ async fn corner_cache_survives_session_restart() {
     let obj = tmp.path().join("persist.o");
     let (exit, cached, obj_v1) = compile_and_read(
         &mut client1,
-        sid1,
+        &sid1,
+        &clang.to_string_lossy(),
         &["-c", "persist.cpp", "-o", "persist.o"],
         &cwd,
         &obj,
@@ -294,7 +302,8 @@ async fn corner_cache_survives_session_restart() {
     std::fs::remove_file(&obj).unwrap();
     let (exit, cached, obj_v2) = compile_and_read(
         &mut client2,
-        sid2,
+        &sid2,
+        &clang.to_string_lossy(),
         &["-c", "persist.cpp", "-o", "persist.o"],
         &cwd,
         &obj,
@@ -355,7 +364,8 @@ async fn corner_thundering_herd_same_file() {
             let obj_path = PathBuf::from(&cwd).join(&obj_name);
             let (exit, cached, obj) = compile_and_read(
                 &mut client,
-                sid,
+                &sid,
+                &clang.to_string_lossy(),
                 &["-c", "herd.cpp", "-o", &obj_name],
                 &cwd,
                 &obj_path,
@@ -429,7 +439,8 @@ async fn corner_thundering_herd_all_warm() {
         let obj_path = tmp.path().join("warm.o");
         let (exit, cached, _) = compile_and_read(
             &mut client,
-            sid,
+            &sid,
+            &clang.to_string_lossy(),
             &["-c", "warm.cpp", "-o", "warm.o"],
             &cwd,
             &obj_path,
@@ -459,7 +470,8 @@ async fn corner_thundering_herd_all_warm() {
             let obj_path = PathBuf::from(&cwd).join(&obj_name);
             let (exit, cached, obj) = compile_and_read(
                 &mut client,
-                sid,
+                &sid,
+                &clang.to_string_lossy(),
                 &["-c", "warm.cpp", "-o", &obj_name],
                 &cwd,
                 &obj_path,

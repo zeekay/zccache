@@ -36,36 +36,41 @@ async fn start_daemon() -> (String, JoinHandle<()>, Arc<Notify>) {
     (endpoint, handle, shutdown)
 }
 
-async fn start_session(client: &mut ClientConn, clang: &Path, cwd: &str, log_file: &str) -> u64 {
+async fn start_session(
+    client: &mut ClientConn,
+    _clang: &Path,
+    cwd: &str,
+    log_file: &str,
+) -> String {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: cwd.to_string(),
-            compiler: clang.to_string_lossy().into_owned(),
             log_file: Some(log_file.to_string()),
             track_stats: false,
         })
         .await
         .unwrap();
     match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id, .. }) => session_id,
+        Some(Response::SessionStarted { session_id }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
     }
 }
 
 async fn compile_and_read(
     client: &mut ClientConn,
-    session_id: u64,
+    session_id: &str,
     args: &[&str],
     cwd: &str,
     obj_path: &Path,
+    compiler: &str,
 ) -> (i32, bool, Vec<u8>) {
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_string(),
-            compiler: None,
+            compiler: compiler.to_string(),
             env: None,
         })
         .await
@@ -126,7 +131,7 @@ struct TestHarness {
     server_handle: JoinHandle<()>,
     shutdown: Arc<Notify>,
     client: ClientConn,
-    session_id: u64,
+    session_id: String,
 }
 
 impl TestHarness {
@@ -171,21 +176,27 @@ impl TestHarness {
         p
     }
 
+    fn compiler_str(&self) -> String {
+        self.clang.to_string_lossy().into_owned()
+    }
+
     async fn compile_file_read(&mut self, src: &str, obj: &str) -> (i32, bool, Vec<u8>) {
         let obj_path = self.path(obj);
         let cwd = self.cwd();
+        let compiler = self.compiler_str();
         compile_and_read(
             &mut self.client,
-            self.session_id,
+            &self.session_id,
             &["-c", src, "-o", obj],
             &cwd,
             &obj_path,
+            &compiler,
         )
         .await
     }
 
     /// Start a second session on the same daemon, with a different working directory.
-    async fn second_session(&self, cwd: &str) -> (ClientConn, u64) {
+    async fn second_session(&self, cwd: &str) -> (ClientConn, String) {
         let mut client2 = zccache_ipc::connect(&self.endpoint).await.unwrap();
         let log = PathBuf::from(cwd).join("log2.txt");
         let sid2 = start_session(&mut client2, &self.clang, cwd, &log.to_string_lossy()).await;
@@ -354,6 +365,7 @@ async fn two_sessions_same_dir_share_watcher() {
 
     let cwd = h.cwd();
     let (mut client2, sid2) = h.second_session(&cwd).await;
+    let compiler = h.compiler_str();
     wait_for_watcher().await;
 
     h.write_file("config.h", "#define CFG 1\n");
@@ -370,10 +382,11 @@ async fn two_sessions_same_dir_share_watcher() {
     let obj_path = h.path("shared_b.o");
     let (_, cached, _) = compile_and_read(
         &mut client2,
-        sid2,
+        &sid2,
         &["-c", "shared.cpp", "-o", "shared_b.o"],
         &cwd,
         &obj_path,
+        &compiler,
     )
     .await;
     assert!(cached, "session B should hit from session A's cache");
@@ -389,10 +402,11 @@ async fn two_sessions_same_dir_share_watcher() {
     // Session B recompiles (hit — session A just populated the new artifact)
     let (_, cached, _) = compile_and_read(
         &mut client2,
-        sid2,
+        &sid2,
         &["-c", "shared.cpp", "-o", "shared_b.o"],
         &cwd,
         &obj_path,
+        &compiler,
     )
     .await;
     assert!(cached, "session B should hit from session A's recompile");

@@ -36,35 +36,40 @@ async fn start_daemon() -> (
     (endpoint, handle, shutdown)
 }
 
-async fn start_session(client: &mut ClientConn, clang: &Path, cwd: &str, log_file: &str) -> u64 {
+async fn start_session(
+    client: &mut ClientConn,
+    _clang: &Path,
+    cwd: &str,
+    log_file: &str,
+) -> String {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: cwd.to_string(),
-            compiler: clang.to_string_lossy().into_owned(),
             log_file: Some(log_file.to_string()),
             track_stats: false,
         })
         .await
         .unwrap();
     match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id, .. }) => session_id,
+        Some(Response::SessionStarted { session_id }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
     }
 }
 
 async fn compile(
     client: &mut ClientConn,
-    session_id: u64,
+    session_id: &str,
     args: &[&str],
     cwd: &str,
+    compiler: &str,
 ) -> (i32, bool) {
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_string(),
-            compiler: None,
+            compiler: compiler.to_string(),
             env: None,
         })
         .await
@@ -82,12 +87,13 @@ async fn compile(
 /// Compile and return (exit_code, cached, object_file_bytes).
 async fn compile_and_read(
     client: &mut ClientConn,
-    session_id: u64,
+    session_id: &str,
     args: &[&str],
     cwd: &str,
     obj_path: &Path,
+    compiler: &str,
 ) -> (i32, bool, Vec<u8>) {
-    let (exit_code, cached) = compile(client, session_id, args, cwd).await;
+    let (exit_code, cached) = compile(client, session_id, args, cwd, compiler).await;
     let obj_data = if obj_path.exists() {
         std::fs::read(obj_path).unwrap()
     } else {
@@ -98,7 +104,6 @@ async fn compile_and_read(
 
 /// Convenience: set up daemon + session + temp dir.
 struct TestHarness {
-    #[expect(dead_code)]
     clang: PathBuf,
     tmp: tempfile::TempDir,
     #[expect(dead_code)]
@@ -106,7 +111,7 @@ struct TestHarness {
     server_handle: tokio::task::JoinHandle<()>,
     shutdown: std::sync::Arc<tokio::sync::Notify>,
     client: ClientConn,
-    session_id: u64,
+    session_id: String,
 }
 
 impl TestHarness {
@@ -145,15 +150,21 @@ impl TestHarness {
         p
     }
 
+    fn compiler_str(&self) -> String {
+        self.clang.to_string_lossy().into_owned()
+    }
+
     async fn compile_file_read(&mut self, src: &str, obj: &str) -> (i32, bool, Vec<u8>) {
         let obj_path = self.path(obj);
         let cwd = self.cwd();
+        let compiler = self.compiler_str();
         compile_and_read(
             &mut self.client,
-            self.session_id,
+            &self.session_id,
             &["-c", src, "-o", obj],
             &cwd,
             &obj_path,
+            &compiler,
         )
         .await
     }
@@ -288,6 +299,7 @@ async fn mutation_include_path_creates_different_cache_entry() {
 
     let inc_a_str = format!("-I{}", dir_a.to_string_lossy());
     let inc_b_str = format!("-I{}", dir_b.to_string_lossy());
+    let compiler = h.compiler_str();
 
     // Compile with -I inc_a
     let (exit_code, cached, obj_a) = {
@@ -295,9 +307,10 @@ async fn mutation_include_path_creates_different_cache_entry() {
         let cwd = h.cwd();
         let (ec, c) = compile(
             &mut h.client,
-            h.session_id,
+            &h.session_id,
             &["-c", "inc_test.cpp", "-o", "inc_test.o", &inc_a_str],
             &cwd,
+            &compiler,
         )
         .await;
         let obj = std::fs::read(&obj_path).unwrap();
@@ -313,9 +326,10 @@ async fn mutation_include_path_creates_different_cache_entry() {
         let cwd = h.cwd();
         let (ec, c) = compile(
             &mut h.client,
-            h.session_id,
+            &h.session_id,
             &["-c", "inc_test.cpp", "-o", "inc_test.o", &inc_b_str],
             &cwd,
+            &compiler,
         )
         .await;
         let obj = std::fs::read(&obj_path).unwrap();
@@ -338,9 +352,10 @@ async fn mutation_include_path_creates_different_cache_entry() {
         let cwd = h.cwd();
         let (ec, c) = compile(
             &mut h.client,
-            h.session_id,
+            &h.session_id,
             &["-c", "inc_test.cpp", "-o", "inc_test.o", &inc_a_str],
             &cwd,
+            &compiler,
         )
         .await;
         let obj = std::fs::read(&obj_path).unwrap();
@@ -376,13 +391,15 @@ int f() { return 0; }
     assert!(!cached);
 
     // With -DFEATURE
+    let compiler = h.compiler_str();
     let (_, cached) = {
         let cwd = h.cwd();
         compile(
             &mut h.client,
-            h.session_id,
+            &h.session_id,
             &["-c", "deftog.cpp", "-o", "deftog.o", "-DFEATURE"],
             &cwd,
+            &compiler,
         )
         .await
     };

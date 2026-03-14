@@ -170,6 +170,12 @@ impl DepGraph {
                 changed_headers.push(header.clone());
             }
         }
+        // Also check force-included files (PCH, -include).
+        for fi in &entry.context.force_includes {
+            if !is_fresh(fi) {
+                changed_headers.push(fi.clone());
+            }
+        }
 
         if !changed_headers.is_empty() {
             self.misses.fetch_add(1, Ordering::Relaxed);
@@ -192,6 +198,15 @@ impl DepGraph {
         for header in &entry.resolved_includes {
             if let Some(h) = get_hash(header) {
                 file_hashes.push((header.clone(), h));
+            } else {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return CacheVerdict::Cold;
+            }
+        }
+        // Hash force-included files (PCH content must affect artifact key).
+        for fi in &entry.context.force_includes {
+            if let Some(h) = get_hash(fi) {
+                file_hashes.push((fi.clone(), h));
             } else {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 return CacheVerdict::Cold;
@@ -271,6 +286,12 @@ impl DepGraph {
                 changed_headers.push(header.clone());
             }
         }
+        // Also check force-included files (PCH, -include).
+        for fi in &entry.context.force_includes {
+            if !is_fresh(fi) {
+                changed_headers.push(fi.clone());
+            }
+        }
 
         if !changed_headers.is_empty() {
             self.misses.fetch_add(1, Ordering::Relaxed);
@@ -311,6 +332,18 @@ impl DepGraph {
                 return (
                     CacheVerdict::Cold,
                     format!("header hash missing: {}", header.display()),
+                );
+            }
+        }
+        // Hash force-included files (PCH content must affect artifact key).
+        for fi in &entry.context.force_includes {
+            if let Some(h) = get_hash(fi) {
+                file_hashes.push((fi.clone(), h));
+            } else {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return (
+                    CacheVerdict::Cold,
+                    format!("force-include hash missing: {}", fi.display()),
                 );
             }
         }
@@ -372,6 +405,12 @@ impl DepGraph {
         for header in &entry.resolved_includes {
             if let Some(h) = get_hash(header) {
                 file_hashes.push((header.clone(), h));
+            }
+        }
+        // Hash force-included files (PCH content must affect artifact key).
+        for fi in &entry.context.force_includes {
+            if let Some(h) = get_hash(fi) {
+                file_hashes.push((fi.clone(), h));
             }
         }
 

@@ -35,6 +35,10 @@ pub enum SettledEvent {
 #[derive(Debug)]
 pub struct SettleBuffer {
     settle_window: Duration,
+    /// Maximum time from the first event before forcing batch emission,
+    /// even if events are still arriving. Prevents starvation when
+    /// the daemon writes to watched directories (logs, artifacts).
+    max_wait: Duration,
 }
 
 /// Tracks the most recent change kind for a path during coalescing.
@@ -45,10 +49,13 @@ enum ChangeKind {
 }
 
 impl SettleBuffer {
-    /// Create a settle buffer with the given settle window.
+    /// Create a settle buffer with the given settle window and max wait.
     #[must_use]
     pub fn new(settle_window: Duration) -> Self {
-        Self { settle_window }
+        Self {
+            settle_window,
+            max_wait: Duration::from_millis(50),
+        }
     }
 
     /// Create a settle buffer with the default 50ms settle window.
@@ -97,9 +104,21 @@ impl SettleBuffer {
 
             Self::apply_event(&mut pending, event);
 
-            // Coalesce: keep reading until the settle window elapses with no new events.
+            // Coalesce: keep reading until either (a) the settle window elapses
+            // with no new events, or (b) max_wait from the first event is reached.
+            // Without (b), continuous writes (e.g. session log) starve the buffer.
+            let deadline = tokio::time::Instant::now() + self.max_wait;
             loop {
-                match tokio::time::timeout(self.settle_window, rx.recv()).await {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let wait = self.settle_window.min(remaining);
+                if wait.is_zero() {
+                    // Max wait reached — force emit.
+                    if !pending.is_empty() {
+                        let _ = tx.send(Self::drain(&mut pending));
+                    }
+                    break;
+                }
+                match tokio::time::timeout(wait, rx.recv()).await {
                     Ok(Some(WatchEvent::Overflow | WatchEvent::Error(_))) => {
                         pending.clear();
                         let _ = tx.send(SettledEvent::Overflow);

@@ -19,35 +19,35 @@ const HEADER_COUNT: usize = 10;
 
 // ─── Daemon helpers ──────────────────────────────────────────────────────────
 
-async fn start_session(client: &mut ClientConn, clang: &std::path::Path, cwd: &str) -> u64 {
+async fn start_session(client: &mut ClientConn, _clang: &std::path::Path, cwd: &str) -> String {
     client
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: cwd.to_string(),
-            compiler: clang.to_string_lossy().into_owned(),
             log_file: None,
             track_stats: true,
         })
         .await
         .unwrap();
     match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id, .. }) => session_id,
+        Some(Response::SessionStarted { session_id }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
     }
 }
 
 async fn compile(
     client: &mut ClientConn,
-    session_id: u64,
+    session_id: &str,
+    compiler: &str,
     args: &[&str],
     cwd: &str,
 ) -> (i32, bool) {
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_string(),
-            compiler: None,
+            compiler: compiler.to_string(),
             env: None,
         })
         .await
@@ -240,6 +240,7 @@ async fn profile_compile_phases() {
 
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
     let sid = start_session(&mut client, &clang, &cwd).await;
+    let compiler = clang.to_string_lossy().into_owned();
 
     // ── Cold pass (cache miss) ───────────────────────────────────────
     println!("\n  [1/2] Cold pass ({FILE_COUNT} files)...");
@@ -247,7 +248,14 @@ async fn profile_compile_phases() {
     for i in 0..FILE_COUNT {
         let src = format!("src_{i}.cpp");
         let obj = format!("src_{i}.o");
-        let (exit_code, cached) = compile(&mut client, sid, &["-c", &src, "-o", &obj], &cwd).await;
+        let (exit_code, cached) = compile(
+            &mut client,
+            &sid,
+            &compiler,
+            &["-c", &src, "-o", &obj],
+            &cwd,
+        )
+        .await;
         assert_eq!(exit_code, 0, "cold compile failed for {src}");
         assert!(!cached, "cold compile should be a miss");
     }
@@ -267,8 +275,14 @@ async fn profile_compile_phases() {
             let src = format!("src_{i}.cpp");
             let obj = format!("src_{i}.o");
             let _ = std::fs::remove_file(tmp.path().join(&obj));
-            let (exit_code, cached) =
-                compile(&mut client, sid, &["-c", &src, "-o", &obj], &cwd).await;
+            let (exit_code, cached) = compile(
+                &mut client,
+                &sid,
+                &compiler,
+                &["-c", &src, "-o", &obj],
+                &cwd,
+            )
+            .await;
             assert_eq!(exit_code, 0, "warm compile failed for {src}");
             assert!(cached, "warm compile should be a hit");
         }
@@ -292,7 +306,9 @@ async fn profile_compile_phases() {
 
     // End session to get stats
     client
-        .send(&Request::SessionEnd { session_id: sid })
+        .send(&Request::SessionEnd {
+            session_id: sid.clone(),
+        })
         .await
         .unwrap();
     if let Some(Response::SessionEnded { stats: Some(s), .. }) = client.recv().await.unwrap() {
@@ -363,7 +379,14 @@ async fn profile_compile_phases() {
     for i in 0..FILE_COUNT {
         let src = format!("src_{i}.cpp");
         let obj = format!("src_{i}.o");
-        let (exit_code, _) = compile(&mut client2, sid2, &["-c", &src, "-o", &obj], &cwd2).await;
+        let (exit_code, _) = compile(
+            &mut client2,
+            &sid2,
+            &compiler,
+            &["-c", &src, "-o", &obj],
+            &cwd2,
+        )
+        .await;
         assert_eq!(exit_code, 0);
     }
 
@@ -373,8 +396,14 @@ async fn profile_compile_phases() {
             let src = format!("src_{i}.cpp");
             let obj = format!("src_{i}.o");
             let _ = std::fs::remove_file(tmp2.path().join(&obj));
-            let (exit_code, cached) =
-                compile(&mut client2, sid2, &["-c", &src, "-o", &obj], &cwd2).await;
+            let (exit_code, cached) = compile(
+                &mut client2,
+                &sid2,
+                &compiler,
+                &["-c", &src, "-o", &obj],
+                &cwd2,
+            )
+            .await;
             assert_eq!(exit_code, 0);
             assert!(cached);
         }

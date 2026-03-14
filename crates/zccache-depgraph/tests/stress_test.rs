@@ -395,8 +395,6 @@ End of search list.
     let session_id = mgr.create(SessionConfig {
         client_pid: std::process::id(),
         working_dir: root.to_path_buf(),
-        compiler: PathBuf::from("/usr/bin/g++"),
-        system_includes: sys_includes.clone(),
         log_file: None,
         track_stats: false,
     });
@@ -748,8 +746,6 @@ fn stress_concurrent_session_operations() {
                 let id = mgr.create(SessionConfig {
                     client_pid: (t * 1000 + i) as u32,
                     working_dir: PathBuf::from(format!("/project/{t}")),
-                    compiler: PathBuf::from("/usr/bin/g++"),
-                    system_includes: vec![PathBuf::from("/usr/include")],
                     log_file: None,
                     track_stats: false,
                 });

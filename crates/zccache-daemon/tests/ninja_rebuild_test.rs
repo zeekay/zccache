@@ -145,6 +145,7 @@ async fn build_all_ipc(
 ) -> Vec<(String, i32, bool)> {
     let mut client = zccache_ipc::connect(endpoint).await.unwrap();
     let cwd = root.to_string_lossy().into_owned();
+    let compiler = clang.to_string_lossy().into_owned();
     let flags = TestProject::compiler_flags();
 
     // Start session
@@ -152,7 +153,6 @@ async fn build_all_ipc(
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: cwd.clone(),
-            compiler: clang.to_string_lossy().into_owned(),
             log_file: None,
             track_stats: true,
         })
@@ -160,7 +160,7 @@ async fn build_all_ipc(
         .unwrap();
 
     let session_id = match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id, .. }) => session_id,
+        Some(Response::SessionStarted { session_id }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
     };
 
@@ -174,10 +174,10 @@ async fn build_all_ipc(
 
         client
             .send(&Request::Compile {
-                session_id,
+                session_id: session_id.clone(),
                 args,
                 cwd: cwd.clone(),
-                compiler: None,
+                compiler: compiler.clone(),
                 env: None,
             })
             .await
@@ -533,7 +533,6 @@ async fn ninja_concurrent_cold_build() {
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: root.to_string_lossy().into_owned(),
-            compiler: clang.to_string_lossy().into_owned(),
             log_file: None,
             track_stats: false,
         })
@@ -546,11 +545,14 @@ async fn ninja_concurrent_cold_build() {
     drop(client);
 
     // Spawn concurrent compile tasks
+    let compiler = clang.to_string_lossy().into_owned();
     let mut handles = Vec::new();
     for (src, obj) in units.clone() {
         let ep = endpoint.clone();
         let cwd = root.to_string_lossy().into_owned();
         let fl: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+        let comp = compiler.clone();
+        let sid = session_id.clone();
         handles.push(tokio::spawn(async move {
             let mut conn = zccache_ipc::connect(&ep).await.unwrap();
             let mut args = fl;
@@ -559,10 +561,10 @@ async fn ninja_concurrent_cold_build() {
             args.push(obj.to_string_lossy().into_owned());
 
             conn.send(&Request::Compile {
-                session_id,
+                session_id: sid,
                 args,
                 cwd,
-                compiler: None,
+                compiler: comp,
                 env: None,
             })
             .await

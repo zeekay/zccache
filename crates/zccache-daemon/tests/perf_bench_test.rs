@@ -130,7 +130,7 @@ fn source_names() -> Vec<String> {
 
 async fn zccache_compile_single(
     client: &mut zccache_ipc::IpcClientConnection,
-    session_id: u64,
+    session_id: &str,
     compiler: &str,
     cwd: &str,
     sources: &[String],
@@ -140,7 +140,7 @@ async fn zccache_compile_single(
     for src in sources {
         client
             .send(&Request::Compile {
-                session_id,
+                session_id: session_id.to_string(),
                 args: vec![
                     "-c".into(),
                     src.clone(),
@@ -151,7 +151,7 @@ async fn zccache_compile_single(
                     "-std=c++17".into(),
                 ],
                 cwd: cwd.into(),
-                compiler: Some(compiler.into()),
+                compiler: compiler.to_string(),
                 env: None,
             })
             .await
@@ -168,7 +168,7 @@ async fn zccache_compile_single(
 
 async fn zccache_compile_multi(
     client: &mut zccache_ipc::IpcClientConnection,
-    session_id: u64,
+    session_id: &str,
     compiler: &str,
     cwd: &str,
     sources: &[String],
@@ -181,10 +181,10 @@ async fn zccache_compile_multi(
     let start = Instant::now();
     client
         .send(&Request::Compile {
-            session_id,
+            session_id: session_id.to_string(),
             args,
             cwd: cwd.into(),
-            compiler: Some(compiler.into()),
+            compiler: compiler.to_string(),
             env: None,
         })
         .await
@@ -510,7 +510,6 @@ async fn perf_warm_cache_zccache_vs_sccache() {
         .send(&Request::SessionStart {
             client_pid: std::process::id(),
             working_dir: zc_cwd.clone(),
-            compiler: compiler.clone(),
             log_file: None,
             track_stats: true,
         })
@@ -526,14 +525,14 @@ async fn perf_warm_cache_zccache_vs_sccache() {
     warmup_compiler(&compiler, zc_dir.path());
     eprint!("  Cold single-file...");
     let zc_cold_single =
-        zccache_compile_single(&mut client, session_id, &compiler, &zc_cwd, &sources).await;
+        zccache_compile_single(&mut client, &session_id, &compiler, &zc_cwd, &sources).await;
     eprintln!(" {}", fmt_dur(zc_cold_single));
 
     // Warm trials: single-file (cache populated from cold pass)
     let mut zc_single_times = Vec::with_capacity(WARM_TRIALS);
     for _ in 0..WARM_TRIALS {
         zc_single_times.push(
-            zccache_compile_single(&mut client, session_id, &compiler, &zc_cwd, &sources).await,
+            zccache_compile_single(&mut client, &session_id, &compiler, &zc_cwd, &sources).await,
         );
     }
     print_trials("zccache single-file (warm)", &zc_single_times);
@@ -546,21 +545,23 @@ async fn perf_warm_cache_zccache_vs_sccache() {
 
     eprint!("  Cold multi-file...");
     let zc_cold_multi =
-        zccache_compile_multi(&mut client, session_id, &compiler, &zc_cwd, &sources).await;
+        zccache_compile_multi(&mut client, &session_id, &compiler, &zc_cwd, &sources).await;
     eprintln!(" {}", fmt_dur(zc_cold_multi));
 
     // Warm trials: multi-file
     let mut zc_multi_times = Vec::with_capacity(WARM_TRIALS);
     for _ in 0..WARM_TRIALS {
         zc_multi_times.push(
-            zccache_compile_multi(&mut client, session_id, &compiler, &zc_cwd, &sources).await,
+            zccache_compile_multi(&mut client, &session_id, &compiler, &zc_cwd, &sources).await,
         );
     }
     print_trials("zccache multi-file (warm)", &zc_multi_times);
 
     // End session
     client
-        .send(&Request::SessionEnd { session_id })
+        .send(&Request::SessionEnd {
+            session_id: session_id.clone(),
+        })
         .await
         .unwrap();
     let _ = client.recv::<Response>().await;

@@ -292,14 +292,32 @@ fn split_and_unescape(deps: &str) -> Vec<String> {
 
 /// Canonicalize a path, falling back to the joined path if canonicalization
 /// fails (e.g., the file does not exist on disk).
+///
+/// On Windows, `std::fs::canonicalize` produces `\\?\` extended-length paths.
+/// These must be stripped so paths match the format used by the file watcher
+/// (which also strips `\\?\`), ensuring journal/metadata lookups work correctly.
 fn canonicalize_path(path: &Path, cwd: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| {
         if path.is_absolute() {
             path.to_path_buf()
         } else {
             cwd.join(path)
         }
-    })
+    });
+    strip_win_prefix(canonical)
+}
+
+/// Strip the `\\?\` extended-length prefix on Windows.
+/// No-op on other platforms.
+fn strip_win_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    path
 }
 
 #[cfg(test)]
@@ -317,9 +335,9 @@ mod tests {
         p
     }
 
-    /// Helper: canonicalize a path (or return it unchanged).
+    /// Helper: canonicalize a path (or return it unchanged), stripping \\?\ on Windows.
     fn canon(p: &Path) -> PathBuf {
-        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+        strip_win_prefix(std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
     }
 
     // ── 1. parse_single_line ─────────────────────────────────────────
