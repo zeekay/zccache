@@ -50,9 +50,6 @@ enum Commands {
         /// IPC endpoint (default: platform-specific).
         #[arg(long)]
         endpoint: Option<String>,
-        /// PID to monitor for session auto-cleanup (default: parent process).
-        #[arg(long)]
-        pid: Option<u32>,
     },
     /// End a build session.
     #[command(name = "session-end")]
@@ -80,15 +77,6 @@ enum Commands {
         #[arg(long)]
         clear: bool,
     },
-    /// Show the daemon event log.
-    Log {
-        /// Number of lines to show (default: 50, 0 = all).
-        #[arg(long, short = 'n', default_value = "50")]
-        lines: usize,
-        /// Show log file path only.
-        #[arg(long)]
-        path: bool,
-    },
 }
 
 /// Known subcommand names for auto-detect.
@@ -102,7 +90,6 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "session-start",
     "session-end",
     "crashes",
-    "log",
     "help",
     "--help",
     "-h",
@@ -145,7 +132,6 @@ fn main() -> ExitCode {
             cwd,
             log,
             endpoint,
-            pid,
         } => {
             let endpoint = resolve_endpoint(endpoint.as_deref());
             let compiler = zccache_core::path::normalize_msys_path(&compiler);
@@ -155,13 +141,11 @@ fn main() -> ExitCode {
                     .to_string_lossy()
                     .into_owned()
             });
-            let client_pid = pid.unwrap_or_else(parent_pid);
             run_async(cmd_session_start(
                 &endpoint,
                 &compiler,
                 &cwd,
                 log.as_deref(),
-                client_pid,
             ))
         }
         Commands::SessionEnd {
@@ -177,7 +161,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         Commands::Crashes { clear } => cmd_crashes(clear),
-        Commands::Log { lines, path } => cmd_log(lines, path),
     }
 }
 
@@ -340,7 +323,6 @@ async fn cmd_session_start(
     compiler: &str,
     cwd: &str,
     log: Option<&str>,
-    client_pid: u32,
 ) -> ExitCode {
     if let Err(e) = ensure_daemon(endpoint).await {
         eprintln!("cannot start daemon at {endpoint}: {e}");
@@ -356,7 +338,7 @@ async fn cmd_session_start(
     };
 
     conn.send(&zccache_protocol::Request::SessionStart {
-        client_pid,
+        client_pid: std::process::id(),
         working_dir: cwd.to_string(),
         compiler: compiler.to_string(),
         log_file: log.map(String::from),
@@ -436,35 +418,6 @@ async fn cmd_session_end(endpoint: &str, session_id: u64) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-fn cmd_log(lines: usize, path_only: bool) -> ExitCode {
-    let log_path = zccache_core::config::log_dir().join("daemon.log");
-
-    if path_only {
-        println!("{}", log_path.display());
-        return ExitCode::SUCCESS;
-    }
-
-    let content = match std::fs::read_to_string(&log_path) {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("No daemon log found at {}", log_path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if lines == 0 {
-        print!("{content}");
-    } else {
-        let all_lines: Vec<&str> = content.lines().collect();
-        let start = all_lines.len().saturating_sub(lines);
-        for line in &all_lines[start..] {
-            println!("{line}");
-        }
-    }
-
-    ExitCode::SUCCESS
 }
 
 fn cmd_crashes(clear: bool) -> ExitCode {
@@ -560,8 +513,10 @@ fn run_wrap(args: &[String]) -> ExitCode {
     let client_env: Vec<(String, String)> = std::env::vars().collect();
     let endpoint = resolve_endpoint(None);
 
-    // Check if this is an archiver tool
-    if zccache_compiler::parse_archiver::is_archiver(&args[0]) {
+    // Check if this is an archiver or linker tool (including gcc -shared)
+    if zccache_compiler::parse_archiver::is_archiver(&args[0])
+        || zccache_compiler::parse_linker::is_link_invocation(&args[0], &tool_args)
+    {
         return run_async(cmd_link_ephemeral(
             &endpoint,
             &wrapped_tool,
@@ -1053,78 +1008,6 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
-}
-
-/// Get the parent process PID. Used as the default `client_pid` for sessions,
-/// so the daemon tracks the long-lived parent (shell/Python script) rather than
-/// the short-lived `zccache session-start` CLI process.
-fn parent_pid() -> u32 {
-    #[cfg(unix)]
-    {
-        std::os::unix::process::parent_id()
-    }
-    #[cfg(windows)]
-    {
-        get_parent_pid_windows()
-    }
-}
-
-/// Windows: get parent PID via CreateToolhelp32Snapshot + Process32First/Next.
-#[cfg(windows)]
-fn get_parent_pid_windows() -> u32 {
-    use std::mem;
-
-    #[repr(C)]
-    struct ProcessEntry32 {
-        dw_size: u32,
-        cnt_usage: u32,
-        th32_process_id: u32,
-        th32_default_heap_id: usize,
-        th32_module_id: u32,
-        cnt_threads: u32,
-        th32_parent_process_id: u32,
-        pc_pri_class_base: i32,
-        dw_flags: u32,
-        sz_exe_file: [u8; 260],
-    }
-
-    extern "system" {
-        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> isize;
-        fn Process32First(snapshot: isize, entry: *mut ProcessEntry32) -> i32;
-        fn Process32Next(snapshot: isize, entry: *mut ProcessEntry32) -> i32;
-        fn CloseHandle(handle: isize) -> i32;
-    }
-
-    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
-    const INVALID_HANDLE_VALUE: isize = -1;
-
-    let my_pid = std::process::id();
-
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            return my_pid; // fallback to own PID
-        }
-
-        let mut entry: ProcessEntry32 = mem::zeroed();
-        entry.dw_size = mem::size_of::<ProcessEntry32>() as u32;
-
-        if Process32First(snapshot, &mut entry) != 0 {
-            loop {
-                if entry.th32_process_id == my_pid {
-                    let ppid = entry.th32_parent_process_id;
-                    CloseHandle(snapshot);
-                    return ppid;
-                }
-                if Process32Next(snapshot, &mut entry) == 0 {
-                    break;
-                }
-            }
-        }
-
-        CloseHandle(snapshot);
-        my_pid // fallback to own PID
     }
 }
 

@@ -6,6 +6,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 pub mod parse_archiver;
+pub mod parse_linker;
 pub mod response_file;
 
 use std::path::PathBuf;

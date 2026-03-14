@@ -276,25 +276,22 @@ async fn test_ar_non_deterministic_warning() {
             ..
         }) => {
             assert_eq!(exit_code, 0, "ar should succeed even without D flag");
-            assert!(!cached, "non-deterministic invocation should not be cached");
+            assert!(!cached, "first invocation should be a cache miss");
             assert!(
                 warning.is_some(),
                 "should warn about non-deterministic invocation"
             );
             let w = warning.unwrap();
             assert!(
-                w.contains("non-deterministic") || w.contains("D flag"),
+                w.contains("non-deterministic"),
                 "warning should mention non-determinism: {w}"
             );
         }
         other => panic!("expected LinkResult, got: {other:?}"),
     }
 
-    // The archive should still be produced (passthrough succeeded)
-    assert!(
-        output_lib.exists(),
-        "ar should produce output even without caching"
-    );
+    // The archive should still be produced
+    assert!(output_lib.exists(), "ar should produce output");
 
     shutdown.notify_one();
     server_handle.await.unwrap();

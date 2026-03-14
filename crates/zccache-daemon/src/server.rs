@@ -16,7 +16,6 @@ use zccache_ipc::{IpcConnection, IpcListener};
 use zccache_protocol::{ArtifactData, ArtifactOutput, Request, Response};
 use zccache_watcher::{NotifyWatcher, SettleBuffer, SettledEvent};
 
-use crate::event_log::{CompileEvent, CompileOutcome, EventLogger};
 use crate::stats::{HitPhases, MissPhases, PhaseProfiler, StatsCollector};
 
 /// Cached result of a verified cache hit, enabling zero-hash fast path.
@@ -80,8 +79,6 @@ struct SharedState {
     /// Whether the file watcher is active. Fast-hit cache is only used when
     /// the watcher is running, since we rely on it for change detection.
     watcher_active: AtomicBool,
-    /// Event logger — writes to daemon.log via lock-free channel + background thread.
-    event_logger: EventLogger,
 }
 
 /// The daemon server that listens for IPC connections.
@@ -165,11 +162,6 @@ impl DaemonServer {
                 },
                 fast_hit_cache: DashMap::new(),
                 watcher_active: AtomicBool::new(false),
-                event_logger: EventLogger::new(
-                    zccache_core::config::log_dir(),
-                    10 * 1024 * 1024, // 10 MB
-                    5,
-                ),
             }),
         })
     }
@@ -192,7 +184,6 @@ impl DaemonServer {
     /// seconds with no client activity. Pass 0 to disable.
     pub async fn run(&mut self, idle_timeout_secs: u64) -> Result<(), zccache_ipc::IpcError> {
         tracing::info!("daemon server running");
-        self.state.event_logger.log_daemon_event("daemon started");
 
         self.start_watcher_pipeline().await;
 
@@ -214,33 +205,6 @@ impl DaemonServer {
             });
         }
 
-        // Session reaper: clean up sessions whose owner process has died
-        // and sessions that have been idle longer than the timeout.
-        {
-            let state = Arc::clone(&self.state);
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    let dead = state
-                        .sessions
-                        .cleanup_dead_pids(zccache_ipc::is_process_alive);
-                    for session in &dead {
-                        state.event_logger.log_daemon_event(&format!(
-                            "reaped dead session {} (pid {})",
-                            session.id, session.client_pid
-                        ));
-                    }
-                    let expired = state.sessions.cleanup_expired();
-                    for session in &expired {
-                        state.event_logger.log_daemon_event(&format!(
-                            "expired idle session {} (pid {})",
-                            session.id, session.client_pid
-                        ));
-                    }
-                }
-            });
-        }
-
         loop {
             tokio::select! {
                 result = self.listener.accept() => {
@@ -254,7 +218,6 @@ impl DaemonServer {
                 }
                 () = self.shutdown.notified() => {
                     tracing::info!("daemon server shutting down");
-                    self.state.event_logger.log_daemon_event("daemon shutting down");
                     // Drop the watcher to stop the OS thread and close channels.
                     // The settle buffer and consumer tasks will exit when their
                     // input channels close.
@@ -630,49 +593,74 @@ async fn handle_link_ephemeral(
     env: Option<Vec<(String, String)>>,
 ) -> Response {
     use zccache_compiler::parse_archiver::{parse_archive_invocation, ParsedArchiveInvocation};
+    use zccache_compiler::parse_linker::{parse_linker_invocation, ParsedLinkerInvocation};
 
     state.stats.record_link();
 
-    // 1. Parse the archiver invocation
-    let parsed = parse_archive_invocation(tool, args);
-    let archive = match parsed {
-        ParsedArchiveInvocation::Cacheable(c) => c,
-        ParsedArchiveInvocation::NonCacheable { reason } => {
-            tracing::debug!(%reason, "link non-cacheable, passing through");
-            state.stats.record_link_non_cacheable();
-            return run_tool_passthrough(tool, args, cwd, env).await;
+    // 1. Parse the tool invocation — try archiver first, then linker
+    struct ParsedTool {
+        input_files: Vec<std::path::PathBuf>,
+        output_file: std::path::PathBuf,
+        secondary_outputs: Vec<std::path::PathBuf>,
+        cache_relevant_flags: Vec<String>,
+        non_deterministic: bool,
+        non_determinism_hint: String,
+    }
+
+    let parsed_tool = match parse_archive_invocation(tool, args) {
+        ParsedArchiveInvocation::Cacheable(c) => ParsedTool {
+            non_determinism_hint: match c.family {
+                zccache_compiler::parse_archiver::ArchiverFamily::MsvcLib => "/BREPRO".to_string(),
+                _ => "D".to_string(),
+            },
+            input_files: c.input_files,
+            output_file: c.output_file,
+            secondary_outputs: Vec::new(),
+            cache_relevant_flags: c.cache_relevant_flags,
+            non_deterministic: c.non_deterministic,
+        },
+        ParsedArchiveInvocation::NonCacheable { reason: ar_reason } => {
+            // Try linker parser
+            match parse_linker_invocation(tool, args) {
+                ParsedLinkerInvocation::Cacheable(c) => ParsedTool {
+                    non_determinism_hint: match c.family {
+                        zccache_compiler::parse_linker::LinkerFamily::MsvcLink => {
+                            "/DETERMINISTIC".to_string()
+                        }
+                        _ => "--build-id=sha1 (avoid --build-id=uuid)".to_string(),
+                    },
+                    input_files: c.input_files,
+                    output_file: c.output_file,
+                    secondary_outputs: c.secondary_outputs,
+                    cache_relevant_flags: c.cache_relevant_flags,
+                    non_deterministic: c.non_deterministic,
+                },
+                ParsedLinkerInvocation::NonCacheable {
+                    reason: link_reason,
+                } => {
+                    tracing::debug!(
+                        ar_reason = %ar_reason,
+                        link_reason = %link_reason,
+                        "link non-cacheable, passing through"
+                    );
+                    state.stats.record_link_non_cacheable();
+                    return run_tool_passthrough(tool, args, cwd, env).await;
+                }
+            }
         }
     };
 
-    // 2. Non-determinism check: warn and pass through
-    if archive.non_deterministic {
-        let warning = format!(
-            "non-deterministic archiver invocation (missing {} flag) — skipping cache",
-            match archive.family {
-                zccache_compiler::parse_archiver::ArchiverFamily::MsvcLib => "/BREPRO",
-                _ => "D",
-            }
+    // 2. Non-determinism check: warn but still cache
+    let nd_warning = if parsed_tool.non_deterministic {
+        let w = format!(
+            "non-deterministic invocation (missing {} flag) — output is cached but may differ from a fresh link",
+            parsed_tool.non_determinism_hint
         );
-        tracing::warn!(%warning);
-        state.stats.record_link_non_cacheable();
-        let result = run_tool_passthrough(tool, args, cwd, env).await;
-        return match result {
-            Response::LinkResult {
-                exit_code,
-                stdout,
-                stderr,
-                cached,
-                ..
-            } => Response::LinkResult {
-                exit_code,
-                stdout,
-                stderr,
-                cached,
-                warning: Some(warning),
-            },
-            other => other,
-        };
-    }
+        tracing::warn!(%w);
+        Some(w)
+    } else {
+        None
+    };
 
     // 3. Hash the tool binary
     let tool_path = std::path::Path::new(tool);
@@ -688,11 +676,11 @@ async fn handle_link_ephemeral(
     let cwd_path = std::path::Path::new(cwd);
     let mut key_builder = zccache_hash::link_cache_key::LinkCacheKeyBuilder::new().tool(tool_hash);
 
-    for flag in &archive.cache_relevant_flags {
+    for flag in &parsed_tool.cache_relevant_flags {
         key_builder = key_builder.flag(flag);
     }
 
-    for input in &archive.input_files {
+    for input in &parsed_tool.input_files {
         let input_path = if input.is_absolute() {
             input.clone()
         } else {
@@ -720,10 +708,10 @@ async fn handle_link_ephemeral(
         state.stats.record_link_hit();
 
         // Write cached output to disk
-        let output_path = if archive.output_file.is_absolute() {
-            archive.output_file.clone()
+        let output_path = if parsed_tool.output_file.is_absolute() {
+            parsed_tool.output_file.clone()
         } else {
-            cwd_path.join(&archive.output_file)
+            cwd_path.join(&parsed_tool.output_file)
         };
         for out in &entry.artifact.outputs {
             let target = if entry.artifact.outputs.len() == 1 {
@@ -745,7 +733,7 @@ async fn handle_link_ephemeral(
             stdout: entry.artifact.stdout.clone(),
             stderr: entry.artifact.stderr.clone(),
             cached: true,
-            warning: None,
+            warning: nd_warning,
         };
     }
 
@@ -763,22 +751,45 @@ async fn handle_link_ephemeral(
         ..
     } = result
     {
-        let output_path = if archive.output_file.is_absolute() {
-            archive.output_file.clone()
+        let output_path = if parsed_tool.output_file.is_absolute() {
+            parsed_tool.output_file.clone()
         } else {
-            cwd_path.join(&archive.output_file)
+            cwd_path.join(&parsed_tool.output_file)
         };
         if let Ok(data) = std::fs::read(&output_path) {
+            let mut outputs = vec![ArtifactOutput {
+                name: parsed_tool
+                    .output_file
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                data,
+            }];
+
+            // Collect secondary outputs (e.g., MSVC import lib + .exp)
+            for secondary in &parsed_tool.secondary_outputs {
+                let sec_path = if secondary.is_absolute() {
+                    secondary.clone()
+                } else {
+                    cwd_path.join(secondary)
+                };
+                if let Ok(sec_data) = std::fs::read(&sec_path) {
+                    outputs.push(ArtifactOutput {
+                        name: secondary
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                        data: sec_data,
+                    });
+                }
+                // Missing secondary outputs are silently skipped —
+                // e.g., .exp may not always be generated.
+            }
+
             let artifact = ArtifactData {
-                outputs: vec![ArtifactOutput {
-                    name: archive
-                        .output_file
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                    data,
-                }],
+                outputs,
                 stdout: stdout.clone(),
                 stderr: stderr.clone(),
                 exit_code: 0,
@@ -797,7 +808,25 @@ async fn handle_link_ephemeral(
         }
     }
 
-    result
+    match (result, nd_warning) {
+        (
+            Response::LinkResult {
+                exit_code,
+                stdout,
+                stderr,
+                cached,
+                ..
+            },
+            warning @ Some(_),
+        ) => Response::LinkResult {
+            exit_code,
+            stdout,
+            stderr,
+            cached,
+            warning,
+        },
+        (result, _) => result,
+    }
 }
 
 /// Hash a file using the metadata cache (with watcher-assisted confidence).
@@ -921,6 +950,22 @@ fn record_session_stat(
     });
 }
 
+/// Write a log line to the session's log file (if configured).
+fn write_session_log(sessions: &SessionManager, session_id: &SessionId, message: &str) {
+    if let Some(session) = sessions.get(session_id) {
+        if let Some(ref log_path) = session.log_file {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+            {
+                let _ = writeln!(f, "{message}");
+            }
+        }
+    }
+}
+
 /// Hash a file using the CacheSystem's metadata cache.
 ///
 /// This stat-verifies the file, hashes if needed (with TOCTOU protection),
@@ -1023,17 +1068,9 @@ async fn handle_compile(
         zccache_compiler::ParsedInvocation::NonCacheable { reason } => {
             state.stats.record_non_cacheable();
             record_session_stat(&state.sessions, &sid, |t| t.record_non_cacheable());
-            return run_compiler_direct(
-                state,
-                &compiler,
-                args,
-                cwd,
-                &sid,
-                &client_env,
-                compile_start,
-                Some(&reason),
-            )
-            .await;
+            write_session_log(&state.sessions, &sid, &format!("non-cacheable: {reason}"));
+            return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid, &client_env)
+                .await;
         }
         zccache_compiler::ParsedInvocation::MultiFile {
             compilations,
@@ -1117,18 +1154,14 @@ async fn handle_compile(
                     record_session_stat(&state.sessions, &sid, move |t| {
                         t.record_hit(src, latency_us, artifact_bytes);
                     });
-                    state.event_logger.log_event(
+                    write_session_log(
                         &state.sessions,
-                        &CompileEvent {
-                            session_id: Some(session_id),
-                            compiler: compiler.to_str().unwrap_or(""),
-                            args,
-                            cwd,
-                            exit_code: cached.artifact.exit_code,
-                            outcome: CompileOutcome::HitFast,
-                            latency: compile_start.elapsed(),
-                            reason: None,
-                        },
+                        &sid,
+                        &format!(
+                            "[HIT_FAST] {} -> {}",
+                            source_path.display(),
+                            output_path.display()
+                        ),
                     );
                     let bookkeeping_us = t7.elapsed().as_micros() as u64;
 
@@ -1166,22 +1199,13 @@ async fn handle_compile(
             hash_map.insert(source_path.clone(), h);
         }
         Err(e) => {
-            state.event_logger.log_diagnostic(
+            write_session_log(
                 &state.sessions,
                 &sid,
-                &format!("cache_key_error: {e}, falling back to direct compile"),
+                &format!("cache key error: {e}, falling back to direct compile"),
             );
-            return run_compiler_direct(
-                state,
-                &compiler,
-                args,
-                cwd,
-                &sid,
-                &client_env,
-                compile_start,
-                Some("cache-key-error"),
-            )
-            .await;
+            return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid, &client_env)
+                .await;
         }
     }
     let hash_source_us = t2.elapsed().as_micros() as u64;
@@ -1195,10 +1219,10 @@ async fn handle_compile(
                     hash_map.insert(header.clone(), h);
                 }
                 Err(e) => {
-                    state.event_logger.log_diagnostic(
+                    write_session_log(
                         &state.sessions,
                         &sid,
-                        &format!("header_hash_fail: {} error={e}", header.display()),
+                        &format!("[DIAG] header_hash_fail: {} error={e}", header.display()),
                     );
                 }
             }
@@ -1216,11 +1240,11 @@ async fn handle_compile(
             .check_diagnostic(&context_key, is_fresh, get_hash)
     };
     let depgraph_check_us = t4.elapsed().as_micros() as u64;
-    state.event_logger.log_diagnostic(
+    write_session_log(
         &state.sessions,
         &sid,
         &format!(
-            "depgraph_check: {} -> {} verdict={} reason={}",
+            "[DIAG] depgraph_check: {} -> {} verdict={} reason={}",
             source_path.display(),
             output_path.display(),
             match &verdict {
@@ -1277,18 +1301,14 @@ async fn handle_compile(
                 record_session_stat(&state.sessions, &sid, move |t| {
                     t.record_hit(src, latency_us, artifact_bytes);
                 });
-                state.event_logger.log_event(
+                write_session_log(
                     &state.sessions,
-                    &CompileEvent {
-                        session_id: Some(session_id),
-                        compiler: compiler.to_str().unwrap_or(""),
-                        args,
-                        cwd,
-                        exit_code: cached.artifact.exit_code,
-                        outcome: CompileOutcome::Hit,
-                        latency: compile_start.elapsed(),
-                        reason: None,
-                    },
+                    &sid,
+                    &format!(
+                        "[HIT] {} -> {}",
+                        source_path.display(),
+                        output_path.display()
+                    ),
                 );
                 let bookkeeping_us = t7.elapsed().as_micros() as u64;
 
@@ -1325,10 +1345,10 @@ async fn handle_compile(
                 };
             }
             // Artifact key computed but no artifact stored yet — fall through to compile
-            state.event_logger.log_diagnostic(
+            write_session_log(
                 &state.sessions,
                 &sid,
-                &format!("artifact_not_found: key={artifact_key_hex}"),
+                &format!("[DIAG] artifact_not_found: key={artifact_key_hex}"),
             );
         }
         zccache_depgraph::CacheVerdict::Cold
@@ -1342,18 +1362,14 @@ async fn handle_compile(
     state.fast_hit_cache.remove(&context_key);
 
     // Cache miss — run the compiler
-    state.event_logger.log_event(
+    write_session_log(
         &state.sessions,
-        &CompileEvent {
-            session_id: Some(session_id),
-            compiler: compiler.to_str().unwrap_or(""),
-            args,
-            cwd,
-            exit_code: 0,
-            outcome: CompileOutcome::Miss,
-            latency: compile_start.elapsed(),
-            reason: Some(&diag_reason),
-        },
+        &sid,
+        &format!(
+            "[MISS] {} -> {} (reason: {diag_reason})",
+            source_path.display(),
+            output_path.display()
+        ),
     );
 
     // ── Phase: compiler exec (with depfile injection) ────────────────
@@ -1423,10 +1439,13 @@ async fn handle_compile(
                     }
                     Err(e) => {
                         tracing::warn!("depfile parse failed, falling back to scanner: {e}");
-                        state.event_logger.log_diagnostic(
+                        write_session_log(
                             &state.sessions,
                             &sid,
-                            &format!("depfile_parse_fail: path={} error={e}", path.display()),
+                            &format!(
+                                "[DIAG] depfile_parse_fail: path={} error={e}",
+                                path.display()
+                            ),
                         );
                         if matches!(depfile_strategy, DepfileStrategy::Injected { .. }) {
                             let _ = std::fs::remove_file(path);
@@ -1481,11 +1500,11 @@ async fn handle_compile(
         let include_count = scan_result.resolved.len();
         if let Some(artifact_key) = state.dep_graph.update(&context_key, scan_result, get_hash) {
             let artifact_key_hex = artifact_key.hash().to_hex();
-            state.event_logger.log_diagnostic(
+            write_session_log(
                 &state.sessions,
                 &sid,
                 &format!(
-                    "update: {} artifact_key={} includes={include_count}",
+                    "[DIAG] update: {} artifact_key={} includes={include_count}",
                     source_path.display(),
                     &artifact_key_hex[..8],
                 ),
@@ -1776,7 +1795,7 @@ async fn handle_compile_multi(
                 });
             }
             UnitCacheResult::Miss { source_path, .. } => {
-                state.event_logger.log_diagnostic(
+                write_session_log(
                     &state.sessions,
                     &sid,
                     &format!("multi-file cache miss: {}", source_path.display()),
@@ -1822,7 +1841,7 @@ async fn handle_compile_multi(
         };
     }
 
-    state.event_logger.log_diagnostic(
+    write_session_log(
         &state.sessions,
         &sid,
         &format!(
@@ -2014,16 +2033,13 @@ async fn handle_compile_multi(
 }
 
 /// Run the compiler directly without caching.
-#[allow(clippy::too_many_arguments)]
 async fn run_compiler_direct(
-    state: &SharedState,
     compiler: &PathBuf,
     args: &[String],
     cwd: &str,
+    sessions: &SessionManager,
     sid: &SessionId,
     client_env: &Option<Vec<(String, String)>>,
-    compile_start: std::time::Instant,
-    reason: Option<&str>,
 ) -> Response {
     let mut cmd = tokio::process::Command::new(compiler);
     cmd.args(args).current_dir(cwd);
@@ -2033,19 +2049,7 @@ async fn run_compiler_direct(
     match result {
         Ok(output) => {
             let exit_code = output.status.code().unwrap_or(-1);
-            state.event_logger.log_event(
-                &state.sessions,
-                &CompileEvent {
-                    session_id: Some(sid.value()),
-                    compiler: compiler.to_str().unwrap_or(""),
-                    args,
-                    cwd,
-                    exit_code,
-                    outcome: CompileOutcome::Direct,
-                    latency: compile_start.elapsed(),
-                    reason,
-                },
-            );
+            write_session_log(sessions, sid, &format!("[DIRECT] exit_code={exit_code}"));
             Response::CompileResult {
                 exit_code,
                 stdout: output.stdout,
