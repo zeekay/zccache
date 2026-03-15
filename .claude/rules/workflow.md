@@ -16,10 +16,9 @@
 - Review lessons at session start
 
 ## Verification
-- Never mark a task complete without proving it works
-- Diff behavior between main and your changes when relevant
-- Ask yourself: "Would a staff engineer approve this?"
-- Run tests, check logs, demonstrate correctness
+- Speed above all. Ship fast, don't block on perfect correctness.
+- Capture failures in unit tests and fix them as they arise.
+- Diff behavior between main and your changes when relevant.
 
 ## Autonomous Bug Fixing
 - When given a bug report: just fix it. Don't ask for hand-holding.

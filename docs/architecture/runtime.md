@@ -80,7 +80,7 @@ When in doubt, zccache assumes the file has changed and re-verifies. Specific po
 
 | Failure | Impact | Mitigation |
 |---|---|---|
-| Watcher misses an event | Stale metadata at Medium | Stat verification on every cache key computation |
+| Watcher misses an event | Stale metadata at Medium | Stat verification on every cache key computation (stat guard in `lookup_since()` catches changes even without watcher) |
 | Watcher overflows | Many stale entries | Downgrade all to Low; stat-verify everything |
 | File replaced with same mtime/size | Incorrect cache hit | file_id (inode) detection; extremely rare in practice |
 | Compiler updated in-place | Incorrect cache hit | Compiler binary is in metadata cache; stat-verified on use |

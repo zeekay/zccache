@@ -155,6 +155,37 @@ impl MetadataCache {
             })
     }
 
+    /// Return a cached content hash only if `(mtime, size)` still match the
+    /// filesystem — one `stat()` syscall, zero hashing.
+    ///
+    /// This is the safety net for the journal fast path: even when the journal
+    /// reports no changes (watcher latency), a single stat catches files that
+    /// were modified underneath us.
+    ///
+    /// Returns `None` if the entry is missing, Low confidence, has no cached
+    /// hash, or the stat check fails / shows a mismatch.
+    #[must_use]
+    pub fn get_cached_hash_if_stat_valid(&self, path: &Path) -> Option<zccache_hash::ContentHash> {
+        let entry = self.entries.get(path)?;
+        match entry.confidence {
+            Confidence::High | Confidence::Medium => {}
+            Confidence::Low => return None,
+        }
+        let hash = entry
+            .content_hash
+            .map(zccache_hash::ContentHash::from_bytes)?;
+
+        // One stat syscall to verify mtime + size still match.
+        let fs_meta = std::fs::metadata(path).ok()?;
+        let mtime = fs_meta.modified().ok()?;
+        let size = fs_meta.len();
+        if entry.mtime == mtime && entry.size == size {
+            Some(hash)
+        } else {
+            None
+        }
+    }
+
     /// Trim entries whose `last_verified` is older than `max_age`.
     /// Returns the number of entries removed.
     pub fn trim(&self, max_age: Duration) -> usize {

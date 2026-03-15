@@ -87,5 +87,5 @@ Hooks are in `ci/hooks/` (Python) and `crates/zccache-ci` (Rust), invoked via `u
 
 - Simplicity first. Minimal code impact. No over-engineering.
 - No laziness. Root causes only. Senior developer standards.
-- Verify before done. Run tests, demonstrate correctness.
+- Speed above all. Ship fast, capture failures in unit tests, fix as they arise.
 - Plan non-trivial work in `tasks/todo.md`. Capture lessons in `tasks/lessons.md`.

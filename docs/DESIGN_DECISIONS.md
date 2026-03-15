@@ -62,21 +62,22 @@ This document records the key architectural and technical decisions for **zccach
 
 **Context:** File system watchers (`inotify`, `FSEvents`, `ReadDirectoryChangesW`) can miss events due to queue overflow, race conditions, or platform-specific quirks. Builds must never return stale artifacts because a watcher dropped an event.
 
-**Decision:** File watchers update a *confidence level* on cached metadata entries. All cache lookups perform a stat-verify before returning a hit. Watchers accelerate the common case (high confidence means we might skip some work) but are never the sole source of truth for file state.
+**Decision:** File watchers update a *confidence level* on cached metadata entries. All cache lookups perform at least a stat-verify (mtime + size check) before returning a hit. Watchers accelerate the common case (high confidence means we can skip content hashing) but are never the sole source of truth for file state.
 
 **Rationale:**
 - **Correctness over performance.** A wrong cache hit is catastrophic (silent miscompilation). A redundant `stat()` call is cheap (~1 microsecond on modern file systems).
-- Watchers are treated as an optimization hint: when the watcher reports no changes, confidence is high, and certain fast paths can be taken. But the stat check is always the final arbiter.
-- This design degrades gracefully: if the watcher crashes or overflows, the system becomes slightly slower (more stat calls) but never incorrect.
+- Watchers are treated as an optimization hint: when the watcher reports no changes, confidence is high, and content re-hashing can be skipped. But the stat check is always the final arbiter.
+- The daemon's ultra-fast path (`fast_hit_cache`) provides an additional layer: if the journal clock hasn't advanced since the last verified hit, all hash computation is skipped entirely. This is safe because the clock advances on every watcher event.
+- This design degrades gracefully: if the watcher crashes or overflows, the system becomes slightly slower (more re-hashes) but never incorrect.
 
 **Alternatives Considered:**
 | Approach | Why not |
 |----------|---------|
-| Trust watcher fully | Incorrect under overflow or missed events. Unacceptable for a compiler cache. |
-| Ignore watcher entirely | Slower: must stat every file on every lookup with no fast-path optimization. |
+| Trust watcher fully (zero syscalls) | Incorrect under overflow, delayed events, or watcher crashes. Unacceptable for a compiler cache. |
+| Ignore watcher entirely | Slower: must content-hash every file on every lookup with no fast-path optimization. |
 
 **Consequences:**
-- Every cache lookup includes at least one `stat()` call. This is acceptable given stat latency.
+- Every cache lookup on the slow path includes at least one `stat()` call per file. This is acceptable given stat latency (~1µs). The fast path skips content hashing when stat matches.
 - Watcher code can be simpler because it does not need to guarantee delivery.
 - The confidence-level design adds a small amount of complexity to the metadata cache.
 

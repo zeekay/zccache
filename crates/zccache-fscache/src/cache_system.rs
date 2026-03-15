@@ -62,9 +62,9 @@ impl CacheSystem {
 
     /// Clock-aware lookup. The critical fast path for concurrent clients.
     ///
-    /// If the journal says the file hasn't changed since `since_clock` AND
-    /// the cache has a usable hash at High/Medium confidence, returns the
-    /// hash immediately — **zero syscalls**.
+    /// When the journal says the file hasn't changed since `since_clock` AND
+    /// the cached `(mtime, size)` still match the filesystem, returns the
+    /// cached hash — **one stat syscall, zero hashing**.
     ///
     /// Otherwise falls through to the full stat-verify + hash path.
     ///
@@ -74,9 +74,11 @@ impl CacheSystem {
     pub fn lookup_since(&self, path: &Path, since_clock: Clock) -> Result<ClockLookup> {
         let clock = self.journal.current_clock();
 
-        // Fast path: journal says no changes AND we have a cached hash.
+        // Fast path: journal says no changes AND stat confirms mtime+size match.
+        // The stat guards against watcher latency: even if the watcher hasn't
+        // delivered the event yet, a changed mtime/size falls through to re-hash.
         if !self.journal.changed_since(path, since_clock) {
-            if let Some(hash) = self.metadata.get_cached_hash(path) {
+            if let Some(hash) = self.metadata.get_cached_hash_if_stat_valid(path) {
                 return Ok(ClockLookup { hash, clock });
             }
         }

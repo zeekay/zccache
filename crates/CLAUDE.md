@@ -33,7 +33,7 @@ zccache-test-support (test utilities) ──────────────
 
 ## Key Design Patterns
 
-**Correctness model (layered invalidation):** Watcher events set confidence to Medium, never High. All cache lookups stat-verify before returning a hit. Content hashing is ground truth. A wrong cache hit is catastrophic; an extra stat is cheap.
+**Correctness model (layered invalidation):** Watcher events set confidence to Medium, never High. `lookup_since()` has a fast path (one stat, zero hash) that checks `(mtime, size)` against the cached entry even when the journal says "no changes"; `metadata.lookup()` is the full stat-verify + hash fallback. Content hashing is ground truth. A wrong cache hit is catastrophic; an extra stat is cheap.
 
 **IPC:** Unix domain sockets on Linux/macOS, named pipes on Windows, behind a transport trait. Messages are length-prefixed bincode. Daemon is lazily started by CLI if not running.
 
