@@ -1,6 +1,9 @@
 //! Performance benchmark: warm-cache compilation latency.
 //!
-//! Compares single-file vs multi-file compilation modes on 50 translation units.
+//! Two benchmarks:
+//!   - `perf_warm_cache_zccache_vs_sccache`: single-file vs multi-file (inline args)
+//!   - `perf_response_file`: same workload but args passed via large nested response files
+//!
 //! Each tool gets its own fresh tempdir to avoid OS page cache cross-contamination.
 //!
 //! Run with: uv run cargo test -p zccache-daemon --test perf_bench_test -- --nocapture --ignored
@@ -41,6 +44,11 @@ fn find_sccache() -> Option<PathBuf> {
     }
     None
 }
+
+/// Number of synthetic `-D` defines in the large response file.
+const RSP_NUM_DEFINES: usize = 200;
+/// Number of synthetic `-I` include paths in the large response file.
+const RSP_NUM_INCLUDES: usize = 50;
 
 /// Generate NUM_FILES lightweight C++ source files with a shared header.
 fn generate_project(dir: &Path) {
@@ -111,6 +119,12 @@ fn nuke_and_regenerate(dir: &Path) {
         }
     }
     generate_project(dir);
+}
+
+/// Delete all files in dir and regenerate project + response files.
+fn nuke_and_regenerate_with_rsp(dir: &Path) {
+    nuke_and_regenerate(dir);
+    generate_response_files(dir);
 }
 
 fn clean_objects(dir: &Path) {
@@ -294,6 +308,221 @@ fn baseline_multi(compiler: &str, cwd: &Path, sources: &[String]) -> Duration {
     let start = Instant::now();
     let status = cmd.status().expect("failed to run compiler");
     assert!(status.success(), "multi-file compile failed");
+    start.elapsed()
+}
+
+// ── Response-file generation ─────────────────────────────────────────────
+
+/// Generate a large response file hierarchy that exercises the expansion path.
+///
+/// Layout:
+///   flags.rsp          — top-level: @warnings.rsp, @defines.rsp, -Iinclude, -O2, -std=c++17
+///   warnings.rsp       — ~30 warning flags
+///   defines.rsp        — RSP_NUM_DEFINES -D flags + RSP_NUM_INCLUDES -I flags
+///   sources_multi.rsp  — @flags.rsp + all source file names (for multi-file rsp mode)
+///
+/// The total expanded arg count is ~300+ flags per compilation, which is realistic
+/// for large build systems (CMake, Bazel) that pass everything via response files.
+fn generate_response_files(dir: &Path) {
+    // warnings.rsp — realistic warning flags
+    let warnings = [
+        "-Wall",
+        "-Wextra",
+        "-Wpedantic",
+        "-Wconversion",
+        "-Wshadow",
+        "-Wold-style-cast",
+        "-Wcast-align",
+        "-Wunused",
+        "-Woverloaded-virtual",
+        "-Wnon-virtual-dtor",
+        "-Wformat=2",
+        "-Wmisleading-indentation",
+        "-Wduplicated-cond",
+        "-Wduplicated-branches",
+        "-Wlogical-op",
+        "-Wnull-dereference",
+        "-Wuseless-cast",
+        "-Wdouble-promotion",
+        "-Wno-unused-parameter",
+        "-Wno-missing-field-initializers",
+        "-Werror=return-type",
+        "-Werror=implicit-fallthrough",
+        "-Wno-sign-conversion",
+        "-Wno-shorten-64-to-32",
+        "-Wno-c++98-compat",
+        "-Wno-c++98-compat-pedantic",
+        "-Wno-global-constructors",
+        "-Wno-exit-time-destructors",
+        "-Wno-padded",
+        "-Wno-weak-vtables",
+    ];
+    std::fs::write(dir.join("warnings.rsp"), warnings.join("\n")).unwrap();
+
+    // defines.rsp — many -D and -I flags to make it large
+    let mut defines_content = String::with_capacity(16 * 1024);
+    for i in 0..RSP_NUM_DEFINES {
+        defines_content.push_str(&format!("-DBENCH_DEFINE_{i:04}={i}\n"));
+    }
+    for i in 0..RSP_NUM_INCLUDES {
+        // Synthetic include paths (won't be used by compiler, but exercises arg parsing)
+        defines_content.push_str(&format!("-Isynthetic/include/path_{i:03}\n"));
+    }
+    std::fs::write(dir.join("defines.rsp"), &defines_content).unwrap();
+
+    // flags.rsp — top-level: nests warnings + defines, adds real compile flags
+    std::fs::write(
+        dir.join("flags.rsp"),
+        "@warnings.rsp\n@defines.rsp\n-Iinclude\n-O2\n-std=c++17\n",
+    )
+    .unwrap();
+
+    // sources_multi.rsp — all sources + flags (for multi-file rsp mode)
+    let mut multi_content = String::from("@flags.rsp\n-c\n");
+    for i in 0..NUM_FILES {
+        multi_content.push_str(&format!("unit_{i:03}.cpp\n"));
+    }
+    std::fs::write(dir.join("sources_multi.rsp"), &multi_content).unwrap();
+}
+
+// ── Response-file benchmarks: baseline ──────────────────────────────────
+
+fn baseline_single_rsp(compiler: &str, cwd: &Path, sources: &[String]) -> Duration {
+    clean_objects(cwd);
+    let start = Instant::now();
+    for src in sources {
+        let status = std::process::Command::new(compiler)
+            .args(["-c", src, "-o", &src.replace(".cpp", ".o"), "@flags.rsp"])
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("failed to run compiler with rsp");
+        assert!(status.success(), "rsp compile failed for {src}");
+    }
+    start.elapsed()
+}
+
+fn baseline_multi_rsp(compiler: &str, cwd: &Path) -> Duration {
+    clean_objects(cwd);
+    let start = Instant::now();
+    let status = std::process::Command::new(compiler)
+        .arg("@sources_multi.rsp")
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to run compiler with multi rsp");
+    assert!(status.success(), "multi-file rsp compile failed");
+    start.elapsed()
+}
+
+// ── Response-file benchmarks: sccache ───────────────────────────────────
+
+fn sccache_compile_single_rsp(
+    sccache: &Path,
+    compiler: &str,
+    cwd: &Path,
+    sources: &[String],
+) -> Duration {
+    clean_objects(cwd);
+    let start = Instant::now();
+    for src in sources {
+        let status = std::process::Command::new(sccache)
+            .args([
+                compiler,
+                "-c",
+                src,
+                "-o",
+                &src.replace(".cpp", ".o"),
+                "@flags.rsp",
+            ])
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("failed to run sccache with rsp");
+        assert!(status.success(), "sccache rsp compile failed for {src}");
+    }
+    start.elapsed()
+}
+
+fn sccache_compile_multi_rsp(sccache: &Path, compiler: &str, cwd: &Path) -> Duration {
+    clean_objects(cwd);
+    let mut cmd = std::process::Command::new(sccache);
+    cmd.arg(compiler).arg("@sources_multi.rsp");
+    cmd.current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    let start = Instant::now();
+    let status = cmd.status().expect("failed to run sccache with multi rsp");
+    assert!(status.success(), "sccache multi-file rsp compile failed");
+    start.elapsed()
+}
+
+// ── Response-file benchmarks: zccache ───────────────────────────────────
+
+async fn zccache_compile_single_rsp(
+    client: &mut zccache_ipc::IpcClientConnection,
+    session_id: &str,
+    compiler: &str,
+    cwd: &str,
+    sources: &[String],
+) -> Duration {
+    clean_objects(Path::new(cwd));
+    let start = Instant::now();
+    for src in sources {
+        client
+            .send(&Request::Compile {
+                session_id: session_id.to_string(),
+                args: vec![
+                    "-c".into(),
+                    src.clone(),
+                    "-o".into(),
+                    src.replace(".cpp", ".o"),
+                    "@flags.rsp".into(),
+                ],
+                cwd: cwd.into(),
+                compiler: compiler.to_string().into(),
+                env: None,
+            })
+            .await
+            .unwrap();
+        match client.recv().await.unwrap() {
+            Some(Response::CompileResult { exit_code, .. }) => {
+                assert_eq!(exit_code, 0, "rsp compile failed for {src}");
+            }
+            other => panic!("expected CompileResult, got: {other:?}"),
+        }
+    }
+    start.elapsed()
+}
+
+async fn zccache_compile_multi_rsp(
+    client: &mut zccache_ipc::IpcClientConnection,
+    session_id: &str,
+    compiler: &str,
+    cwd: &str,
+) -> Duration {
+    clean_objects(Path::new(cwd));
+    let start = Instant::now();
+    client
+        .send(&Request::Compile {
+            session_id: session_id.to_string(),
+            args: vec!["@sources_multi.rsp".into()],
+            cwd: cwd.into(),
+            compiler: compiler.to_string().into(),
+            env: None,
+        })
+        .await
+        .unwrap();
+    match client.recv().await.unwrap() {
+        Some(Response::CompileResult { exit_code, .. }) => {
+            assert_eq!(exit_code, 0, "multi-file rsp compile failed");
+        }
+        other => panic!("expected CompileResult, got: {other:?}"),
+    }
     start.elapsed()
 }
 
@@ -687,6 +916,376 @@ async fn perf_warm_cache_zccache_vs_sccache() {
     }
     print_speedup(
         "zccache multi  vs zccache single",
+        zc_single_med,
+        zc_multi_med,
+    );
+    eprintln!();
+}
+
+// ── Response-file benchmark (separate test) ─────────────────────────────
+
+#[tokio::test]
+#[ignore] // Run explicitly: uv run cargo test -p zccache-daemon --test perf_bench_test -- perf_response_file --nocapture --ignored
+async fn perf_response_file() {
+    let compiler_path = match zccache_test_support::find_clang() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: no C++ compiler found");
+            return;
+        }
+    };
+    let compiler = compiler_path.to_string_lossy().to_string();
+    let sources = source_names();
+
+    eprintln!("\n=== Response-File Performance Benchmark ===");
+    eprintln!("  Files: {NUM_FILES} C++ translation units");
+    eprintln!("  Trials: {WARM_TRIALS} (warm cache)");
+    eprintln!("  Compiler: {compiler}");
+    eprintln!(
+        "  RSP: {} defines + {} include paths + 30 warnings (~{} expanded args per compile)",
+        RSP_NUM_DEFINES,
+        RSP_NUM_INCLUDES,
+        RSP_NUM_DEFINES + RSP_NUM_INCLUDES + 30 + 3,
+    );
+    eprintln!("  Note: each tool gets its own fresh tempdir\n");
+
+    // ── Baseline RSP (fresh dir) ─────────────────────────────────────
+    let bl_dir = tempfile::tempdir().unwrap();
+    generate_project(bl_dir.path());
+    generate_response_files(bl_dir.path());
+
+    eprintln!("--- Baseline RSP (no cache) ---");
+
+    nuke_and_regenerate_with_rsp(bl_dir.path());
+    warmup_compiler(&compiler, bl_dir.path());
+    let bl_cold_single = baseline_single_rsp(&compiler, bl_dir.path(), &sources);
+    eprintln!(
+        "  Single-file rsp cold ({NUM_FILES} invocations): {}",
+        fmt_dur(bl_cold_single)
+    );
+
+    let bl_warm_single = baseline_single_rsp(&compiler, bl_dir.path(), &sources);
+    eprintln!(
+        "  Single-file rsp warm ({NUM_FILES} invocations): {}",
+        fmt_dur(bl_warm_single)
+    );
+
+    nuke_and_regenerate_with_rsp(bl_dir.path());
+    warmup_compiler(&compiler, bl_dir.path());
+    let bl_cold_multi = baseline_multi_rsp(&compiler, bl_dir.path());
+    eprintln!(
+        "  Multi-file  rsp cold (1 invocation):  {}",
+        fmt_dur(bl_cold_multi)
+    );
+
+    let bl_warm_multi = baseline_multi_rsp(&compiler, bl_dir.path());
+    eprintln!(
+        "  Multi-file  rsp warm (1 invocation):  {}\n",
+        fmt_dur(bl_warm_multi)
+    );
+    drop(bl_dir);
+
+    // ── sccache RSP (fresh dir) ──────────────────────────────────────
+    let sccache_cold_single;
+    let sccache_cold_multi;
+    let sccache_single_times;
+    let sccache_multi_times;
+
+    if let Some(sccache_bin) = find_sccache() {
+        let sc_dir = tempfile::tempdir().unwrap();
+        generate_project(sc_dir.path());
+        generate_response_files(sc_dir.path());
+
+        let sc_cache_dir = tempfile::tempdir().unwrap();
+        let sc_cache_str = sc_cache_dir.path().to_string_lossy().into_owned();
+        std::env::set_var("SCCACHE_DIR", &sc_cache_str);
+
+        eprintln!("--- sccache RSP ({}) ---", sccache_bin.display());
+        eprintln!("  Cache dir: {sc_cache_str}");
+
+        let stop_purge_start = |sccache: &Path, cache_dir: &str| {
+            let _ = std::process::Command::new(sccache)
+                .arg("--stop-server")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let cache_path = std::path::Path::new(cache_dir);
+            if cache_path.exists() {
+                let _ = std::fs::remove_dir_all(cache_path);
+                let _ = std::fs::create_dir_all(cache_path);
+            }
+            let _ = std::process::Command::new(sccache)
+                .arg("--start-server")
+                .env("SCCACHE_DIR", cache_dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        };
+
+        stop_purge_start(&sccache_bin, &sc_cache_str);
+
+        nuke_and_regenerate_with_rsp(sc_dir.path());
+        warmup_compiler(&compiler, sc_dir.path());
+        eprint!("  Cold single-file rsp...");
+        let cold_s = sccache_compile_single_rsp(&sccache_bin, &compiler, sc_dir.path(), &sources);
+        eprintln!(" {}", fmt_dur(cold_s));
+        sccache_cold_single = Some(cold_s);
+
+        let mut times = Vec::with_capacity(WARM_TRIALS);
+        for _ in 0..WARM_TRIALS {
+            times.push(sccache_compile_single_rsp(
+                &sccache_bin,
+                &compiler,
+                sc_dir.path(),
+                &sources,
+            ));
+        }
+        print_trials("sccache single-file rsp (warm)", &times);
+        sccache_single_times = Some(times);
+
+        stop_purge_start(&sccache_bin, &sc_cache_str);
+
+        nuke_and_regenerate_with_rsp(sc_dir.path());
+        warmup_compiler(&compiler, sc_dir.path());
+        eprint!("  Cold multi-file rsp...");
+        let cold_m = sccache_compile_multi_rsp(&sccache_bin, &compiler, sc_dir.path());
+        eprintln!(" {}", fmt_dur(cold_m));
+        sccache_cold_multi = Some(cold_m);
+
+        let mut times = Vec::with_capacity(WARM_TRIALS);
+        for _ in 0..WARM_TRIALS {
+            times.push(sccache_compile_multi_rsp(
+                &sccache_bin,
+                &compiler,
+                sc_dir.path(),
+            ));
+        }
+        print_trials("sccache multi-file rsp (warm)", &times);
+        sccache_multi_times = Some(times);
+
+        let _ = std::process::Command::new(&sccache_bin)
+            .arg("--stop-server")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        std::env::remove_var("SCCACHE_DIR");
+        drop(sc_dir);
+        drop(sc_cache_dir);
+        eprintln!();
+    } else {
+        eprintln!("--- sccache RSP: not found, skipping ---\n");
+        sccache_cold_single = None;
+        sccache_cold_multi = None;
+        sccache_single_times = None;
+        sccache_multi_times = None;
+    }
+
+    // ── zccache RSP (fresh dir, in-process daemon) ───────────────────
+    let zc_dir = tempfile::tempdir().unwrap();
+    generate_project(zc_dir.path());
+    generate_response_files(zc_dir.path());
+    let zc_cwd = zc_dir.path().to_string_lossy().into_owned();
+
+    eprintln!("--- zccache RSP (in-process daemon) ---");
+
+    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+
+    client
+        .send(&Request::SessionStart {
+            client_pid: std::process::id(),
+            working_dir: zc_cwd.clone().into(),
+            log_file: None,
+            track_stats: true,
+        })
+        .await
+        .unwrap();
+    let session_id = match client.recv().await.unwrap() {
+        Some(Response::SessionStarted { session_id, .. }) => session_id,
+        other => panic!("expected SessionStarted, got: {other:?}"),
+    };
+
+    // Cold single-file rsp
+    nuke_and_regenerate_with_rsp(zc_dir.path());
+    warmup_compiler(&compiler, zc_dir.path());
+    eprint!("  Cold single-file rsp...");
+    let zc_cold_single =
+        zccache_compile_single_rsp(&mut client, &session_id, &compiler, &zc_cwd, &sources).await;
+    eprintln!(" {}", fmt_dur(zc_cold_single));
+
+    let mut zc_single_times = Vec::with_capacity(WARM_TRIALS);
+    for _ in 0..WARM_TRIALS {
+        zc_single_times.push(
+            zccache_compile_single_rsp(&mut client, &session_id, &compiler, &zc_cwd, &sources)
+                .await,
+        );
+    }
+    print_trials("zccache single-file rsp (warm)", &zc_single_times);
+
+    // Cold multi-file rsp
+    client.send(&Request::Clear).await.unwrap();
+    let _ = client.recv::<Response>().await;
+    nuke_and_regenerate_with_rsp(zc_dir.path());
+    warmup_compiler(&compiler, zc_dir.path());
+
+    eprint!("  Cold multi-file rsp...");
+    let zc_cold_multi =
+        zccache_compile_multi_rsp(&mut client, &session_id, &compiler, &zc_cwd).await;
+    eprintln!(" {}", fmt_dur(zc_cold_multi));
+
+    let mut zc_multi_times = Vec::with_capacity(WARM_TRIALS);
+    for _ in 0..WARM_TRIALS {
+        zc_multi_times
+            .push(zccache_compile_multi_rsp(&mut client, &session_id, &compiler, &zc_cwd).await);
+    }
+    print_trials("zccache multi-file rsp (warm)", &zc_multi_times);
+
+    // End session
+    client
+        .send(&Request::SessionEnd {
+            session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let _ = client.recv::<Response>().await;
+
+    shutdown.notify_one();
+    server_handle.await.unwrap();
+
+    // ── Summary ─────────────────────────────────────────────────────
+    let zc_single_med = median(&zc_single_times);
+    let zc_multi_med = median(&zc_multi_times);
+
+    let scc_single_str = sccache_single_times.as_ref().map(|t| fmt_dur(median(t)));
+    let scc_multi_str = sccache_multi_times.as_ref().map(|t| fmt_dur(median(t)));
+    let scc_cold_s_str = sccache_cold_single.map(fmt_dur);
+    let scc_cold_m_str = sccache_cold_multi.map(fmt_dur);
+    let dash = "—";
+
+    eprintln!();
+    eprintln!(
+        "## Response-File Benchmark: {NUM_FILES} C++ files, ~{} expanded args, {WARM_TRIALS} warm trials",
+        RSP_NUM_DEFINES + RSP_NUM_INCLUDES + 30 + 3,
+    );
+    eprintln!();
+    eprintln!("| Scenario | Bare Clang | sccache | zccache | vs sccache | vs bare clang |");
+    eprintln!("|:---------|----------:|--------:|--------:|-----------:|--------------:|");
+
+    // Single-file RSP, Cold
+    let scc_cs = scc_cold_s_str.as_deref().unwrap_or(dash);
+    let vs_scc_cold_s = sccache_cold_single.map(|t| {
+        let ratio = t.as_secs_f64() / zc_cold_single.as_secs_f64();
+        format!("{ratio:.1}x faster")
+    });
+    let vs_bare_cold_s = {
+        let ratio = bl_cold_single.as_secs_f64() / zc_cold_single.as_secs_f64();
+        format!("{ratio:.1}x")
+    };
+    eprintln!(
+        "| Single-file RSP, Cold | {} | {} | {} | {} | {} |",
+        fmt_dur(bl_cold_single),
+        scc_cs,
+        fmt_dur(zc_cold_single),
+        vs_scc_cold_s.as_deref().unwrap_or(dash),
+        vs_bare_cold_s,
+    );
+
+    // Single-file RSP, Warm
+    let scc_ws = scc_single_str.as_deref().unwrap_or(dash);
+    let vs_scc_warm_s = sccache_single_times.as_ref().map(|t| {
+        let ratio = median(t).as_secs_f64() / zc_single_med.as_secs_f64();
+        format!("**{ratio:.0}x faster**")
+    });
+    let vs_bare_warm_s = {
+        let ratio = bl_warm_single.as_secs_f64() / zc_single_med.as_secs_f64();
+        format!("**{ratio:.0}x faster**")
+    };
+    eprintln!(
+        "| Single-file RSP, Warm | {} | {} | **{}** | {} | {} |",
+        fmt_dur(bl_warm_single),
+        scc_ws,
+        fmt_dur(zc_single_med),
+        vs_scc_warm_s.as_deref().unwrap_or(dash),
+        vs_bare_warm_s,
+    );
+
+    // Multi-file RSP, Cold
+    let scc_cm = scc_cold_m_str.as_deref().unwrap_or(dash);
+    let vs_scc_cold_m = sccache_cold_multi.map(|t| {
+        let ratio = t.as_secs_f64() / zc_cold_multi.as_secs_f64();
+        format!("{ratio:.1}x faster")
+    });
+    let vs_bare_cold_m = {
+        let ratio = bl_cold_multi.as_secs_f64() / zc_cold_multi.as_secs_f64();
+        format!("{ratio:.1}x")
+    };
+    eprintln!(
+        "| Multi-file RSP, Cold | {} | {} | {} | {} | {} |",
+        fmt_dur(bl_cold_multi),
+        scc_cm,
+        fmt_dur(zc_cold_multi),
+        vs_scc_cold_m.as_deref().unwrap_or(dash),
+        vs_bare_cold_m,
+    );
+
+    // Multi-file RSP, Warm
+    let scc_wm = scc_multi_str.as_deref().unwrap_or(dash);
+    let vs_scc_warm_m = sccache_multi_times.as_ref().map(|t| {
+        let ratio = median(t).as_secs_f64() / zc_multi_med.as_secs_f64();
+        format!("**{ratio:.0}x faster**")
+    });
+    let vs_bare_warm_m = {
+        let ratio = bl_warm_multi.as_secs_f64() / zc_multi_med.as_secs_f64();
+        format!("**{ratio:.0}x faster**")
+    };
+    eprintln!(
+        "| Multi-file RSP, Warm | {} | {} | **{}** | {} | {} |",
+        fmt_dur(bl_warm_multi),
+        scc_wm,
+        fmt_dur(zc_multi_med),
+        vs_scc_warm_m.as_deref().unwrap_or(dash),
+        vs_bare_warm_m,
+    );
+
+    eprintln!();
+    eprintln!("> **Cold** = first compile (empty cache). **Warm** = median of {WARM_TRIALS} subsequent runs.");
+    eprintln!(
+        "> All args passed via nested response files: flags.rsp -> @warnings.rsp + @defines.rsp"
+    );
+    eprintln!("> {RSP_NUM_DEFINES} -D defines + {RSP_NUM_INCLUDES} -I paths + 30 warning flags = ~{} total expanded args per compile.",
+        RSP_NUM_DEFINES + RSP_NUM_INCLUDES + 30 + 3);
+
+    // ── Speedup summary ─────────────────────────────────────────────
+    eprintln!();
+    eprintln!("### Speedups (warm cache hit, median)");
+    eprintln!();
+    print_speedup(
+        "zccache single rsp vs bare clang rsp",
+        bl_warm_single,
+        zc_single_med,
+    );
+    print_speedup(
+        "zccache multi rsp  vs bare clang rsp",
+        bl_warm_multi,
+        zc_multi_med,
+    );
+    if let Some(ref t) = sccache_single_times {
+        print_speedup(
+            "zccache single rsp vs sccache single rsp",
+            median(t),
+            zc_single_med,
+        );
+    }
+    if let Some(ref t) = sccache_multi_times {
+        print_speedup(
+            "zccache multi rsp  vs sccache multi rsp",
+            median(t),
+            zc_multi_med,
+        );
+    }
+    print_speedup(
+        "zccache multi rsp  vs zccache single rsp",
         zc_single_med,
         zc_multi_med,
     );

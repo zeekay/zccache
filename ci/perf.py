@@ -2,10 +2,14 @@
 # /// script
 # requires-python = ">=3.10"
 # ///
-"""Run the performance benchmark (zccache vs sccache vs bare clang).
+"""Run performance benchmarks (zccache vs sccache vs bare clang).
+
+Two benchmarks:
+  - perf_warm_cache_zccache_vs_sccache: inline args (single-file + multi-file)
+  - perf_response_file: large nested response files (~283 expanded args)
 
 Usage:
-    uv run perf               # run the benchmark
+    uv run perf               # run all benchmarks
     uv run perf --nocapture   # (default) show output as it runs
 """
 
