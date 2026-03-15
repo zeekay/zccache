@@ -104,13 +104,34 @@ pub fn parse_response_file_content(content: &str) -> Vec<String> {
 ///
 /// Arguments that are exactly `@` (with no filename) are passed through
 /// unchanged, as they are not valid response file references.
+///
+/// Resolves relative `@file` paths against the process's current working
+/// directory. Use [`expand_response_files_in`] to specify a custom base directory.
 pub fn expand_response_files(args: &[String]) -> Result<Vec<String>, ResponseFileError> {
+    let cwd = std::env::current_dir().map_err(|e| ResponseFileError::ReadError {
+        path: PathBuf::from("."),
+        source: e,
+    })?;
+    expand_response_files_in(args, &cwd)
+}
+
+/// Expand response file references (`@filename`) with a custom base directory.
+///
+/// Like [`expand_response_files`], but resolves relative `@file` paths against
+/// `base_dir` instead of the process's current working directory. For nested
+/// `@file` references inside a response file, paths are resolved against the
+/// parent file's directory (matching compiler behavior).
+pub fn expand_response_files_in(
+    args: &[String],
+    base_dir: &Path,
+) -> Result<Vec<String>, ResponseFileError> {
     let mut seen = HashSet::new();
-    expand_recursive(args, &mut seen, 0)
+    expand_recursive(args, base_dir, &mut seen, 0)
 }
 
 fn expand_recursive(
     args: &[String],
+    base_dir: &Path,
     seen: &mut HashSet<PathBuf>,
     depth: usize,
 ) -> Result<Vec<String>, ResponseFileError> {
@@ -124,34 +145,38 @@ fn expand_recursive(
                 continue;
             }
 
-            let path = Path::new(filename);
-            let canonical = path
+            let raw_path = Path::new(filename);
+            let resolved = if raw_path.is_absolute() {
+                raw_path.to_path_buf()
+            } else {
+                base_dir.join(raw_path)
+            };
+            let canonical = resolved
                 .canonicalize()
                 .map_err(|e| ResponseFileError::ReadError {
-                    path: path.to_path_buf(),
+                    path: resolved.clone(),
                     source: e,
                 })?;
 
             if !seen.insert(canonical.clone()) {
-                return Err(ResponseFileError::CircularReference {
-                    path: path.to_path_buf(),
-                });
+                return Err(ResponseFileError::CircularReference { path: resolved });
             }
 
             if depth >= MAX_DEPTH {
-                return Err(ResponseFileError::TooDeep {
-                    path: path.to_path_buf(),
-                });
+                return Err(ResponseFileError::TooDeep { path: resolved });
             }
 
             let content =
                 std::fs::read_to_string(&canonical).map_err(|e| ResponseFileError::ReadError {
-                    path: path.to_path_buf(),
+                    path: resolved,
                     source: e,
                 })?;
 
+            // Nested @file references resolve against the parent file's directory
+            let parent_dir = canonical.parent().unwrap_or(base_dir).to_path_buf();
+
             let expanded_args = parse_response_file_content(&content);
-            let nested = expand_recursive(&expanded_args, seen, depth + 1)?;
+            let nested = expand_recursive(&expanded_args, &parent_dir, seen, depth + 1)?;
             result.extend(nested);
 
             // Remove from seen so the same file can appear in sibling branches
@@ -427,5 +452,182 @@ mod tests {
             }
             _ => panic!("unexpected variant"),
         }
+    }
+
+    // ── expand_response_files_in tests ──
+
+    #[test]
+    fn expand_in_resolves_relative_against_base_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let rsp_path = dir.path().join("flags.rsp");
+        std::fs::write(&rsp_path, "-O2 -Wall").unwrap();
+
+        // Use relative name, resolve against dir
+        let args = s(&["@flags.rsp", "-c", "foo.cpp"]);
+        let result = expand_response_files_in(&args, dir.path()).unwrap();
+        assert_eq!(result, s(&["-O2", "-Wall", "-c", "foo.cpp"]));
+    }
+
+    #[test]
+    fn expand_in_absolute_path_ignores_base_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let rsp_path = dir.path().join("flags.rsp");
+        std::fs::write(&rsp_path, "-O2").unwrap();
+
+        let abs_ref = format!("@{}", rsp_path.display());
+        let args = s(&[&abs_ref, "-c", "foo.cpp"]);
+        // base_dir is irrelevant for absolute paths
+        let other_dir = tempfile::tempdir().unwrap();
+        let result = expand_response_files_in(&args, other_dir.path()).unwrap();
+        assert_eq!(result, s(&["-O2", "-c", "foo.cpp"]));
+    }
+
+    #[test]
+    fn expand_in_nested_resolves_against_parent_dir() {
+        // outer/ contains outer.rsp which references @inner.rsp
+        // inner/ (sibling) contains inner.rsp
+        // But inner.rsp is in same dir as outer.rsp, so it resolves correctly.
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let inner_path = sub.join("inner.rsp");
+        std::fs::write(&inner_path, "-DINNER=1").unwrap();
+
+        let outer_path = sub.join("outer.rsp");
+        std::fs::write(&outer_path, "-DOUTER=1 @inner.rsp").unwrap();
+
+        // Resolve @sub/outer.rsp against base dir
+        let args = s(&["-c", "foo.cpp", "@sub/outer.rsp"]);
+        let result = expand_response_files_in(&args, dir.path()).unwrap();
+        assert_eq!(result, s(&["-c", "foo.cpp", "-DOUTER=1", "-DINNER=1"]));
+    }
+
+    #[test]
+    fn expand_in_nested_relative_cross_directory() {
+        // base_dir/outer.rsp references @subdir/inner.rsp
+        // subdir/inner.rsp exists relative to outer.rsp's directory
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        std::fs::write(subdir.join("inner.rsp"), "-DINNER=1").unwrap();
+        std::fs::write(dir.path().join("outer.rsp"), "@subdir/inner.rsp -DOUTER=1").unwrap();
+
+        let args = s(&["@outer.rsp"]);
+        let result = expand_response_files_in(&args, dir.path()).unwrap();
+        assert_eq!(result, s(&["-DINNER=1", "-DOUTER=1"]));
+    }
+
+    #[test]
+    fn expand_in_dotdot_traversal() {
+        // base_dir/sub/outer.rsp references @../sibling.rsp
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        std::fs::write(dir.path().join("sibling.rsp"), "-DSIBLING=1").unwrap();
+        std::fs::write(sub.join("outer.rsp"), "@../sibling.rsp -DOUTER=1").unwrap();
+
+        let args = s(&["@sub/outer.rsp"]);
+        let result = expand_response_files_in(&args, dir.path()).unwrap();
+        assert_eq!(result, s(&["-DSIBLING=1", "-DOUTER=1"]));
+    }
+
+    #[test]
+    fn expand_in_nested_absolute_inside_relative() {
+        // @relative.rsp contains @/absolute/path.rsp — absolute ref ignores parent dir
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let abs_rsp = sub.join("abs.rsp");
+        std::fs::write(&abs_rsp, "-DABS=1").unwrap();
+
+        // outer.rsp in base_dir references abs.rsp by absolute path
+        std::fs::write(
+            dir.path().join("outer.rsp"),
+            format!("@{} -DOUTER=1", abs_rsp.display()),
+        )
+        .unwrap();
+
+        let args = s(&["@outer.rsp"]);
+        let result = expand_response_files_in(&args, dir.path()).unwrap();
+        assert_eq!(result, s(&["-DABS=1", "-DOUTER=1"]));
+    }
+
+    #[test]
+    fn expand_in_three_level_relative_chain() {
+        // a/1.rsp -> @b/2.rsp -> @c/3.rsp — each relative to its parent
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let ab = a.join("b");
+        let abc = ab.join("c");
+        std::fs::create_dir_all(&abc).unwrap();
+
+        std::fs::write(abc.join("3.rsp"), "-DLEVEL3=1").unwrap();
+        std::fs::write(ab.join("2.rsp"), "@c/3.rsp -DLEVEL2=1").unwrap();
+        std::fs::write(a.join("1.rsp"), "@b/2.rsp -DLEVEL1=1").unwrap();
+
+        let args = s(&["@a/1.rsp"]);
+        let result = expand_response_files_in(&args, dir.path()).unwrap();
+        assert_eq!(result, s(&["-DLEVEL3=1", "-DLEVEL2=1", "-DLEVEL1=1"]));
+    }
+
+    #[test]
+    fn expand_in_error_shows_resolved_path() {
+        // @relative.rsp that doesn't exist — error should show resolved path, not raw
+        let dir = tempfile::tempdir().unwrap();
+        let args = s(&["@missing.rsp"]);
+        let err = expand_response_files_in(&args, dir.path()).unwrap_err();
+        match &err {
+            ResponseFileError::ReadError { path, .. } => {
+                // Error path should be the resolved path (base_dir/missing.rsp)
+                assert!(
+                    path.starts_with(dir.path()),
+                    "error path {path:?} should be under {dir:?}",
+                    dir = dir.path()
+                );
+            }
+            other => panic!("expected ReadError, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn expand_in_circular_in_custom_base_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rsp");
+        let b = dir.path().join("b.rsp");
+        std::fs::write(&a, format!("@{}", b.display())).unwrap();
+        std::fs::write(&b, format!("@{}", a.display())).unwrap();
+
+        let args = s(&["@a.rsp"]);
+        let err = expand_response_files_in(&args, dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ResponseFileError::CircularReference { .. }),
+            "expected CircularReference, got: {err}"
+        );
+    }
+
+    #[test]
+    fn expand_in_depth_limit_with_custom_base_dir() {
+        // Chain of 11 files (depth 0..10, exceeds MAX_DEPTH=10)
+        let dir = tempfile::tempdir().unwrap();
+        for i in (0..=MAX_DEPTH).rev() {
+            let name = format!("{i}.rsp");
+            let content = if i == MAX_DEPTH {
+                "-DLEAF=1".to_string()
+            } else {
+                format!("@{}.rsp", i + 1)
+            };
+            std::fs::write(dir.path().join(name), content).unwrap();
+        }
+
+        let args = s(&["@0.rsp"]);
+        let err = expand_response_files_in(&args, dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ResponseFileError::TooDeep { .. }),
+            "expected TooDeep, got: {err}"
+        );
     }
 }

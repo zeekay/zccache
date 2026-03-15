@@ -1174,15 +1174,24 @@ async fn handle_compile(
 
     state.sessions.touch(&sid);
 
-    // ── Phase: parse args ────────────────────────────────────────────
+    // ── Phase: expand response files + parse args ─────────────────────
     let t0 = std::time::Instant::now();
-    let parsed = zccache_compiler::parse_invocation(compiler.to_str().unwrap_or(""), args);
+    let expanded_args = match zccache_compiler::response_file::expand_response_files_in(args, cwd) {
+        Ok(expanded) => expanded,
+        Err(e) => {
+            tracing::debug!("response file expansion failed: {e}, passing raw args");
+            args.to_vec()
+        }
+    };
+    let compiler_str = compiler.to_str().unwrap_or("");
+    let parsed = zccache_compiler::parse_invocation(compiler_str, &expanded_args);
     let compilation = match parsed {
         zccache_compiler::ParsedInvocation::Cacheable(c) => c,
         zccache_compiler::ParsedInvocation::NonCacheable { reason } => {
             state.stats.record_non_cacheable();
             record_session_stat(&state.sessions, &sid, |t| t.record_non_cacheable());
             write_session_log(&state.sessions, &sid, &format!("non-cacheable: {reason}"));
+            // Use raw args — compiler handles @file natively
             return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid, &client_env)
                 .await;
         }
@@ -1538,7 +1547,7 @@ async fn handle_compile(
     );
 
     let mut cmd = tokio::process::Command::new(&compiler);
-    cmd.args(args).current_dir(cwd);
+    cmd.args(&expanded_args).current_dir(cwd);
     if !extra_args.is_empty() {
         cmd.args(&extra_args);
     }
