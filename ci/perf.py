@@ -28,6 +28,7 @@ def main():
         "--",
         "--nocapture",
         "--ignored",
+        "--test-threads=1",
     ]
 
     result = subprocess.run(

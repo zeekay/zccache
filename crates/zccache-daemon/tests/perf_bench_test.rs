@@ -542,19 +542,35 @@ fn print_trials(label: &str, times: &[Duration]) {
     let med = median(times);
     let min = times.iter().min().unwrap();
     let max = times.iter().max().unwrap();
-    let trials: Vec<String> = times.iter().map(|t| fmt_dur(*t)).collect();
     eprintln!(
-        "  {label:<40} median={:<10} min={:<10} max={:<10} trials={:?}",
+        "        {label:<14}{} ({} \u{2013} {})",
         fmt_dur(med),
         fmt_dur(*min),
         fmt_dur(*max),
-        trials,
     );
 }
 
-fn print_speedup(label: &str, baseline: Duration, test: Duration) {
-    let speedup = baseline.as_secs_f64() / test.as_secs_f64();
-    eprintln!("  {label:<45} {speedup:>6.1}x");
+fn fmt_ratio(baseline: Duration, test: Duration, bold: bool) -> String {
+    let ratio = baseline.as_secs_f64() / test.as_secs_f64();
+    let text = if ratio >= 10.0 {
+        format!("{ratio:.0}x faster")
+    } else if ratio >= 1.05 {
+        format!("{ratio:.1}x faster")
+    } else if ratio > 0.95 {
+        "~same".to_string()
+    } else {
+        let inv = 1.0 / ratio;
+        if inv >= 10.0 {
+            format!("{inv:.0}x slower")
+        } else {
+            format!("{inv:.1}x slower")
+        }
+    };
+    if bold && ratio >= 2.0 {
+        format!("**{text}**")
+    } else {
+        text
+    }
 }
 
 // ── Main benchmark ──────────────────────────────────────────────────────
@@ -572,48 +588,36 @@ async fn perf_warm_cache_zccache_vs_sccache() {
     let compiler = compiler_path.to_string_lossy().to_string();
     let sources = source_names();
 
-    eprintln!("\n=== Warm-Cache Performance Benchmark ===");
-    eprintln!("  Files: {NUM_FILES} C++ translation units");
-    eprintln!("  Trials: {WARM_TRIALS} (warm cache)");
+    eprintln!();
+    eprintln!("\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}");
+    eprintln!("  WARM-CACHE BENCHMARK");
+    eprintln!("  {NUM_FILES} C++ files \u{00b7} {WARM_TRIALS} warm trials \u{00b7} each tool in its own tempdir");
     eprintln!("  Compiler: {compiler}");
-    eprintln!("  Note: each tool gets its own fresh tempdir\n");
+    eprintln!("\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}");
+    eprintln!();
 
     // ── Baseline (fresh dir) ──────────────────────────────────────────
     let bl_dir = tempfile::tempdir().unwrap();
     generate_project(bl_dir.path());
 
-    eprintln!("--- Baseline (no cache) ---");
+    eprintln!("  [1/3] Bare clang (baseline)");
 
-    // Single-file: nuke, regenerate, warmup clang once to normalize page cache
     nuke_and_regenerate(bl_dir.path());
     warmup_compiler(&compiler, bl_dir.path());
     let bl_cold_single = baseline_single(&compiler, bl_dir.path(), &sources);
-    eprintln!(
-        "  Single-file cold ({NUM_FILES} invocations): {}",
-        fmt_dur(bl_cold_single)
-    );
+    eprintln!("        single cold:  {}", fmt_dur(bl_cold_single));
 
-    // Run again — now OS page cache is warm for this dir
     let bl_warm_single = baseline_single(&compiler, bl_dir.path(), &sources);
-    eprintln!(
-        "  Single-file warm ({NUM_FILES} invocations): {}",
-        fmt_dur(bl_warm_single)
-    );
+    eprintln!("        single warm:  {}", fmt_dur(bl_warm_single));
 
-    // Multi-file: nuke, regenerate, warmup clang
     nuke_and_regenerate(bl_dir.path());
     warmup_compiler(&compiler, bl_dir.path());
     let bl_cold_multi = baseline_multi(&compiler, bl_dir.path(), &sources);
-    eprintln!(
-        "  Multi-file  cold (1 invocation):  {}",
-        fmt_dur(bl_cold_multi)
-    );
+    eprintln!("        multi cold:   {}", fmt_dur(bl_cold_multi));
 
     let bl_warm_multi = baseline_multi(&compiler, bl_dir.path(), &sources);
-    eprintln!(
-        "  Multi-file  warm (1 invocation):  {}\n",
-        fmt_dur(bl_warm_multi)
-    );
+    eprintln!("        multi warm:   {}", fmt_dur(bl_warm_multi));
+    eprintln!();
 
     drop(bl_dir);
 
@@ -634,8 +638,7 @@ async fn perf_warm_cache_zccache_vs_sccache() {
         // Set SCCACHE_DIR for this process so both server and client see it.
         std::env::set_var("SCCACHE_DIR", &sc_cache_str);
 
-        eprintln!("--- sccache ({}) ---", sccache_bin.display());
-        eprintln!("  Cache dir: {sc_cache_str}");
+        eprintln!("  [2/3] sccache ({})", sccache_bin.display());
 
         // Helper: stop server, purge disk cache, restart with fresh SCCACHE_DIR.
         let stop_purge_start = |sccache: &Path, cache_dir: &str| {
@@ -664,9 +667,9 @@ async fn perf_warm_cache_zccache_vs_sccache() {
         // Cold single-file: nuke dir, regenerate, warmup clang, compile (cache empty)
         nuke_and_regenerate(sc_dir.path());
         warmup_compiler(&compiler, sc_dir.path());
-        eprint!("  Cold single-file...");
+        eprint!("        single cold:  ");
         let cold_s = sccache_compile_single(&sccache_bin, &compiler, sc_dir.path(), &sources);
-        eprintln!(" {}", fmt_dur(cold_s));
+        eprintln!("{}", fmt_dur(cold_s));
         sccache_cold_single = Some(cold_s);
 
         // Warm trials: single-file (cache populated from cold pass)
@@ -679,18 +682,16 @@ async fn perf_warm_cache_zccache_vs_sccache() {
                 &sources,
             ));
         }
-        print_trials("sccache single-file (warm)", &times);
+        print_trials("single warm:", &times);
         sccache_single_times = Some(times);
 
-        // Purge cache and restart for cold multi-file
         stop_purge_start(&sccache_bin, &sc_cache_str);
 
-        // Cold multi-file: nuke dir, regenerate, warmup clang
         nuke_and_regenerate(sc_dir.path());
         warmup_compiler(&compiler, sc_dir.path());
-        eprint!("  Cold multi-file...");
+        eprint!("        multi cold:   ");
         let cold_m = sccache_compile_multi(&sccache_bin, &compiler, sc_dir.path(), &sources);
-        eprintln!(" {}", fmt_dur(cold_m));
+        eprintln!("{}", fmt_dur(cold_m));
         sccache_cold_multi = Some(cold_m);
 
         // Warm trials: multi-file (sccache can't cache this — passes through)
@@ -703,7 +704,7 @@ async fn perf_warm_cache_zccache_vs_sccache() {
                 &sources,
             ));
         }
-        print_trials("sccache multi-file (warm)", &times);
+        print_trials("multi warm:", &times);
         sccache_multi_times = Some(times);
 
         let _ = std::process::Command::new(&sccache_bin)
@@ -717,7 +718,8 @@ async fn perf_warm_cache_zccache_vs_sccache() {
         drop(sc_cache_dir);
         eprintln!();
     } else {
-        eprintln!("--- sccache: not found, skipping ---\n");
+        eprintln!("  [2/3] sccache: not found, skipping");
+        eprintln!();
         sccache_cold_single = None;
         sccache_cold_multi = None;
         sccache_single_times = None;
@@ -729,7 +731,7 @@ async fn perf_warm_cache_zccache_vs_sccache() {
     generate_project(zc_dir.path());
     let zc_cwd = zc_dir.path().to_string_lossy().into_owned();
 
-    eprintln!("--- zccache (in-process daemon) ---");
+    eprintln!("  [3/3] zccache (in-process daemon)");
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
@@ -749,42 +751,38 @@ async fn perf_warm_cache_zccache_vs_sccache() {
         other => panic!("expected SessionStarted, got: {other:?}"),
     };
 
-    // Cold single-file: nuke dir, regenerate, warmup clang, compile (daemon cache empty)
     nuke_and_regenerate(zc_dir.path());
     warmup_compiler(&compiler, zc_dir.path());
-    eprint!("  Cold single-file...");
+    eprint!("        single cold:  ");
     let zc_cold_single =
         zccache_compile_single(&mut client, &session_id, &compiler, &zc_cwd, &sources).await;
-    eprintln!(" {}", fmt_dur(zc_cold_single));
+    eprintln!("{}", fmt_dur(zc_cold_single));
 
-    // Warm trials: single-file (cache populated from cold pass)
     let mut zc_single_times = Vec::with_capacity(WARM_TRIALS);
     for _ in 0..WARM_TRIALS {
         zc_single_times.push(
             zccache_compile_single(&mut client, &session_id, &compiler, &zc_cwd, &sources).await,
         );
     }
-    print_trials("zccache single-file (warm)", &zc_single_times);
+    print_trials("single warm:", &zc_single_times);
 
-    // Cold multi-file: clear daemon cache, nuke dir, regenerate, warmup clang
     client.send(&Request::Clear).await.unwrap();
     let _ = client.recv::<Response>().await;
     nuke_and_regenerate(zc_dir.path());
     warmup_compiler(&compiler, zc_dir.path());
 
-    eprint!("  Cold multi-file...");
+    eprint!("        multi cold:   ");
     let zc_cold_multi =
         zccache_compile_multi(&mut client, &session_id, &compiler, &zc_cwd, &sources).await;
-    eprintln!(" {}", fmt_dur(zc_cold_multi));
+    eprintln!("{}", fmt_dur(zc_cold_multi));
 
-    // Warm trials: multi-file
     let mut zc_multi_times = Vec::with_capacity(WARM_TRIALS);
     for _ in 0..WARM_TRIALS {
         zc_multi_times.push(
             zccache_compile_multi(&mut client, &session_id, &compiler, &zc_cwd, &sources).await,
         );
     }
-    print_trials("zccache multi-file (warm)", &zc_multi_times);
+    print_trials("multi warm:", &zc_multi_times);
 
     // End session
     client
@@ -806,9 +804,12 @@ async fn perf_warm_cache_zccache_vs_sccache() {
     let scc_multi_str = sccache_multi_times.as_ref().map(|t| fmt_dur(median(t)));
     let scc_cold_s_str = sccache_cold_single.map(fmt_dur);
     let scc_cold_m_str = sccache_cold_multi.map(fmt_dur);
-    let dash = "—";
+    let dash = "\u{2014}";
 
-    // ── Markdown table (README-ready) ────────────────────────────────
+    eprintln!();
+    eprintln!("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}");
+    eprintln!("  RESULTS");
+    eprintln!("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}");
     eprintln!();
     eprintln!("## Benchmark: {NUM_FILES} C++ files, {WARM_TRIALS} warm trials");
     eprintln!();
@@ -817,14 +818,8 @@ async fn perf_warm_cache_zccache_vs_sccache() {
 
     // Single-file, Cold
     let scc_cs = scc_cold_s_str.as_deref().unwrap_or(dash);
-    let vs_scc_cold_s = sccache_cold_single.map(|t| {
-        let ratio = t.as_secs_f64() / zc_cold_single.as_secs_f64();
-        format!("{ratio:.1}x faster")
-    });
-    let vs_bare_cold_s = {
-        let ratio = bl_cold_single.as_secs_f64() / zc_cold_single.as_secs_f64();
-        format!("{ratio:.1}x")
-    };
+    let vs_scc_cold_s = sccache_cold_single.map(|t| fmt_ratio(t, zc_cold_single, false));
+    let vs_bare_cold_s = fmt_ratio(bl_cold_single, zc_cold_single, false);
     eprintln!(
         "| Single-file, Cold | {} | {} | {} | {} | {} |",
         fmt_dur(bl_cold_single),
@@ -836,14 +831,10 @@ async fn perf_warm_cache_zccache_vs_sccache() {
 
     // Single-file, Warm
     let scc_ws = scc_single_str.as_deref().unwrap_or(dash);
-    let vs_scc_warm_s = sccache_single_times.as_ref().map(|t| {
-        let ratio = median(t).as_secs_f64() / zc_single_med.as_secs_f64();
-        format!("**{ratio:.0}x faster**")
-    });
-    let vs_bare_warm_s = {
-        let ratio = bl_warm_single.as_secs_f64() / zc_single_med.as_secs_f64();
-        format!("**{ratio:.0}x faster**")
-    };
+    let vs_scc_warm_s = sccache_single_times
+        .as_ref()
+        .map(|t| fmt_ratio(median(t), zc_single_med, true));
+    let vs_bare_warm_s = fmt_ratio(bl_warm_single, zc_single_med, true);
     eprintln!(
         "| Single-file, Warm | {} | {} | **{}** | {} | {} |",
         fmt_dur(bl_warm_single),
@@ -855,14 +846,8 @@ async fn perf_warm_cache_zccache_vs_sccache() {
 
     // Multi-file, Cold
     let scc_cm = scc_cold_m_str.as_deref().unwrap_or(dash);
-    let vs_scc_cold_m = sccache_cold_multi.map(|t| {
-        let ratio = t.as_secs_f64() / zc_cold_multi.as_secs_f64();
-        format!("{ratio:.1}x faster")
-    });
-    let vs_bare_cold_m = {
-        let ratio = bl_cold_multi.as_secs_f64() / zc_cold_multi.as_secs_f64();
-        format!("{ratio:.1}x")
-    };
+    let vs_scc_cold_m = sccache_cold_multi.map(|t| fmt_ratio(t, zc_cold_multi, false));
+    let vs_bare_cold_m = fmt_ratio(bl_cold_multi, zc_cold_multi, false);
     eprintln!(
         "| Multi-file, Cold | {} | {} | {} | {} | {} |",
         fmt_dur(bl_cold_multi),
@@ -874,14 +859,10 @@ async fn perf_warm_cache_zccache_vs_sccache() {
 
     // Multi-file, Warm
     let scc_wm = scc_multi_str.as_deref().unwrap_or(dash);
-    let vs_scc_warm_m = sccache_multi_times.as_ref().map(|t| {
-        let ratio = median(t).as_secs_f64() / zc_multi_med.as_secs_f64();
-        format!("**{ratio:.0}x faster**")
-    });
-    let vs_bare_warm_m = {
-        let ratio = bl_warm_multi.as_secs_f64() / zc_multi_med.as_secs_f64();
-        format!("**{ratio:.0}x faster**")
-    };
+    let vs_scc_warm_m = sccache_multi_times
+        .as_ref()
+        .map(|t| fmt_ratio(median(t), zc_multi_med, true));
+    let vs_bare_warm_m = fmt_ratio(bl_warm_multi, zc_multi_med, true);
     eprintln!(
         "| Multi-file, Warm | {} | {} | **{}** | {} | {} |",
         fmt_dur(bl_warm_multi),
@@ -895,30 +876,31 @@ async fn perf_warm_cache_zccache_vs_sccache() {
     eprintln!("> **Cold** = first compile (empty cache). **Warm** = median of {WARM_TRIALS} subsequent runs.");
     eprintln!("> Single-file = {NUM_FILES} sequential `clang++ -c unit.cpp` invocations. Multi-file = one `clang++ -c *.cpp` invocation.");
     if sccache_multi_times.is_some() {
-        eprintln!("> sccache cannot cache multi-file compilations — its \"warm\" multi-file time is a full recompile.");
+        eprintln!("> sccache cannot cache multi-file compilations \u{2014} its \"warm\" multi-file time is a full recompile.");
     }
 
-    // ── Speedup summary ─────────────────────────────────────────────
+    // ── Bottom Line ─────────────────────────────────────────────────
     eprintln!();
-    eprintln!("### Speedups (warm cache hit, median)");
+    eprintln!("### Bottom Line");
     eprintln!();
-    print_speedup(
-        "zccache single vs bare clang",
-        bl_warm_single,
-        zc_single_med,
-    );
-    print_speedup("zccache multi  vs bare clang", bl_warm_multi, zc_multi_med);
+    let single_vs_clang = bl_warm_single.as_secs_f64() / zc_single_med.as_secs_f64();
+    let multi_vs_clang = bl_warm_multi.as_secs_f64() / zc_multi_med.as_secs_f64();
     if let Some(ref t) = sccache_single_times {
-        print_speedup("zccache single vs sccache single", median(t), zc_single_med);
+        let single_vs_scc = median(t).as_secs_f64() / zc_single_med.as_secs_f64();
+        eprintln!(
+            "  Warm single-file:  {single_vs_clang:.0}x faster than clang, {single_vs_scc:.0}x faster than sccache"
+        );
+    } else {
+        eprintln!("  Warm single-file:  {single_vs_clang:.0}x faster than clang");
     }
     if let Some(ref t) = sccache_multi_times {
-        print_speedup("zccache multi  vs sccache multi", median(t), zc_multi_med);
+        let multi_vs_scc = median(t).as_secs_f64() / zc_multi_med.as_secs_f64();
+        eprintln!(
+            "  Warm multi-file:   {multi_vs_clang:.0}x faster than clang, {multi_vs_scc:.0}x faster than sccache"
+        );
+    } else {
+        eprintln!("  Warm multi-file:   {multi_vs_clang:.0}x faster than clang");
     }
-    print_speedup(
-        "zccache multi  vs zccache single",
-        zc_single_med,
-        zc_multi_med,
-    );
     eprintln!();
 }
 
@@ -937,52 +919,40 @@ async fn perf_response_file() {
     let compiler = compiler_path.to_string_lossy().to_string();
     let sources = source_names();
 
-    eprintln!("\n=== Response-File Performance Benchmark ===");
-    eprintln!("  Files: {NUM_FILES} C++ translation units");
-    eprintln!("  Trials: {WARM_TRIALS} (warm cache)");
-    eprintln!("  Compiler: {compiler}");
+    eprintln!();
+    eprintln!("\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}");
+    eprintln!("  RESPONSE-FILE BENCHMARK");
     eprintln!(
-        "  RSP: {} defines + {} include paths + 30 warnings (~{} expanded args per compile)",
-        RSP_NUM_DEFINES,
-        RSP_NUM_INCLUDES,
+        "  {NUM_FILES} C++ files \u{00b7} {WARM_TRIALS} warm trials \u{00b7} ~{} expanded args per compile",
         RSP_NUM_DEFINES + RSP_NUM_INCLUDES + 30 + 3,
     );
-    eprintln!("  Note: each tool gets its own fresh tempdir\n");
+    eprintln!("  Compiler: {compiler}");
+    eprintln!("\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}");
+    eprintln!();
 
     // ── Baseline RSP (fresh dir) ─────────────────────────────────────
     let bl_dir = tempfile::tempdir().unwrap();
     generate_project(bl_dir.path());
     generate_response_files(bl_dir.path());
 
-    eprintln!("--- Baseline RSP (no cache) ---");
+    eprintln!("  [1/3] Bare clang (baseline)");
 
     nuke_and_regenerate_with_rsp(bl_dir.path());
     warmup_compiler(&compiler, bl_dir.path());
     let bl_cold_single = baseline_single_rsp(&compiler, bl_dir.path(), &sources);
-    eprintln!(
-        "  Single-file rsp cold ({NUM_FILES} invocations): {}",
-        fmt_dur(bl_cold_single)
-    );
+    eprintln!("        single cold:  {}", fmt_dur(bl_cold_single));
 
     let bl_warm_single = baseline_single_rsp(&compiler, bl_dir.path(), &sources);
-    eprintln!(
-        "  Single-file rsp warm ({NUM_FILES} invocations): {}",
-        fmt_dur(bl_warm_single)
-    );
+    eprintln!("        single warm:  {}", fmt_dur(bl_warm_single));
 
     nuke_and_regenerate_with_rsp(bl_dir.path());
     warmup_compiler(&compiler, bl_dir.path());
     let bl_cold_multi = baseline_multi_rsp(&compiler, bl_dir.path());
-    eprintln!(
-        "  Multi-file  rsp cold (1 invocation):  {}",
-        fmt_dur(bl_cold_multi)
-    );
+    eprintln!("        multi cold:   {}", fmt_dur(bl_cold_multi));
 
     let bl_warm_multi = baseline_multi_rsp(&compiler, bl_dir.path());
-    eprintln!(
-        "  Multi-file  rsp warm (1 invocation):  {}\n",
-        fmt_dur(bl_warm_multi)
-    );
+    eprintln!("        multi warm:   {}", fmt_dur(bl_warm_multi));
+    eprintln!();
     drop(bl_dir);
 
     // ── sccache RSP (fresh dir) ──────────────────────────────────────
@@ -1000,8 +970,7 @@ async fn perf_response_file() {
         let sc_cache_str = sc_cache_dir.path().to_string_lossy().into_owned();
         std::env::set_var("SCCACHE_DIR", &sc_cache_str);
 
-        eprintln!("--- sccache RSP ({}) ---", sccache_bin.display());
-        eprintln!("  Cache dir: {sc_cache_str}");
+        eprintln!("  [2/3] sccache ({})", sccache_bin.display());
 
         let stop_purge_start = |sccache: &Path, cache_dir: &str| {
             let _ = std::process::Command::new(sccache)
@@ -1026,9 +995,9 @@ async fn perf_response_file() {
 
         nuke_and_regenerate_with_rsp(sc_dir.path());
         warmup_compiler(&compiler, sc_dir.path());
-        eprint!("  Cold single-file rsp...");
+        eprint!("        single cold:  ");
         let cold_s = sccache_compile_single_rsp(&sccache_bin, &compiler, sc_dir.path(), &sources);
-        eprintln!(" {}", fmt_dur(cold_s));
+        eprintln!("{}", fmt_dur(cold_s));
         sccache_cold_single = Some(cold_s);
 
         let mut times = Vec::with_capacity(WARM_TRIALS);
@@ -1040,16 +1009,16 @@ async fn perf_response_file() {
                 &sources,
             ));
         }
-        print_trials("sccache single-file rsp (warm)", &times);
+        print_trials("single warm:", &times);
         sccache_single_times = Some(times);
 
         stop_purge_start(&sccache_bin, &sc_cache_str);
 
         nuke_and_regenerate_with_rsp(sc_dir.path());
         warmup_compiler(&compiler, sc_dir.path());
-        eprint!("  Cold multi-file rsp...");
+        eprint!("        multi cold:   ");
         let cold_m = sccache_compile_multi_rsp(&sccache_bin, &compiler, sc_dir.path());
-        eprintln!(" {}", fmt_dur(cold_m));
+        eprintln!("{}", fmt_dur(cold_m));
         sccache_cold_multi = Some(cold_m);
 
         let mut times = Vec::with_capacity(WARM_TRIALS);
@@ -1060,7 +1029,7 @@ async fn perf_response_file() {
                 sc_dir.path(),
             ));
         }
-        print_trials("sccache multi-file rsp (warm)", &times);
+        print_trials("multi warm:", &times);
         sccache_multi_times = Some(times);
 
         let _ = std::process::Command::new(&sccache_bin)
@@ -1074,7 +1043,8 @@ async fn perf_response_file() {
         drop(sc_cache_dir);
         eprintln!();
     } else {
-        eprintln!("--- sccache RSP: not found, skipping ---\n");
+        eprintln!("  [2/3] sccache: not found, skipping");
+        eprintln!();
         sccache_cold_single = None;
         sccache_cold_multi = None;
         sccache_single_times = None;
@@ -1087,7 +1057,7 @@ async fn perf_response_file() {
     generate_response_files(zc_dir.path());
     let zc_cwd = zc_dir.path().to_string_lossy().into_owned();
 
-    eprintln!("--- zccache RSP (in-process daemon) ---");
+    eprintln!("  [3/3] zccache (in-process daemon)");
 
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
@@ -1106,13 +1076,12 @@ async fn perf_response_file() {
         other => panic!("expected SessionStarted, got: {other:?}"),
     };
 
-    // Cold single-file rsp
     nuke_and_regenerate_with_rsp(zc_dir.path());
     warmup_compiler(&compiler, zc_dir.path());
-    eprint!("  Cold single-file rsp...");
+    eprint!("        single cold:  ");
     let zc_cold_single =
         zccache_compile_single_rsp(&mut client, &session_id, &compiler, &zc_cwd, &sources).await;
-    eprintln!(" {}", fmt_dur(zc_cold_single));
+    eprintln!("{}", fmt_dur(zc_cold_single));
 
     let mut zc_single_times = Vec::with_capacity(WARM_TRIALS);
     for _ in 0..WARM_TRIALS {
@@ -1121,25 +1090,24 @@ async fn perf_response_file() {
                 .await,
         );
     }
-    print_trials("zccache single-file rsp (warm)", &zc_single_times);
+    print_trials("single warm:", &zc_single_times);
 
-    // Cold multi-file rsp
     client.send(&Request::Clear).await.unwrap();
     let _ = client.recv::<Response>().await;
     nuke_and_regenerate_with_rsp(zc_dir.path());
     warmup_compiler(&compiler, zc_dir.path());
 
-    eprint!("  Cold multi-file rsp...");
+    eprint!("        multi cold:   ");
     let zc_cold_multi =
         zccache_compile_multi_rsp(&mut client, &session_id, &compiler, &zc_cwd).await;
-    eprintln!(" {}", fmt_dur(zc_cold_multi));
+    eprintln!("{}", fmt_dur(zc_cold_multi));
 
     let mut zc_multi_times = Vec::with_capacity(WARM_TRIALS);
     for _ in 0..WARM_TRIALS {
         zc_multi_times
             .push(zccache_compile_multi_rsp(&mut client, &session_id, &compiler, &zc_cwd).await);
     }
-    print_trials("zccache multi-file rsp (warm)", &zc_multi_times);
+    print_trials("multi warm:", &zc_multi_times);
 
     // End session
     client
@@ -1161,8 +1129,12 @@ async fn perf_response_file() {
     let scc_multi_str = sccache_multi_times.as_ref().map(|t| fmt_dur(median(t)));
     let scc_cold_s_str = sccache_cold_single.map(fmt_dur);
     let scc_cold_m_str = sccache_cold_multi.map(fmt_dur);
-    let dash = "—";
+    let dash = "\u{2014}";
 
+    eprintln!();
+    eprintln!("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}");
+    eprintln!("  RESULTS");
+    eprintln!("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}");
     eprintln!();
     eprintln!(
         "## Response-File Benchmark: {NUM_FILES} C++ files, ~{} expanded args, {WARM_TRIALS} warm trials",
@@ -1174,14 +1146,8 @@ async fn perf_response_file() {
 
     // Single-file RSP, Cold
     let scc_cs = scc_cold_s_str.as_deref().unwrap_or(dash);
-    let vs_scc_cold_s = sccache_cold_single.map(|t| {
-        let ratio = t.as_secs_f64() / zc_cold_single.as_secs_f64();
-        format!("{ratio:.1}x faster")
-    });
-    let vs_bare_cold_s = {
-        let ratio = bl_cold_single.as_secs_f64() / zc_cold_single.as_secs_f64();
-        format!("{ratio:.1}x")
-    };
+    let vs_scc_cold_s = sccache_cold_single.map(|t| fmt_ratio(t, zc_cold_single, false));
+    let vs_bare_cold_s = fmt_ratio(bl_cold_single, zc_cold_single, false);
     eprintln!(
         "| Single-file RSP, Cold | {} | {} | {} | {} | {} |",
         fmt_dur(bl_cold_single),
@@ -1193,14 +1159,10 @@ async fn perf_response_file() {
 
     // Single-file RSP, Warm
     let scc_ws = scc_single_str.as_deref().unwrap_or(dash);
-    let vs_scc_warm_s = sccache_single_times.as_ref().map(|t| {
-        let ratio = median(t).as_secs_f64() / zc_single_med.as_secs_f64();
-        format!("**{ratio:.0}x faster**")
-    });
-    let vs_bare_warm_s = {
-        let ratio = bl_warm_single.as_secs_f64() / zc_single_med.as_secs_f64();
-        format!("**{ratio:.0}x faster**")
-    };
+    let vs_scc_warm_s = sccache_single_times
+        .as_ref()
+        .map(|t| fmt_ratio(median(t), zc_single_med, true));
+    let vs_bare_warm_s = fmt_ratio(bl_warm_single, zc_single_med, true);
     eprintln!(
         "| Single-file RSP, Warm | {} | {} | **{}** | {} | {} |",
         fmt_dur(bl_warm_single),
@@ -1212,14 +1174,8 @@ async fn perf_response_file() {
 
     // Multi-file RSP, Cold
     let scc_cm = scc_cold_m_str.as_deref().unwrap_or(dash);
-    let vs_scc_cold_m = sccache_cold_multi.map(|t| {
-        let ratio = t.as_secs_f64() / zc_cold_multi.as_secs_f64();
-        format!("{ratio:.1}x faster")
-    });
-    let vs_bare_cold_m = {
-        let ratio = bl_cold_multi.as_secs_f64() / zc_cold_multi.as_secs_f64();
-        format!("{ratio:.1}x")
-    };
+    let vs_scc_cold_m = sccache_cold_multi.map(|t| fmt_ratio(t, zc_cold_multi, false));
+    let vs_bare_cold_m = fmt_ratio(bl_cold_multi, zc_cold_multi, false);
     eprintln!(
         "| Multi-file RSP, Cold | {} | {} | {} | {} | {} |",
         fmt_dur(bl_cold_multi),
@@ -1231,14 +1187,10 @@ async fn perf_response_file() {
 
     // Multi-file RSP, Warm
     let scc_wm = scc_multi_str.as_deref().unwrap_or(dash);
-    let vs_scc_warm_m = sccache_multi_times.as_ref().map(|t| {
-        let ratio = median(t).as_secs_f64() / zc_multi_med.as_secs_f64();
-        format!("**{ratio:.0}x faster**")
-    });
-    let vs_bare_warm_m = {
-        let ratio = bl_warm_multi.as_secs_f64() / zc_multi_med.as_secs_f64();
-        format!("**{ratio:.0}x faster**")
-    };
+    let vs_scc_warm_m = sccache_multi_times
+        .as_ref()
+        .map(|t| fmt_ratio(median(t), zc_multi_med, true));
+    let vs_bare_warm_m = fmt_ratio(bl_warm_multi, zc_multi_med, true);
     eprintln!(
         "| Multi-file RSP, Warm | {} | {} | **{}** | {} | {} |",
         fmt_dur(bl_warm_multi),
@@ -1256,38 +1208,27 @@ async fn perf_response_file() {
     eprintln!("> {RSP_NUM_DEFINES} -D defines + {RSP_NUM_INCLUDES} -I paths + 30 warning flags = ~{} total expanded args per compile.",
         RSP_NUM_DEFINES + RSP_NUM_INCLUDES + 30 + 3);
 
-    // ── Speedup summary ─────────────────────────────────────────────
+    // ── Bottom Line ─────────────────────────────────────────────────
     eprintln!();
-    eprintln!("### Speedups (warm cache hit, median)");
+    eprintln!("### Bottom Line");
     eprintln!();
-    print_speedup(
-        "zccache single rsp vs bare clang rsp",
-        bl_warm_single,
-        zc_single_med,
-    );
-    print_speedup(
-        "zccache multi rsp  vs bare clang rsp",
-        bl_warm_multi,
-        zc_multi_med,
-    );
+    let single_vs_clang = bl_warm_single.as_secs_f64() / zc_single_med.as_secs_f64();
+    let multi_vs_clang = bl_warm_multi.as_secs_f64() / zc_multi_med.as_secs_f64();
     if let Some(ref t) = sccache_single_times {
-        print_speedup(
-            "zccache single rsp vs sccache single rsp",
-            median(t),
-            zc_single_med,
+        let single_vs_scc = median(t).as_secs_f64() / zc_single_med.as_secs_f64();
+        eprintln!(
+            "  Warm single-file:  {single_vs_clang:.0}x faster than clang, {single_vs_scc:.0}x faster than sccache"
         );
+    } else {
+        eprintln!("  Warm single-file:  {single_vs_clang:.0}x faster than clang");
     }
     if let Some(ref t) = sccache_multi_times {
-        print_speedup(
-            "zccache multi rsp  vs sccache multi rsp",
-            median(t),
-            zc_multi_med,
+        let multi_vs_scc = median(t).as_secs_f64() / zc_multi_med.as_secs_f64();
+        eprintln!(
+            "  Warm multi-file:   {multi_vs_clang:.0}x faster than clang, {multi_vs_scc:.0}x faster than sccache"
         );
+    } else {
+        eprintln!("  Warm multi-file:   {multi_vs_clang:.0}x faster than clang");
     }
-    print_speedup(
-        "zccache multi rsp  vs zccache single rsp",
-        zc_single_med,
-        zc_multi_med,
-    );
     eprintln!();
 }
