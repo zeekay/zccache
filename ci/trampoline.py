@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 
 def _find_cargo_bin():
@@ -89,3 +90,17 @@ def run_zccache_daemon():
 
 def check_on_stop():
     _run_cargo_bin("zccache-ci")
+
+
+def test():
+    """Run workspace tests via ci/test.py."""
+    script = Path(__file__).parent / "test.py"
+    result = subprocess.run([sys.executable, str(script)] + sys.argv[1:])
+    sys.exit(result.returncode)
+
+
+def perf():
+    """Run performance benchmarks via ci/perf.py."""
+    script = Path(__file__).parent / "perf.py"
+    result = subprocess.run([sys.executable, str(script)] + sys.argv[1:])
+    sys.exit(result.returncode)

@@ -40,6 +40,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "cd \"$(git rev-parse --show-toplevel)\" && uv run cargo fmt --all",
+            "timeout": 60
+          },
+          {
+            "type": "command",
             "command": "cd \"$(git rev-parse --show-toplevel)\" && uv run check_on_stop",
             "timeout": 600
           }

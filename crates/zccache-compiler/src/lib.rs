@@ -68,6 +68,12 @@ pub struct CacheableCompilation {
     pub original_args: Vec<String>,
 }
 
+/// Check if a `-x` language value is a header language (PCH generation).
+/// Uses exact match — does not match hypothetical values like `c-header-unit`.
+fn is_header_language(lang: &str) -> bool {
+    matches!(lang, "c-header" | "c++-header")
+}
+
 /// Source file extensions we recognize as C/C++.
 const SOURCE_EXTENSIONS: &[&str] = &["c", "cc", "cpp", "cxx", "c++", "C", "m", "mm", "i", "ii"];
 
@@ -168,11 +174,8 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
 
         // Flags that take a value in the next arg — skip both flag and value
         if let Some(&flag) = FLAGS_WITH_VALUE.iter().find(|&&f| f == arg.as_str()) {
-            if flag == "-x"
-                && i + 1 < args.len()
-                && (args[i + 1].starts_with("c-header") || args[i + 1].starts_with("c++-header"))
-            {
-                header_mode = true;
+            if flag == "-x" && i + 1 < args.len() {
+                header_mode = is_header_language(&args[i + 1]);
             }
             i += 2;
             continue;
@@ -192,7 +195,10 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
         i += 1;
     }
 
-    if !has_c_flag {
+    // `-x c++-header` / `-x c-header` implies compilation (PCH generation)
+    // even without an explicit `-c` flag. Clang treats header mode as
+    // "compile to PCH, don't link", so `-c` is redundant.
+    if !has_c_flag && !header_mode {
         return ParsedInvocation::NonCacheable {
             reason: "no -c flag (likely a link invocation)".to_string(),
         };
@@ -443,12 +449,232 @@ mod tests {
     }
 
     #[test]
+    fn pch_generation_without_c_flag_is_cacheable() {
+        // Meson invokes PCH generation without -c:
+        // `clang++ -x c++-header header.h -o header.pch`
+        // `-x c++-header` implies compilation, so -c is redundant.
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-header", "FastLED.h", "-o", "FastLED.h.pch"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("FastLED.h"));
+                assert_eq!(c.output_file, PathBuf::from("FastLED.h.pch"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pch_generation_c_header_without_c_flag_is_cacheable() {
+        let result = parse_invocation(
+            "gcc",
+            &args(&["-x", "c-header", "stdafx.h", "-o", "stdafx.h.gch"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("stdafx.h"));
+                assert_eq!(c.output_file, PathBuf::from("stdafx.h.gch"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pch_generation_with_meson_flags_is_cacheable() {
+        // Full Meson-style PCH invocation with extra flags
+        let result = parse_invocation(
+            "ctc-clang++",
+            &args(&[
+                "-x",
+                "c++-header",
+                "FastLED.h",
+                "-o",
+                "FastLED.h.pch",
+                "-MD",
+                "-MF",
+                "FastLED.h.pch.d",
+                "-fPIC",
+                "-Iinclude",
+                "-Werror=invalid-pch",
+            ]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("FastLED.h"));
+                assert_eq!(c.output_file, PathBuf::from("FastLED.h.pch"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn header_without_x_flag_is_not_source() {
         // Without `-x c++-header`, a .h file should NOT be recognized as a source
         let result = parse_invocation("clang++", &args(&["-c", "pch.h"]));
         assert!(
             matches!(result, ParsedInvocation::NonCacheable { .. }),
             "bare .h without -x header mode should be non-cacheable"
+        );
+    }
+
+    #[test]
+    fn x_flag_reset_disables_header_mode() {
+        // `-x c++-header pch.h -x c++ main.cpp -c -o main.o`
+        // After `-x c++`, header_mode resets — main.cpp is a normal source,
+        // pch.h was collected as header-mode source → multi-file.
+        let result = parse_invocation(
+            "clang++",
+            &args(&[
+                "-x",
+                "c++-header",
+                "pch.h",
+                "-x",
+                "c++",
+                "main.cpp",
+                "-c",
+                "-o",
+                "main.o",
+            ]),
+        );
+        match result {
+            ParsedInvocation::MultiFile { compilations, .. } => {
+                assert_eq!(compilations.len(), 2);
+                assert_eq!(compilations[0].source_file, PathBuf::from("pch.h"));
+                assert_eq!(compilations[1].source_file, PathBuf::from("main.cpp"));
+            }
+            other => panic!("expected MultiFile, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x_cpp_after_header_is_normal_compilation() {
+        // `-x c++-header -x c++ main.cpp -c -o main.o`
+        // No header file between the two -x flags. The second -x c++ resets
+        // header_mode, so main.cpp is a normal compilation.
+        let result = parse_invocation(
+            "clang++",
+            &args(&[
+                "-x",
+                "c++-header",
+                "-x",
+                "c++",
+                "main.cpp",
+                "-c",
+                "-o",
+                "main.o",
+            ]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("main.cpp"));
+                assert_eq!(c.output_file, PathBuf::from("main.o"));
+            }
+            other => panic!("expected Cacheable, got: {other:?}"),
+        }
+    }
+
+    // ─── Regression tests: sticky header_mode bug ─────────────────────
+
+    #[test]
+    fn sticky_header_mode_cpp_not_spuriously_pch() {
+        // BUG: old code set header_mode=true on `-x c++-header` but never
+        // reset it on `-x c++`, so main.cpp was treated as a header file
+        // needing PCH generation. After the fix, `-x c++` resets header_mode,
+        // and main.cpp is a normal source — not a PCH candidate.
+        let result = parse_invocation(
+            "clang++",
+            &args(&[
+                "-x",
+                "c++-header",
+                "pch.h",
+                "-o",
+                "pch.h.pch",
+                "-x",
+                "c++",
+                "-c",
+                "main.cpp",
+                "-o",
+                "main.o",
+            ]),
+        );
+        // main.cpp must be recognized as a normal source via its extension,
+        // NOT via header_mode. With the old bug, header_mode stayed true and
+        // both pch.h and main.cpp were header-mode sources.
+        match &result {
+            ParsedInvocation::MultiFile { compilations, .. } => {
+                assert_eq!(compilations.len(), 2);
+                // pch.h picked up in header_mode
+                assert_eq!(compilations[0].source_file, PathBuf::from("pch.h"));
+                // main.cpp picked up by extension after reset
+                assert_eq!(compilations[1].source_file, PathBuf::from("main.cpp"));
+            }
+            other => panic!("expected MultiFile, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sticky_header_mode_non_source_not_captured_after_reset() {
+        // BUG: with sticky header_mode, a positional arg like "README.txt"
+        // after `-x c++` would be treated as a source file because
+        // `is_source_file(arg) || header_mode` was true. After fix,
+        // header_mode is false after `-x c++`, so non-source extensions
+        // are correctly ignored.
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-header", "pch.h", "-x", "c++", "-c", "main.cpp"]),
+        );
+        match &result {
+            ParsedInvocation::MultiFile { compilations, .. } => {
+                assert_eq!(compilations.len(), 2);
+                assert_eq!(compilations[0].source_file, PathBuf::from("pch.h"));
+                assert_eq!(compilations[1].source_file, PathBuf::from("main.cpp"));
+            }
+            other => panic!("expected MultiFile, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sticky_header_mode_no_c_flag_after_reset_is_non_cacheable() {
+        // BUG: with sticky header_mode, the `!has_c_flag && !header_mode`
+        // check at the end would pass (header_mode was still true),
+        // making a link invocation appear cacheable. After fix, `-x c++`
+        // resets header_mode so without -c it's correctly non-cacheable.
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-header", "-x", "c++", "main.cpp", "-o", "main"]),
+        );
+        assert!(
+            matches!(result, ParsedInvocation::NonCacheable { .. }),
+            "after -x c++ reset, no -c should be non-cacheable, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn header_language_exact_match_no_prefix() {
+        // `-x c-header-unit` should NOT activate header_mode (exact match only).
+        // With old starts_with("c-header"), this would have set header_mode=true.
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c-header-unit", "foo.h", "-o", "foo.pcm"]),
+        );
+        assert!(
+            matches!(result, ParsedInvocation::NonCacheable { .. }),
+            "c-header-unit should not activate header mode, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn header_language_exact_match_cpp_no_prefix() {
+        // `-x c++-header-unit` should NOT activate header_mode.
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-header-unit", "foo.h", "-o", "foo.pcm"]),
+        );
+        assert!(
+            matches!(result, ParsedInvocation::NonCacheable { .. }),
+            "c++-header-unit should not activate header mode, got: {result:?}"
         );
     }
 

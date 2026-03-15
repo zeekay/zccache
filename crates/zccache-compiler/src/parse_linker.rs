@@ -72,8 +72,21 @@ pub fn is_link_invocation(tool: &str, args: &[String]) -> bool {
     if detect_family(tool).is_some() {
         return true;
     }
-    // Compiler driver: it's a link invocation if no compile-only flag is present
-    is_compiler_driver(tool) && !args.iter().any(|a| a == "-c" || a == "-E" || a == "-S")
+    // Compiler driver: it's a link invocation if no compile-only flag is present.
+    // `-x c++-header` / `-x c-header` imply compilation (PCH generation), not linking.
+    if !is_compiler_driver(tool) {
+        return false;
+    }
+    if args.iter().any(|a| a == "-c" || a == "-E" || a == "-S") {
+        return false;
+    }
+    // Check for `-x c++-header` or `-x c-header` (PCH generation mode)
+    for pair in args.windows(2) {
+        if pair[0] == "-x" && super::is_header_language(&pair[1]) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Detect the linker family from the tool path/name.
@@ -1556,6 +1569,60 @@ mod tests {
         assert!(!is_link_invocation("gcc", &args(&["-S", "foo.c"])));
         // gcc -o a.out main.o IS a link invocation (exe link)
         assert!(is_link_invocation("gcc", &args(&["-o", "a.out", "main.o"])));
+    }
+
+    #[test]
+    fn is_link_invocation_pch_generation_not_link() {
+        // PCH generation with -x c++-header is compilation, NOT linking
+        assert!(!is_link_invocation(
+            "clang++",
+            &args(&["-x", "c++-header", "header.h", "-o", "header.pch"])
+        ));
+        assert!(!is_link_invocation(
+            "gcc",
+            &args(&["-x", "c-header", "stdafx.h", "-o", "stdafx.h.gch"])
+        ));
+        // Cross-compiler with "clang" in the name
+        assert!(!is_link_invocation(
+            "ctc-clang++",
+            &args(&[
+                "-x",
+                "c++-header",
+                "FastLED.h",
+                "-o",
+                "FastLED.h.pch",
+                "-fPIC",
+                "-Iinclude",
+            ])
+        ));
+        // With -c AND -x c++-header — still not a link
+        assert!(!is_link_invocation(
+            "clang++",
+            &args(&["-x", "c++-header", "-c", "header.h", "-o", "header.pch"])
+        ));
+    }
+
+    #[test]
+    fn is_link_pch_exact_match() {
+        // `-x c-header-unit` is NOT a PCH header language — exact match only.
+        // Without -c, this should be treated as a link invocation.
+        assert!(is_link_invocation(
+            "clang++",
+            &args(&["-x", "c-header-unit", "foo.h", "-o", "foo.pcm"])
+        ));
+        assert!(is_link_invocation(
+            "clang++",
+            &args(&["-x", "c++-header-unit", "foo.h", "-o", "foo.pcm"])
+        ));
+        // But exact `c-header` and `c++-header` should still NOT be link
+        assert!(!is_link_invocation(
+            "clang++",
+            &args(&["-x", "c-header", "foo.h", "-o", "foo.gch"])
+        ));
+        assert!(!is_link_invocation(
+            "clang++",
+            &args(&["-x", "c++-header", "foo.h", "-o", "foo.pch"])
+        ));
     }
 
     #[test]
