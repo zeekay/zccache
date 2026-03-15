@@ -10,6 +10,7 @@ pub mod parse_linker;
 pub mod response_file;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Supported compiler families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +42,7 @@ pub enum ParsedInvocation {
         /// One entry per source file, each with its own output path.
         compilations: Vec<CacheableCompilation>,
         /// The original full argument list (for batched compiler invocation of misses).
-        original_args: Vec<String>,
+        original_args: Arc<[String]>,
         /// Indices of source files in `original_args`, so the daemon can filter
         /// out cache-hit sources without reconstructing args.
         source_indices: Vec<usize>,
@@ -65,7 +66,7 @@ pub struct CacheableCompilation {
     /// The output file path.
     pub output_file: PathBuf,
     /// The full original argument list — always passed to the compiler as-is.
-    pub original_args: Vec<String>,
+    pub original_args: Arc<[String]>,
 }
 
 /// Check if a `-x` language value is a header language (PCH generation).
@@ -216,6 +217,7 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     // so each source gets its default output name (stem.o).
     if source_files.len() > 1 {
         let source_indices: Vec<usize> = source_files.iter().map(|(_, idx)| *idx).collect();
+        let shared_args: Arc<[String]> = Arc::from(args.to_vec());
         let compilations = source_files
             .iter()
             .map(|(src, _)| {
@@ -228,13 +230,13 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
                     family,
                     source_file: PathBuf::from(src),
                     output_file: PathBuf::from(format!("{stem}.o")),
-                    original_args: args.to_vec(),
+                    original_args: Arc::clone(&shared_args),
                 }
             })
             .collect();
         return ParsedInvocation::MultiFile {
             compilations,
-            original_args: args.to_vec(),
+            original_args: shared_args,
             source_indices,
         };
     }
@@ -254,7 +256,7 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
         family,
         source_file: PathBuf::from(source),
         output_file: PathBuf::from(output),
-        original_args: args.to_vec(),
+        original_args: Arc::from(args.to_vec()),
     })
 }
 
@@ -371,7 +373,7 @@ mod tests {
         let result = parse_invocation("clang++", &input);
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.original_args, input);
+                assert_eq!(*c.original_args, *input);
             }
             _ => panic!("expected cacheable"),
         }
@@ -390,7 +392,7 @@ mod tests {
         let result = parse_invocation("clang++", &input);
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.original_args, input);
+                assert_eq!(*c.original_args, *input);
                 assert_eq!(c.source_file, PathBuf::from("hello.cpp"));
                 assert_eq!(c.output_file, PathBuf::from("hello.o"));
             }

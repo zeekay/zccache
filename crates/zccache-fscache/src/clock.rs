@@ -173,6 +173,20 @@ impl ChangeJournal {
         self.mark_overflow()
     }
 
+    /// Remove `last_change` entries whose path is not in the `live` set.
+    /// Returns the number of entries removed.
+    pub fn retain_paths(&self, live: &std::collections::HashSet<PathBuf>) -> usize {
+        let before = self.last_change.len();
+        self.last_change.retain(|path, _| live.contains(path));
+        before - self.last_change.len()
+    }
+
+    /// Returns the number of entries in the `last_change` map.
+    #[must_use]
+    pub fn last_change_len(&self) -> usize {
+        self.last_change.len()
+    }
+
     /// Register a file as tracked at the current clock tick without advancing
     /// the clock.
     ///
@@ -409,6 +423,43 @@ mod tests {
         // After the overflow clock, a newly tracked file should be "not changed".
         journal.register(PathBuf::from("new.c"));
         assert!(!journal.changed_since(Path::new("new.c"), overflow_clock));
+    }
+
+    #[test]
+    fn retain_removes_orphans() {
+        let journal = ChangeJournal::new();
+        journal.advance(vec![
+            PathBuf::from("a.c"),
+            PathBuf::from("b.c"),
+            PathBuf::from("c.c"),
+        ]);
+        let live: std::collections::HashSet<PathBuf> = [PathBuf::from("a.c")].into_iter().collect();
+        let removed = journal.retain_paths(&live);
+        assert_eq!(removed, 2);
+        assert_eq!(journal.last_change_len(), 1);
+        assert!(!journal.changed_since(Path::new("a.c"), Clock(1)));
+    }
+
+    #[test]
+    fn retain_keeps_all() {
+        let journal = ChangeJournal::new();
+        journal.advance(vec![PathBuf::from("a.c"), PathBuf::from("b.c")]);
+        let live: std::collections::HashSet<PathBuf> = [PathBuf::from("a.c"), PathBuf::from("b.c")]
+            .into_iter()
+            .collect();
+        let removed = journal.retain_paths(&live);
+        assert_eq!(removed, 0);
+        assert_eq!(journal.last_change_len(), 2);
+    }
+
+    #[test]
+    fn last_change_len_tracks() {
+        let journal = ChangeJournal::new();
+        assert_eq!(journal.last_change_len(), 0);
+        journal.advance(vec![PathBuf::from("x.c")]);
+        assert_eq!(journal.last_change_len(), 1);
+        journal.advance(vec![PathBuf::from("y.c"), PathBuf::from("z.c")]);
+        assert_eq!(journal.last_change_len(), 3);
     }
 
     #[test]

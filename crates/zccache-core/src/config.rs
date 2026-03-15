@@ -18,6 +18,10 @@ pub struct Config {
     pub watcher_poll_fallback: bool,
     /// Log level filter (e.g., "info", "debug", "trace").
     pub log_level: String,
+    /// Maximum in-memory cache budget in bytes (default: 1 GB).
+    pub max_memory_bytes: u64,
+    /// How often (in seconds) the eviction background task runs (default: 30).
+    pub eviction_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -29,6 +33,8 @@ impl Default for Config {
             enable_watcher: true,
             watcher_poll_fallback: false,
             log_level: String::from("info"),
+            max_memory_bytes: 1_073_741_824, // 1 GB
+            eviction_interval_secs: 30,
         }
     }
 }

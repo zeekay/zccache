@@ -23,10 +23,10 @@ use crate::stats::{HitPhases, MissPhases, PhaseProfiler, StatsCollector};
 /// When the journal clock hasn't advanced since the last verified hit for a
 /// context, we can skip all stat/hash/depgraph work and jump straight to
 /// artifact lookup.
-struct FastHitEntry {
-    clock: Clock,
-    artifact_key_hex: String,
-    cached_at: std::time::Instant,
+pub(crate) struct FastHitEntry {
+    pub(crate) clock: Clock,
+    pub(crate) artifact_key_hex: String,
+    pub(crate) cached_at: std::time::Instant,
 }
 
 /// Maximum age for fast-hit cache entries. Matches the High→Medium confidence
@@ -37,8 +37,10 @@ const FAST_HIT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60)
 
 /// Cached compilation artifact.
 #[derive(Debug, Clone)]
-struct CachedArtifact {
-    artifact: ArtifactData,
+pub(crate) struct CachedArtifact {
+    pub(crate) artifact: ArtifactData,
+    /// When this artifact was last used (inserted or returned as a hit).
+    pub(crate) last_used: std::time::Instant,
 }
 
 /// Shared state accessible by all connection handlers.
@@ -88,6 +90,23 @@ pub struct DaemonServer {
     state: Arc<SharedState>,
 }
 
+/// Remove fast-hit cache entries older than `max_age`. Returns entries removed.
+pub(crate) fn trim_fast_hit_cache(
+    cache: &DashMap<ContextKey, FastHitEntry>,
+    max_age: std::time::Duration,
+) -> usize {
+    let mut removed = 0;
+    cache.retain(|_, entry| {
+        if entry.cached_at.elapsed() > max_age {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    removed
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -124,7 +143,13 @@ impl DaemonServer {
                                 .unwrap_or_default()
                                 .to_string_lossy()
                                 .into_owned();
-                            artifacts.insert(stem, CachedArtifact { artifact });
+                            artifacts.insert(
+                                stem,
+                                CachedArtifact {
+                                    artifact,
+                                    last_used: std::time::Instant::now(),
+                                },
+                            );
                         }
                     }
                 }
@@ -200,6 +225,32 @@ impl DaemonServer {
                         tracing::info!(idle_secs = idle, "idle timeout — shutting down");
                         state.shutdown.notify_one();
                         break;
+                    }
+                }
+            });
+        }
+
+        // Start memory eviction background task.
+        {
+            let state = Arc::clone(&self.state);
+            let budget = zccache_core::config::Config::default().max_memory_bytes;
+            let interval_secs = zccache_core::config::Config::default().eviction_interval_secs;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                    let (freed, items) = crate::eviction::evict_to_budget(
+                        budget,
+                        &state.cache_system,
+                        &state.dep_graph,
+                        &state.fast_hit_cache,
+                        &state.artifacts,
+                    );
+                    if items > 0 {
+                        tracing::info!(
+                            freed_bytes = freed,
+                            items_removed = items,
+                            "memory eviction"
+                        );
                     }
                 }
             });
@@ -772,7 +823,9 @@ async fn handle_link_ephemeral(
     let key_hex = cache_key.to_hex();
 
     // 5. Cache lookup
-    if let Some(entry) = state.artifacts.get(&key_hex) {
+    if let Some(mut entry) = state.artifacts.get_mut(&key_hex) {
+        entry.last_used = std::time::Instant::now();
+        let entry = entry.downgrade();
         tracing::debug!(%key_hex, "link cache hit");
         state.stats.record_link_hit();
 
@@ -870,9 +923,13 @@ async fn handle_link_ephemeral(
                 std::fs::write(&meta_path, &encoded).ok();
             }
 
-            state
-                .artifacts
-                .insert(key_hex.clone(), CachedArtifact { artifact });
+            state.artifacts.insert(
+                key_hex.clone(),
+                CachedArtifact {
+                    artifact,
+                    last_used: std::time::Instant::now(),
+                },
+            );
             tracing::debug!(%key_hex, "link artifact cached");
         }
     }
@@ -1244,7 +1301,10 @@ async fn handle_compile(
             if entry.clock == current_clock && entry.cached_at.elapsed() < FAST_HIT_MAX_AGE {
                 let artifact_key_hex = &entry.artifact_key_hex;
                 let t5 = std::time::Instant::now();
-                let cached = state.artifacts.get(artifact_key_hex).map(|r| r.clone());
+                let cached = state.artifacts.get_mut(artifact_key_hex).map(|mut r| {
+                    r.last_used = std::time::Instant::now();
+                    r.clone()
+                });
                 let artifact_lookup_ns = t5.elapsed().as_nanos() as u64;
 
                 if let Some(cached) = cached {
@@ -1420,7 +1480,10 @@ async fn handle_compile(
             // ── Phase: artifact lookup ────────────────────────────────
             let t5 = std::time::Instant::now();
             let artifact_key_hex = artifact_key.hash().to_hex();
-            let cached = state.artifacts.get(&artifact_key_hex).map(|r| r.clone());
+            let cached = state.artifacts.get_mut(&artifact_key_hex).map(|mut r| {
+                r.last_used = std::time::Instant::now();
+                r.clone()
+            });
             let artifact_lookup_ns = t5.elapsed().as_nanos() as u64;
 
             if let Some(cached) = cached {
@@ -1758,9 +1821,13 @@ async fn handle_compile(
             }
 
             let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
-            state
-                .artifacts
-                .insert(artifact_key_hex, CachedArtifact { artifact });
+            state.artifacts.insert(
+                artifact_key_hex,
+                CachedArtifact {
+                    artifact,
+                    last_used: std::time::Instant::now(),
+                },
+            );
 
             let latency_ns = compile_start.elapsed().as_nanos() as u64;
             state.stats.record_miss(latency_ns, artifact_bytes);
@@ -1907,7 +1974,10 @@ fn check_unit_cache(
     | zccache_depgraph::CacheVerdict::SourceChanged { artifact_key } = verdict
     {
         let artifact_key_hex = artifact_key.hash().to_hex();
-        if let Some(cached) = state.artifacts.get(&artifact_key_hex).map(|r| r.clone()) {
+        if let Some(cached) = state.artifacts.get_mut(&artifact_key_hex).map(|mut r| {
+            r.last_used = std::time::Instant::now();
+            r.clone()
+        }) {
             let t_lookup = t0.elapsed();
             // Build deferred writes instead of writing immediately
             let mut pending = Vec::with_capacity(cached.artifact.outputs.len());
@@ -1973,7 +2043,7 @@ async fn handle_compile_multi(
     sid: SessionId,
     compiler: PathBuf,
     compilations: Vec<zccache_compiler::CacheableCompilation>,
-    original_args: Vec<String>,
+    original_args: Arc<[String]>,
     source_indices: Vec<usize>,
     cwd_path: PathBuf,
     system_includes: Vec<PathBuf>,
@@ -2303,9 +2373,13 @@ async fn handle_compile_multi(
             }
 
             let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
-            state
-                .artifacts
-                .insert(artifact_key_hex, CachedArtifact { artifact });
+            state.artifacts.insert(
+                artifact_key_hex,
+                CachedArtifact {
+                    artifact,
+                    last_used: std::time::Instant::now(),
+                },
+            );
 
             state.stats.record_miss(0, artifact_bytes);
             let src = source_path.clone();

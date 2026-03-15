@@ -154,6 +154,28 @@ impl CacheSystem {
         self.journal.clear()
     }
 
+    /// Trim metadata entries older than `max_age`, then remove orphaned
+    /// journal `last_change` entries. Returns `(metadata_removed, journal_removed)`.
+    pub fn trim(&self, max_age: std::time::Duration) -> (usize, usize) {
+        let meta_removed = self.metadata.trim(max_age);
+        let journal_removed = self.cleanup_journal();
+        (meta_removed, journal_removed)
+    }
+
+    /// Evict the `count` oldest metadata entries, then remove orphaned
+    /// journal entries. Returns `(metadata_removed, journal_removed)`.
+    pub fn evict_oldest(&self, count: usize) -> (usize, usize) {
+        let meta_removed = self.metadata.evict_oldest(count);
+        let journal_removed = self.cleanup_journal();
+        (meta_removed, journal_removed)
+    }
+
+    /// Remove journal `last_change` entries not in the metadata cache.
+    fn cleanup_journal(&self) -> usize {
+        let live: std::collections::HashSet<PathBuf> = self.metadata.paths().into_iter().collect();
+        self.journal.retain_paths(&live)
+    }
+
     /// Register files as tracked by the journal without downgrading their
     /// confidence.
     ///
@@ -458,6 +480,41 @@ mod tests {
         let overflow_clock = cache.clear();
         assert!(cache.metadata().is_empty());
         assert!(overflow_clock > Clock::ZERO);
+    }
+
+    #[test]
+    fn trim_cascades_to_journal() {
+        let cache = CacheSystem::new();
+
+        // Insert a file and track it in the journal.
+        let dir = TempDir::new().unwrap();
+        let path = create_file(&dir, "old.c", "content");
+        cache.lookup_since(&path, Clock::ZERO).unwrap();
+        cache.apply_changes(vec![path.clone()]);
+
+        // Journal should track this file.
+        assert_eq!(cache.journal().last_change_len(), 1);
+
+        // Trim with zero max_age removes everything.
+        let (meta_removed, journal_removed) = cache.trim(Duration::ZERO);
+        assert!(meta_removed >= 1);
+        assert_eq!(journal_removed, 1);
+        assert!(cache.metadata().is_empty());
+        assert_eq!(cache.journal().last_change_len(), 0);
+    }
+
+    #[test]
+    fn evict_oldest_cascades() {
+        let cache = CacheSystem::new();
+        let dir = TempDir::new().unwrap();
+        let path = create_file(&dir, "evict.c", "data");
+        cache.lookup_since(&path, Clock::ZERO).unwrap();
+        cache.apply_changes(vec![path.clone()]);
+
+        let (meta_removed, journal_removed) = cache.evict_oldest(10);
+        assert_eq!(meta_removed, 1);
+        assert_eq!(journal_removed, 1);
+        assert!(cache.metadata().is_empty());
     }
 
     #[test]

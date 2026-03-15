@@ -155,6 +155,47 @@ impl MetadataCache {
             })
     }
 
+    /// Trim entries whose `last_verified` is older than `max_age`.
+    /// Returns the number of entries removed.
+    pub fn trim(&self, max_age: Duration) -> usize {
+        let now = Instant::now();
+        let mut removed = 0;
+        self.entries.retain(|_, entry| {
+            if now.duration_since(entry.last_verified) > max_age {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
+    /// Evict the `count` oldest entries by `last_verified`.
+    /// Returns the number actually removed (may be less than `count`).
+    pub fn evict_oldest(&self, count: usize) -> usize {
+        if count == 0 {
+            return 0;
+        }
+        // Collect (path, last_verified) then sort oldest first.
+        let mut entries: Vec<(PathBuf, Instant)> = self
+            .entries
+            .iter()
+            .map(|e| (e.key().clone(), e.value().last_verified))
+            .collect();
+        entries.sort_by_key(|(_path, ts)| *ts);
+        let to_remove = entries.len().min(count);
+        for (path, _) in entries.into_iter().take(to_remove) {
+            self.entries.remove(&path);
+        }
+        to_remove
+    }
+
+    /// Iterate all cached paths.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        self.entries.iter().map(|e| e.key().clone()).collect()
+    }
+
     fn decayed_confidence(&self, meta: &FileMetadata) -> Confidence {
         let elapsed = meta.last_verified.elapsed();
         match meta.confidence {
@@ -174,6 +215,7 @@ impl Default for MetadataCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn insert_and_get() {
@@ -400,6 +442,136 @@ mod tests {
         assert_eq!(cache.len(), 5);
         cache.clear();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn trim_removes_old_entries() {
+        let cache = MetadataCache::new();
+        let old = Instant::now() - Duration::from_secs(120);
+        cache.insert(
+            PathBuf::from("/tmp/old.c"),
+            FileMetadata {
+                mtime: SystemTime::now(),
+                size: 10,
+                confidence: Confidence::High,
+                last_verified: old,
+                content_hash: None,
+            },
+        );
+        cache.insert(
+            PathBuf::from("/tmp/new.c"),
+            FileMetadata {
+                mtime: SystemTime::now(),
+                size: 10,
+                confidence: Confidence::High,
+                last_verified: Instant::now(),
+                content_hash: None,
+            },
+        );
+        let removed = cache.trim(Duration::from_secs(60));
+        assert_eq!(removed, 1);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(Path::new("/tmp/old.c")).is_none());
+        assert!(cache.get(Path::new("/tmp/new.c")).is_some());
+    }
+
+    #[test]
+    fn trim_keeps_recent_entries() {
+        let cache = MetadataCache::new();
+        for i in 0..5 {
+            cache.insert(
+                PathBuf::from(format!("/tmp/recent{i}.c")),
+                FileMetadata {
+                    mtime: SystemTime::now(),
+                    size: 10,
+                    confidence: Confidence::High,
+                    last_verified: Instant::now(),
+                    content_hash: None,
+                },
+            );
+        }
+        let removed = cache.trim(Duration::from_secs(60));
+        assert_eq!(removed, 0);
+        assert_eq!(cache.len(), 5);
+    }
+
+    #[test]
+    fn evict_oldest_removes_n() {
+        let cache = MetadataCache::new();
+        let base = Instant::now() - Duration::from_secs(100);
+        for i in 0..5 {
+            cache.insert(
+                PathBuf::from(format!("/tmp/e{i}.c")),
+                FileMetadata {
+                    mtime: SystemTime::now(),
+                    size: 10,
+                    confidence: Confidence::High,
+                    last_verified: base + Duration::from_secs(i * 10),
+                    content_hash: None,
+                },
+            );
+        }
+        let removed = cache.evict_oldest(2);
+        assert_eq!(removed, 2);
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn evict_oldest_zero_noop() {
+        let cache = MetadataCache::new();
+        cache.insert(
+            PathBuf::from("/tmp/z.c"),
+            FileMetadata {
+                mtime: SystemTime::now(),
+                size: 10,
+                confidence: Confidence::High,
+                last_verified: Instant::now(),
+                content_hash: None,
+            },
+        );
+        let removed = cache.evict_oldest(0);
+        assert_eq!(removed, 0);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn evict_oldest_exceeds_count() {
+        let cache = MetadataCache::new();
+        cache.insert(
+            PathBuf::from("/tmp/only.c"),
+            FileMetadata {
+                mtime: SystemTime::now(),
+                size: 10,
+                confidence: Confidence::High,
+                last_verified: Instant::now(),
+                content_hash: None,
+            },
+        );
+        let removed = cache.evict_oldest(100);
+        assert_eq!(removed, 1);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn paths_returns_all() {
+        let cache = MetadataCache::new();
+        let expected: HashSet<PathBuf> = (0..3)
+            .map(|i| PathBuf::from(format!("/tmp/p{i}.c")))
+            .collect();
+        for p in &expected {
+            cache.insert(
+                p.clone(),
+                FileMetadata {
+                    mtime: SystemTime::now(),
+                    size: 10,
+                    confidence: Confidence::High,
+                    last_verified: Instant::now(),
+                    content_hash: None,
+                },
+            );
+        }
+        let actual: HashSet<PathBuf> = cache.paths().into_iter().collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]
