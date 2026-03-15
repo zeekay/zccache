@@ -376,9 +376,9 @@ fn write_to_file(path: &Path, line: &str) {
 mod tests {
     use super::*;
 
-    /// Give the background thread time to drain the channel.
+    /// Give the background thread time to drain the channel and complete I/O.
     fn flush_logger(_logger: &EventLogger) {
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(200));
     }
 
     #[test]

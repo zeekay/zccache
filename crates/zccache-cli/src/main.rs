@@ -116,6 +116,18 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "-V",
 ];
 
+/// Convert an i32 exit code to ExitCode without silent truncation.
+/// A bare `exit_code as u8` wraps: 256 → 0 (success), masking failures.
+/// This preserves success/failure semantics: non-zero stays non-zero.
+fn exit_code_from_i32(code: i32) -> ExitCode {
+    let truncated = (code & 0xFF) as u8;
+    if code != 0 && truncated == 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::from(truncated)
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
@@ -598,7 +610,7 @@ fn run_passthrough(args: &[String]) -> ExitCode {
         .args(tool_args)
         .status()
     {
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Ok(status) => exit_code_from_i32(status.code().unwrap_or(1)),
         Err(e) => {
             eprintln!("zccache: failed to run {}: {e}", resolved.display());
             ExitCode::FAILURE
@@ -738,7 +750,7 @@ async fn cmd_compile(
             use std::io::Write;
             let _ = std::io::stdout().write_all(&stdout);
             let _ = std::io::stderr().write_all(&stderr);
-            ExitCode::from(exit_code as u8)
+            exit_code_from_i32(exit_code)
         }
         Some(zccache_protocol::Response::Error { message }) => {
             eprintln!("zccache error: {message}");
@@ -794,7 +806,7 @@ async fn cmd_compile_ephemeral(
             use std::io::Write;
             let _ = std::io::stdout().write_all(&stdout);
             let _ = std::io::stderr().write_all(&stderr);
-            ExitCode::from(exit_code as u8)
+            exit_code_from_i32(exit_code)
         }
         Some(zccache_protocol::Response::Error { message }) => {
             eprintln!("zccache error: {message}");
@@ -852,7 +864,7 @@ async fn cmd_link_ephemeral(
             if let Some(w) = warning {
                 eprintln!("zccache warning: {w}");
             }
-            ExitCode::from(exit_code as u8)
+            exit_code_from_i32(exit_code)
         }
         Some(zccache_protocol::Response::Error { message }) => {
             eprintln!("zccache error: {message}");
@@ -1172,4 +1184,49 @@ fn init_tracing() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_code_zero_stays_zero() {
+        assert_eq!(exit_code_from_i32(0), ExitCode::from(0));
+    }
+
+    #[test]
+    fn exit_code_one_stays_one() {
+        assert_eq!(exit_code_from_i32(1), ExitCode::from(1));
+    }
+
+    #[test]
+    fn exit_code_255_stays_255() {
+        assert_eq!(exit_code_from_i32(255), ExitCode::from(255));
+    }
+
+    #[test]
+    fn exit_code_256_becomes_one_not_zero() {
+        // Without the fix, 256 as u8 == 0, masking the failure.
+        assert_ne!(exit_code_from_i32(256), ExitCode::from(0));
+        assert_eq!(exit_code_from_i32(256), ExitCode::from(1));
+    }
+
+    #[test]
+    fn exit_code_512_becomes_one_not_zero() {
+        assert_eq!(exit_code_from_i32(512), ExitCode::from(1));
+    }
+
+    #[test]
+    fn exit_code_negative_preserves_failure() {
+        // -1 & 0xFF == 255
+        assert_ne!(exit_code_from_i32(-1), ExitCode::from(0));
+        assert_eq!(exit_code_from_i32(-1), ExitCode::from(255));
+    }
+
+    #[test]
+    fn exit_code_257_keeps_low_byte() {
+        // 257 & 0xFF == 1, non-zero, so kept as-is.
+        assert_eq!(exit_code_from_i32(257), ExitCode::from(1));
+    }
 }

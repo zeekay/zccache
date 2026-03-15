@@ -487,7 +487,9 @@ impl DepGraph {
         let mut removed = 0;
 
         self.contexts.retain(|_, entry| {
-            if now.duration_since(entry.last_accessed) > max_age {
+            // Use saturating_duration_since to avoid panic if Instant is
+            // non-monotonic (documented edge case on some platforms/VMs).
+            if now.saturating_duration_since(entry.last_accessed) > max_age {
                 removed += 1;
                 false
             } else {
@@ -503,6 +505,9 @@ impl DepGraph {
                 |entry: dashmap::mapref::multiple::RefMulti<'_, ContextKey, ContextEntry>| {
                     let mut paths = entry.value().resolved_includes.clone();
                     paths.push(entry.value().context.source_file.clone());
+                    for fi in &entry.value().context.force_includes {
+                        paths.push(fi.clone());
+                    }
                     paths
                 },
             )
@@ -1022,5 +1027,70 @@ mod tests {
 
         assert!(graph.mark_stale(&key));
         assert_eq!(graph.get_state(&key), Some(ContextState::Stale));
+    }
+
+    #[test]
+    fn trim_preserves_force_include_files() {
+        let graph = DepGraph::new();
+
+        // Create a context with a force-include (PCH file).
+        let mut ctx = make_ctx("/src/a.c");
+        ctx.force_includes = vec![PathBuf::from("/pch/precompiled.h")];
+        let key = graph.register(ctx);
+
+        let scan = ScanResult {
+            resolved: vec![PathBuf::from("/inc/b.h")],
+            unresolved: Vec::new(),
+            has_computed: false,
+        };
+        graph.update(&key, scan, dummy_hash);
+
+        // Populate the files map for both the force-include and resolved include.
+        let empty_includes = vec![crate::IncludeDirective {
+            kind: crate::IncludeKind::Quoted,
+            path: "stdafx.h".to_string(),
+            line: 1,
+        }];
+        graph.store_file_includes(PathBuf::from("/pch/precompiled.h"), empty_includes.clone());
+        graph.store_file_includes(PathBuf::from("/inc/b.h"), empty_includes);
+
+        // Also add an unreferenced file that should be evicted.
+        graph.store_file_includes(
+            PathBuf::from("/stale/old.h"),
+            vec![crate::IncludeDirective {
+                kind: crate::IncludeKind::Quoted,
+                path: "gone.h".to_string(),
+                line: 1,
+            }],
+        );
+
+        assert_eq!(graph.stats().file_count, 3);
+
+        // Trim with a long max_age — no contexts should be removed.
+        let removed = graph.trim(Duration::from_secs(3600));
+        assert_eq!(removed, 0);
+
+        // The force-included PCH file must still be in the files map.
+        assert!(
+            graph
+                .get_file_includes(&PathBuf::from("/pch/precompiled.h"))
+                .is_some(),
+            "force-included PCH file should not be evicted by trim"
+        );
+        // Regular includes should also be preserved.
+        assert!(
+            graph
+                .get_file_includes(&PathBuf::from("/inc/b.h"))
+                .is_some(),
+            "resolved include should not be evicted by trim"
+        );
+        // Unreferenced file should be evicted.
+        assert!(
+            graph
+                .get_file_includes(&PathBuf::from("/stale/old.h"))
+                .is_none(),
+            "unreferenced file should be evicted by trim"
+        );
+        assert_eq!(graph.stats().file_count, 2);
     }
 }

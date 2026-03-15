@@ -87,7 +87,7 @@ pub fn detect_family(compiler: &str) -> CompilerFamily {
         .unwrap_or(compiler);
     if name.contains("clang") {
         CompilerFamily::Clang
-    } else if name == "cl" {
+    } else if name.eq_ignore_ascii_case("cl") {
         CompilerFamily::Msvc
     } else {
         CompilerFamily::Gcc
@@ -692,6 +692,21 @@ mod tests {
     fn detect_msvc_family() {
         assert_eq!(detect_family("cl"), CompilerFamily::Msvc);
         assert_eq!(detect_family("C:\\MSVC\\cl"), CompilerFamily::Msvc);
+    }
+
+    #[test]
+    fn detect_msvc_case_insensitive() {
+        // MSVC cl.exe is commonly invoked in uppercase on Windows.
+        // Bug: detect_family used case-sensitive `name == "cl"`, so
+        // CL.EXE was misclassified as Gcc.
+        assert_eq!(detect_family("CL"), CompilerFamily::Msvc);
+        assert_eq!(detect_family("CL.EXE"), CompilerFamily::Msvc);
+        assert_eq!(detect_family("Cl.exe"), CompilerFamily::Msvc);
+        assert_eq!(detect_family("C:\\MSVC\\CL.EXE"), CompilerFamily::Msvc);
+        assert_eq!(
+            detect_family("C:\\Program Files\\MSVC\\cl.EXE"),
+            CompilerFamily::Msvc
+        );
     }
 
     #[test]

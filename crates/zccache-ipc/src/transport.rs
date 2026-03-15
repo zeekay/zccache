@@ -213,15 +213,23 @@ pub async fn connect(endpoint: &str) -> Result<IpcConnection, IpcError> {
 pub async fn connect(endpoint: &str) -> Result<IpcClientConnection, IpcError> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
-    // Retry loop for ERROR_PIPE_BUSY
-    let client = loop {
-        match ClientOptions::new().open(endpoint) {
-            Ok(client) => break client,
-            Err(e) if e.raw_os_error() == Some(231) => {
-                // ERROR_PIPE_BUSY = 231, wait and retry
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Retry loop for ERROR_PIPE_BUSY with bounded retries.
+    const MAX_PIPE_BUSY_RETRIES: u32 = 100; // 100 × 50ms = 5s max
+    let client = {
+        let mut attempts = 0u32;
+        loop {
+            match ClientOptions::new().open(endpoint) {
+                Ok(client) => break client,
+                Err(e) if e.raw_os_error() == Some(231) => {
+                    // ERROR_PIPE_BUSY = 231, wait and retry
+                    attempts += 1;
+                    if attempts >= MAX_PIPE_BUSY_RETRIES {
+                        return Err(IpcError::Io(e));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => return Err(IpcError::Io(e)),
             }
-            Err(e) => return Err(IpcError::Io(e)),
         }
     };
 

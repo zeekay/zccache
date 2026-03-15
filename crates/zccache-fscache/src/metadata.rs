@@ -192,7 +192,9 @@ impl MetadataCache {
         let now = Instant::now();
         let mut removed = 0;
         self.entries.retain(|_, entry| {
-            if now.duration_since(entry.last_verified) > max_age {
+            // Use saturating_duration_since to avoid panic if Instant is
+            // non-monotonic (documented edge case on some platforms/VMs).
+            if now.saturating_duration_since(entry.last_verified) > max_age {
                 removed += 1;
                 false
             } else {
@@ -228,7 +230,9 @@ impl MetadataCache {
     }
 
     fn decayed_confidence(&self, meta: &FileMetadata) -> Confidence {
-        let elapsed = meta.last_verified.elapsed();
+        // Use saturating_duration_since to avoid panic if Instant is
+        // non-monotonic (documented edge case on some platforms/VMs).
+        let elapsed = Instant::now().saturating_duration_since(meta.last_verified);
         match meta.confidence {
             Confidence::High if elapsed > self.high_decay => Confidence::Medium,
             Confidence::Medium if elapsed > self.medium_decay => Confidence::Low,

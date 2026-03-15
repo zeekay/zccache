@@ -113,8 +113,18 @@ fn convert_event(ignore: &IgnoreFilter, event: &Event) -> Vec<WatchEvent> {
     {
         let from = &event.paths[0];
         let to = &event.paths[1];
-        if ignore.should_ignore(from) && ignore.should_ignore(to) {
+        let from_ignored = ignore.should_ignore(from);
+        let to_ignored = ignore.should_ignore(to);
+        if from_ignored && to_ignored {
             return vec![];
+        }
+        if from_ignored {
+            // File appeared from ignored area — treat as creation.
+            return vec![WatchEvent::Created(to.clone())];
+        }
+        if to_ignored {
+            // File moved to ignored area — treat as removal.
+            return vec![WatchEvent::Removed(from.clone())];
         }
         return vec![WatchEvent::Renamed {
             from: from.clone(),
@@ -279,6 +289,44 @@ mod tests {
         };
         let result = convert_event(&filter, &event);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn rename_from_ignored_to_visible_becomes_created() {
+        // Rename from an ignored dir to a visible dir should produce Created(to).
+        let filter = test_filter();
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both,
+            )),
+            paths: vec![
+                PathBuf::from("project/.git/stash"),
+                PathBuf::from("src/recovered.c"),
+            ],
+            attrs: Default::default(),
+        };
+        let result = convert_event(&filter, &event);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], WatchEvent::Created(p) if p == Path::new("src/recovered.c")));
+    }
+
+    #[test]
+    fn rename_from_visible_to_ignored_becomes_removed() {
+        // Rename from a visible dir to an ignored dir should produce Removed(from).
+        let filter = test_filter();
+        let event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both,
+            )),
+            paths: vec![
+                PathBuf::from("src/main.rs"),
+                PathBuf::from("project/.git/stash"),
+            ],
+            attrs: Default::default(),
+        };
+        let result = convert_event(&filter, &event);
+        assert_eq!(result.len(), 1);
+        assert!(matches!(&result[0], WatchEvent::Removed(p) if p == Path::new("src/main.rs")));
     }
 
     #[test]

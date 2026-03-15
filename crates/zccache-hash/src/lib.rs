@@ -32,10 +32,21 @@ impl ContentHash {
     }
 
     /// Returns the first N bytes for directory sharding.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `levels * bytes_per_level > 32` (exceeds hash size).
     #[must_use]
     pub fn shard_prefix(&self, levels: usize, bytes_per_level: usize) -> Vec<String> {
         let hex = self.to_hex();
         let chars_per_level = bytes_per_level * 2;
+        let required = levels * chars_per_level;
+        assert!(
+            required <= hex.len(),
+            "shard_prefix: levels={levels} * bytes_per_level={bytes_per_level} \
+             requires {required} hex chars but hash is only {} chars",
+            hex.len()
+        );
         (0..levels)
             .map(|i| {
                 let start = i * chars_per_level;
@@ -147,5 +158,31 @@ mod tests {
         assert_eq!(shards.len(), 2);
         assert_eq!(shards[0].len(), 2);
         assert_eq!(shards[1].len(), 2);
+    }
+
+    #[test]
+    fn shard_prefix_max_valid() {
+        // 32 bytes = 64 hex chars. 32 levels of 1 byte each uses all 64 chars.
+        let h = hash_bytes(b"test");
+        let shards = h.shard_prefix(32, 1);
+        assert_eq!(shards.len(), 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "shard_prefix")]
+    fn shard_prefix_overflow_panics() {
+        // Bug: shard_prefix(33, 1) would index past the 64-char hex string,
+        // causing an opaque "index out of bounds" panic. Now panics with a
+        // descriptive message.
+        let h = hash_bytes(b"test");
+        let _ = h.shard_prefix(33, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "shard_prefix")]
+    fn shard_prefix_large_bytes_per_level_panics() {
+        let h = hash_bytes(b"test");
+        // 2 levels of 17 bytes each = 34 bytes > 32 hash bytes.
+        let _ = h.shard_prefix(2, 17);
     }
 }
