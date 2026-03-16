@@ -92,10 +92,12 @@ const SOURCE_EXTENSIONS: &[&str] = &["c", "cc", "cpp", "cxx", "c++", "C", "m", "
 /// Detect the compiler family from the compiler path.
 #[must_use]
 pub fn detect_family(compiler: &str) -> CompilerFamily {
-    let name = std::path::Path::new(compiler)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(compiler);
+    // Split on both `/` and `\` so Windows-style paths work on all platforms.
+    let basename = compiler.rsplit(['/', '\\']).next().unwrap_or(compiler);
+    let name = match basename.rsplit_once('.') {
+        Some((stem, _)) => stem,
+        None => basename,
+    };
     if name.contains("clang") {
         CompilerFamily::Clang
     } else if name.eq_ignore_ascii_case("cl") {
