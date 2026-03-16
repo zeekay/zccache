@@ -29,7 +29,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          set +e
+          cargo test --workspace --no-fail-fast 2>&1 | tee test-output.txt
+          status=${PIPESTATUS[0]}
+          if [ $status -ne 0 ]; then
+            {
+              echo '## Test Failures'
+              echo '```'
+              # Extract the "failures:" summary blocks (test names + assertion details)
+              awk '/^failures:$/,/^test result:/' test-output.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $status
 
   fmt:
     name: Formatting
