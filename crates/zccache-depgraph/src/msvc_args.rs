@@ -265,6 +265,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn basic_msvc_compile() {
         let parsed = parse_msvc_args(
             &args(&["/c", "foo.cpp", "/Fofoo.obj"]),
@@ -278,6 +279,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn include_dirs() {
         let parsed = parse_msvc_args(
             &args(&["/I", "inc", "/Ilib\\include", "/c", "x.cpp"]),
@@ -323,6 +325,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn force_include() {
         let parsed = parse_msvc_args(&args(&["/FIpch.h", "/c", "x.cpp"]), Path::new("C:\\p"));
         assert_eq!(parsed.force_includes, vec![Path::new("C:\\p\\pch.h")]);
@@ -360,6 +363,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn dash_prefix_include() {
         let parsed = parse_msvc_args(&args(&["-I", "inc", "/c", "x.cpp"]), Path::new("C:\\p"));
         assert_eq!(parsed.include_search.user, vec![Path::new("C:\\p\\inc")]);
