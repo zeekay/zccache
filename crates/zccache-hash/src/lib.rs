@@ -70,6 +70,38 @@ pub fn hash_bytes(data: &[u8]) -> ContentHash {
     ContentHash(*hash.as_bytes())
 }
 
+/// Incremental hasher for building a `ContentHash` from multiple updates.
+///
+/// Avoids allocating an intermediate buffer when the input is spread across
+/// multiple slices (e.g., request fingerprinting).
+pub struct StreamHasher(blake3::Hasher);
+
+impl StreamHasher {
+    /// Create a new streaming hasher.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(blake3::Hasher::new())
+    }
+
+    /// Feed bytes into the hasher.
+    pub fn update(&mut self, data: &[u8]) -> &mut Self {
+        self.0.update(data);
+        self
+    }
+
+    /// Finalize and return the hash.
+    #[must_use]
+    pub fn finalize(self) -> ContentHash {
+        ContentHash(*self.0.finalize().as_bytes())
+    }
+}
+
+impl Default for StreamHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Hash the contents of a reader.
 ///
 /// # Errors
