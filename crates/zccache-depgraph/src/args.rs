@@ -12,7 +12,7 @@ use crate::search_paths::IncludeSearchPaths;
 pub struct UserDepFlags {
     /// User has -MD or -MMD (emit depfile as side-effect of compilation).
     pub has_md: bool,
-    /// User has -MF <path> (explicit depfile output path).
+    /// User has -MF `<path>` (explicit depfile output path).
     pub mf_path: Option<PathBuf>,
 }
 

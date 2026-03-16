@@ -257,6 +257,27 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // Doc check (catches unclosed HTML tags, broken intra-doc links, etc.)
+    let doc_cmd: Vec<String> = vec![
+        "uv".into(),
+        "run".into(),
+        "cargo".into(),
+        "doc".into(),
+        "--workspace".into(),
+        "--no-deps".into(),
+    ];
+    // Set RUSTDOCFLAGS to deny warnings
+    std::env::set_var("RUSTDOCFLAGS", "-D warnings");
+    let (doc_rc, doc_timeout) = run_streaming(&root, &doc_cmd, "Doc check");
+    if doc_timeout {
+        eprintln!("Doc check timed out — skipping tests");
+        return ExitCode::from(2);
+    }
+    if doc_rc != 0 {
+        eprintln!("Doc check failed — skipping tests");
+        return ExitCode::from(2);
+    }
+
     // Unit tests only — skip integration/stress tests (which need
     // a fully compiled binary and are gated behind --include-ignored).
     // Exclude zccache-daemon: its server tests start a real daemon with

@@ -100,7 +100,7 @@ pub fn parse_response_file_content(content: &str) -> Vec<String> {
 /// Scans `args` for arguments starting with `@`. For each such argument,
 /// reads the referenced file, parses its contents, and splices the
 /// resulting arguments into the list. Supports nested response files
-/// up to [`MAX_DEPTH`] levels. Detects circular references.
+/// up to `MAX_DEPTH` levels. Detects circular references.
 ///
 /// Arguments that are exactly `@` (with no filename) are passed through
 /// unchanged, as they are not valid response file references.

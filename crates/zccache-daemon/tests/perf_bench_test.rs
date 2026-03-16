@@ -13,6 +13,11 @@ use std::time::{Duration, Instant};
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
+#[cfg(unix)]
+type ClientConn = zccache_ipc::IpcConnection;
+#[cfg(windows)]
+type ClientConn = zccache_ipc::IpcClientConnection;
+
 const NUM_FILES: usize = 50;
 const WARM_TRIALS: usize = 5;
 
@@ -143,7 +148,7 @@ fn source_names() -> Vec<String> {
 // ── zccache benchmarks (in-process daemon, no subprocess overhead) ──────
 
 async fn zccache_compile_single(
-    client: &mut zccache_ipc::IpcClientConnection,
+    client: &mut ClientConn,
     session_id: &str,
     compiler: &str,
     cwd: &str,
@@ -181,7 +186,7 @@ async fn zccache_compile_single(
 }
 
 async fn zccache_compile_multi(
-    client: &mut zccache_ipc::IpcClientConnection,
+    client: &mut ClientConn,
     session_id: &str,
     compiler: &str,
     cwd: &str,
@@ -464,7 +469,7 @@ fn sccache_compile_multi_rsp(sccache: &Path, compiler: &str, cwd: &Path) -> Dura
 // ── Response-file benchmarks: zccache ───────────────────────────────────
 
 async fn zccache_compile_single_rsp(
-    client: &mut zccache_ipc::IpcClientConnection,
+    client: &mut ClientConn,
     session_id: &str,
     compiler: &str,
     cwd: &str,
@@ -500,7 +505,7 @@ async fn zccache_compile_single_rsp(
 }
 
 async fn zccache_compile_multi_rsp(
-    client: &mut zccache_ipc::IpcClientConnection,
+    client: &mut ClientConn,
     session_id: &str,
     compiler: &str,
     cwd: &str,

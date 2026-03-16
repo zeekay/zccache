@@ -72,7 +72,7 @@ def lint_single_file(file_path):
 
 
 def lint_workspace():
-    """Full workspace lint: fmt check + clippy."""
+    """Full workspace lint: fmt check + clippy + doc check."""
     # Format check
     result = run_cmd(["uv", "run", "cargo", "fmt", "--all", "--check"])
     if result.returncode != 0:
@@ -84,6 +84,20 @@ def lint_workspace():
         "uv", "run", "cargo", "clippy", "--workspace", "--all-targets",
         "--", "-D", "warnings",
     ])
+    if result.returncode != 0:
+        return result.returncode
+
+    # Doc check (catches unclosed HTML tags, broken intra-doc links, etc.)
+    env = os.environ.copy()
+    env["RUSTDOCFLAGS"] = "-D warnings"
+    result = subprocess.run(
+        ["uv", "run", "cargo", "doc", "--workspace", "--no-deps"],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(SCRIPT_DIR),
+        env=env,
+    )
     return result.returncode
 
 

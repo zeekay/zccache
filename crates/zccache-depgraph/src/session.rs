@@ -282,7 +282,10 @@ impl SessionManager {
     /// Remove sessions that have been idle longer than the timeout.
     /// Returns the removed sessions.
     pub fn cleanup_expired(&self) -> Vec<Session> {
-        let cutoff = Instant::now() - self.idle_timeout;
+        let cutoff = match Instant::now().checked_sub(self.idle_timeout) {
+            Some(c) => c,
+            None => return Vec::new(), // timeout exceeds uptime; nothing can be expired
+        };
         let mut expired = Vec::new();
 
         self.sessions.retain(|_, session| {

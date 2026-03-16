@@ -4,7 +4,7 @@
 //!
 //! 1. Subcommand mode:
 //!    zccache session-start --compiler /path/to/clang++
-//!    zccache session-end <id>
+//!    zccache session-end `<id>`
 //!    zccache status
 //!
 //! 2. Compiler wrapper mode (auto-detected):
