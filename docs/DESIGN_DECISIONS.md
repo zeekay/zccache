@@ -601,3 +601,31 @@ v1 is deliberately minimal. The goal is a correct, useful tool for the most comm
 - Disk usage is slightly higher (~1x metadata overhead per artifact).
 - `zccache clear` must delete `.meta` files alongside output files (already handled).
 - Dep graph is NOT persisted — cold compiles still re-discover include dependencies. Only the artifact data survives restarts.
+
+---
+
+## DD-018: Protocol Version Separate from Package Version
+
+**Context:** Any version difference between CLI and daemon caused an error requiring `zccache stop`. This was too strict — patch bumps for bug fixes or performance improvements that don't change the wire format shouldn't force daemon restarts. The `DaemonStatus.version` field was compared as a string against the CLI's package version.
+
+**Decision:** Introduce a `PROTOCOL_VERSION: u32` constant in `zccache-protocol` and embed it in the message framing layer. Every message is now `[4-byte LE length][4-byte LE protocol version][bincode payload]`. The protocol version is checked automatically on every `decode_message` call — no separate handshake roundtrip needed.
+
+**Rationale:**
+- Patch releases (e.g., 1.0.22 → 1.0.23) that only fix bugs or improve performance should not require a daemon restart.
+- Wire format changes are rare compared to bug-fix releases. Tying restart requirements to wire changes is the correct granularity.
+- Embedding the version in every frame means the check is zero-cost (no extra roundtrip) and catches mismatches on the very first message exchange.
+- A numeric protocol version is unambiguous: increment it whenever the serialized format changes.
+
+**Alternatives Considered:**
+| Approach | Why not |
+|----------|---------|
+| Compare major.minor only | Semantic versioning is not granular enough — a minor bump might or might not change the wire format. |
+| Separate version handshake roundtrip | Adds latency to every connection. The version check should piggyback on real work. |
+| `protocol_version` field in `DaemonStatus` | Requires a dedicated Status roundtrip to discover. Adds an extra connection just for version checking. |
+| `#[serde(default)]` for backward compat | Bincode does not honor `serde(default)` — it requires exact field matching. Only works for JSON-style formats. |
+
+**Consequences:**
+- Developers must remember to bump `PROTOCOL_VERSION` when changing `Request`, `Response`, or any struct sent over the wire. This is documented in the constant's doc comment.
+- The framing format change is itself a one-time wire-breaking change. After this, protocol-compatible releases avoid daemon restarts.
+- Old daemons (without the protocol version frame) produce a `VersionMismatch` or `Deserialization` error on first message, giving a clear "run `zccache stop` first" error.
+- 4 extra bytes per message — negligible compared to payload sizes.

@@ -283,12 +283,13 @@ async fn cmd_status(endpoint: &str) -> ExitCode {
             };
 
             println!(
-                "zccache daemon v{} ({}) — uptime {}",
+                "zccache daemon v{} (protocol v{}) ({}) — uptime {}",
                 if s.version.is_empty() {
                     "unknown"
                 } else {
                     &s.version
                 },
+                zccache_protocol::PROTOCOL_VERSION,
                 endpoint,
                 format_uptime(s.uptime_secs)
             );
@@ -879,53 +880,17 @@ async fn cmd_link_ephemeral(
 
 // ─── Daemon auto-start ─────────────────────────────────────────────────────
 
-/// Check that the running daemon's version matches the CLI version.
-///
-/// Sends a Status request to get the daemon's version. Returns `Ok(())` if
-/// versions match, or `Err(message)` if there is a mismatch.
-async fn check_daemon_version(endpoint: &str) -> Result<(), String> {
-    let mut conn = match connect(endpoint).await {
-        Ok(c) => c,
-        Err(_) => return Ok(()), // Can't connect — caller will handle separately.
-    };
-
-    if conn.send(&zccache_protocol::Request::Status).await.is_err() {
-        return Ok(());
-    }
-
-    match conn.recv().await {
-        Ok(Some(zccache_protocol::Response::Status(status))) => {
-            let daemon_version = if status.version.is_empty() {
-                "unknown"
-            } else {
-                &status.version
-            };
-            if daemon_version != zccache_core::VERSION {
-                return Err(format!(
-                    "version mismatch: daemon is v{daemon_version}, client is v{}. \
-                     Run `zccache stop` first.",
-                    zccache_core::VERSION
-                ));
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
 /// Ensure the daemon is running. If not, spawn it and wait for it to accept.
 ///
 /// Handles concurrent calls gracefully: when multiple processes race to start
 /// the daemon, only one wins the bind. The losers detect this and connect to
 /// the winning daemon instead of failing.
 ///
-/// If a running daemon has a different version than this CLI, returns an error
-/// telling the user to run `zccache stop` first.
+/// Protocol version is checked automatically by the framing layer on every
+/// message exchange — no separate version handshake needed.
 async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
     // Fast path: try to connect
     if connect(endpoint).await.is_ok() {
-        // Check version — fail if mismatched.
-        check_daemon_version(endpoint).await?;
         return Ok(());
     }
 

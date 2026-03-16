@@ -173,7 +173,6 @@ pub enum Response {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     /// Daemon version (e.g. "1.0.8"). Used by CLI to detect stale daemons.
-    #[serde(default)]
     pub version: String,
     /// Number of artifacts in cache.
     pub artifact_count: u64,
@@ -555,11 +554,6 @@ mod tests {
         roundtrip(&with_version);
     }
 
-    /// Verify that `#[serde(default)]` on `version` produces an empty string
-    /// when the field is default-constructed (as an older daemon would omit it).
-    #[test]
-    fn daemon_status_version_default_is_empty() {
-        let default_version: String = Default::default();
-        assert_eq!(default_version, "");
-    }
+    // Compile-time check: PROTOCOL_VERSION must be positive.
+    const _: () = assert!(crate::PROTOCOL_VERSION > 0);
 }
