@@ -10,18 +10,30 @@ with aggressive file metadata caching and filesystem watching.
 
 ## Performance
 
-### Benchmark: 50 C++ files, warm cache
+### Benchmark: 50 C++ files, 5 warm trials
 
 | Scenario | Bare Clang | sccache | zccache | vs sccache | vs bare clang |
 |:---------|----------:|--------:|--------:|-----------:|--------------:|
-| Single-file, Cold | 10.336s | 17.292s | 11.489s | 1.5x faster | 0.9x |
-| Single-file, Warm | 10.141s | 1.331s | **0.031s** | **43x faster** | **324x faster** |
-| Multi-file, Cold | 9.898s | 9.906s | 10.337s | 1.0x faster | 1.0x |
-| Multi-file, Warm | 10.422s | 9.809s | **0.023s** | **419x faster** | **446x faster** |
+| Single-file, Cold | 12.641s | 20.632s | 13.430s | 1.5x faster | 1.1x slower |
+| Single-file, Warm | 11.705s | 1.576s | **0.050s** | **32x faster** | **236x faster** |
+| Multi-file, Cold | 11.358s | 11.759s | 12.867s | 1.1x slower | 1.1x slower |
+| Multi-file, Warm | 11.553s | 11.530s | **0.017s** | **695x faster** | **696x faster** |
 
 > **Cold** = first compile (empty cache). **Warm** = median of 5 subsequent runs.
 > Single-file = 50 sequential `clang++ -c unit.cpp` invocations. Multi-file = one `clang++ -c *.cpp` invocation.
 > sccache cannot cache multi-file compilations — its "warm" multi-file time is a full recompile.
+
+### Response-file benchmark: 50 C++ files, ~283 expanded args, 5 warm trials
+
+| Scenario | Bare Clang | sccache | zccache | vs sccache | vs bare clang |
+|:---------|----------:|--------:|--------:|-----------:|--------------:|
+| Single-file RSP, Cold | 12.063s | 20.607s | 14.087s | 1.5x faster | 1.2x slower |
+| Single-file RSP, Warm | 12.540s | 1.558s | **0.047s** | **33x faster** | **267x faster** |
+| Multi-file RSP, Cold | 13.030s | 25.303s | 13.975s | 1.8x faster | 1.1x slower |
+| Multi-file RSP, Warm | 12.049s | 12.434s | **0.019s** | **669x faster** | **648x faster** |
+
+> All args passed via nested response files: `flags.rsp` -> `@warnings.rsp` + `@defines.rsp`.
+> 200 `-D` defines + 50 `-I` paths + 30 warning flags = ~283 total expanded args per compile.
 
 Run the benchmark yourself: `uv run perf`
 

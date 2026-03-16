@@ -1612,79 +1612,109 @@ async fn handle_compile(
 
     // ── Slow path: hash + depgraph verify ────────────────────────────
 
+    // Skip pre-compile hashing for cold contexts — the depgraph would
+    // return Cold without examining any hashes, so the work is wasted.
+    // Jump straight to compiler exec.
+    let context_is_cold = state.dep_graph.is_cold(&context_key);
+
     // ── Phase: hash source ───────────────────────────────────────────
     let t2 = std::time::Instant::now();
     let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
-    match hash_file(&state.cache_system, &source_path, snap_clock) {
-        Ok(h) => {
-            hash_map.insert(source_path.clone(), h);
-        }
-        Err(e) => {
-            write_session_log(
-                &state.sessions,
-                &sid,
-                &format!("cache key error: {e}, falling back to direct compile"),
-            );
-            return run_compiler_direct(&compiler, args, cwd, &state.sessions, &sid, &client_env)
-                .await;
-        }
-    }
-    let hash_source_ns = t2.elapsed().as_nanos() as u64;
-
-    // ── Phase: hash headers ──────────────────────────────────────────
-    let t3 = std::time::Instant::now();
-    if let Some(includes) = state.dep_graph.get_includes(&context_key) {
-        for header in &includes {
-            // For PCH binaries in the include list, hash the source header instead.
-            let hash_path = pch_source_header(header).unwrap_or_else(|| header.clone());
-            match hash_file(&state.cache_system, &hash_path, snap_clock) {
-                Ok(h) => {
-                    hash_map.insert(header.clone(), h);
-                }
-                Err(e) => {
-                    write_session_log(
-                        &state.sessions,
-                        &sid,
-                        &format!("[DIAG] header_hash_fail: {} error={e}", hash_path.display()),
-                    );
-                }
-            }
-        }
-    }
-    // Hash force-included files (PCH, -include) so their content
-    // is part of the artifact key.
-    // For PCH binaries (.pch/.gch), hash the SOURCE header instead — PCH
-    // binaries are not bit-reproducible (clang embeds timestamps).
-    for fi in &ctx.force_includes {
-        let hash_path = pch_source_header(fi).unwrap_or_else(|| fi.clone());
-        match hash_file(&state.cache_system, &hash_path, snap_clock) {
+    if !context_is_cold {
+        match hash_file(&state.cache_system, &source_path, snap_clock) {
             Ok(h) => {
-                hash_map.insert(fi.clone(), h);
+                hash_map.insert(source_path.clone(), h);
             }
             Err(e) => {
                 write_session_log(
                     &state.sessions,
                     &sid,
-                    &format!(
-                        "[DIAG] force_include_hash_fail: {} error={e}",
-                        hash_path.display()
-                    ),
+                    &format!("cache key error: {e}, falling back to direct compile"),
                 );
+                return run_compiler_direct(
+                    &compiler,
+                    args,
+                    cwd,
+                    &state.sessions,
+                    &sid,
+                    &client_env,
+                )
+                .await;
             }
         }
     }
-    let hash_headers_ns = t3.elapsed().as_nanos() as u64;
+    let hash_source_ns = t2.elapsed().as_nanos() as u64;
 
-    // ── Phase: depgraph check ────────────────────────────────────────
-    let t4 = std::time::Instant::now();
-    let (verdict, diag_reason) = {
-        let is_fresh = |p: &Path| !state.cache_system.journal().changed_since(p, snap_clock);
-        let get_hash = |p: &Path| hash_map.get(p).copied();
-        state
-            .dep_graph
-            .check_diagnostic(&context_key, is_fresh, get_hash)
-    };
-    let depgraph_check_ns = t4.elapsed().as_nanos() as u64;
+    // ── Phase: hash headers + depgraph check ────────────────────────
+    let t3 = std::time::Instant::now();
+    let hash_headers_ns;
+    let depgraph_check_ns;
+    let verdict;
+    let diag_reason;
+
+    if context_is_cold {
+        // Cold context — skip hashing and depgraph check entirely.
+        hash_headers_ns = 0;
+        depgraph_check_ns = 0;
+        verdict = zccache_depgraph::CacheVerdict::Cold;
+        diag_reason = "cold_skip".to_string();
+    } else {
+        if let Some(includes) = state.dep_graph.get_includes(&context_key) {
+            for header in &includes {
+                // For PCH binaries in the include list, hash the source header instead.
+                let hash_path = pch_source_header(header).unwrap_or_else(|| header.clone());
+                match hash_file(&state.cache_system, &hash_path, snap_clock) {
+                    Ok(h) => {
+                        hash_map.insert(header.clone(), h);
+                    }
+                    Err(e) => {
+                        write_session_log(
+                            &state.sessions,
+                            &sid,
+                            &format!("[DIAG] header_hash_fail: {} error={e}", hash_path.display()),
+                        );
+                    }
+                }
+            }
+        }
+        // Hash force-included files (PCH, -include) so their content
+        // is part of the artifact key.
+        // For PCH binaries (.pch/.gch), hash the SOURCE header instead — PCH
+        // binaries are not bit-reproducible (clang embeds timestamps).
+        for fi in &ctx.force_includes {
+            let hash_path = pch_source_header(fi).unwrap_or_else(|| fi.clone());
+            match hash_file(&state.cache_system, &hash_path, snap_clock) {
+                Ok(h) => {
+                    hash_map.insert(fi.clone(), h);
+                }
+                Err(e) => {
+                    write_session_log(
+                        &state.sessions,
+                        &sid,
+                        &format!(
+                            "[DIAG] force_include_hash_fail: {} error={e}",
+                            hash_path.display()
+                        ),
+                    );
+                }
+            }
+        }
+        hash_headers_ns = t3.elapsed().as_nanos() as u64;
+
+        // ── Phase: depgraph check ────────────────────────────────────
+        let t4 = std::time::Instant::now();
+        let result = {
+            let is_fresh = |p: &Path| !state.cache_system.journal().changed_since(p, snap_clock);
+            let get_hash = |p: &Path| hash_map.get(p).copied();
+            state
+                .dep_graph
+                .check_diagnostic(&context_key, is_fresh, get_hash)
+        };
+        depgraph_check_ns = t4.elapsed().as_nanos() as u64;
+        verdict = result.0;
+        diag_reason = result.1;
+    }
+
     write_session_log(
         &state.sessions,
         &sid,
@@ -1868,6 +1898,8 @@ async fn handle_compile(
     let compiler_exec_ns = t_exec.elapsed().as_nanos() as u64;
 
     let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = output.stdout;
+    let stderr = output.stderr;
 
     if exit_code != 0 {
         state.stats.record_error();
@@ -1889,8 +1921,8 @@ async fn handle_compile(
                 tracing::warn!("failed to read output file {}: {e}", output_path.display());
                 return Response::CompileResult {
                     exit_code,
-                    stdout: output.stdout,
-                    stderr: output.stderr,
+                    stdout,
+                    stderr,
                     cached: false,
                 };
             }
@@ -1940,31 +1972,27 @@ async fn handle_compile(
             .collect();
         state.cache_system.register_tracked(&tracked_paths);
 
-        // Watch parent directories of source file AND discovered headers so
-        // watcher events keep the journal accurate and enable the zero-syscall
-        // fast path. Without watching the source dir, edits to the source file
-        // won't advance the clock and the fast_hit_cache serves stale artifacts.
-        {
-            let dep_dirs: Vec<PathBuf> = {
-                let mut dirs = HashSet::new();
-                if let Some(parent) = source_path.parent() {
+        // Collect directories to watch. The actual watch_directories call
+        // (which involves expensive canonicalize() on Windows) is deferred
+        // to a background task to avoid blocking the response.
+        let dep_dirs: Vec<PathBuf> = {
+            let mut dirs = HashSet::new();
+            if let Some(parent) = source_path.parent() {
+                dirs.insert(parent.to_path_buf());
+            }
+            for header in &scan_result.resolved {
+                if let Some(parent) = header.parent() {
                     dirs.insert(parent.to_path_buf());
                 }
-                for header in &scan_result.resolved {
-                    if let Some(parent) = header.parent() {
-                        dirs.insert(parent.to_path_buf());
-                    }
+            }
+            // Also watch force-include parent dirs (PCH files, etc.).
+            for fi in &ctx.force_includes {
+                if let Some(parent) = fi.parent() {
+                    dirs.insert(parent.to_path_buf());
                 }
-                // Also watch force-include parent dirs (PCH files, etc.).
-                for fi in &ctx.force_includes {
-                    if let Some(parent) = fi.parent() {
-                        dirs.insert(parent.to_path_buf());
-                    }
-                }
-                dirs.into_iter().collect()
-            };
-            watch_directories(state, &dep_dirs).await;
-        }
+            }
+            dirs.into_iter().collect()
+        };
 
         // ── Phase: hash all files ────────────────────────────────────
         let t_hash = std::time::Instant::now();
@@ -2033,8 +2061,8 @@ async fn handle_compile(
                         .into_owned(),
                     data: output_data,
                 }],
-                stdout: output.stdout.clone(),
-                stderr: output.stderr.clone(),
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
                 exit_code,
             };
 
@@ -2087,13 +2115,6 @@ async fn handle_compile(
                 t.record_miss(src, artifact_bytes);
             });
         }
-        // Watch output dir + force-invalidate so downstream consumers
-        // (link cache) see the freshly compiled output.
-        if let Some(out_dir) = output_path.parent() {
-            watch_directory(state, out_dir).await;
-        }
-        state.cache_system.apply_changes(vec![output_path.clone()]);
-
         let artifact_store_ns = t_store.elapsed().as_nanos() as u64;
 
         // Record miss phase profile
@@ -2105,12 +2126,27 @@ async fn handle_compile(
             artifact_store_ns,
             total_ns,
         });
+
+        // Defer expensive watch_directories to background — canonicalize()
+        // on Windows costs ~1-5ms per directory. This doesn't affect cache
+        // correctness; it only delays watcher-based invalidation setup.
+        {
+            let bg_state = Arc::clone(state_arc);
+            tokio::spawn(async move {
+                let state = &*bg_state;
+                watch_directories(state, &dep_dirs).await;
+                if let Some(out_dir) = output_path.parent() {
+                    watch_directory(state, out_dir).await;
+                }
+                state.cache_system.apply_changes(vec![output_path]);
+            });
+        }
     }
 
     Response::CompileResult {
         exit_code,
-        stdout: output.stdout,
-        stderr: output.stderr,
+        stdout,
+        stderr,
         cached: false,
     }
 }

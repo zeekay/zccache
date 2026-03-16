@@ -129,6 +129,17 @@ impl DepGraph {
         key
     }
 
+    /// Returns `true` if the context has never been updated (no artifact key).
+    /// Used by the server to skip pre-compile hashing on cold contexts where
+    /// `check_diagnostic` would return `Cold` without examining any hashes.
+    #[must_use]
+    pub fn is_cold(&self, key: &ContextKey) -> bool {
+        match self.contexts.get(key) {
+            Some(entry) => entry.state == ContextState::Cold,
+            None => true,
+        }
+    }
+
     /// Check if a compilation can use cached output.
     ///
     /// `is_fresh` is called for each file path. It should query Layer 1
