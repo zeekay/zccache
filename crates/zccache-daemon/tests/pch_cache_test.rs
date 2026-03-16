@@ -929,3 +929,163 @@ async fn pch_chained_sub_header_change() {
     shutdown.notify_one();
     server_handle.await.unwrap();
 }
+
+/// Regression test: modifying a sub-header included by a PCH must NOT create
+/// a spurious `.pch` file next to the modified header in the source tree.
+///
+/// Reproduces the bug reported in BUG_PCH_SPURIOUS_GENERATION.md:
+/// - Source tree has `src/sub.h` (dependency) and `src/pch.h` (PCH target)
+/// - PCH output goes to a separate `build/` directory via explicit `-o`
+/// - After modifying `sub.h` and rebuilding, `src/sub.h.pch` must NOT exist
+///
+/// Root cause: `default_output()` used to preserve directory components for
+/// header files (e.g., `src/sub.h` → `src/sub.h.pch`), which the daemon
+/// could resolve into the source tree during cache restoration.
+#[tokio::test]
+#[ignore] // integration: spawns clang + watcher sleeps, run with --full
+async fn pch_rebuild_no_spurious_output_in_source_tree() {
+    let clang = match zccache_test_support::find_clang() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping test: clang not found");
+            return;
+        }
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let log_dir = tmp.path().join("logs");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let log = log_dir.join("session.log");
+    let compiler = clang.to_string_lossy().into_owned();
+
+    // Source in src/, PCH output in build/ — separate directories.
+    let src_dir = tmp.path().join("src");
+    let build_dir = tmp.path().join("build");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&build_dir).unwrap();
+
+    let cwd = tmp.path().to_string_lossy().into_owned();
+
+    // sub.h — the header we'll modify
+    let sub_h = src_dir.join("sub.h");
+    std::fs::write(&sub_h, "#pragma once\ninline int sub() { return 1; }\n").unwrap();
+
+    // pch.h — the PCH target that includes sub.h
+    let pch_h = src_dir.join("pch.h");
+    std::fs::write(&pch_h, "#pragma once\n#include \"sub.h\"\n").unwrap();
+
+    // main.cpp — source file
+    let main_cpp = src_dir.join("main.cpp");
+    std::fs::write(
+        &main_cpp,
+        "#include \"sub.h\"\nint main() { return sub(); }\n",
+    )
+    .unwrap();
+
+    let pch_output = build_dir.join("pch.h.pch");
+    let main_obj = build_dir.join("main.o");
+
+    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+    let sid = start_session(&mut client, &cwd, &log.to_string_lossy()).await;
+
+    let isrc = format!("-I{}", src_dir.to_string_lossy());
+
+    // ── Step 1: Generate PCH (explicit -o into build dir) ────────
+    let (exit_code, _, stderr) = compile_raw(
+        &mut client,
+        &sid,
+        &compiler,
+        vec![
+            "-x".into(),
+            "c++-header".into(),
+            pch_h.to_string_lossy().into_owned(),
+            "-o".into(),
+            pch_output.to_string_lossy().into_owned(),
+            isrc.clone(),
+        ],
+        &cwd,
+    )
+    .await;
+    let stderr_str = String::from_utf8_lossy(&stderr);
+    assert_eq!(exit_code, 0, "PCH gen failed: {stderr_str}");
+    assert!(pch_output.exists(), "PCH file should be created");
+
+    // ── Step 2: Compile main.cpp using PCH ───────────────────────
+    let (exit_code, _, stderr) = compile_raw(
+        &mut client,
+        &sid,
+        &compiler,
+        vec![
+            "-c".into(),
+            main_cpp.to_string_lossy().into_owned(),
+            "-o".into(),
+            main_obj.to_string_lossy().into_owned(),
+            "-include-pch".into(),
+            pch_output.to_string_lossy().into_owned(),
+            isrc.clone(),
+        ],
+        &cwd,
+    )
+    .await;
+    let stderr_str = String::from_utf8_lossy(&stderr);
+    assert_eq!(exit_code, 0, "compile with PCH failed: {stderr_str}");
+
+    // ── Step 3: Modify sub.h ─────────────────────────────────────
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::fs::write(&sub_h, "#pragma once\ninline int sub() { return 2; }\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+
+    // ── Step 4: Rebuild PCH ──────────────────────────────────────
+    let (exit_code, _, _) = compile_raw(
+        &mut client,
+        &sid,
+        &compiler,
+        vec![
+            "-x".into(),
+            "c++-header".into(),
+            pch_h.to_string_lossy().into_owned(),
+            "-o".into(),
+            pch_output.to_string_lossy().into_owned(),
+            isrc.clone(),
+        ],
+        &cwd,
+    )
+    .await;
+    assert_eq!(exit_code, 0, "PCH rebuild failed");
+
+    // ── Step 5: Recompile main.cpp ───────────────────────────────
+    let (exit_code, _, _) = compile_raw(
+        &mut client,
+        &sid,
+        &compiler,
+        vec![
+            "-c".into(),
+            main_cpp.to_string_lossy().into_owned(),
+            "-o".into(),
+            main_obj.to_string_lossy().into_owned(),
+            "-include-pch".into(),
+            pch_output.to_string_lossy().into_owned(),
+            isrc.clone(),
+        ],
+        &cwd,
+    )
+    .await;
+    assert_eq!(exit_code, 0, "recompile with PCH failed");
+
+    // ── Step 6: ASSERTION — no .pch files in source tree ─────────
+    for entry in std::fs::read_dir(&src_dir).unwrap() {
+        let path = entry.unwrap().path();
+        assert!(
+            path.extension().and_then(|e| e.to_str()) != Some("pch"),
+            "BUG: spurious PCH file found in source tree: {}",
+            path.display()
+        );
+    }
+
+    let log_text = std::fs::read_to_string(&log).unwrap();
+    eprintln!("=== spurious PCH test log ===\n{log_text}");
+
+    shutdown.notify_one();
+    server_handle.await.unwrap();
+}

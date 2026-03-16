@@ -121,12 +121,27 @@ fn is_source_file(path: &str) -> bool {
 
 /// Compute the default output path when `-o` is absent.
 ///
-/// For PCH generation (header files), compilers produce `{source}.{ext}`
-/// next to the source file. For normal compilation, the default is `{stem}.o`.
+/// For both normal compilation and PCH generation, the output is placed in
+/// the current working directory using just the filename — never preserving
+/// directory components from the source path.
+///
+/// Normal compilation: `src/foo.cpp` → `foo.o`
+/// PCH generation:     `src/pch.h`   → `pch.h.pch`  (clang)
+///                     `src/pch.h`   → `pch.h.gch`  (gcc)
+///
+/// Note: real compilers place PCH output next to the source file
+/// (`src/pch.h` → `src/pch.h.pch`), but zccache intentionally uses only
+/// the filename. This prevents spurious `.pch` files from being written
+/// into the source tree when a compilation falls back to `default_output`
+/// (e.g., during cache restoration without an explicit `-o` flag).
 fn default_output(source: &str, family: CompilerFamily, is_header: bool) -> String {
     if is_header {
         if let Some(ext) = family.pch_extension() {
-            return format!("{source}.{ext}");
+            let filename = std::path::Path::new(source)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(source);
+            return format!("{filename}.{ext}");
         }
     }
     let stem = std::path::Path::new(source)
@@ -746,12 +761,12 @@ mod tests {
 
     #[test]
     fn pch_default_output_clang() {
-        // `clang++ -x c++-header src/pch.h` → output `src/pch.h.pch`
+        // `clang++ -x c++-header src/pch.h` → output `pch.h.pch` (filename only, no dir)
         let result = parse_invocation("clang++", &args(&["-x", "c++-header", "src/pch.h"]));
         match result {
             ParsedInvocation::Cacheable(c) => {
                 assert_eq!(c.source_file, PathBuf::from("src/pch.h"));
-                assert_eq!(c.output_file, PathBuf::from("src/pch.h.pch"));
+                assert_eq!(c.output_file, PathBuf::from("pch.h.pch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -759,20 +774,22 @@ mod tests {
 
     #[test]
     fn pch_default_output_gcc() {
-        // `gcc -x c-header src/pch.h` → output `src/pch.h.gch`
+        // `gcc -x c-header src/pch.h` → output `pch.h.gch` (filename only, no dir)
         let result = parse_invocation("gcc", &args(&["-x", "c-header", "src/pch.h"]));
         match result {
             ParsedInvocation::Cacheable(c) => {
                 assert_eq!(c.source_file, PathBuf::from("src/pch.h"));
-                assert_eq!(c.output_file, PathBuf::from("src/pch.h.gch"));
+                assert_eq!(c.output_file, PathBuf::from("pch.h.gch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
     #[test]
-    fn pch_default_output_with_path() {
-        // `clang++ -x c++-header src/fl/audio/fft/fft.h` → output preserves full path
+    fn pch_default_output_strips_directory() {
+        // `clang++ -x c++-header src/fl/audio/fft/fft.h` → output uses filename only.
+        // Regression: old code produced `src/fl/audio/fft/fft.h.pch`, causing spurious
+        // PCH files to be written into the source tree during cache restoration.
         let result = parse_invocation(
             "clang++",
             &args(&["-x", "c++-header", "src/fl/audio/fft/fft.h"]),
@@ -780,7 +797,25 @@ mod tests {
         match result {
             ParsedInvocation::Cacheable(c) => {
                 assert_eq!(c.source_file, PathBuf::from("src/fl/audio/fft/fft.h"));
-                assert_eq!(c.output_file, PathBuf::from("src/fl/audio/fft/fft.h.pch"));
+                assert_eq!(c.output_file, PathBuf::from("fft.h.pch"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pch_default_output_absolute_path_strips_to_filename() {
+        // Absolute source path must also produce filename-only output.
+        // Regression: old code produced `/abs/path/src/pch.h.pch` which
+        // the daemon resolved as an absolute write into the source tree.
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-header", "/abs/path/src/pch.h"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("/abs/path/src/pch.h"));
+                assert_eq!(c.output_file, PathBuf::from("pch.h.pch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
