@@ -30,6 +30,17 @@ impl CompilerFamily {
     pub fn supports_depfile(&self) -> bool {
         matches!(self, CompilerFamily::Gcc | CompilerFamily::Clang)
     }
+
+    /// Default PCH output extension (without dot) for this compiler family.
+    /// Returns `None` for MSVC (uses /Yc + /Fp mechanism instead).
+    #[must_use]
+    pub fn pch_extension(&self) -> Option<&'static str> {
+        match self {
+            CompilerFamily::Gcc => Some("gch"),
+            CompilerFamily::Clang => Some("pch"),
+            CompilerFamily::Msvc => None,
+        }
+    }
 }
 
 /// The result of parsing a compiler invocation.
@@ -106,6 +117,23 @@ fn is_source_file(path: &str) -> bool {
     }
 }
 
+/// Compute the default output path when `-o` is absent.
+///
+/// For PCH generation (header files), compilers produce `{source}.{ext}`
+/// next to the source file. For normal compilation, the default is `{stem}.o`.
+fn default_output(source: &str, family: CompilerFamily, is_header: bool) -> String {
+    if is_header {
+        if let Some(ext) = family.pch_extension() {
+            return format!("{source}.{ext}");
+        }
+    }
+    let stem = std::path::Path::new(source)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("a");
+    format!("{stem}.o")
+}
+
 /// Flags that take a following argument (value in next argv element).
 const FLAGS_WITH_VALUE: &[&str] = &[
     "-o",
@@ -136,7 +164,7 @@ const FLAGS_WITH_VALUE: &[&str] = &[
 #[must_use]
 pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     let mut has_c_flag = false;
-    let mut source_files: Vec<(String, usize)> = Vec::new();
+    let mut source_files: Vec<(String, usize, bool)> = Vec::new();
     let mut output_file: Option<String> = None;
     let mut header_mode = false;
 
@@ -190,7 +218,7 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
 
         // Positional arg — source file candidate
         if is_source_file(arg) || header_mode {
-            source_files.push((arg.clone(), i));
+            source_files.push((arg.clone(), i, header_mode));
         }
 
         i += 1;
@@ -216,22 +244,16 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     // Multi-file: `-o` is invalid with `-c` and multiple sources (compiler rejects it),
     // so each source gets its default output name (stem.o).
     if source_files.len() > 1 {
-        let source_indices: Vec<usize> = source_files.iter().map(|(_, idx)| *idx).collect();
+        let source_indices: Vec<usize> = source_files.iter().map(|(_, idx, _)| *idx).collect();
         let shared_args: Arc<[String]> = Arc::from(args.to_vec());
         let compilations = source_files
             .iter()
-            .map(|(src, _)| {
-                let stem = std::path::Path::new(src)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("a");
-                CacheableCompilation {
-                    compiler: PathBuf::from(compiler),
-                    family,
-                    source_file: PathBuf::from(src),
-                    output_file: PathBuf::from(format!("{stem}.o")),
-                    original_args: Arc::clone(&shared_args),
-                }
+            .map(|(src, _, is_header)| CacheableCompilation {
+                compiler: PathBuf::from(compiler),
+                family,
+                source_file: PathBuf::from(src),
+                output_file: PathBuf::from(default_output(src, family, *is_header)),
+                original_args: Arc::clone(&shared_args),
             })
             .collect();
         return ParsedInvocation::MultiFile {
@@ -242,14 +264,8 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     }
 
     // Single source file
-    let (source, _) = source_files.into_iter().next().unwrap();
-    let output = output_file.unwrap_or_else(|| {
-        let stem = std::path::Path::new(&source)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("a");
-        format!("{stem}.o")
-    });
+    let (source, _, is_header) = source_files.into_iter().next().unwrap();
+    let output = output_file.unwrap_or_else(|| default_output(&source, family, is_header));
 
     ParsedInvocation::Cacheable(CacheableCompilation {
         compiler: PathBuf::from(compiler),
@@ -722,5 +738,77 @@ mod tests {
     #[test]
     fn msvc_no_depfile() {
         assert!(!CompilerFamily::Msvc.supports_depfile());
+    }
+
+    // ─── PCH default output tests ────────────────────────────────────
+
+    #[test]
+    fn pch_default_output_clang() {
+        // `clang++ -x c++-header src/pch.h` → output `src/pch.h.pch`
+        let result = parse_invocation("clang++", &args(&["-x", "c++-header", "src/pch.h"]));
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("src/pch.h"));
+                assert_eq!(c.output_file, PathBuf::from("src/pch.h.pch"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pch_default_output_gcc() {
+        // `gcc -x c-header src/pch.h` → output `src/pch.h.gch`
+        let result = parse_invocation("gcc", &args(&["-x", "c-header", "src/pch.h"]));
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("src/pch.h"));
+                assert_eq!(c.output_file, PathBuf::from("src/pch.h.gch"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pch_default_output_with_path() {
+        // `clang++ -x c++-header src/fl/audio/fft/fft.h` → output preserves full path
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-header", "src/fl/audio/fft/fft.h"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("src/fl/audio/fft/fft.h"));
+                assert_eq!(c.output_file, PathBuf::from("src/fl/audio/fft/fft.h.pch"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pch_default_output_explicit_o_unchanged() {
+        // Explicit `-o` still honored — no change in behavior
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-header", "pch.h", "-o", "build/pch.h.pch"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("pch.h"));
+                assert_eq!(c.output_file, PathBuf::from("build/pch.h.pch"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normal_compile_default_output_unchanged() {
+        // Regression guard: normal compilation still defaults to stem.o
+        let result = parse_invocation("gcc", &args(&["-c", "foo.cpp"]));
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.output_file, PathBuf::from("foo.o"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
     }
 }

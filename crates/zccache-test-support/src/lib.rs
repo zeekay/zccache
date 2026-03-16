@@ -110,6 +110,22 @@ pub fn find_clang() -> Option<PathBuf> {
     find_on_path("clang++")
 }
 
+// ─── Integration test timeout ───────────────────────────────────────────────
+
+/// Default timeout for integration tests that start a daemon / use IPC.
+/// Prevents tests from hanging forever if the daemon doesn't respond.
+pub const INTEGRATION_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run an async future with a timeout, panicking with a clear message if exceeded.
+///
+/// Wrap integration test bodies with this to ensure they fail fast instead of
+/// hanging indefinitely on a stuck daemon or broken IPC channel.
+pub async fn test_timeout<F: std::future::Future<Output = ()>>(f: F) {
+    tokio::time::timeout(INTEGRATION_TEST_TIMEOUT, f)
+        .await
+        .expect("integration test timed out after 30s — daemon may be unresponsive");
+}
+
 // ─── Temp directories ───────────────────────────────────────────────────────
 
 /// Create a temporary directory for test artifacts.
