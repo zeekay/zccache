@@ -41,6 +41,12 @@ with aggressive file metadata caching and filesystem watching.
 
 Run the benchmark yourself: `uv run perf`
 
+### Install
+
+pip install zccache
+
+(run it like sccache, jusy substitute zccavhe)
+
 ### Build system integration (ninja, meson, cmake, make)
 
 zccache is a **drop-in compiler wrapper**. Point your build system's compiler
