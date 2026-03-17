@@ -583,7 +583,7 @@ v1 is deliberately minimal. The goal is a correct, useful tool for the most comm
 
 **Context:** Artifacts were stored in `$TMPDIR/zccache-artifacts-{pid}`, lost on daemon restart. After a reboot or daemon crash, the entire cache was cold.
 
-**Decision:** Store artifacts in `~/.cache/zccache/artifacts/` (Linux/macOS) or `%LOCALAPPDATA%\zccache\artifacts\` (Windows). Write `.meta` sidecar files (bincode-serialized `ArtifactData`) alongside output files. On startup, scan for `.meta` files and rebuild the in-memory artifact map.
+**Decision:** Store artifacts in `~/.zccache/artifacts/` (all platforms). Write `.meta` sidecar files (bincode-serialized `ArtifactData`) alongside output files. On startup, scan for `.meta` files and rebuild the in-memory artifact map.
 
 **Rationale:**
 - Eliminates cold-start penalty after daemon restarts.
@@ -629,3 +629,52 @@ v1 is deliberately minimal. The goal is a correct, useful tool for the most comm
 - The framing format change is itself a one-time wire-breaking change. After this, protocol-compatible releases avoid daemon restarts.
 - Old daemons (without the protocol version frame) produce a `VersionMismatch` or `Deserialization` error on first message, giving a clear "run `zccache stop` first" error.
 - 4 extra bytes per message — negligible compared to payload sizes.
+
+---
+
+## DD-019: JSONL Compile Journal for Build Replay
+
+**Context:** Debugging build failures, auditing cache behavior, and replaying builds all require knowing the exact commands that were executed. The daemon's `daemon.log` is human-readable but not machine-parseable, and it doesn't capture enough detail (full args, env, working directory) to replay a build.
+
+**Decision:** Record every compile and link command to `~/.zccache/logs/compile_journal.jsonl` as one JSON object per line. The schema captures: ISO 8601 timestamp, outcome (`hit`/`miss`/`error`/`link_hit`/`link_miss`), full compiler path, full argument list, working directory, environment variables (when explicitly passed), exit code, session ID, and wall-clock latency in nanoseconds.
+
+**Rationale:**
+- **JSONL** is trivially parseable by `jq`, Python, and any JSON library. One object per line means no framing issues and the file is append-only.
+- **Full argument list + cwd + env** is sufficient to replay any recorded command exactly: `cd $cwd && env $env $compiler $args`.
+- **Lock-free channel + background thread** pattern (same as `EventLogger`) means zero contention on the compilation hot path. Serialization (`serde_json`) happens on the caller's tokio task; the background thread only does file I/O.
+- **Shared delete on Windows** (`FILE_SHARE_DELETE`) allows log rotation or deletion while the daemon holds the file open.
+
+**Alternatives Considered:**
+| Format | Why not |
+|--------|---------|
+| CSV | Escaping args with commas/quotes is fragile. No nested structures for env arrays. |
+| SQLite | Heavier dependency, slower writes, harder to tail/stream. |
+| Binary (bincode/protobuf) | Not human-inspectable. Requires tooling to read. |
+| Extend daemon.log | daemon.log is human-readable with rotation/GC. Mixing machine-parseable JSON would complicate both parsers. |
+
+**Consequences:**
+- Disk usage grows linearly with compilations. Unlike `daemon.log`, the journal has no rotation — it is an append-only record. Users can truncate or delete it at will.
+- The `serde_json` dependency is added to `zccache-daemon`. This is a well-maintained, widely-used crate.
+- Future tooling can consume the journal for build analysis, replay, or CI diagnostics.
+
+---
+
+## DD-020: Unified Cache Root at `~/.zccache/`
+
+**Context:** The cache root was platform-specific: `~/.cache/zccache` (Linux), `~/Library/Caches/zccache` (macOS), `%LOCALAPPDATA%\zccache` (Windows). This scattered path logic across `zccache-core/config.rs`, `zccache-ipc/lib.rs`, benchmark scripts, and docs. Users couldn't easily find their cache, and the code had multiple `#[cfg]` branches for the same concept.
+
+**Decision:** Unify to `~/.zccache/` on all platforms. Centralize all subdirectory path definitions (`artifacts_dir()`, `log_dir()`, `crash_dump_dir()`, `tmp_dir()`, `depgraph_dir()`, `index_path()`) in `zccache-core::config`. The Windows lock file also moves from `%LOCALAPPDATA%\zccache\daemon.lock` to `~/.zccache/daemon.lock`.
+
+**Rationale:**
+- A single path is easier to document, discover, and communicate to users.
+- Eliminates `#[cfg]` blocks and env-var lookups in `default_cache_dir()`.
+- `~/.zccache/` is visible and unambiguous on all platforms, consistent with tools like `.cargo/`, `.rustup/`, `.npm/`.
+- Centralizing path accessors prevents ad-hoc `.join("artifacts")` scattered across crates.
+
+**What does NOT change:**
+- IPC endpoints (`default_endpoint()`): socket paths and named pipes stay as-is (they are runtime IPC, not cache storage).
+- Unix lock file: stays adjacent to socket, not in cache dir.
+
+**Consequences:**
+- Existing caches at old platform-specific locations are orphaned. Users must manually delete them or re-warm.
+- `~` on Windows resolves via `%USERPROFILE%` (typically `C:\Users\<name>`), which always exists.

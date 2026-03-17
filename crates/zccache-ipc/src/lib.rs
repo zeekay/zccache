@@ -51,10 +51,7 @@ pub fn lock_file_path() -> PathBuf {
     }
     #[cfg(windows)]
     {
-        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| String::from("."));
-        PathBuf::from(local_app_data)
-            .join("zccache")
-            .join("daemon.lock")
+        zccache_core::config::default_cache_dir().join("daemon.lock")
     }
 }
 

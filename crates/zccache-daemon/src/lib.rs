@@ -5,6 +5,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod compile_journal;
 pub mod crash;
 pub mod event_log;
 pub mod eviction;

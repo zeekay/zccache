@@ -28,7 +28,7 @@ type PlatformTransport = NamedPipeTransport;
 
 **Windows:**
 - Named pipe: `\\.\pipe\zccache-{username}`
-- Lock file: `%LOCALAPPDATA%\zccache\lock`
+- Lock file: `~/.zccache/daemon.lock`
 - Username obtained via `GetUserNameW`.
 
 ## Connection Lifecycle

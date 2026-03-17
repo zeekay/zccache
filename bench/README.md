@@ -58,5 +58,5 @@ Key optimizations for build system integration:
 - **Single-roundtrip IPC:** `CompileEphemeral` combines session + compile + teardown
 - **Ultra-fast path (60s):** Clock-based skip avoids all hashing when the watcher
   confirms no files changed since the last verified hit
-- **Persistent artifacts:** Cache in `~/.cache/zccache/artifacts/` survives daemon
+- **Persistent artifacts:** Cache in `~/.zccache/artifacts/` survives daemon
   restarts — no cold-start penalty after reboot

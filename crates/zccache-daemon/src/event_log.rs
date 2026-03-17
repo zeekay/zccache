@@ -23,7 +23,7 @@ use zccache_depgraph::{SessionId, SessionManager};
 /// but omits `FILE_SHARE_DELETE`, which prevents any other process from deleting or
 /// renaming the file while a handle is open. This helper adds `FILE_SHARE_DELETE`
 /// so log files remain deletable at any time.
-fn open_append(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_append(path: &Path) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(windows)]
@@ -329,7 +329,7 @@ fn format_latency(d: Duration) -> String {
 /// Format a `SystemTime` as `YYYY-MM-DDTHH:MM:SS.mmmZ` in UTC.
 ///
 /// Manual decomposition from Unix epoch — no external dependency needed.
-fn format_timestamp(time: SystemTime) -> String {
+pub(crate) fn format_timestamp(time: SystemTime) -> String {
     let dur = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();

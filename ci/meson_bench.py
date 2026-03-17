@@ -145,7 +145,7 @@ def clear_zccache(tools: dict[str, str]) -> None:
     zccache = tools["zccache"]
     subprocess.run([zccache, "stop"], capture_output=True)
     time.sleep(0.5)
-    cache_dir = Path(os.environ.get("LOCALAPPDATA", "")) / "zccache"
+    cache_dir = Path.home() / ".zccache"
     if cache_dir.exists():
         shutil.rmtree(cache_dir, ignore_errors=True)
     # Pre-start daemon so meson probes don't race on auto-start

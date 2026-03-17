@@ -23,10 +23,7 @@ For how cache keys are computed see [overview.md](overview.md) (section 2.8). Fo
   index.redb                     # redb database
 ```
 
-**cache_root** defaults:
-- Linux: `$XDG_CACHE_HOME/zccache` or `~/.cache/zccache`
-- macOS: `~/Library/Caches/zccache`
-- Windows: `%LOCALAPPDATA%\zccache`
+**cache_root** defaults to `~/.zccache` on all platforms.
 
 ## Content Addressing
 

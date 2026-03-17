@@ -32,6 +32,7 @@ zccache-compiler = { path = "../zccache-compiler" }
 zccache-depgraph = { path = "../zccache-depgraph" }
 dashmap = { workspace = true }
 bincode = { workspace = true }
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

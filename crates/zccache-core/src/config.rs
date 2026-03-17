@@ -39,35 +39,34 @@ impl Default for Config {
     }
 }
 
-/// Returns the default cache directory path.
-///
-/// - Linux: `$XDG_CACHE_HOME/zccache` or `~/.cache/zccache`
-/// - macOS: `~/Library/Caches/zccache`
-/// - Windows: `%LOCALAPPDATA%\zccache`
+/// Returns the default cache directory path: `~/.zccache` on all platforms.
 #[must_use]
 pub fn default_cache_dir() -> PathBuf {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-            return PathBuf::from(xdg).join("zccache");
-        }
-        dirs_fallback().join(".cache/zccache")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        dirs_fallback().join("Library/Caches/zccache")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            return PathBuf::from(local).join("zccache");
-        }
-        dirs_fallback().join("AppData/Local/zccache")
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        dirs_fallback().join(".cache/zccache")
-    }
+    dirs_fallback().join(".zccache")
+}
+
+/// Returns the directory for content-addressed compiled outputs.
+#[must_use]
+pub fn artifacts_dir() -> PathBuf {
+    default_cache_dir().join("artifacts")
+}
+
+/// Returns the directory for in-progress artifact writes (cleaned on startup).
+#[must_use]
+pub fn tmp_dir() -> PathBuf {
+    default_cache_dir().join("tmp")
+}
+
+/// Returns the directory for serialized dependency graph storage (future).
+#[must_use]
+pub fn depgraph_dir() -> PathBuf {
+    default_cache_dir().join("depgraph")
+}
+
+/// Returns the path to the artifact index database.
+#[must_use]
+pub fn index_path() -> PathBuf {
+    default_cache_dir().join("index.redb")
 }
 
 /// Returns the directory for crash dump files.
@@ -94,6 +93,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_cache_dir_ends_with_zccache() {
+        let dir = default_cache_dir();
+        assert!(dir.ends_with(".zccache"));
+    }
+
+    #[test]
     fn crash_dump_dir_ends_with_crashes() {
         let dir = crash_dump_dir();
         assert!(dir.ends_with("crashes"));
@@ -117,5 +122,33 @@ mod tests {
         let cache = default_cache_dir();
         let logs = log_dir();
         assert!(logs.starts_with(&cache));
+    }
+
+    #[test]
+    fn artifacts_dir_ends_with_artifacts() {
+        let dir = artifacts_dir();
+        assert!(dir.ends_with("artifacts"));
+        assert!(dir.starts_with(default_cache_dir()));
+    }
+
+    #[test]
+    fn tmp_dir_ends_with_tmp() {
+        let dir = tmp_dir();
+        assert!(dir.ends_with("tmp"));
+        assert!(dir.starts_with(default_cache_dir()));
+    }
+
+    #[test]
+    fn depgraph_dir_ends_with_depgraph() {
+        let dir = depgraph_dir();
+        assert!(dir.ends_with("depgraph"));
+        assert!(dir.starts_with(default_cache_dir()));
+    }
+
+    #[test]
+    fn index_path_ends_with_redb() {
+        let p = index_path();
+        assert!(p.ends_with("index.redb"));
+        assert!(p.starts_with(default_cache_dir()));
     }
 }

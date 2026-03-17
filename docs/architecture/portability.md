@@ -14,7 +14,7 @@ Cross-platform differences and planned extension points.
 | File ID | `st_dev` + `st_ino` | `st_dev` + `st_ino` | `dwVolumeSerialNumber` + `nFileIndex{High,Low}` |
 | Atomic rename | `rename(2)` | `rename(2)` | `MoveFileExW` |
 | Lock file PID check | `kill(pid, 0)` | `kill(pid, 0)` | `OpenProcess(SYNCHRONIZE, pid)` |
-| Cache root | `~/.cache/zccache` | `~/Library/Caches/zccache` | `%LOCALAPPDATA%\zccache` |
+| Cache root | `~/.zccache` | `~/.zccache` | `~/.zccache` |
 | Daemon spawn | `fork` + `setsid` + `exec` | `fork` + `setsid` + `exec` | `CreateProcessW` (detached) |
 
 ## Path Handling

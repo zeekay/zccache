@@ -1711,6 +1711,7 @@ dependencies = [
  "clap",
  "dashmap",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1777,6 +1778,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "zccache-core",
  "zccache-protocol",
 ]
 

@@ -16,6 +16,7 @@ use zccache_ipc::{IpcConnection, IpcListener};
 use zccache_protocol::{ArtifactData, ArtifactOutput, Request, Response};
 use zccache_watcher::{NotifyWatcher, SettleBuffer, SettledEvent};
 
+use crate::compile_journal::{extract_outcome, CompileJournal, JournalContext, JournalEntry};
 use crate::stats::{HitPhases, MissPhases, PhaseProfiler, StatsCollector};
 
 /// Cached result of a verified cache hit, enabling zero-hash fast path.
@@ -100,6 +101,8 @@ struct SharedState {
     /// consuming compilations can hash the source header instead of the
     /// non-deterministic PCH binary.
     pch_source_map: DashMap<PathBuf, PathBuf>,
+    /// JSONL compile journal for build replay.
+    journal: CompileJournal,
 }
 
 /// Pre-computed compile request data for the request-level fast path.
@@ -151,7 +154,7 @@ impl DaemonServer {
         let shutdown = Arc::new(Notify::new());
         let now = now_secs();
         let instance = SERVER_INSTANCE.fetch_add(1, Ordering::Relaxed);
-        let artifact_dir = zccache_core::config::default_cache_dir().join("artifacts");
+        let artifact_dir = zccache_core::config::artifacts_dir();
         std::fs::create_dir_all(&artifact_dir).ok();
 
         let artifacts: DashMap<String, CachedArtifact> = DashMap::new();
@@ -217,6 +220,7 @@ impl DaemonServer {
                 request_cache: DashMap::new(),
                 watched_raw_dirs: DashMap::new(),
                 pch_source_map: DashMap::new(),
+                journal: CompileJournal::new(zccache_core::config::log_dir()),
             }),
         })
     }
@@ -496,6 +500,51 @@ async fn handle_connection(
         tracing::debug!(?request, "received request");
         state.last_activity.store(now_secs(), Ordering::Relaxed);
 
+        // Capture journal metadata from journalable requests before dispatch.
+        let journal_ctx: Option<JournalContext> = match &request {
+            Request::Compile {
+                compiler,
+                args,
+                cwd,
+                env,
+                session_id,
+            } => Some(JournalContext {
+                compiler: compiler.to_string_lossy().into_owned(),
+                args: args.clone(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                env: env.clone(),
+                session_id: Some(session_id.clone()),
+            }),
+            Request::CompileEphemeral {
+                compiler,
+                args,
+                cwd,
+                env,
+                ..
+            } => Some(JournalContext {
+                compiler: compiler.to_string_lossy().into_owned(),
+                args: args.clone(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                env: env.clone(),
+                session_id: None,
+            }),
+            Request::LinkEphemeral {
+                tool,
+                args,
+                cwd,
+                env,
+                ..
+            } => Some(JournalContext {
+                compiler: tool.to_string_lossy().into_owned(),
+                args: args.clone(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                env: env.clone(),
+                session_id: None,
+            }),
+            _ => None,
+        };
+        let journal_start = journal_ctx.as_ref().map(|_| std::time::Instant::now());
+
         let response = match request {
             Request::Ping => Response::Pong,
             Request::Shutdown => {
@@ -652,6 +701,16 @@ async fn handle_connection(
                     .await
             }
         };
+
+        // Log to compile journal for journalable requests.
+        if let (Some(ctx), Some(start)) = (journal_ctx, journal_start) {
+            if let Some((outcome, exit_code)) = extract_outcome(&response) {
+                let latency_ns = start.elapsed().as_nanos();
+                state
+                    .journal
+                    .log(&JournalEntry::new(ctx, outcome, exit_code, latency_ns));
+            }
+        }
 
         conn.send(&response).await?;
     }

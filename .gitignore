@@ -16,6 +16,9 @@ Thumbs.db
 # Session cache (hook fingerprints)
 .cache/
 
+# zccache cache directory
+.zccache/
+
 # Cargo lock is checked in for binaries
 # (workspace contains binary crates)
 .loop

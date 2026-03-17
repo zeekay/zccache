@@ -189,7 +189,7 @@ def clear_sccache() -> None:
 def clear_zccache() -> None:
     subprocess.run([ZCCACHE, "stop"], capture_output=True)
     # Clear zccache cache directory
-    cache_dir = Path.home() / "AppData/Local/zccache"
+    cache_dir = Path.home() / ".zccache"
     if cache_dir.exists():
         shutil.rmtree(cache_dir, ignore_errors=True)
 

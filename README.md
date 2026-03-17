@@ -83,9 +83,22 @@ zccache session-stats $ZCCACHE_SESSION_ID   # query mid-build
 zccache session-end $ZCCACHE_SESSION_ID     # final stats
 ```
 
-**Persistent cache:** Artifacts are stored in `~/.cache/zccache/artifacts/`
-(or `%LOCALAPPDATA%\zccache\artifacts\` on Windows) and survive daemon
-restarts. No need to re-warm the cache after a reboot.
+**Persistent cache:** Artifacts are stored in `~/.zccache/artifacts/`
+and survive daemon restarts. No need to re-warm the cache after a reboot.
+
+**Compile journal (build replay):** Every compile and link command is recorded
+to `~/.zccache/logs/compile_journal.jsonl` as a JSONL file with enough
+detail to replay the entire build:
+
+```json
+{"ts":"2026-03-17T10:30:00.123Z","outcome":"hit","compiler":"/usr/bin/clang++","args":["-c","foo.cpp","-o","foo.o"],"cwd":"/project/build","env":[["CC","clang"]],"exit_code":0,"session_id":"uuid","latency_ns":1234567}
+```
+
+Fields: `ts` (ISO 8601 UTC), `outcome` (`hit`/`miss`/`error`/`link_hit`/`link_miss`),
+`compiler` (full path), `args` (full argument list), `cwd`, `env` (omitted when
+inheriting daemon env), `exit_code`, `session_id` (null for ephemeral),
+`latency_ns` (wall-clock nanoseconds). One JSON object per line — pipe through
+`jq` to filter, or replay builds by extracting compiler + args + cwd.
 
 ### Multi-file compilation (fast path)
 

@@ -351,7 +351,7 @@ mod tests {
             dep_graph_files: 4201,
             sessions_total: 41,
             sessions_active: 3,
-            cache_dir: PathBuf::from("/home/user/.cache/zccache"),
+            cache_dir: PathBuf::from("/home/user/.zccache"),
         };
         roundtrip(&status);
     }
