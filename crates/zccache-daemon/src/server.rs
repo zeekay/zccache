@@ -95,6 +95,11 @@ struct SharedState {
     /// already processed. Avoids expensive canonicalize() syscalls (~1-5ms each
     /// on Windows) for directories that are already being watched.
     watched_raw_dirs: DashMap<PathBuf, ()>,
+    /// PCH source registry: pch_output_path → source_header_path.
+    /// When a PCH generation succeeds, we record the mapping so that
+    /// consuming compilations can hash the source header instead of the
+    /// non-deterministic PCH binary.
+    pch_source_map: DashMap<PathBuf, PathBuf>,
 }
 
 /// Pre-computed compile request data for the request-level fast path.
@@ -211,6 +216,7 @@ impl DaemonServer {
                 rsp_cache: DashMap::new(),
                 request_cache: DashMap::new(),
                 watched_raw_dirs: DashMap::new(),
+                pch_source_map: DashMap::new(),
             }),
         })
     }
@@ -1167,6 +1173,18 @@ fn pch_source_header(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Resolve the source header for a PCH binary. First checks the in-memory
+/// registry (populated when PCH generation succeeds), then falls back to the
+/// filesystem heuristic. Returns `None` for non-PCH files.
+fn resolve_pch_source(path: &Path, pch_map: &DashMap<PathBuf, PathBuf>) -> Option<PathBuf> {
+    // Fast path: check registry (covers build-dir separation).
+    if let Some(src) = pch_map.get(path) {
+        return Some(src.clone());
+    }
+    // Fallback: filesystem heuristic.
+    pch_source_header(path)
+}
+
 /// Build a CompileContext and UserDepFlags from a CacheableCompilation and session info.
 fn build_compile_context(
     compilation: &zccache_compiler::CacheableCompilation,
@@ -1662,7 +1680,8 @@ async fn handle_compile(
         if let Some(includes) = state.dep_graph.get_includes(&context_key) {
             for header in &includes {
                 // For PCH binaries in the include list, hash the source header instead.
-                let hash_path = pch_source_header(header).unwrap_or_else(|| header.clone());
+                let hash_path = resolve_pch_source(header, &state.pch_source_map)
+                    .unwrap_or_else(|| header.clone());
                 match hash_file(&state.cache_system, &hash_path, snap_clock) {
                     Ok(h) => {
                         hash_map.insert(header.clone(), h);
@@ -1682,7 +1701,8 @@ async fn handle_compile(
         // For PCH binaries (.pch/.gch), hash the SOURCE header instead — PCH
         // binaries are not bit-reproducible (clang embeds timestamps).
         for fi in &ctx.force_includes {
-            let hash_path = pch_source_header(fi).unwrap_or_else(|| fi.clone());
+            let hash_path =
+                resolve_pch_source(fi, &state.pch_source_map).unwrap_or_else(|| fi.clone());
             match hash_file(&state.cache_system, &hash_path, snap_clock) {
                 Ok(h) => {
                     hash_map.insert(fi.clone(), h);
@@ -1719,9 +1739,10 @@ async fn handle_compile(
         &state.sessions,
         &sid,
         &format!(
-            "[DIAG] depgraph_check: {} -> {} verdict={} reason={}",
+            "[DIAG] depgraph_check: {} -> {} ctx={} verdict={} reason={}",
             source_path.display(),
             output_path.display(),
+            &context_key.hash().to_hex()[..8],
             match &verdict {
                 zccache_depgraph::CacheVerdict::Hit { .. } => "Hit",
                 zccache_depgraph::CacheVerdict::SourceChanged { .. } => "SourceChanged",
@@ -2005,7 +2026,8 @@ async fn handle_compile(
         }
         for header in &scan_result.resolved {
             // For PCH binaries in the resolved include list, hash the source header.
-            let hash_path = pch_source_header(header).unwrap_or_else(|| header.clone());
+            let hash_path =
+                resolve_pch_source(header, &state.pch_source_map).unwrap_or_else(|| header.clone());
             if let Ok(h) = hash_file(&state.cache_system, &hash_path, snap_clock) {
                 hash_map.insert(header.clone(), h);
             } else {
@@ -2016,7 +2038,8 @@ async fn handle_compile(
         // is part of the artifact key.
         // For PCH binaries (.pch/.gch), hash the SOURCE header instead.
         for fi in &ctx.force_includes {
-            let hash_path = pch_source_header(fi).unwrap_or_else(|| fi.clone());
+            let hash_path =
+                resolve_pch_source(fi, &state.pch_source_map).unwrap_or_else(|| fi.clone());
             if let Ok(h) = hash_file(&state.cache_system, &hash_path, snap_clock) {
                 hash_map.insert(fi.clone(), h);
             } else {
@@ -2043,15 +2066,27 @@ async fn handle_compile(
         let include_count = scan_result.resolved.len();
         if let Some(artifact_key) = state.dep_graph.update(&context_key, scan_result, get_hash) {
             let artifact_key_hex = artifact_key.hash().to_hex();
+            let ctx_hex = &context_key.hash().to_hex()[..8];
             write_session_log(
                 &state.sessions,
                 &sid,
                 &format!(
-                    "[DIAG] update: {} artifact_key={} includes={include_count}",
+                    "[DIAG] update: {} ctx={ctx_hex} artifact_key={} includes={include_count}",
                     source_path.display(),
                     &artifact_key_hex[..8],
                 ),
             );
+
+            // Record PCH source mapping so consuming compilations can hash
+            // the source header instead of the non-deterministic PCH binary.
+            if let Some(ext) = output_path.extension() {
+                if ext == "pch" || ext == "gch" {
+                    state
+                        .pch_source_map
+                        .insert(output_path.clone(), source_path.clone());
+                }
+            }
+
             let artifact = ArtifactData {
                 outputs: vec![ArtifactOutput {
                     name: output_path
@@ -3391,5 +3426,107 @@ mod tests {
             server_handle.await.unwrap();
         })
         .await;
+    }
+
+    // ── pch_source_header unit tests ────────────────────────────────────
+
+    #[test]
+    fn pch_source_header_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let header = tmp.path().join("pch.h");
+        let pch = tmp.path().join("pch.h.pch");
+        std::fs::write(&header, "// pch").unwrap();
+        std::fs::write(&pch, "binary").unwrap();
+
+        let result = pch_source_header(&pch);
+        assert_eq!(result, Some(header));
+    }
+
+    #[test]
+    fn pch_source_header_build_dir() {
+        // The walk-up heuristic looks for `<dir_name>/<header_name>` from ancestors.
+        // e.g., for .build/tests/pch.h.pch it looks for tests/pch.h in parents.
+        let tmp = tempfile::tempdir().unwrap();
+        // Source: tmp/tests/pch.h (matches the `tests/pch.h` relative lookup)
+        let src_dir = tmp.path().join("tests");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let header = src_dir.join("pch.h");
+        std::fs::write(&header, "// pch").unwrap();
+
+        // PCH: tmp/build/tests/pch.h.pch
+        let build_dir = tmp.path().join("build").join("tests");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        let pch = build_dir.join("pch.h.pch");
+        std::fs::write(&pch, "binary").unwrap();
+
+        let result = pch_source_header(&pch);
+        assert_eq!(result, Some(header));
+    }
+
+    #[test]
+    fn pch_source_header_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let build_dir = tmp.path().join("build");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        let pch = build_dir.join("pch.h.pch");
+        std::fs::write(&pch, "binary").unwrap();
+
+        let result = pch_source_header(&pch);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn pch_source_header_non_pch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let obj = tmp.path().join("foo.o");
+        std::fs::write(&obj, "object").unwrap();
+
+        let result = pch_source_header(&obj);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn pch_source_header_gch_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let header = tmp.path().join("pch.h");
+        let gch = tmp.path().join("pch.h.gch");
+        std::fs::write(&header, "// pch").unwrap();
+        std::fs::write(&gch, "binary").unwrap();
+
+        let result = pch_source_header(&gch);
+        assert_eq!(result, Some(header));
+    }
+
+    // ── resolve_pch_source unit tests ───────────────────────────────────
+
+    #[test]
+    fn resolve_pch_source_registry_hit() {
+        let pch_map: DashMap<PathBuf, PathBuf> = DashMap::new();
+        let pch_path = PathBuf::from("/build/tests/pch.h.pch");
+        let src_path = PathBuf::from("/src/tests/pch.h");
+        pch_map.insert(pch_path.clone(), src_path.clone());
+
+        let result = resolve_pch_source(&pch_path, &pch_map);
+        assert_eq!(result, Some(src_path));
+    }
+
+    #[test]
+    fn resolve_pch_source_falls_back_to_filesystem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let header = tmp.path().join("pch.h");
+        let pch = tmp.path().join("pch.h.pch");
+        std::fs::write(&header, "// pch").unwrap();
+        std::fs::write(&pch, "binary").unwrap();
+
+        let pch_map: DashMap<PathBuf, PathBuf> = DashMap::new();
+        let result = resolve_pch_source(&pch, &pch_map);
+        assert_eq!(result, Some(header));
+    }
+
+    #[test]
+    fn resolve_pch_source_non_pch_returns_none() {
+        let pch_map: DashMap<PathBuf, PathBuf> = DashMap::new();
+        let result = resolve_pch_source(Path::new("/build/foo.o"), &pch_map);
+        assert_eq!(result, None);
     }
 }

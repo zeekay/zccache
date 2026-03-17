@@ -457,15 +457,16 @@ impl DepGraph {
     {
         let mut entry = self.contexts.get_mut(key)?;
 
+        // Always update include lists (useful for diagnostics even if hashing fails).
         entry.resolved_includes = scan_result.resolved;
         entry.unresolved_includes = scan_result.unresolved;
         entry.has_computed_includes = scan_result.has_computed;
-        entry.state = ContextState::Warm;
         entry.last_accessed = Instant::now();
+        // DO NOT set state=Warm here — wait until all hashes succeed.
 
-        // Compute artifact key — only if ALL files are hashable.
-        // If any file is missing a hash, skip artifact key computation so
-        // check() won't see a key computed from a partial file list.
+        // Compute artifact key — if any file is missing a hash, leave state
+        // unchanged (Cold stays Cold) so check() doesn't see a Warm context
+        // with no artifact key.
         let mut file_hashes = Vec::new();
         let source_hash = get_hash(&entry.context.source_file)?;
         file_hashes.push((entry.context.source_file.clone(), source_hash));
@@ -473,7 +474,7 @@ impl DepGraph {
         for header in &entry.resolved_includes {
             match get_hash(header) {
                 Some(h) => file_hashes.push((header.clone(), h)),
-                None => return None, // Incomplete hashes → don't store a partial key
+                None => return None, // Incomplete hashes → state stays unchanged
             }
         }
         // Hash force-included files (PCH content must affect artifact key).
@@ -485,6 +486,9 @@ impl DepGraph {
         }
 
         let artifact_key = compute_artifact_key(key, &mut file_hashes);
+
+        // SUCCESS: all hashes computed — transition to Warm atomically with artifact key.
+        entry.state = ContextState::Warm;
         entry.artifact_key = Some(artifact_key);
         entry.last_file_hashes = file_hashes;
 
@@ -1038,6 +1042,126 @@ mod tests {
 
         assert!(graph.mark_stale(&key));
         assert_eq!(graph.get_state(&key), Some(ContextState::Stale));
+    }
+
+    // ── update() atomicity tests ──────────────────────────────────────
+
+    #[test]
+    fn update_with_hash_failure_stays_cold() {
+        let graph = DepGraph::new();
+        let key = graph.register(make_ctx("/src/a.c"));
+        assert_eq!(graph.get_state(&key), Some(ContextState::Cold));
+
+        let scan = ScanResult {
+            resolved: vec![PathBuf::from("/inc/b.h")],
+            unresolved: Vec::new(),
+            has_computed: false,
+        };
+        // Source hash fails → update returns None, state must stay Cold.
+        let no_hash = |_: &Path| -> Option<ContentHash> { None };
+        let result = graph.update(&key, scan, no_hash);
+        assert!(result.is_none());
+        assert_eq!(graph.get_state(&key), Some(ContextState::Cold));
+    }
+
+    #[test]
+    fn update_partial_hash_failure_stays_cold() {
+        let graph = DepGraph::new();
+        let key = graph.register(make_ctx("/src/a.c"));
+
+        let scan = ScanResult {
+            resolved: vec![
+                PathBuf::from("/inc/a.h"),
+                PathBuf::from("/inc/b.h"),
+                PathBuf::from("/inc/c.h"),
+            ],
+            unresolved: Vec::new(),
+            has_computed: false,
+        };
+        // 2nd header hash fails → state must stay Cold.
+        let partial_hash = |p: &Path| -> Option<ContentHash> {
+            if p == Path::new("/inc/b.h") {
+                None
+            } else {
+                Some(zccache_hash::hash_bytes(p.to_string_lossy().as_bytes()))
+            }
+        };
+        let result = graph.update(&key, scan, partial_hash);
+        assert!(result.is_none());
+        assert_eq!(graph.get_state(&key), Some(ContextState::Cold));
+    }
+
+    #[test]
+    fn update_success_transitions_to_warm() {
+        let graph = DepGraph::new();
+        let key = graph.register(make_ctx("/src/a.c"));
+        assert_eq!(graph.get_state(&key), Some(ContextState::Cold));
+
+        let scan = ScanResult {
+            resolved: vec![PathBuf::from("/inc/b.h")],
+            unresolved: Vec::new(),
+            has_computed: false,
+        };
+        let result = graph.update(&key, scan, dummy_hash);
+        assert!(result.is_some());
+        assert_eq!(graph.get_state(&key), Some(ContextState::Warm));
+    }
+
+    #[test]
+    fn pch_gen_context_hit_after_update() {
+        // Register a PCH-generation context (no force_includes — it IS the PCH).
+        let graph = DepGraph::new();
+        let key = graph.register(make_ctx("/src/pch.h"));
+
+        let scan = ScanResult {
+            resolved: vec![PathBuf::from("/inc/a.h"), PathBuf::from("/inc/b.h")],
+            unresolved: Vec::new(),
+            has_computed: false,
+        };
+        graph.update(&key, scan, dummy_hash);
+
+        // check() should return Hit, not Cold.
+        let verdict = graph.check(&key, always_fresh, dummy_hash);
+        assert!(
+            matches!(verdict, CacheVerdict::Hit { .. }),
+            "expected Hit after update, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn warm_context_with_no_artifact_returns_cold_on_check() {
+        // Simulate the bug scenario: state=Warm but artifact_key=None.
+        // With the fix, this can't happen via update() — but if someone
+        // manually sets state=Warm, check_diagnostic should handle it.
+        let graph = DepGraph::new();
+        let ctx = make_ctx("/src/a.c");
+        let key = ctx.context_key();
+
+        // Manually insert a Warm entry with no artifact key.
+        graph.contexts.insert(
+            key,
+            ContextEntry {
+                context: ctx,
+                resolved_includes: vec![PathBuf::from("/inc/b.h")],
+                unresolved_includes: Vec::new(),
+                has_computed_includes: false,
+                artifact_key: None,
+                last_file_hashes: Vec::new(),
+                last_accessed: Instant::now(),
+                state: ContextState::Warm,
+            },
+        );
+
+        // check_diagnostic should still produce a valid verdict (not panic).
+        // With all fresh, it should compute an artifact key and return Hit.
+        let (verdict, _reason) = graph.check_diagnostic(&key, always_fresh, dummy_hash);
+        assert!(
+            matches!(
+                verdict,
+                CacheVerdict::Hit { .. } | CacheVerdict::SourceChanged { .. }
+            ),
+            "warm context with all hashes available should hit, got {verdict:?}"
+        );
     }
 
     #[test]
