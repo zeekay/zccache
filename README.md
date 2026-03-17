@@ -45,7 +45,7 @@ Run the benchmark yourself: `uv run perf`
 
 pip install zccache
 
-(run it like sccache, jusy substitute zccavhe)
+(run it like sccache, jusy substitute zccache)
 
 ### Build system integration (ninja, meson, cmake, make)
 
