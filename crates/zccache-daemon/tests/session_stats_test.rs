@@ -118,12 +118,13 @@ async fn session_stats_mid_session_query() {
                 working_dir: cwd.clone().into(),
                 log_file: None,
                 track_stats: true,
+                journal: false,
             })
             .await
             .unwrap();
 
         let session_id = match client.recv().await.unwrap() {
-            Some(Response::SessionStarted { session_id }) => session_id,
+            Some(Response::SessionStarted { session_id, .. }) => session_id,
             other => panic!("expected SessionStarted, got: {other:?}"),
         };
 
@@ -212,12 +213,13 @@ async fn session_stats_not_tracked_returns_none() {
                 working_dir: std::env::current_dir().unwrap(),
                 log_file: None,
                 track_stats: false,
+                journal: false,
             })
             .await
             .unwrap();
 
         let session_id = match client.recv().await.unwrap() {
-            Some(Response::SessionStarted { session_id }) => session_id,
+            Some(Response::SessionStarted { session_id, .. }) => session_id,
             other => panic!("expected SessionStarted, got: {other:?}"),
         };
 

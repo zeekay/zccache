@@ -34,6 +34,8 @@ pub enum Request {
         log_file: Option<PathBuf>,
         /// Whether to track per-session statistics.
         track_stats: bool,
+        /// Whether to write a per-session JSONL compile journal.
+        journal: bool,
     },
     /// Compile a source file within an existing session.
     Compile {
@@ -115,6 +117,8 @@ pub enum Response {
     SessionStarted {
         /// Assigned session ID (UUID string).
         session_id: String,
+        /// Path to the per-session JSONL journal file (if journal was requested).
+        journal_path: Option<PathBuf>,
     },
     /// Result of a compilation request.
     CompileResult {
@@ -363,6 +367,7 @@ mod tests {
             working_dir: PathBuf::from("/home/user/project"),
             log_file: None,
             track_stats: true,
+            journal: false,
         };
         roundtrip(&req);
 
@@ -371,8 +376,38 @@ mod tests {
             working_dir: PathBuf::from("/home/user/project"),
             log_file: None,
             track_stats: false,
+            journal: false,
         };
         roundtrip(&req_no_stats);
+    }
+
+    #[test]
+    fn session_start_with_journal_roundtrip() {
+        let req = Request::SessionStart {
+            client_pid: 5678,
+            working_dir: PathBuf::from("/home/user/project"),
+            log_file: None,
+            track_stats: false,
+            journal: true,
+        };
+        roundtrip(&req);
+    }
+
+    #[test]
+    fn session_started_with_journal_path_roundtrip() {
+        let resp = Response::SessionStarted {
+            session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            journal_path: Some(PathBuf::from(
+                "/home/user/.zccache/logs/sessions/test.jsonl",
+            )),
+        };
+        roundtrip(&resp);
+
+        let resp_no_journal = Response::SessionStarted {
+            session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            journal_path: None,
+        };
+        roundtrip(&resp_no_journal);
     }
 
     #[test]

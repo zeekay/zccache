@@ -26,11 +26,12 @@ async fn start_session(client: &mut ClientConn, _clang: &std::path::Path, cwd: &
             working_dir: cwd.to_string().into(),
             log_file: None,
             track_stats: true,
+            journal: false,
         })
         .await
         .unwrap();
     match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id }) => session_id,
+        Some(Response::SessionStarted { session_id, .. }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
     }
 }

@@ -401,6 +401,7 @@ End of search list.
         working_dir: root.to_path_buf(),
         log_file: None,
         track_stats: false,
+        journal: false,
     });
     assert!(mgr.exists(&session_id));
 
@@ -756,6 +757,7 @@ fn stress_concurrent_session_operations() {
                     working_dir: PathBuf::from(format!("/project/{t}")),
                     log_file: None,
                     track_stats: false,
+                    journal: false,
                 });
                 ids.push(id);
                 mgr.touch(&id);

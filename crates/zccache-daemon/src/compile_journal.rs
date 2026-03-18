@@ -7,9 +7,10 @@
 //! `EventLogger`. Serialization happens on the caller's tokio task; the
 //! background thread does file I/O only. Zero contention on the hot path.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::Serialize;
@@ -73,9 +74,20 @@ impl JournalEntry {
     }
 }
 
+/// Message sent to the background journal writer thread.
+enum JournalMessage {
+    /// Write a line to the global journal and optionally to a session journal.
+    Entry {
+        line: String,
+        session_path: Option<PathBuf>,
+    },
+    /// Close a session journal file handle.
+    CloseSession { path: PathBuf },
+}
+
 /// JSONL compile journal backed by a lock-free channel and background writer thread.
 pub struct CompileJournal {
-    sender: Option<mpsc::UnboundedSender<String>>,
+    sender: Option<mpsc::UnboundedSender<JournalMessage>>,
 }
 
 impl CompileJournal {
@@ -115,12 +127,18 @@ impl CompileJournal {
 
     /// Log a journal entry. Serialization happens on the caller; file I/O
     /// happens on the background thread. Never blocks.
-    pub fn log(&self, entry: &JournalEntry) {
+    ///
+    /// If `session_path` is provided, the entry is also written to that
+    /// per-session JSONL file.
+    pub fn log(&self, entry: &JournalEntry, session_path: Option<&Path>) {
         if let Some(tx) = &self.sender {
             // Serialize on caller's thread (tokio task).
             match serde_json::to_string(entry) {
                 Ok(line) => {
-                    let _ = tx.send(line);
+                    let _ = tx.send(JournalMessage::Entry {
+                        line,
+                        session_path: session_path.map(Path::to_path_buf),
+                    });
                 }
                 Err(e) => {
                     tracing::debug!("journal serialize error: {e}");
@@ -128,16 +146,63 @@ impl CompileJournal {
             }
         }
     }
+
+    /// Close a session journal file handle. Call this when a session ends
+    /// so the background thread can release the file.
+    pub fn close_session(&self, path: &Path) {
+        if let Some(tx) = &self.sender {
+            let _ = tx.send(JournalMessage::CloseSession {
+                path: path.to_path_buf(),
+            });
+        }
+    }
 }
 
-/// Background thread: receives pre-serialized JSON lines and writes to file.
-fn journal_thread(mut rx: mpsc::UnboundedReceiver<String>, path: PathBuf, mut file: std::fs::File) {
-    while let Some(line) = rx.blocking_recv() {
-        if writeln!(file, "{line}").is_err() {
-            // Try to reopen (file may have been deleted/rotated).
-            if let Ok(f) = open_append(&path) {
-                file = f;
-                let _ = writeln!(file, "{line}");
+/// Background thread: receives journal messages and writes to files.
+fn journal_thread(
+    mut rx: mpsc::UnboundedReceiver<JournalMessage>,
+    global_path: PathBuf,
+    mut global_file: std::fs::File,
+) {
+    let mut session_files: HashMap<PathBuf, std::fs::File> = HashMap::new();
+
+    while let Some(msg) = rx.blocking_recv() {
+        match msg {
+            JournalMessage::Entry { line, session_path } => {
+                // Write to global journal.
+                if writeln!(global_file, "{line}").is_err() {
+                    if let Ok(f) = open_append(&global_path) {
+                        global_file = f;
+                        let _ = writeln!(global_file, "{line}");
+                    }
+                }
+                // Write to session journal if requested.
+                if let Some(ref path) = session_path {
+                    let file = session_files.entry(path.clone()).or_insert_with(|| {
+                        match open_append(path) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                tracing::debug!("session journal open error: {e}");
+                                // Return a dummy that will fail writes — we'll
+                                // skip silently via is_err() below.
+                                open_append(path).unwrap_or_else(|_| {
+                                    // Last resort: /dev/null equivalent. The HashMap
+                                    // entry will be cleaned up on CloseSession.
+                                    std::fs::File::open(if cfg!(windows) {
+                                        "NUL"
+                                    } else {
+                                        "/dev/null"
+                                    })
+                                    .expect("cannot open null device")
+                                })
+                            }
+                        }
+                    });
+                    let _ = writeln!(file, "{line}");
+                }
+            }
+            JournalMessage::CloseSession { path } => {
+                session_files.remove(&path);
             }
         }
     }
@@ -241,7 +306,7 @@ mod tests {
             session_id: Some("session-1".to_string()),
         };
         let entry = JournalEntry::new(ctx, "hit", 0, 5_000_000);
-        journal.log(&entry);
+        journal.log(&entry, None);
 
         // Give the background thread time to write.
         std::thread::sleep(Duration::from_millis(200));
@@ -268,7 +333,68 @@ mod tests {
         };
         let entry = JournalEntry::new(ctx, "miss", 0, 0);
         // Should not panic.
-        journal.log(&entry);
+        journal.log(&entry, None);
+    }
+
+    #[test]
+    fn test_session_journal_file_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        fs::create_dir_all(&session_dir).unwrap();
+        let session_path = session_dir.join("test-session.jsonl");
+
+        let journal = CompileJournal::new(dir.path().to_path_buf());
+
+        let ctx = JournalContext {
+            compiler: "/usr/bin/clang++".to_string(),
+            args: vec!["-c".to_string(), "test.cpp".to_string()],
+            cwd: "/project".to_string(),
+            env: None,
+            session_id: Some("test-session".to_string()),
+        };
+        let entry = JournalEntry::new(ctx, "miss", 0, 2_000_000);
+        journal.log(&entry, Some(&session_path));
+
+        // Give the background thread time to write.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Global journal should have the entry.
+        let global = fs::read_to_string(dir.path().join("compile_journal.jsonl")).unwrap();
+        assert!(!global.is_empty(), "global journal should have content");
+
+        // Session journal should also have the entry.
+        let session = fs::read_to_string(&session_path).unwrap();
+        assert!(!session.is_empty(), "session journal should have content");
+        let v: serde_json::Value = serde_json::from_str(session.trim()).unwrap();
+        assert_eq!(v["outcome"], "miss");
+        assert_eq!(v["session_id"], "test-session");
+    }
+
+    #[test]
+    fn test_close_session_releases_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        fs::create_dir_all(&session_dir).unwrap();
+        let session_path = session_dir.join("close-test.jsonl");
+
+        let journal = CompileJournal::new(dir.path().to_path_buf());
+
+        let ctx = JournalContext {
+            compiler: "clang".to_string(),
+            args: vec![],
+            cwd: "/tmp".to_string(),
+            env: None,
+            session_id: Some("close-test".to_string()),
+        };
+        let entry = JournalEntry::new(ctx, "hit", 0, 100);
+        journal.log(&entry, Some(&session_path));
+        journal.close_session(&session_path);
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        // File should exist and have content.
+        let content = fs::read_to_string(&session_path).unwrap();
+        assert!(!content.is_empty());
     }
 
     #[test]

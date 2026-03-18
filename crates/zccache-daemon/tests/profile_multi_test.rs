@@ -93,11 +93,12 @@ async fn profile_multi_file_warm_path() {
             working_dir: cwd.clone().into(),
             log_file: None,
             track_stats: true,
+            journal: false,
         })
         .await
         .unwrap();
     let session_id = match client.recv::<Response>().await.unwrap() {
-        Some(Response::SessionStarted { session_id }) => session_id,
+        Some(Response::SessionStarted { session_id, .. }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
     };
 

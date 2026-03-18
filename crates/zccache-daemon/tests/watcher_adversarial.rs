@@ -48,11 +48,12 @@ async fn start_session(
             working_dir: cwd.to_string().into(),
             log_file: Some(log_file.to_string().into()),
             track_stats: false,
+            journal: false,
         })
         .await
         .unwrap();
     match client.recv().await.unwrap() {
-        Some(Response::SessionStarted { session_id }) => session_id,
+        Some(Response::SessionStarted { session_id, .. }) => session_id,
         other => panic!("expected SessionStarted, got: {other:?}"),
     }
 }

@@ -59,6 +59,9 @@ enum Commands {
         /// Enable per-session hit/miss statistics tracking.
         #[arg(long)]
         stats: bool,
+        /// Write a per-session JSONL compile journal for build replay/debugging.
+        #[arg(long)]
+        journal: bool,
     },
     /// End a build session.
     #[command(name = "session-end")]
@@ -186,6 +189,7 @@ fn main() -> ExitCode {
             log,
             endpoint,
             stats,
+            journal,
         } => {
             let endpoint = resolve_endpoint(endpoint.as_deref());
             let cwd = cwd
@@ -199,7 +203,13 @@ fn main() -> ExitCode {
                     std::env::current_dir().unwrap_or_default().join(p)
                 }
             });
-            run_async(cmd_session_start(&endpoint, &cwd, log.as_deref(), stats))
+            run_async(cmd_session_start(
+                &endpoint,
+                &cwd,
+                log.as_deref(),
+                stats,
+                journal,
+            ))
         }
         Commands::SessionEnd {
             session_id,
@@ -389,6 +399,7 @@ async fn cmd_session_start(
     cwd: &Path,
     log: Option<&Path>,
     track_stats: bool,
+    journal: bool,
 ) -> ExitCode {
     if let Err(e) = ensure_daemon(endpoint).await {
         eprintln!("cannot start daemon at {endpoint}: {e}");
@@ -408,22 +419,35 @@ async fn cmd_session_start(
         working_dir: cwd.to_path_buf(),
         log_file: log.map(Path::to_path_buf),
         track_stats,
+        journal,
     })
     .await
     .unwrap();
 
     match conn.recv().await.unwrap() {
-        Some(zccache_protocol::Response::SessionStarted { session_id }) => {
+        Some(zccache_protocol::Response::SessionStarted {
+            session_id,
+            journal_path,
+        }) => {
             // One-line JSON so scripts can parse both the session ID and start time:
             //   result=$(zccache session-start)
             let started_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            println!(
-                r#"{{"session_id":"{}","started_at":{}}}"#,
-                session_id, started_at
-            );
+            if let Some(ref jp) = journal_path {
+                println!(
+                    r#"{{"session_id":"{}","started_at":{},"journal_path":"{}"}}"#,
+                    session_id,
+                    started_at,
+                    jp.display()
+                );
+            } else {
+                println!(
+                    r#"{{"session_id":"{}","started_at":{}}}"#,
+                    session_id, started_at
+                );
+            }
             ExitCode::SUCCESS
         }
         Some(zccache_protocol::Response::Error { message }) => {

@@ -77,12 +77,13 @@ async fn test_session_start_with_nonexistent_compiler() {
                 working_dir: std::env::current_dir().unwrap(),
                 log_file: None,
                 track_stats: false,
+                journal: false,
             })
             .await
             .unwrap();
 
         let session_id = match client.recv().await.unwrap() {
-            Some(Response::SessionStarted { session_id }) => session_id,
+            Some(Response::SessionStarted { session_id, .. }) => session_id,
             other => panic!("expected SessionStarted, got: {other:?}"),
         };
 
@@ -135,13 +136,14 @@ async fn test_session_start_with_clang_toolchain() {
                 working_dir: std::env::current_dir().unwrap(),
                 log_file: None,
                 track_stats: false,
+                journal: false,
             })
             .await
             .unwrap();
 
         let resp: Option<Response> = client.recv().await.unwrap();
         let session_id = match resp {
-            Some(Response::SessionStarted { session_id }) => {
+            Some(Response::SessionStarted { session_id, .. }) => {
                 // Session ID should be a valid UUID string
                 eprintln!("session_id: {session_id}");
                 assert!(
@@ -160,6 +162,7 @@ async fn test_session_start_with_clang_toolchain() {
                 working_dir: std::env::current_dir().unwrap(),
                 log_file: None,
                 track_stats: false,
+                journal: false,
             })
             .await
             .unwrap();
@@ -206,6 +209,7 @@ async fn test_full_client_flow() {
                 working_dir: std::env::current_dir().unwrap(),
                 log_file: None,
                 track_stats: false,
+                journal: false,
             })
             .await
             .unwrap();
@@ -274,6 +278,7 @@ int main() {
                 working_dir: tmp.path().to_string_lossy().into_owned().into(),
                 log_file: Some(log_file.to_string_lossy().into_owned().into()),
                 track_stats: false,
+                journal: false,
             })
             .await
             .unwrap();

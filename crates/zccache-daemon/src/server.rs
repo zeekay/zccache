@@ -601,9 +601,18 @@ async fn handle_connection(
                 working_dir,
                 log_file,
                 track_stats,
+                journal,
             } => {
                 state.stats.record_session();
-                handle_session_start(&state, client_pid, &working_dir, log_file, track_stats).await
+                handle_session_start(
+                    &state,
+                    client_pid,
+                    &working_dir,
+                    log_file,
+                    track_stats,
+                    journal,
+                )
+                .await
             }
             Request::Compile {
                 session_id,
@@ -663,6 +672,10 @@ async fn handle_connection(
             Request::SessionEnd { session_id } => match session_id.parse::<SessionId>() {
                 Ok(sid) => {
                     if let Some(session) = state.sessions.end(&sid) {
+                        // Close the session journal file handle if one was open.
+                        if let Some(ref path) = session.journal_path {
+                            state.journal.close_session(path);
+                        }
                         let stats = session.stats_tracker.map(|tracker| {
                             let f = tracker.finalize(session.created_at);
                             zccache_protocol::SessionStats {
@@ -706,9 +719,19 @@ async fn handle_connection(
         if let (Some(ctx), Some(start)) = (journal_ctx, journal_start) {
             if let Some((outcome, exit_code)) = extract_outcome(&response) {
                 let latency_ns = start.elapsed().as_nanos();
-                state
-                    .journal
-                    .log(&JournalEntry::new(ctx, outcome, exit_code, latency_ns));
+                // Look up session journal path for per-session logging.
+                let session_journal_path = ctx.session_id.as_ref().and_then(|sid| {
+                    sid.parse::<SessionId>().ok().and_then(|parsed| {
+                        state
+                            .sessions
+                            .get(&parsed)
+                            .and_then(|s| s.journal_path.clone())
+                    })
+                });
+                state.journal.log(
+                    &JournalEntry::new(ctx, outcome, exit_code, latency_ns),
+                    session_journal_path.as_deref(),
+                );
             }
         }
 
@@ -785,7 +808,8 @@ async fn handle_compile_ephemeral(
 ) -> Response {
     // 1. Start ephemeral session (inline, no IPC roundtrip)
     state.stats.record_session();
-    let session_resp = handle_session_start(state, client_pid, working_dir, None, false).await;
+    let session_resp =
+        handle_session_start(state, client_pid, working_dir, None, false, false).await;
     let session_id = match session_resp {
         Response::SessionStarted { session_id, .. } => session_id,
         Response::Error { message } => return Response::Error { message },
@@ -1119,12 +1143,14 @@ async fn handle_session_start(
     working_dir: &Path,
     log_file: Option<PathBuf>,
     track_stats: bool,
+    journal: bool,
 ) -> Response {
     let session_config = zccache_depgraph::SessionConfig {
         client_pid,
         working_dir: working_dir.to_path_buf(),
         log_file,
         track_stats,
+        journal,
     };
 
     let session_id = state.sessions.create(session_config);
@@ -1132,8 +1158,14 @@ async fn handle_session_start(
     // Watch the working directory for file changes.
     watch_directory(state, working_dir).await;
 
+    let journal_path = state
+        .sessions
+        .get(&session_id)
+        .and_then(|s| s.journal_path.clone());
+
     Response::SessionStarted {
         session_id: session_id.to_string(),
+        journal_path,
     }
 }
 
@@ -3063,12 +3095,13 @@ mod tests {
                     working_dir: cwd.clone().into(),
                     log_file: Some(log.to_string_lossy().into_owned().into()),
                     track_stats: false,
+                    journal: false,
                 })
                 .await
                 .unwrap();
 
             let session_id = match client.recv().await.unwrap() {
-                Some(Response::SessionStarted { session_id }) => session_id,
+                Some(Response::SessionStarted { session_id, .. }) => session_id,
                 other => panic!("expected SessionStarted, got: {other:?}"),
             };
 
@@ -3239,12 +3272,13 @@ mod tests {
                     working_dir: cwd.clone().into(),
                     log_file: None,
                     track_stats: false,
+                    journal: false,
                 })
                 .await
                 .unwrap();
 
             let session_id = match client.recv().await.unwrap() {
-                Some(Response::SessionStarted { session_id }) => session_id,
+                Some(Response::SessionStarted { session_id, .. }) => session_id,
                 other => panic!("expected SessionStarted, got: {other:?}"),
             };
 
@@ -3327,12 +3361,13 @@ mod tests {
                     working_dir: cwd.clone().into(),
                     log_file: None,
                     track_stats: false,
+                    journal: false,
                 })
                 .await
                 .unwrap();
 
             let session_id2 = match client.recv().await.unwrap() {
-                Some(Response::SessionStarted { session_id }) => session_id,
+                Some(Response::SessionStarted { session_id, .. }) => session_id,
                 other => panic!("expected SessionStarted, got: {other:?}"),
             };
 
@@ -3393,12 +3428,13 @@ mod tests {
                     working_dir: cwd.clone().into(),
                     log_file: None,
                     track_stats: true,
+                    journal: false,
                 })
                 .await
                 .unwrap();
 
             let session_id = match client.recv().await.unwrap() {
-                Some(Response::SessionStarted { session_id }) => session_id,
+                Some(Response::SessionStarted { session_id, .. }) => session_id,
                 other => panic!("expected SessionStarted, got: {other:?}"),
             };
 
