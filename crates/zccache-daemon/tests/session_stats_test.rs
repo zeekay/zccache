@@ -118,7 +118,7 @@ async fn session_stats_mid_session_query() {
                 working_dir: cwd.clone().into(),
                 log_file: None,
                 track_stats: true,
-                journal: false,
+                journal_path: None,
             })
             .await
             .unwrap();
@@ -213,7 +213,7 @@ async fn session_stats_not_tracked_returns_none() {
                 working_dir: std::env::current_dir().unwrap(),
                 log_file: None,
                 track_stats: false,
-                journal: false,
+                journal_path: None,
             })
             .await
             .unwrap();

@@ -93,7 +93,7 @@ async fn profile_multi_file_warm_path() {
             working_dir: cwd.clone().into(),
             log_file: None,
             track_stats: true,
-            journal: false,
+            journal_path: None,
         })
         .await
         .unwrap();

@@ -81,12 +81,6 @@ pub fn log_dir() -> PathBuf {
     default_cache_dir().join("logs")
 }
 
-/// Returns the directory for per-session JSONL compile journals.
-#[must_use]
-pub fn session_log_dir() -> PathBuf {
-    log_dir().join("sessions")
-}
-
 fn dirs_fallback() -> PathBuf {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -156,12 +150,5 @@ mod tests {
         let p = index_path();
         assert!(p.ends_with("index.redb"));
         assert!(p.starts_with(default_cache_dir()));
-    }
-
-    #[test]
-    fn session_log_dir_ends_with_sessions() {
-        let dir = session_log_dir();
-        assert!(dir.ends_with("sessions"));
-        assert!(dir.starts_with(log_dir()));
     }
 }

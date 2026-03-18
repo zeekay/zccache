@@ -24,7 +24,7 @@ Tokio runtime:     multi-threaded (default thread count)
 
 Dedicated OS thread:  file watcher (notify)
 Dedicated OS thread:  event log writer (daemon.log)
-Dedicated OS thread:  compile journal writer (compile_journal.jsonl)
+Dedicated OS thread:  compile journal writer (compile_journal.jsonl + per-session journals)
 ```
 
 ### Synchronization Points
@@ -36,7 +36,7 @@ Dedicated OS thread:  compile journal writer (compile_journal.jsonl)
 | redb index | redb internal MVCC (readers never block, writer serialized) | Low — write transactions are short |
 | File watcher event channel | tokio mpsc (bounded, 4096) | Low — single producer, single consumer |
 | Event log channel | tokio mpsc (unbounded) | None — lock-free send, single consumer thread |
-| Compile journal channel | tokio mpsc (unbounded) | None — lock-free send, single consumer thread |
+| Compile journal channel | tokio mpsc (unbounded) | None — lock-free send, single consumer thread (writes global + per-session files) |
 
 ### Lock Ordering
 

@@ -26,7 +26,7 @@ async fn start_session(client: &mut ClientConn, _clang: &std::path::Path, cwd: &
             working_dir: cwd.to_string().into(),
             log_file: None,
             track_stats: true,
-            journal: false,
+            journal_path: None,
         })
         .await
         .unwrap();

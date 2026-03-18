@@ -601,7 +601,7 @@ async fn handle_connection(
                 working_dir,
                 log_file,
                 track_stats,
-                journal,
+                journal_path,
             } => {
                 state.stats.record_session();
                 handle_session_start(
@@ -610,7 +610,7 @@ async fn handle_connection(
                     &working_dir,
                     log_file,
                     track_stats,
-                    journal,
+                    journal_path,
                 )
                 .await
             }
@@ -809,7 +809,7 @@ async fn handle_compile_ephemeral(
     // 1. Start ephemeral session (inline, no IPC roundtrip)
     state.stats.record_session();
     let session_resp =
-        handle_session_start(state, client_pid, working_dir, None, false, false).await;
+        handle_session_start(state, client_pid, working_dir, None, false, None).await;
     let session_id = match session_resp {
         Response::SessionStarted { session_id, .. } => session_id,
         Response::Error { message } => return Response::Error { message },
@@ -1143,14 +1143,14 @@ async fn handle_session_start(
     working_dir: &Path,
     log_file: Option<PathBuf>,
     track_stats: bool,
-    journal: bool,
+    journal_path: Option<PathBuf>,
 ) -> Response {
     let session_config = zccache_depgraph::SessionConfig {
         client_pid,
         working_dir: working_dir.to_path_buf(),
         log_file,
         track_stats,
-        journal,
+        journal_path,
     };
 
     let session_id = state.sessions.create(session_config);
@@ -3095,7 +3095,7 @@ mod tests {
                     working_dir: cwd.clone().into(),
                     log_file: Some(log.to_string_lossy().into_owned().into()),
                     track_stats: false,
-                    journal: false,
+                    journal_path: None,
                 })
                 .await
                 .unwrap();
@@ -3272,7 +3272,7 @@ mod tests {
                     working_dir: cwd.clone().into(),
                     log_file: None,
                     track_stats: false,
-                    journal: false,
+                    journal_path: None,
                 })
                 .await
                 .unwrap();
@@ -3361,7 +3361,7 @@ mod tests {
                     working_dir: cwd.clone().into(),
                     log_file: None,
                     track_stats: false,
-                    journal: false,
+                    journal_path: None,
                 })
                 .await
                 .unwrap();
@@ -3428,7 +3428,7 @@ mod tests {
                     working_dir: cwd.clone().into(),
                     log_file: None,
                     track_stats: true,
-                    journal: false,
+                    journal_path: None,
                 })
                 .await
                 .unwrap();

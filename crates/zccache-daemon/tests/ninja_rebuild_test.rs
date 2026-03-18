@@ -171,7 +171,7 @@ async fn build_all_ipc(
             working_dir: cwd.clone().into(),
             log_file: None,
             track_stats: true,
-            journal: false,
+            journal_path: None,
         })
         .await
         .unwrap();
@@ -551,7 +551,7 @@ async fn ninja_concurrent_cold_build() {
             working_dir: root.to_string_lossy().into_owned().into(),
             log_file: None,
             track_stats: false,
-            journal: false,
+            journal_path: None,
         })
         .await
         .unwrap();

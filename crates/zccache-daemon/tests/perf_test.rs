@@ -90,7 +90,7 @@ async fn start_session(
             working_dir: cwd.to_string().into(),
             log_file: Some(log_file.to_string().into()),
             track_stats: false,
-            journal: false,
+            journal_path: None,
         })
         .await
         .unwrap();

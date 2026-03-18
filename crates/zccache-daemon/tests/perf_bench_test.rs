@@ -748,7 +748,7 @@ async fn perf_warm_cache_zccache_vs_sccache() {
             working_dir: zc_cwd.clone().into(),
             log_file: None,
             track_stats: true,
-            journal: false,
+            journal_path: None,
         })
         .await
         .unwrap();
@@ -1074,7 +1074,7 @@ async fn perf_response_file() {
             working_dir: zc_cwd.clone().into(),
             log_file: None,
             track_stats: true,
-            journal: false,
+            journal_path: None,
         })
         .await
         .unwrap();

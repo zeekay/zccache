@@ -59,9 +59,9 @@ enum Commands {
         /// Enable per-session hit/miss statistics tracking.
         #[arg(long)]
         stats: bool,
-        /// Write a per-session JSONL compile journal for build replay/debugging.
+        /// Write a per-session JSONL compile journal to this path (must end in .jsonl).
         #[arg(long)]
-        journal: bool,
+        journal: Option<String>,
     },
     /// End a build session.
     #[command(name = "session-end")]
@@ -196,6 +196,18 @@ fn main() -> ExitCode {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let log = log.map(|p| {
+                let path = Path::new(&p);
+                if path.is_absolute() {
+                    PathBuf::from(p)
+                } else {
+                    std::env::current_dir().unwrap_or_default().join(p)
+                }
+            });
+            let journal = journal.map(|p| {
+                if !p.ends_with(".jsonl") {
+                    eprintln!("error: --journal path must end in .jsonl");
+                    std::process::exit(1);
+                }
                 let path = Path::new(&p);
                 if path.is_absolute() {
                     PathBuf::from(p)
@@ -399,7 +411,7 @@ async fn cmd_session_start(
     cwd: &Path,
     log: Option<&Path>,
     track_stats: bool,
-    journal: bool,
+    journal: Option<PathBuf>,
 ) -> ExitCode {
     if let Err(e) = ensure_daemon(endpoint).await {
         eprintln!("cannot start daemon at {endpoint}: {e}");
@@ -419,7 +431,7 @@ async fn cmd_session_start(
         working_dir: cwd.to_path_buf(),
         log_file: log.map(Path::to_path_buf),
         track_stats,
-        journal,
+        journal_path: journal,
     })
     .await
     .unwrap();

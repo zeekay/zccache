@@ -100,6 +100,27 @@ inheriting daemon env), `exit_code`, `session_id` (null for ephemeral),
 `latency_ns` (wall-clock nanoseconds). One JSON object per line — pipe through
 `jq` to filter, or replay builds by extracting compiler + args + cwd.
 
+**Per-session compile journal:** Pass `--journal <path>` to `session-start` to
+write a dedicated JSONL log containing only the commands from that session.
+The path must end in `.jsonl`:
+
+```bash
+result=$(zccache session-start --journal build.jsonl)
+session_id=$(echo "$result" | jq -r .session_id)
+export ZCCACHE_SESSION_ID=$session_id
+
+# ... build runs ...
+
+# Inspect this session's commands only (no noise from other sessions)
+jq . build.jsonl
+
+zccache session-end $session_id
+```
+
+The session journal uses the same JSONL schema as the global journal. Entries
+are written to both the global and session journals simultaneously. The session
+file handle is released when `session-end` is called.
+
 ### Multi-file compilation (fast path)
 
 When a build system passes multiple source files to a single compiler invocation

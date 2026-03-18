@@ -503,7 +503,7 @@ mod tests {
             working_dir: PathBuf::from("/test"),
             log_file: Some(session_log.to_path_buf()),
             track_stats: false,
-            journal: false,
+            journal_path: None,
         });
         let sid_str = sid.to_string();
 

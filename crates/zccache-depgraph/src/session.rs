@@ -165,8 +165,8 @@ pub struct SessionConfig {
     pub log_file: Option<PathBuf>,
     /// Whether to track per-session statistics.
     pub track_stats: bool,
-    /// Whether to write a per-session JSONL compile journal.
-    pub journal: bool,
+    /// Path for per-session JSONL compile journal (must end in .jsonl).
+    pub journal_path: Option<PathBuf>,
 }
 
 /// An active session.
@@ -222,13 +222,7 @@ impl SessionManager {
             None
         };
 
-        let journal_path = if config.journal {
-            let dir = zccache_core::config::session_log_dir();
-            let _ = std::fs::create_dir_all(&dir);
-            Some(dir.join(format!("{id}.jsonl")))
-        } else {
-            None
-        };
+        let journal_path = config.journal_path;
 
         let session = Session {
             id,
@@ -375,7 +369,7 @@ mod tests {
             working_dir: PathBuf::from("/home/user/project"),
             log_file: None,
             track_stats: false,
-            journal: false,
+            journal_path: None,
         }
     }
 

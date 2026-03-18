@@ -652,8 +652,11 @@ v1 is deliberately minimal. The goal is a correct, useful tool for the most comm
 | Binary (bincode/protobuf) | Not human-inspectable. Requires tooling to read. |
 | Extend daemon.log | daemon.log is human-readable with rotation/GC. Mixing machine-parseable JSON would complicate both parsers. |
 
+**Per-session journals:** When `session-start --journal <path>` is used, the daemon also writes a per-session JSONL file to the user-specified path (must end in `.jsonl`). This uses the same schema and the same background writer thread — entries are written to both the global and session files in a single `JournalMessage::Entry`. Session file handles are tracked in a `HashMap<PathBuf, File>` and released on `CloseSession`. The session journal path is returned to the CLI in `Response::SessionStarted { journal_path }`.
+
 **Consequences:**
 - Disk usage grows linearly with compilations. Unlike `daemon.log`, the journal has no rotation — it is an append-only record. Users can truncate or delete it at will.
+- Per-session journals allow build systems to isolate a single build's commands for debugging or replay without filtering the global journal by session ID.
 - The `serde_json` dependency is added to `zccache-daemon`. This is a well-maintained, widely-used crate.
 - Future tooling can consume the journal for build analysis, replay, or CI diagnostics.
 

@@ -34,8 +34,8 @@ pub enum Request {
         log_file: Option<PathBuf>,
         /// Whether to track per-session statistics.
         track_stats: bool,
-        /// Whether to write a per-session JSONL compile journal.
-        journal: bool,
+        /// Path for per-session JSONL compile journal (must end in .jsonl).
+        journal_path: Option<PathBuf>,
     },
     /// Compile a source file within an existing session.
     Compile {
@@ -367,7 +367,7 @@ mod tests {
             working_dir: PathBuf::from("/home/user/project"),
             log_file: None,
             track_stats: true,
-            journal: false,
+            journal_path: None,
         };
         roundtrip(&req);
 
@@ -376,21 +376,30 @@ mod tests {
             working_dir: PathBuf::from("/home/user/project"),
             log_file: None,
             track_stats: false,
-            journal: false,
+            journal_path: None,
         };
         roundtrip(&req_no_stats);
     }
 
     #[test]
-    fn session_start_with_journal_roundtrip() {
+    fn session_start_with_journal_path_roundtrip() {
         let req = Request::SessionStart {
             client_pid: 5678,
             working_dir: PathBuf::from("/home/user/project"),
             log_file: None,
             track_stats: false,
-            journal: true,
+            journal_path: Some(PathBuf::from("/tmp/build.jsonl")),
         };
         roundtrip(&req);
+
+        let req_no_journal = Request::SessionStart {
+            client_pid: 5678,
+            working_dir: PathBuf::from("/home/user/project"),
+            log_file: None,
+            track_stats: false,
+            journal_path: None,
+        };
+        roundtrip(&req_no_journal);
     }
 
     #[test]
