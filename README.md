@@ -43,9 +43,26 @@ Run the benchmark yourself: `uv run perf`
 
 ### Install
 
+```bash
 pip install zccache
+```
 
-(run it like sccache, jusy substitute zccache)
+This installs **native Rust binaries** (`zccache` and `zccache-daemon`) directly
+onto your PATH — no Python runtime dependency. Pre-built wheels are available for:
+
+| Platform | Architecture |
+|----------|-------------|
+| Linux | x86_64, aarch64 |
+| macOS | x86_64, Apple Silicon |
+| Windows | x86_64 |
+
+Verify the install:
+
+```bash
+zccache --version
+```
+
+Use it as a drop-in replacement for sccache — just substitute `zccache`:
 
 ### Build system integration (ninja, meson, cmake, make)
 
