@@ -1015,27 +1015,109 @@ async fn cmd_link_ephemeral(
 
 // ─── Daemon auto-start ─────────────────────────────────────────────────────
 
-/// Ensure the daemon is running. If not, spawn it and wait for it to accept.
+enum VersionCheck {
+    Ok,
+    Mismatch {
+        daemon_ver: String,
+    },
+    /// Could not connect to the daemon at all.
+    Unreachable,
+    /// Connected but could not complete the version exchange (protocol mismatch, etc.).
+    CommError,
+}
+
+/// Connect to the daemon and compare its version to ours.
+async fn check_daemon_version(endpoint: &str) -> VersionCheck {
+    let mut conn = match connect(endpoint).await {
+        Ok(c) => c,
+        Err(_) => return VersionCheck::Unreachable,
+    };
+    if conn.send(&zccache_protocol::Request::Status).await.is_err() {
+        return VersionCheck::CommError;
+    }
+    match conn.recv::<zccache_protocol::Response>().await {
+        Ok(Some(zccache_protocol::Response::Status(s))) => {
+            if s.version == zccache_core::VERSION {
+                VersionCheck::Ok
+            } else {
+                VersionCheck::Mismatch {
+                    daemon_ver: s.version,
+                }
+            }
+        }
+        _ => VersionCheck::CommError,
+    }
+}
+
+/// Stop a running daemon by sending it a Shutdown request.
+async fn stop_running_daemon(endpoint: &str) {
+    if let Ok(mut conn) = connect(endpoint).await {
+        let _ = conn.send(&zccache_protocol::Request::Shutdown).await;
+        // Wait for shutdown acknowledgement (best-effort)
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.recv::<zccache_protocol::Response>(),
+        )
+        .await;
+    }
+    // Give the OS time to release the pipe/socket
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+}
+
+/// Spawn a new daemon and wait for it to become ready.
+async fn spawn_and_wait(endpoint: &str) -> Result<(), String> {
+    let daemon_bin = find_daemon_binary().ok_or("cannot find zccache-daemon binary")?;
+    tracing::debug!(?daemon_bin, %endpoint, "spawning daemon");
+    spawn_daemon(&daemon_bin, endpoint)?;
+
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if connect(endpoint).await.is_ok() {
+            return Ok(());
+        }
+    }
+    Err("daemon started but not accepting connections after 10s".to_string())
+}
+
+/// Ensure the daemon is running **and version-compatible**. If a stale daemon
+/// from another project or an older install is running, stop it and respawn.
 ///
 /// Handles concurrent calls gracefully: when multiple processes race to start
 /// the daemon, only one wins the bind. The losers detect this and connect to
 /// the winning daemon instead of failing.
-///
-/// Protocol version is checked automatically by the framing layer on every
-/// message exchange — no separate version handshake needed.
 async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
-    // Fast path: try to connect
-    if connect(endpoint).await.is_ok() {
-        return Ok(());
+    // Fast path: connect + version check in a single connection attempt
+    match check_daemon_version(endpoint).await {
+        VersionCheck::Ok => return Ok(()),
+        VersionCheck::Mismatch { daemon_ver } => {
+            eprintln!(
+                "zccache: daemon v{daemon_ver} running, need v{} — restarting",
+                zccache_core::VERSION,
+            );
+            stop_running_daemon(endpoint).await;
+            return spawn_and_wait(endpoint).await;
+        }
+        VersionCheck::CommError => {
+            // Connected but can't communicate (protocol mismatch?) — restart
+            stop_running_daemon(endpoint).await;
+            return spawn_and_wait(endpoint).await;
+        }
+        VersionCheck::Unreachable => {
+            // Fall through to lock-file check / spawn
+        }
     }
 
     // Check lock file for a running daemon we just can't reach yet
     if let Some(pid) = zccache_ipc::check_running_daemon() {
-        // Daemon process exists — wait a bit for it to become ready
         for _ in 0..20 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if connect(endpoint).await.is_ok() {
-                return Ok(());
+            match check_daemon_version(endpoint).await {
+                VersionCheck::Ok => return Ok(()),
+                VersionCheck::Mismatch { .. } | VersionCheck::CommError => {
+                    stop_running_daemon(endpoint).await;
+                    return spawn_and_wait(endpoint).await;
+                }
+                VersionCheck::Unreachable => continue,
             }
         }
         return Err(format!(
@@ -1044,35 +1126,7 @@ async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
     }
 
     // No daemon running — spawn one
-    let daemon_bin = find_daemon_binary().ok_or("cannot find zccache-daemon binary")?;
-
-    tracing::debug!(?daemon_bin, %endpoint, "spawning daemon");
-
-    spawn_daemon(&daemon_bin, endpoint)?;
-
-    // Wait for daemon to become ready (up to 10s).
-    // Our daemon might win the bind, or another concurrent spawn might win.
-    // Either way, we just need a daemon accepting connections on the endpoint.
-    for _ in 0..100 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if connect(endpoint).await.is_ok() {
-            return Ok(());
-        }
-    }
-
-    // Final attempt: our daemon may have lost the bind race to another
-    // process. The winning daemon might have started after our polling began.
-    // Check if any daemon is now running and give it one more chance.
-    if zccache_ipc::check_running_daemon().is_some() {
-        for _ in 0..20 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if connect(endpoint).await.is_ok() {
-                return Ok(());
-            }
-        }
-    }
-
-    Err("daemon started but not accepting connections after 12s".to_string())
+    spawn_and_wait(endpoint).await
 }
 
 /// Find the daemon binary. Looks next to the CLI binary first, then on PATH.
