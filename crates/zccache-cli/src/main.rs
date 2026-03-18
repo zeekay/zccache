@@ -1049,21 +1049,6 @@ async fn check_daemon_version(endpoint: &str) -> VersionCheck {
     }
 }
 
-/// Stop a running daemon by sending it a Shutdown request.
-async fn stop_running_daemon(endpoint: &str) {
-    if let Ok(mut conn) = connect(endpoint).await {
-        let _ = conn.send(&zccache_protocol::Request::Shutdown).await;
-        // Wait for shutdown acknowledgement (best-effort)
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            conn.recv::<zccache_protocol::Response>(),
-        )
-        .await;
-    }
-    // Give the OS time to release the pipe/socket
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-}
-
 /// Spawn a new daemon and wait for it to become ready.
 async fn spawn_and_wait(endpoint: &str) -> Result<(), String> {
     let daemon_bin = find_daemon_binary().ok_or("cannot find zccache-daemon binary")?;
@@ -1079,28 +1064,32 @@ async fn spawn_and_wait(endpoint: &str) -> Result<(), String> {
     Err("daemon started but not accepting connections after 10s".to_string())
 }
 
-/// Ensure the daemon is running **and version-compatible**. If a stale daemon
-/// from another project or an older install is running, stop it and respawn.
+/// Ensure the daemon is running **and version-compatible**.
+///
+/// If a daemon with a different version is running, returns a hard error
+/// telling the user to run `zccache stop` first. This avoids silently
+/// restarting a daemon that another project may be relying on.
 ///
 /// Handles concurrent calls gracefully: when multiple processes race to start
 /// the daemon, only one wins the bind. The losers detect this and connect to
 /// the winning daemon instead of failing.
 async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
-    // Fast path: connect + version check in a single connection attempt
+    // Fast path: connect + version check
     match check_daemon_version(endpoint).await {
         VersionCheck::Ok => return Ok(()),
         VersionCheck::Mismatch { daemon_ver } => {
-            eprintln!(
-                "zccache: daemon v{daemon_ver} running, need v{} — restarting",
+            return Err(format!(
+                "version mismatch: daemon is v{daemon_ver}, client is v{}. \
+                 Run `zccache stop` first.",
                 zccache_core::VERSION,
-            );
-            stop_running_daemon(endpoint).await;
-            return spawn_and_wait(endpoint).await;
+            ));
         }
         VersionCheck::CommError => {
-            // Connected but can't communicate (protocol mismatch?) — restart
-            stop_running_daemon(endpoint).await;
-            return spawn_and_wait(endpoint).await;
+            return Err(
+                "cannot communicate with daemon (possible protocol mismatch). \
+                 Run `zccache stop` first."
+                    .to_string(),
+            );
         }
         VersionCheck::Unreachable => {
             // Fall through to lock-file check / spawn
@@ -1113,9 +1102,19 @@ async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             match check_daemon_version(endpoint).await {
                 VersionCheck::Ok => return Ok(()),
-                VersionCheck::Mismatch { .. } | VersionCheck::CommError => {
-                    stop_running_daemon(endpoint).await;
-                    return spawn_and_wait(endpoint).await;
+                VersionCheck::Mismatch { daemon_ver } => {
+                    return Err(format!(
+                        "version mismatch: daemon is v{daemon_ver}, client is v{}. \
+                         Run `zccache stop` first.",
+                        zccache_core::VERSION,
+                    ));
+                }
+                VersionCheck::CommError => {
+                    return Err(
+                        "cannot communicate with daemon (possible protocol mismatch). \
+                         Run `zccache stop` first."
+                            .to_string(),
+                    );
                 }
                 VersionCheck::Unreachable => continue,
             }
