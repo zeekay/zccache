@@ -273,13 +273,24 @@ async fn cmd_stop(endpoint: &str) -> ExitCode {
     conn.send(&zccache_protocol::Request::Shutdown)
         .await
         .unwrap();
-    match conn.recv().await.unwrap() {
+    let recv_result = match conn.recv().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zccache: broken connection to daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match recv_result {
         Some(zccache_protocol::Response::ShuttingDown) => {
             eprintln!("daemon stopped");
             ExitCode::SUCCESS
         }
-        other => {
-            eprintln!("unexpected response: {other:?}");
+        None => {
+            eprintln!("zccache: lost connection to daemon (no response received)");
+            ExitCode::FAILURE
+        }
+        Some(other) => {
+            eprintln!("zccache: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -295,7 +306,14 @@ async fn cmd_status(endpoint: &str) -> ExitCode {
     };
 
     conn.send(&zccache_protocol::Request::Status).await.unwrap();
-    match conn.recv().await.unwrap() {
+    let recv_result = match conn.recv().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zccache: broken connection to daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match recv_result {
         Some(zccache_protocol::Response::Status(s)) => {
             let total = s.cache_hits + s.cache_misses;
             let hit_rate = if total > 0 {
@@ -363,8 +381,12 @@ async fn cmd_status(endpoint: &str) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        other => {
-            eprintln!("unexpected response: {other:?}");
+        None => {
+            eprintln!("zccache: lost connection to daemon (no response received)");
+            ExitCode::FAILURE
+        }
+        Some(other) => {
+            eprintln!("zccache: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -380,7 +402,14 @@ async fn cmd_clear(endpoint: &str) -> ExitCode {
     };
 
     conn.send(&zccache_protocol::Request::Clear).await.unwrap();
-    match conn.recv().await.unwrap() {
+    let recv_result = match conn.recv().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zccache: broken connection to daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match recv_result {
         Some(zccache_protocol::Response::Cleared {
             artifacts_removed,
             metadata_cleared,
@@ -399,8 +428,12 @@ async fn cmd_clear(endpoint: &str) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        other => {
-            eprintln!("unexpected response: {other:?}");
+        None => {
+            eprintln!("zccache: lost connection to daemon (no response received)");
+            ExitCode::FAILURE
+        }
+        Some(other) => {
+            eprintln!("zccache: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -436,7 +469,14 @@ async fn cmd_session_start(
     .await
     .unwrap();
 
-    match conn.recv().await.unwrap() {
+    let recv_result = match conn.recv().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zccache: broken connection to daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match recv_result {
         Some(zccache_protocol::Response::SessionStarted {
             session_id,
             journal_path,
@@ -466,8 +506,12 @@ async fn cmd_session_start(
             eprintln!("session-start failed: {message}");
             ExitCode::FAILURE
         }
-        other => {
-            eprintln!("unexpected response: {other:?}");
+        None => {
+            eprintln!("zccache: lost connection to daemon (no response received)");
+            ExitCode::FAILURE
+        }
+        Some(other) => {
+            eprintln!("zccache: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -488,7 +532,14 @@ async fn cmd_session_end(endpoint: &str, session_id: String) -> ExitCode {
     .await
     .unwrap();
 
-    match conn.recv().await.unwrap() {
+    let recv_result = match conn.recv().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zccache: broken connection to daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match recv_result {
         Some(zccache_protocol::Response::SessionEnded { stats }) => {
             if let Some(s) = stats {
                 let total = s.hits + s.misses;
@@ -516,8 +567,12 @@ async fn cmd_session_end(endpoint: &str, session_id: String) -> ExitCode {
             eprintln!("session-end failed: {message}");
             ExitCode::FAILURE
         }
-        other => {
-            eprintln!("unexpected response: {other:?}");
+        None => {
+            eprintln!("zccache: lost connection to daemon (no response received)");
+            ExitCode::FAILURE
+        }
+        Some(other) => {
+            eprintln!("zccache: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -538,7 +593,14 @@ async fn cmd_session_stats(endpoint: &str, session_id: String) -> ExitCode {
     .await
     .unwrap();
 
-    match conn.recv().await.unwrap() {
+    let recv_result = match conn.recv().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zccache: broken connection to daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match recv_result {
         Some(zccache_protocol::Response::SessionStatsResult { stats }) => {
             if let Some(s) = stats {
                 let total = s.hits + s.misses;
@@ -568,8 +630,12 @@ async fn cmd_session_stats(endpoint: &str, session_id: String) -> ExitCode {
             eprintln!("session-stats failed: {message}");
             ExitCode::FAILURE
         }
-        other => {
-            eprintln!("unexpected response: {other:?}");
+        None => {
+            eprintln!("zccache: lost connection to daemon (no response received)");
+            ExitCode::FAILURE
+        }
+        Some(other) => {
+            eprintln!("zccache: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -776,7 +842,14 @@ async fn cmd_compile(
     .await
     .unwrap();
 
-    match conn.recv().await.unwrap() {
+    let recv_result = match conn.recv().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zccache: broken connection to daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match recv_result {
         Some(zccache_protocol::Response::CompileResult {
             exit_code,
             stdout,
@@ -793,8 +866,12 @@ async fn cmd_compile(
             eprintln!("zccache error: {message}");
             ExitCode::FAILURE
         }
-        other => {
-            eprintln!("unexpected response: {other:?}");
+        None => {
+            eprintln!("zccache: lost connection to daemon (no response received)");
+            ExitCode::FAILURE
+        }
+        Some(other) => {
+            eprintln!("zccache: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -833,7 +910,14 @@ async fn cmd_compile_ephemeral(
     .await
     .unwrap();
 
-    match conn.recv().await.unwrap() {
+    let recv_result = match conn.recv().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zccache: broken connection to daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match recv_result {
         Some(zccache_protocol::Response::CompileResult {
             exit_code,
             stdout,
@@ -849,8 +933,12 @@ async fn cmd_compile_ephemeral(
             eprintln!("zccache error: {message}");
             ExitCode::FAILURE
         }
-        other => {
-            eprintln!("unexpected response: {other:?}");
+        None => {
+            eprintln!("zccache: lost connection to daemon (no response received)");
+            ExitCode::FAILURE
+        }
+        Some(other) => {
+            eprintln!("zccache: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -887,7 +975,14 @@ async fn cmd_link_ephemeral(
     .await
     .unwrap();
 
-    match conn.recv().await.unwrap() {
+    let recv_result = match conn.recv().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zccache: broken connection to daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match recv_result {
         Some(zccache_protocol::Response::LinkResult {
             exit_code,
             stdout,
@@ -907,8 +1002,12 @@ async fn cmd_link_ephemeral(
             eprintln!("zccache error: {message}");
             ExitCode::FAILURE
         }
-        other => {
-            eprintln!("unexpected response: {other:?}");
+        None => {
+            eprintln!("zccache: lost connection to daemon (no response received)");
+            ExitCode::FAILURE
+        }
+        Some(other) => {
+            eprintln!("zccache: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
