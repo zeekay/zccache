@@ -448,11 +448,11 @@ async fn cmd_session_start(
                 .unwrap_or_default()
                 .as_secs();
             if let Some(ref jp) = journal_path {
+                // Escape backslashes for valid JSON (Windows paths contain `\`)
+                let jp_escaped = jp.display().to_string().replace('\\', "\\\\");
                 println!(
                     r#"{{"session_id":"{}","started_at":{},"journal_path":"{}"}}"#,
-                    session_id,
-                    started_at,
-                    jp.display()
+                    session_id, started_at, jp_escaped
                 );
             } else {
                 println!(
