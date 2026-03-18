@@ -1028,7 +1028,12 @@ async fn cmd_link_ephemeral(
 
 enum VersionCheck {
     Ok,
-    Mismatch {
+    /// Daemon is newer than client — safe to proceed.
+    DaemonNewer {
+        daemon_ver: String,
+    },
+    /// Daemon is older than client — must restart.
+    DaemonOlder {
         daemon_ver: String,
     },
     /// Could not connect to the daemon at all.
@@ -1049,11 +1054,23 @@ async fn check_daemon_version(endpoint: &str) -> VersionCheck {
     match conn.recv::<zccache_protocol::Response>().await {
         Ok(Some(zccache_protocol::Response::Status(s))) => {
             if s.version == zccache_core::VERSION {
-                VersionCheck::Ok
-            } else {
-                VersionCheck::Mismatch {
+                return VersionCheck::Ok;
+            }
+            let client_ver = zccache_core::version::current();
+            match zccache_core::version::Version::parse(&s.version) {
+                Some(daemon_ver) => match daemon_ver.cmp(&client_ver) {
+                    std::cmp::Ordering::Equal => VersionCheck::Ok,
+                    std::cmp::Ordering::Greater => VersionCheck::DaemonNewer {
+                        daemon_ver: s.version,
+                    },
+                    std::cmp::Ordering::Less => VersionCheck::DaemonOlder {
+                        daemon_ver: s.version,
+                    },
+                },
+                // Unparseable daemon version → treat as older (safe default)
+                None => VersionCheck::DaemonOlder {
                     daemon_ver: s.version,
-                }
+                },
             }
         }
         _ => VersionCheck::CommError,
@@ -1077,9 +1094,9 @@ async fn spawn_and_wait(endpoint: &str) -> Result<(), String> {
 
 /// Ensure the daemon is running **and version-compatible**.
 ///
-/// If a daemon with a different version is running, returns a hard error
-/// telling the user to run `zccache stop` first. This avoids silently
-/// restarting a daemon that another project may be relying on.
+/// Version checking is asymmetric: a newer daemon is accepted (it's
+/// backward-compatible), but an older daemon triggers a hard error
+/// telling the user to run `zccache stop` first.
 ///
 /// Handles concurrent calls gracefully: when multiple processes race to start
 /// the daemon, only one wins the bind. The losers detect this and connect to
@@ -1088,9 +1105,17 @@ async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
     // Fast path: connect + version check
     match check_daemon_version(endpoint).await {
         VersionCheck::Ok => return Ok(()),
-        VersionCheck::Mismatch { daemon_ver } => {
+        VersionCheck::DaemonNewer { daemon_ver } => {
+            tracing::debug!(
+                daemon_ver,
+                client_ver = zccache_core::VERSION,
+                "daemon is newer than client, proceeding"
+            );
+            return Ok(());
+        }
+        VersionCheck::DaemonOlder { daemon_ver } => {
             return Err(format!(
-                "version mismatch: daemon is v{daemon_ver}, client is v{}. \
+                "daemon v{daemon_ver} is older than client v{}. \
                  Run `zccache stop` first.",
                 zccache_core::VERSION,
             ));
@@ -1113,9 +1138,17 @@ async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             match check_daemon_version(endpoint).await {
                 VersionCheck::Ok => return Ok(()),
-                VersionCheck::Mismatch { daemon_ver } => {
+                VersionCheck::DaemonNewer { daemon_ver } => {
+                    tracing::debug!(
+                        daemon_ver,
+                        client_ver = zccache_core::VERSION,
+                        "daemon is newer than client, proceeding"
+                    );
+                    return Ok(());
+                }
+                VersionCheck::DaemonOlder { daemon_ver } => {
                     return Err(format!(
-                        "version mismatch: daemon is v{daemon_ver}, client is v{}. \
+                        "daemon v{daemon_ver} is older than client v{}. \
                          Run `zccache stop` first.",
                         zccache_core::VERSION,
                     ));

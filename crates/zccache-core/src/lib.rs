@@ -6,6 +6,7 @@
 pub mod config;
 pub mod error;
 pub mod path;
+pub mod version;
 
 pub use error::{Error, Result};
 
