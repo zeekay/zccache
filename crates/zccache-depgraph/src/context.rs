@@ -22,6 +22,12 @@ impl ContextKey {
     pub fn hash(&self) -> &ContentHash {
         &self.0
     }
+
+    /// Construct from raw 32-byte hash (for deserialization).
+    #[must_use]
+    pub fn from_raw(bytes: [u8; 32]) -> Self {
+        Self(ContentHash::from_bytes(bytes))
+    }
 }
 
 impl std::fmt::Display for ContextKey {
@@ -40,6 +46,12 @@ impl ArtifactKey {
     #[must_use]
     pub fn hash(&self) -> &ContentHash {
         &self.0
+    }
+
+    /// Construct from raw 32-byte hash (for deserialization).
+    #[must_use]
+    pub fn from_raw(bytes: [u8; 32]) -> Self {
+        Self(ContentHash::from_bytes(bytes))
     }
 }
 

@@ -231,6 +231,15 @@ impl DaemonServer {
         Arc::clone(&self.shutdown)
     }
 
+    /// Replace the dependency graph with a pre-loaded one.
+    ///
+    /// Must be called before `run()` (while this is the only Arc holder).
+    pub fn set_dep_graph(&mut self, graph: zccache_depgraph::DepGraph) {
+        let state =
+            Arc::get_mut(&mut self.state).expect("set_dep_graph must be called before run()");
+        state.dep_graph = graph;
+    }
+
     /// Get a snapshot of the phase profiler (for benchmarks).
     #[must_use]
     pub fn profile_snapshot(&self) -> crate::stats::ProfileSnapshot {
@@ -290,6 +299,22 @@ impl DaemonServer {
             });
         }
 
+        // Start periodic depgraph save task (every 5 minutes).
+        {
+            let state = Arc::clone(&self.state);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                    let path = zccache_depgraph::depgraph_file_path();
+                    std::fs::create_dir_all(path.parent().unwrap()).ok();
+                    match zccache_depgraph::save_to_file(&state.dep_graph, &path) {
+                        Ok(()) => tracing::debug!("periodic depgraph save"),
+                        Err(e) => tracing::warn!("periodic depgraph save failed: {e}"),
+                    }
+                }
+            });
+        }
+
         loop {
             tokio::select! {
                 result = self.listener.accept() => {
@@ -307,6 +332,19 @@ impl DaemonServer {
                     // The settle buffer and consumer tasks will exit when their
                     // input channels close.
                     *self.state.watcher.lock().await = None;
+
+                    // Save depgraph to disk before exiting.
+                    let start = std::time::Instant::now();
+                    let path = zccache_depgraph::depgraph_file_path();
+                    std::fs::create_dir_all(path.parent().unwrap()).ok();
+                    match zccache_depgraph::save_to_file(&self.state.dep_graph, &path) {
+                        Ok(()) => tracing::info!(
+                            elapsed_ms = start.elapsed().as_millis() as u64,
+                            "depgraph saved"
+                        ),
+                        Err(e) => tracing::warn!("depgraph save failed: {e}"),
+                    }
+
                     return Ok(());
                 }
             }
@@ -591,6 +629,11 @@ async fn handle_connection(
                     sessions_total: snap.sessions_total,
                     sessions_active: state.sessions.active_count() as u64,
                     cache_dir: zccache_core::config::default_cache_dir(),
+                    dep_graph_version: zccache_depgraph::DEPGRAPH_VERSION,
+                    dep_graph_disk_size: zccache_depgraph::depgraph_file_path()
+                        .metadata()
+                        .map(|m| m.len())
+                        .unwrap_or(0),
                 })
             }
             Request::Lookup { .. } => Response::LookupResult(zccache_protocol::LookupResult::Miss),
@@ -778,6 +821,9 @@ async fn handle_clear(state: &SharedState) -> Response {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+
+    // Delete on-disk depgraph snapshot.
+    let _ = std::fs::remove_file(zccache_depgraph::depgraph_file_path());
 
     tracing::info!(
         artifacts_removed,

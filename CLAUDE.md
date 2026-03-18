@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md for which architecture doc to read based on what you're working on.
+zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md for which architecture doc to read based on what you're working on, and where to document new features.
 
 ## Essential Rules
 

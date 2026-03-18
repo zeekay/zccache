@@ -466,4 +466,630 @@ mod tests {
     fn test_extract_outcome_non_compile() {
         assert_eq!(extract_outcome(&Response::Pong), None);
     }
+
+    // ─── Adversarial tests ─────────────────────────────────────────────
+
+    // --- extract_outcome edge cases ---
+
+    #[test]
+    fn test_extract_outcome_compile_cached_nonzero_exit() {
+        // exit_code != 0 takes priority over cached flag
+        let resp = Response::CompileResult {
+            exit_code: 1,
+            stdout: vec![],
+            stderr: vec![],
+            cached: true,
+        };
+        assert_eq!(extract_outcome(&resp), Some(("error", 1)));
+    }
+
+    #[test]
+    fn test_extract_outcome_link_cached_nonzero_exit() {
+        let resp = Response::LinkResult {
+            exit_code: 2,
+            stdout: vec![],
+            stderr: vec![],
+            cached: true,
+            warning: None,
+        };
+        assert_eq!(extract_outcome(&resp), Some(("error", 2)));
+    }
+
+    #[test]
+    fn test_extract_outcome_link_error() {
+        let resp = Response::LinkResult {
+            exit_code: 1,
+            stdout: vec![],
+            stderr: vec![],
+            cached: false,
+            warning: None,
+        };
+        assert_eq!(extract_outcome(&resp), Some(("error", 1)));
+    }
+
+    #[test]
+    fn test_extract_outcome_all_non_journalable() {
+        use std::path::PathBuf;
+        use zccache_protocol::{DaemonStatus, LookupResult as LR, SessionStats, StoreResult as SR};
+
+        let non_journalable: Vec<Response> = vec![
+            Response::Pong,
+            Response::ShuttingDown,
+            Response::Status(DaemonStatus {
+                version: String::new(),
+                artifact_count: 0,
+                cache_size_bytes: 0,
+                metadata_entries: 0,
+                uptime_secs: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+                total_compilations: 0,
+                non_cacheable: 0,
+                compile_errors: 0,
+                time_saved_ms: 0,
+                total_links: 0,
+                link_hits: 0,
+                link_misses: 0,
+                link_non_cacheable: 0,
+                dep_graph_contexts: 0,
+                dep_graph_files: 0,
+                sessions_total: 0,
+                sessions_active: 0,
+                cache_dir: PathBuf::new(),
+                dep_graph_version: 0,
+                dep_graph_disk_size: 0,
+            }),
+            Response::LookupResult(LR::Miss),
+            Response::StoreResult(SR::Stored),
+            Response::SessionStarted {
+                session_id: "x".into(),
+                journal_path: None,
+            },
+            Response::SessionEnded { stats: None },
+            Response::Cleared {
+                artifacts_removed: 0,
+                metadata_cleared: 0,
+                dep_graph_contexts_cleared: 0,
+                on_disk_bytes_freed: 0,
+            },
+            Response::SessionStatsResult {
+                stats: Some(SessionStats {
+                    duration_ms: 0,
+                    compilations: 0,
+                    hits: 0,
+                    misses: 0,
+                    non_cacheable: 0,
+                    errors: 0,
+                    time_saved_ms: 0,
+                    unique_sources: 0,
+                    bytes_read: 0,
+                    bytes_written: 0,
+                }),
+            },
+        ];
+        for (i, resp) in non_journalable.iter().enumerate() {
+            assert_eq!(
+                extract_outcome(resp),
+                None,
+                "variant {i} should not be journalable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_outcome_negative_exit_codes() {
+        let resp_neg1 = Response::CompileResult {
+            exit_code: -1,
+            stdout: vec![],
+            stderr: vec![],
+            cached: false,
+        };
+        assert_eq!(extract_outcome(&resp_neg1), Some(("error", -1)));
+
+        let resp_min = Response::CompileResult {
+            exit_code: i32::MIN,
+            stdout: vec![],
+            stderr: vec![],
+            cached: true,
+        };
+        assert_eq!(extract_outcome(&resp_min), Some(("error", i32::MIN)));
+
+        let resp_link_neg = Response::LinkResult {
+            exit_code: -1,
+            stdout: vec![],
+            stderr: vec![],
+            cached: false,
+            warning: None,
+        };
+        assert_eq!(extract_outcome(&resp_link_neg), Some(("error", -1)));
+    }
+
+    // --- Serialization edge cases ---
+
+    #[test]
+    fn test_serialization_empty_fields() {
+        let entry = JournalEntry {
+            ts: "".to_string(),
+            outcome: "miss",
+            compiler: "".to_string(),
+            args: vec![],
+            cwd: "".to_string(),
+            env: None,
+            exit_code: 0,
+            session_id: None,
+            latency_ns: 0,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["compiler"], "");
+        assert_eq!(v["args"].as_array().unwrap().len(), 0);
+        assert_eq!(v["cwd"], "");
+    }
+
+    #[test]
+    fn test_serialization_special_characters() {
+        let entry = JournalEntry {
+            ts: "2026-03-17T10:30:00Z".to_string(),
+            outcome: "hit",
+            compiler: r"C:\Program Files\LLVM\bin\clang++.exe".to_string(),
+            args: vec![
+                "-DFOO=\"bar baz\"".to_string(),
+                "-I/path/with spaces".to_string(),
+                "file\twith\ttabs.cpp".to_string(),
+            ],
+            cwd: "/home/用户/项目".to_string(),
+            env: Some(vec![("PATH".to_string(), r"C:\a;C:\b".to_string())]),
+            exit_code: 0,
+            session_id: None,
+            latency_ns: 42,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        // Must parse back to identical values
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["compiler"], r"C:\Program Files\LLVM\bin\clang++.exe");
+        assert_eq!(v["cwd"], "/home/用户/项目");
+        assert_eq!(v["args"][0], "-DFOO=\"bar baz\"");
+    }
+
+    #[test]
+    fn test_serialization_large_args() {
+        let args: Vec<String> = (0..10_000).map(|i| format!("-DVAR_{i}=val")).collect();
+        let entry = JournalEntry {
+            ts: "2026-03-17T10:30:00Z".to_string(),
+            outcome: "miss",
+            compiler: "clang".to_string(),
+            args: args.clone(),
+            cwd: "/tmp".to_string(),
+            env: None,
+            exit_code: 0,
+            session_id: None,
+            latency_ns: 0,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["args"].as_array().unwrap().len(), 10_000);
+    }
+
+    #[test]
+    fn test_serialization_u128_max_latency() {
+        let entry = JournalEntry {
+            ts: "2026-03-17T10:30:00Z".to_string(),
+            outcome: "miss",
+            compiler: "clang".to_string(),
+            args: vec![],
+            cwd: "/tmp".to_string(),
+            env: None,
+            exit_code: 0,
+            session_id: None,
+            latency_ns: u128::MAX,
+        };
+        // Serialization itself must succeed.
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("latency_ns"));
+
+        // But parsing back through serde_json::Value loses precision:
+        // u128::MAX > 2^53, so the JSON number becomes f64, and as_u64() returns None.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v["latency_ns"].as_u64().is_none(),
+            "u128::MAX should not round-trip through serde_json::Value as u64"
+        );
+        // The value exists but is a lossy float
+        assert!(v["latency_ns"].is_number(), "should still be a number");
+    }
+
+    // --- JSONL integrity ---
+
+    #[test]
+    fn test_multiple_entries_valid_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = CompileJournal::new(dir.path().to_path_buf());
+
+        for i in 0..50 {
+            let ctx = JournalContext {
+                compiler: format!("clang-{i}"),
+                args: vec![format!("file{i}.c")],
+                cwd: "/build".to_string(),
+                env: None,
+                session_id: None,
+            };
+            let entry = JournalEntry::new(ctx, "miss", 0, i as u128 * 1000);
+            journal.log(&entry, None);
+        }
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        let content = fs::read_to_string(dir.path().join("compile_journal.jsonl")).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 50, "expected 50 lines, got {}", lines.len());
+        for (i, line) in lines.iter().enumerate() {
+            let v: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("line {i} invalid JSON: {e}"));
+            assert_eq!(v["outcome"], "miss");
+        }
+    }
+
+    #[test]
+    fn test_concurrent_logging() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(CompileJournal::new(dir.path().to_path_buf()));
+
+        let mut handles = vec![];
+        for t in 0..10 {
+            let j = Arc::clone(&journal);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..100 {
+                    let ctx = JournalContext {
+                        compiler: format!("clang-t{t}"),
+                        args: vec![format!("file{i}.c")],
+                        cwd: "/build".to_string(),
+                        env: None,
+                        session_id: Some(format!("thread-{t}")),
+                    };
+                    let entry = JournalEntry::new(ctx, "hit", 0, i as u128);
+                    j.log(&entry, None);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        let content = fs::read_to_string(dir.path().join("compile_journal.jsonl")).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1000,
+            "expected 1000 lines, got {}",
+            lines.len()
+        );
+        for (i, line) in lines.iter().enumerate() {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("line {i} invalid JSON: {e}"));
+        }
+    }
+
+    // --- Session journal behavior ---
+
+    #[test]
+    fn test_session_multiple_entries_same_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        fs::create_dir_all(&session_dir).unwrap();
+        let session_path = session_dir.join("multi-entry.jsonl");
+
+        let journal = CompileJournal::new(dir.path().to_path_buf());
+
+        for i in 0..5 {
+            let ctx = JournalContext {
+                compiler: format!("clang-{i}"),
+                args: vec![],
+                cwd: "/tmp".to_string(),
+                env: None,
+                session_id: Some("multi".to_string()),
+            };
+            let entry = JournalEntry::new(ctx, "miss", 0, i as u128);
+            journal.log(&entry, Some(&session_path));
+        }
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        let content = fs::read_to_string(&session_path).unwrap();
+        assert_eq!(content.lines().count(), 5, "session should have 5 entries");
+    }
+
+    #[test]
+    fn test_multiple_sessions_correct_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        fs::create_dir_all(&session_dir).unwrap();
+        let path_a = session_dir.join("session-a.jsonl");
+        let path_b = session_dir.join("session-b.jsonl");
+
+        let journal = CompileJournal::new(dir.path().to_path_buf());
+
+        // Interleave entries between two sessions
+        for i in 0..6 {
+            let (sid, path) = if i % 2 == 0 {
+                ("session-a", path_a.as_path())
+            } else {
+                ("session-b", path_b.as_path())
+            };
+            let ctx = JournalContext {
+                compiler: "clang".to_string(),
+                args: vec![],
+                cwd: "/tmp".to_string(),
+                env: None,
+                session_id: Some(sid.to_string()),
+            };
+            let entry = JournalEntry::new(ctx, "hit", 0, 0);
+            journal.log(&entry, Some(path));
+        }
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        let content_a = fs::read_to_string(&path_a).unwrap();
+        let content_b = fs::read_to_string(&path_b).unwrap();
+
+        assert_eq!(
+            content_a.lines().count(),
+            3,
+            "session-a should have 3 entries"
+        );
+        assert_eq!(
+            content_b.lines().count(),
+            3,
+            "session-b should have 3 entries"
+        );
+
+        // Verify routing by session_id
+        for line in content_a.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["session_id"], "session-a");
+        }
+        for line in content_b.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["session_id"], "session-b");
+        }
+    }
+
+    #[test]
+    fn test_close_session_then_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        fs::create_dir_all(&session_dir).unwrap();
+        let session_path = session_dir.join("reopen.jsonl");
+
+        let journal = CompileJournal::new(dir.path().to_path_buf());
+
+        // Write first entry
+        let ctx1 = JournalContext {
+            compiler: "clang".to_string(),
+            args: vec![],
+            cwd: "/tmp".to_string(),
+            env: None,
+            session_id: Some("reopen".to_string()),
+        };
+        let entry1 = JournalEntry::new(ctx1, "miss", 0, 100);
+        journal.log(&entry1, Some(&session_path));
+
+        // Close session — releases file handle
+        journal.close_session(&session_path);
+
+        // Write second entry — should re-open the file via or_insert_with
+        let ctx2 = JournalContext {
+            compiler: "clang".to_string(),
+            args: vec![],
+            cwd: "/tmp".to_string(),
+            env: None,
+            session_id: Some("reopen".to_string()),
+        };
+        let entry2 = JournalEntry::new(ctx2, "hit", 0, 200);
+        journal.log(&entry2, Some(&session_path));
+
+        std::thread::sleep(Duration::from_millis(300));
+
+        let content = fs::read_to_string(&session_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "should have 2 entries after close+reopen");
+
+        let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(v0["outcome"], "miss");
+        assert_eq!(v1["outcome"], "hit");
+    }
+
+    // --- Noop edge case ---
+
+    #[test]
+    fn test_noop_close_session() {
+        let journal = CompileJournal::noop();
+        // Must not panic
+        journal.close_session(Path::new("/nonexistent/session.jsonl"));
+    }
+
+    // --- Additional adversarial tests (beyond plan) ---
+
+    #[test]
+    fn test_serialization_newline_injection() {
+        // Newlines in fields must not corrupt JSONL (one JSON object per line).
+        // serde_json should escape them as \n in the JSON string.
+        let entry = JournalEntry {
+            ts: "2026-03-17T10:30:00Z".to_string(),
+            outcome: "miss",
+            compiler: "clang".to_string(),
+            args: vec!["-DMSG=\"line1\nline2\"".to_string()],
+            cwd: "/tmp".to_string(),
+            env: None,
+            exit_code: 0,
+            session_id: None,
+            latency_ns: 0,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        // The serialized JSON must be a single line (no raw newlines)
+        assert_eq!(
+            json.lines().count(),
+            1,
+            "JSON output must be single-line for JSONL: {json}"
+        );
+        // Round-trip preserves the embedded newline
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["args"][0].as_str().unwrap().contains('\n'));
+    }
+
+    #[test]
+    fn test_serialization_control_chars_and_null_bytes() {
+        // Strings with control characters (including NUL) must serialize to valid JSON.
+        let entry = JournalEntry {
+            ts: "2026-03-17T10:30:00Z".to_string(),
+            outcome: "hit",
+            compiler: "clang".to_string(),
+            args: vec![
+                "has\0null".to_string(),
+                "has\x01ctrl".to_string(),
+                "has\x7fDEL".to_string(),
+            ],
+            cwd: "/tmp".to_string(),
+            env: None,
+            exit_code: 0,
+            session_id: None,
+            latency_ns: 0,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        // Must produce valid single-line JSON
+        assert_eq!(json.lines().count(), 1);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["args"][0].as_str().unwrap().contains('\0'));
+    }
+
+    #[test]
+    fn test_double_close_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        fs::create_dir_all(&session_dir).unwrap();
+        let session_path = session_dir.join("double-close.jsonl");
+
+        let journal = CompileJournal::new(dir.path().to_path_buf());
+
+        let ctx = JournalContext {
+            compiler: "clang".to_string(),
+            args: vec![],
+            cwd: "/tmp".to_string(),
+            env: None,
+            session_id: Some("dc".to_string()),
+        };
+        let entry = JournalEntry::new(ctx, "hit", 0, 0);
+        journal.log(&entry, Some(&session_path));
+
+        // Close twice — second close removes from empty map, must not panic
+        journal.close_session(&session_path);
+        journal.close_session(&session_path);
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        let content = fs::read_to_string(&session_path).unwrap();
+        assert_eq!(content.lines().count(), 1);
+    }
+
+    #[test]
+    fn test_extract_outcome_i32_max_exit_code() {
+        let resp = Response::CompileResult {
+            exit_code: i32::MAX,
+            stdout: vec![],
+            stderr: vec![],
+            cached: false,
+        };
+        assert_eq!(extract_outcome(&resp), Some(("error", i32::MAX)));
+    }
+
+    #[test]
+    fn test_serialization_exit_code_boundary_values() {
+        // Ensure extreme exit codes serialize and round-trip correctly
+        for exit_code in [i32::MIN, -1, 0, 1, 127, 255, i32::MAX] {
+            let entry = JournalEntry {
+                ts: "2026-03-17T10:30:00Z".to_string(),
+                outcome: "error",
+                compiler: "clang".to_string(),
+                args: vec![],
+                cwd: "/tmp".to_string(),
+                env: None,
+                exit_code,
+                session_id: None,
+                latency_ns: 0,
+            };
+            let json = serde_json::to_string(&entry).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                v["exit_code"].as_i64().unwrap(),
+                exit_code as i64,
+                "exit_code {exit_code} round-trip failed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_serialization_latency_precision_boundary() {
+        // serde_json::Value stores numbers as i64/u64/f64 internally.
+        // Values up to u64::MAX round-trip exactly (stored as u64).
+        // Values above u64::MAX (u128 range) fall back to f64 and lose precision.
+        // This is better than most JSON parsers (Python/JS lose precision at 2^53).
+
+        // u64::MAX round-trips exactly through serde_json::Value
+        let entry_u64max = JournalEntry {
+            ts: "2026-03-17T10:30:00Z".to_string(),
+            outcome: "miss",
+            compiler: "clang".to_string(),
+            args: vec![],
+            cwd: "/tmp".to_string(),
+            env: None,
+            exit_code: 0,
+            session_id: None,
+            latency_ns: u64::MAX as u128,
+        };
+        let json = serde_json::to_string(&entry_u64max).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["latency_ns"].as_u64(),
+            Some(u64::MAX),
+            "u64::MAX should round-trip exactly through serde_json::Value"
+        );
+
+        // u64::MAX + 1 does NOT round-trip (falls to f64)
+        let entry_above = JournalEntry {
+            ts: "2026-03-17T10:30:00Z".to_string(),
+            outcome: "miss",
+            compiler: "clang".to_string(),
+            args: vec![],
+            cwd: "/tmp".to_string(),
+            env: None,
+            exit_code: 0,
+            session_id: None,
+            latency_ns: u64::MAX as u128 + 1,
+        };
+        let json2 = serde_json::to_string(&entry_above).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&json2).unwrap();
+        assert!(
+            v2["latency_ns"].as_u64().is_none(),
+            "u64::MAX+1 should NOT parse as u64 through serde_json::Value"
+        );
+    }
+
+    #[test]
+    fn test_noop_log_with_session_path() {
+        // Noop journal with session_path must not panic or create files
+        let journal = CompileJournal::noop();
+        let ctx = JournalContext {
+            compiler: "clang".to_string(),
+            args: vec![],
+            cwd: "/tmp".to_string(),
+            env: None,
+            session_id: Some("x".to_string()),
+        };
+        let entry = JournalEntry::new(ctx, "miss", 0, 0);
+        journal.log(&entry, Some(Path::new("/nonexistent/path.jsonl")));
+    }
 }

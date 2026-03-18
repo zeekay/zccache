@@ -28,6 +28,10 @@ struct Args {
     /// Idle timeout in seconds (0 = no timeout). Default: 3600.
     #[arg(long, default_value = "3600")]
     idle_timeout: u64,
+
+    /// Disable loading/saving the dependency graph from/to disk.
+    #[arg(long)]
+    no_depgraph_cache: bool,
 }
 
 fn main() {
@@ -112,6 +116,46 @@ fn run_server(args: Args) {
         .build()
         .expect("failed to create tokio runtime");
 
+    // Load dep graph from disk (before entering async block).
+    let dep_graph = if args.no_depgraph_cache {
+        let path = zccache_depgraph::depgraph_file_path();
+        let _ = std::fs::remove_file(&path);
+        tracing::info!("depgraph cache disabled — starting with empty graph");
+        None
+    } else {
+        let path = zccache_depgraph::depgraph_file_path();
+        let start = std::time::Instant::now();
+        match zccache_depgraph::load_from_file(&path) {
+            Ok(graph) => {
+                let stats = graph.stats();
+                tracing::info!(
+                    contexts = stats.context_count,
+                    files = stats.file_count,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "loaded depgraph from disk"
+                );
+                Some(graph)
+            }
+            Err(zccache_depgraph::SnapshotError::Io(ref e))
+                if e.kind() == std::io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(zccache_depgraph::SnapshotError::VersionMismatch { file, expected }) => {
+                tracing::warn!(
+                    file_version = file,
+                    expected_version = expected,
+                    "depgraph version mismatch — starting with empty graph"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!("depgraph load failed: {e} — starting with empty graph");
+                None
+            }
+        }
+    };
+
     rt.block_on(async {
         let mut server = match zccache_daemon::DaemonServer::bind(&endpoint) {
             Ok(s) => s,
@@ -121,6 +165,11 @@ fn run_server(args: Args) {
                 std::process::exit(1);
             }
         };
+
+        // Inject pre-loaded dep graph if we have one.
+        if let Some(graph) = dep_graph {
+            server.set_dep_graph(graph);
+        }
 
         // Wire up Ctrl+C to trigger graceful shutdown
         let shutdown = server.shutdown_handle();

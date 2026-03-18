@@ -216,6 +216,10 @@ pub struct DaemonStatus {
     pub sessions_active: u64,
     /// Path to the cache directory.
     pub cache_dir: PathBuf,
+    /// On-disk depgraph snapshot format version.
+    pub dep_graph_version: u32,
+    /// Size of the depgraph snapshot file on disk (0 = not persisted).
+    pub dep_graph_disk_size: u64,
 }
 
 /// Result of a cache lookup.
@@ -356,6 +360,8 @@ mod tests {
             sessions_total: 41,
             sessions_active: 3,
             cache_dir: PathBuf::from("/home/user/.zccache"),
+            dep_graph_version: 1,
+            dep_graph_disk_size: 2_500_000,
         };
         roundtrip(&status);
     }
@@ -594,6 +600,8 @@ mod tests {
             sessions_total: 0,
             sessions_active: 0,
             cache_dir: PathBuf::new(),
+            dep_graph_version: 0,
+            dep_graph_disk_size: 0,
         };
         roundtrip(&with_version);
     }

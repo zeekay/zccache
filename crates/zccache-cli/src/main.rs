@@ -354,10 +354,21 @@ async fn cmd_status(endpoint: &str) -> ExitCode {
                 s.artifact_count,
                 format_bytes(s.cache_size_bytes)
             );
-            println!(
-                "  Dep graph:     {} contexts, {} files",
-                s.dep_graph_contexts, s.dep_graph_files
-            );
+            {
+                let disk_info = if s.dep_graph_disk_size > 0 {
+                    format!(
+                        "v{}, {} on disk",
+                        s.dep_graph_version,
+                        format_bytes(s.dep_graph_disk_size)
+                    )
+                } else {
+                    format!("v{}, not persisted", s.dep_graph_version)
+                };
+                println!(
+                    "  Dep graph:     {} contexts, {} files ({})",
+                    s.dep_graph_contexts, s.dep_graph_files, disk_info
+                );
+            }
             println!("  Metadata:      {} entries", s.metadata_entries);
             println!();
             if s.total_links > 0 {

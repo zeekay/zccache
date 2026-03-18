@@ -38,6 +38,7 @@ notify = "7"
 memmap2 = "0.9"
 tempfile = "3"
 bytes = "1"
+rkyv = { version = "0.7", features = ["validation"] }
 
 # Vendored notify with fixes for Windows ReadDirectoryChangesW:
 # 1. Detect buffer overflow (bytes_written == 0) and report as error

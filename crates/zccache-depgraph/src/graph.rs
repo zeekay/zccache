@@ -86,6 +86,15 @@ pub struct DepGraphStats {
 }
 
 /// The core dependency graph.
+impl std::fmt::Debug for DepGraph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DepGraph")
+            .field("files", &self.files.len())
+            .field("contexts", &self.contexts.len())
+            .finish()
+    }
+}
+
 pub struct DepGraph {
     /// Shared file nodes: path → scanned includes.
     files: DashMap<PathBuf, FileEntry>,
@@ -586,6 +595,25 @@ impl DepGraph {
     /// Iterate over all context entries.
     pub(crate) fn contexts_iter(&self) -> dashmap::iter::Iter<'_, ContextKey, ContextEntry> {
         self.contexts.iter()
+    }
+
+    /// Iterate over all file entries.
+    pub(crate) fn files_iter(&self) -> dashmap::iter::Iter<'_, PathBuf, FileEntry> {
+        self.files.iter()
+    }
+
+    /// Construct a `DepGraph` from pre-built maps (for deserialization).
+    pub(crate) fn from_maps(
+        files: DashMap<PathBuf, FileEntry>,
+        contexts: DashMap<ContextKey, ContextEntry>,
+    ) -> Self {
+        Self {
+            files,
+            contexts,
+            checks: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
     }
 
     /// Mark a context as stale, requiring rescan on next check.

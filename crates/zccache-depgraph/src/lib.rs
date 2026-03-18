@@ -13,6 +13,7 @@ pub mod msvc_args;
 pub mod scanner;
 pub mod search_paths;
 pub mod session;
+pub mod snapshot;
 pub mod system_includes;
 pub mod watcher_support;
 
@@ -25,6 +26,9 @@ pub use scanner::{IncludeDirective, IncludeKind, ScanResult};
 pub use search_paths::IncludeSearchPaths;
 pub use session::{
     FinalizedSessionStats, Session, SessionConfig, SessionId, SessionManager, SessionStatsTracker,
+};
+pub use snapshot::{
+    depgraph_file_path, load_from_file, save_to_file, SnapshotError, DEPGRAPH_VERSION,
 };
 pub use system_includes::{discovery_args, parse_system_include_output, SystemIncludeCache};
 pub use watcher_support::WatchSet;
