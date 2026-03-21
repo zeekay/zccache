@@ -116,8 +116,10 @@ struct ListenerInner {
 #[cfg(windows)]
 struct ListenerInner {
     endpoint: String,
-    /// Pre-created pipe instance waiting for a client.
-    pending: tokio::net::windows::named_pipe::NamedPipeServer,
+    /// Pool of pre-created pipe instances waiting for clients.
+    /// Multiple pending instances eliminate the busy window between
+    /// accepting a connection and creating the next instance (Bug 4 fix).
+    pool: std::collections::VecDeque<tokio::net::windows::named_pipe::NamedPipeServer>,
 }
 
 impl IpcListener {
@@ -137,17 +139,26 @@ impl IpcListener {
         }
         #[cfg(windows)]
         {
+            use std::collections::VecDeque;
             use tokio::net::windows::named_pipe::ServerOptions;
 
-            // Create first pipe instance so clients can find it
-            let pending = ServerOptions::new()
-                .first_pipe_instance(true)
-                .create(endpoint)?;
+            let pool_size = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(16);
+
+            let mut pool = VecDeque::with_capacity(pool_size);
+            for i in 0..pool_size {
+                let pipe = ServerOptions::new()
+                    .first_pipe_instance(i == 0)
+                    .create(endpoint)?;
+                pool.push_back(pipe);
+            }
 
             Ok(Self {
                 inner: ListenerInner {
                     endpoint: endpoint.to_string(),
-                    pending,
+                    pool,
                 },
             })
         }
@@ -172,16 +183,21 @@ impl IpcListener {
         {
             use tokio::net::windows::named_pipe::ServerOptions;
 
-            // Wait for a client to connect to the pending pipe
-            self.inner.pending.connect().await?;
+            // Pop the front pipe and wait for a client to connect.
+            let pipe = self
+                .inner
+                .pool
+                .pop_front()
+                .expect("pipe pool must not be empty");
+            pipe.connect().await?;
 
-            // Take the connected pipe and create a new pending one
-            let connected = ServerOptions::new()
+            // Create a replacement instance and push to the back.
+            let replacement = ServerOptions::new()
                 .first_pipe_instance(false)
                 .create(&self.inner.endpoint)?;
-            let server = std::mem::replace(&mut self.inner.pending, connected);
+            self.inner.pool.push_back(replacement);
 
-            let (reader, writer) = tokio::io::split(server);
+            let (reader, writer) = tokio::io::split(pipe);
             Ok(IpcConnection {
                 reader,
                 writer,
@@ -209,24 +225,44 @@ pub async fn connect(endpoint: &str) -> Result<IpcConnection, IpcError> {
 }
 
 /// Connect to an IPC endpoint as a client.
+///
+/// Uses exponential backoff when the pipe is busy (ERROR_PIPE_BUSY = 231),
+/// starting at 10ms and doubling up to 500ms per attempt, for a total of
+/// ~30 seconds before giving up. This handles bursts from parallel build
+/// systems that spawn hundreds of concurrent compilations.
 #[cfg(windows)]
 pub async fn connect(endpoint: &str) -> Result<IpcClientConnection, IpcError> {
     use tokio::net::windows::named_pipe::ClientOptions;
 
-    // Retry loop for ERROR_PIPE_BUSY with bounded retries.
-    const MAX_PIPE_BUSY_RETRIES: u32 = 100; // 100 × 50ms = 5s max
+    const MAX_PIPE_BUSY_RETRIES: u32 = 50;
+    const INITIAL_BACKOFF_MS: u64 = 10;
+    const MAX_BACKOFF_MS: u64 = 500;
+
     let client = {
         let mut attempts = 0u32;
+        let mut backoff_ms = INITIAL_BACKOFF_MS;
         loop {
             match ClientOptions::new().open(endpoint) {
                 Ok(client) => break client,
                 Err(e) if e.raw_os_error() == Some(231) => {
-                    // ERROR_PIPE_BUSY = 231, wait and retry
+                    // ERROR_PIPE_BUSY = 231: all pipe instances are in use.
+                    // This happens when many clients connect simultaneously
+                    // (e.g. parallel compilation with 300+ source files).
                     attempts += 1;
                     if attempts >= MAX_PIPE_BUSY_RETRIES {
-                        return Err(IpcError::Io(e));
+                        return Err(IpcError::Io(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            format!(
+                                "cannot connect to daemon at {endpoint}: \
+                                 all pipe instances busy after {attempts} retries (~{:.0}s). \
+                                 The daemon may be overloaded — reduce parallel compilation jobs \
+                                 or restart the daemon with `zccache stop && zccache start`",
+                                backoff_ms as f64 * attempts as f64 / 2000.0
+                            ),
+                        )));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                 }
                 Err(e) => return Err(IpcError::Io(e)),
             }
@@ -331,6 +367,40 @@ mod tests {
             other => panic!("unexpected result: {other:?}"),
         }
 
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_parallel_connections() {
+        let endpoint = unique_test_endpoint();
+        let mut listener = IpcListener::bind(&endpoint).unwrap();
+        let n = 8;
+
+        let server = tokio::spawn(async move {
+            for _ in 0..n {
+                let mut conn = listener.accept().await.unwrap();
+                let msg: Option<Request> = conn.recv().await.unwrap();
+                assert_eq!(msg, Some(Request::Ping));
+                conn.send(&Response::Pong).await.unwrap();
+            }
+        });
+
+        // Spawn N clients simultaneously to stress the pipe pool.
+        let mut handles = Vec::new();
+        let ep = endpoint.clone();
+        for _ in 0..n {
+            let ep = ep.clone();
+            handles.push(tokio::spawn(async move {
+                let mut client = connect(&ep).await.unwrap();
+                client.send(&Request::Ping).await.unwrap();
+                let resp: Option<Response> = client.recv().await.unwrap();
+                assert_eq!(resp, Some(Response::Pong));
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
         server.await.unwrap();
     }
 }

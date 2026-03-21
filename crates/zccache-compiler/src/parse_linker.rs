@@ -67,6 +67,9 @@ pub fn is_linker(tool: &str) -> bool {
 /// flag (`-c`, `-E`, `-S`) is present — this routes exe links to the link path.
 /// Cases like `gcc main.c -o main` (compile+link) will be routed here too,
 /// but the parser will find no object inputs and return NonCacheable → passthrough.
+///
+/// Response files (`@file`) are expanded before checking for compile-only flags,
+/// since build systems may place all flags (including `-c`) inside a response file.
 #[must_use]
 pub fn is_link_invocation(tool: &str, args: &[String]) -> bool {
     if detect_family(tool).is_some() {
@@ -77,11 +80,29 @@ pub fn is_link_invocation(tool: &str, args: &[String]) -> bool {
     if !is_compiler_driver(tool) {
         return false;
     }
-    if args.iter().any(|a| a == "-c" || a == "-E" || a == "-S") {
+
+    // Expand response files so we can see flags like -c that may be inside them.
+    // If expansion fails (e.g. file not found), fall back to raw args.
+    let expanded;
+    let effective_args = if args.iter().any(|a| a.starts_with('@') && a.len() > 1) {
+        expanded = crate::response_file::expand_response_files(args).unwrap_or_default();
+        if expanded.is_empty() {
+            args
+        } else {
+            &expanded
+        }
+    } else {
+        args
+    };
+
+    if effective_args
+        .iter()
+        .any(|a| a == "-c" || a == "-E" || a == "-S")
+    {
         return false;
     }
     // Check for `-x c++-header` or `-x c-header` (PCH generation mode)
-    for pair in args.windows(2) {
+    for pair in effective_args.windows(2) {
         if pair[0] == "-x" && super::is_header_language(&pair[1]) {
             return false;
         }
@@ -1628,6 +1649,41 @@ mod tests {
             "rustc",
             &args(&["-shared", "-o", "foo.so"])
         ));
+    }
+
+    #[test]
+    fn is_link_invocation_c_flag_in_response_file() {
+        // When -c is inside a response file (e.g. fbuild on Windows puts all
+        // flags in @response.rsp), is_link_invocation must expand the response
+        // file to find the -c flag and correctly classify it as compilation.
+        use std::io::Write;
+        let mut rsp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(rsp, "-O2 -Wall -c foo.cpp -o foo.o").unwrap();
+
+        let rsp_arg = format!("@{}", rsp.path().display());
+        // Without response file expansion, this would incorrectly return true
+        assert!(
+            !is_link_invocation("gcc", &args(&[&rsp_arg])),
+            "-c inside response file must be detected as compilation, not link"
+        );
+        assert!(
+            !is_link_invocation("xtensa-esp32s3-elf-g++", &args(&[&rsp_arg])),
+            "xtensa cross-compiler with -c in response file must not be classified as link"
+        );
+    }
+
+    #[test]
+    fn is_link_invocation_response_file_without_c_flag() {
+        // A response file that contains link flags (no -c) should still be link
+        use std::io::Write;
+        let mut rsp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(rsp, "-O2 -o a.out main.o").unwrap();
+
+        let rsp_arg = format!("@{}", rsp.path().display());
+        assert!(
+            is_link_invocation("gcc", &args(&[&rsp_arg])),
+            "response file without -c should be classified as link"
+        );
     }
 
     // ─── GNU/LLD --out-implib secondary output ───────────────────────

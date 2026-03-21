@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
+use zccache_artifact::{ArtifactIndex, ArtifactStore};
 use zccache_depgraph::{
     CompileContext, ContextKey, DepGraph, DepfileStrategy, SessionId, SessionManager,
     SystemIncludeCache, UserDepFlags,
@@ -36,12 +37,131 @@ pub(crate) struct FastHitEntry {
 /// + journal provide real invalidation — this timer is just a safety net.
 const FAST_HIT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Cached compilation artifact.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+/// Cached compilation artifact with lazy payload loading.
+///
+/// Metadata (output names, sizes, stdout, stderr, exit code) is always in
+/// memory after startup.  Output payloads (`{key}_0` file bytes) are loaded
+/// lazily on the first cache hit to avoid reading gigabytes at startup.
 pub(crate) struct CachedArtifact {
-    pub(crate) artifact: ArtifactData,
+    pub(crate) meta: ArtifactIndex,
+    /// Arc-wrapped stdout/stderr for cheap IPC response clones.
+    pub(crate) stdout: Arc<Vec<u8>>,
+    pub(crate) stderr: Arc<Vec<u8>>,
+    /// Lazily-loaded output payloads. `None` = not yet loaded from disk.
+    pub(crate) payloads: Option<Vec<Arc<Vec<u8>>>>,
     /// When this artifact was last used (inserted or returned as a hit).
     pub(crate) last_used: std::time::Instant,
+}
+
+impl CachedArtifact {
+    /// Create from a freshly compiled `ArtifactData` (payloads already in memory).
+    fn from_artifact_data(artifact: &ArtifactData) -> Self {
+        let meta = ArtifactIndex::new(
+            artifact.outputs.iter().map(|o| o.name.clone()).collect(),
+            artifact
+                .outputs
+                .iter()
+                .map(|o| o.data.len() as u64)
+                .collect(),
+            (*artifact.stdout).clone(),
+            (*artifact.stderr).clone(),
+            artifact.exit_code,
+        );
+        Self {
+            meta,
+            stdout: artifact.stdout.clone(),
+            stderr: artifact.stderr.clone(),
+            payloads: Some(artifact.outputs.iter().map(|o| o.data.clone()).collect()),
+            last_used: std::time::Instant::now(),
+        }
+    }
+
+    /// Create from index metadata (lazy — payloads not loaded yet).
+    fn from_index(mut meta: ArtifactIndex) -> Self {
+        let stdout = Arc::new(std::mem::take(&mut meta.stdout));
+        let stderr = Arc::new(std::mem::take(&mut meta.stderr));
+        Self {
+            meta,
+            stdout,
+            stderr,
+            payloads: None,
+            last_used: std::time::Instant::now(),
+        }
+    }
+}
+
+/// Load output payloads from `{key}_0`, `{key}_1`, ... files on disk.
+///
+/// Returns the payload slice, or `None` if any data file is missing
+/// (indicating corruption or eviction — caller should treat as cache miss).
+fn ensure_payloads<'a>(
+    cached: &'a mut CachedArtifact,
+    artifact_dir: &Path,
+    key_hex: &str,
+) -> Option<&'a [Arc<Vec<u8>>]> {
+    if cached.payloads.is_none() {
+        let mut payloads = Vec::with_capacity(cached.meta.output_names.len());
+        for i in 0..cached.meta.output_names.len() {
+            let path = artifact_dir.join(format!("{key_hex}_{i}"));
+            match std::fs::read(&path) {
+                Ok(data) => payloads.push(Arc::new(data)),
+                Err(_) => return None,
+            }
+        }
+        cached.payloads = Some(payloads);
+    }
+    cached.payloads.as_deref()
+}
+
+/// Migrate legacy `.meta` files to the redb index.
+/// Called once on first startup after upgrade.
+fn migrate_meta_files(
+    artifact_dir: &Path,
+    artifacts: &DashMap<String, CachedArtifact>,
+    store: &ArtifactStore,
+) -> usize {
+    let mut count = 0usize;
+    if let Ok(entries) = std::fs::read_dir(artifact_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+                continue;
+            }
+            let Ok(data) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(artifact) = bincode::deserialize::<ArtifactData>(&data) else {
+                continue;
+            };
+            let stem = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            // Write {key}_0, {key}_1, ... data files if missing (link artifacts).
+            for (i, out) in artifact.outputs.iter().enumerate() {
+                let data_path = artifact_dir.join(format!("{stem}_{i}"));
+                if !data_path.exists() {
+                    std::fs::write(&data_path, &*out.data).ok();
+                }
+            }
+
+            // Insert into redb index.
+            let cached = CachedArtifact::from_artifact_data(&artifact);
+            store.insert(&stem, &cached.meta).ok();
+            artifacts.insert(stem, cached);
+            count += 1;
+
+            // Delete the .meta file.
+            std::fs::remove_file(&path).ok();
+        }
+    }
+    if count > 0 {
+        tracing::info!(count, "migrated legacy .meta files to redb index");
+    }
+    count
 }
 
 /// Shared state accessible by all connection handlers.
@@ -108,6 +228,10 @@ struct SharedState {
     /// Limits concurrent disk persistence tasks to prevent memory pileup
     /// when disk I/O is slow and compilation requests are fast.
     persist_semaphore: Arc<tokio::sync::Semaphore>,
+    /// redb-backed artifact index for fast startup and persistence.
+    artifact_store: ArtifactStore,
+    /// Whether the background artifact loading has completed.
+    artifacts_loaded: AtomicBool,
 }
 
 /// Pre-computed compile request data for the request-level fast path.
@@ -162,37 +286,18 @@ impl DaemonServer {
         let artifact_dir = zccache_core::config::artifacts_dir();
         std::fs::create_dir_all(&artifact_dir).ok();
 
+        // Artifact loading is deferred to a background task in run() so the
+        // daemon starts accepting connections immediately (Bug 6 fix).
         let artifacts: DashMap<String, CachedArtifact> = DashMap::new();
 
-        // Reload persisted artifacts from .meta sidecars so cache survives
-        // daemon restarts.
-        if let Ok(entries) = std::fs::read_dir(&artifact_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("meta") {
-                    if let Ok(data) = std::fs::read(&path) {
-                        if let Ok(artifact) = bincode::deserialize::<ArtifactData>(&data) {
-                            let stem = path
-                                .file_stem()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .into_owned();
-                            artifacts.insert(
-                                stem,
-                                CachedArtifact {
-                                    artifact,
-                                    last_used: std::time::Instant::now(),
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        let loaded = artifacts.len();
-        if loaded > 0 {
-            tracing::info!(loaded, "restored persisted artifacts");
-        }
+        // Open redb artifact index for fast startup + persistence.
+        let index_path = zccache_core::config::index_path();
+        let artifact_store = ArtifactStore::open(&index_path).map_err(|e| {
+            zccache_ipc::IpcError::Io(std::io::Error::other(format!(
+                "failed to open artifact index at {}: {e}",
+                index_path.display()
+            )))
+        })?;
 
         Ok(Self {
             listener,
@@ -228,6 +333,8 @@ impl DaemonServer {
                 journal: CompileJournal::new(zccache_core::config::log_dir()),
                 in_flight_bytes: AtomicUsize::new(0),
                 persist_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+                artifact_store,
+                artifacts_loaded: AtomicBool::new(false),
             }),
         })
     }
@@ -260,6 +367,23 @@ impl DaemonServer {
     pub async fn run(&mut self, idle_timeout_secs: u64) -> Result<(), zccache_ipc::IpcError> {
         tracing::info!("daemon server running");
 
+        // Clean up legacy log backup directory (Bug 7).
+        {
+            let legacy_logs = zccache_core::config::default_cache_dir().join("logs.bak");
+            if legacy_logs.is_dir() {
+                match std::fs::remove_dir_all(&legacy_logs) {
+                    Ok(()) => tracing::info!("removed legacy logs.bak directory"),
+                    Err(e) => tracing::warn!(
+                        path = %legacy_logs.display(),
+                        "failed to remove legacy logs.bak: {e}"
+                    ),
+                }
+            }
+            // Also remove stale daemon.lock.bak if present.
+            let legacy_lock = zccache_core::config::default_cache_dir().join("daemon.lock.bak");
+            let _ = std::fs::remove_file(&legacy_lock);
+        }
+
         self.start_watcher_pipeline().await;
 
         // Start idle watchdog if timeout is configured.
@@ -277,6 +401,40 @@ impl DaemonServer {
                         break;
                     }
                 }
+            });
+        }
+
+        // Start background artifact loading (non-blocking so daemon responds
+        // immediately — Bug 6 fix).
+        {
+            let state = Arc::clone(&self.state);
+            let state2 = Arc::clone(&self.state);
+            tokio::spawn(async move {
+                let artifact_dir = state.artifact_dir.clone();
+                let artifacts = state.artifacts.clone();
+                let state_ref = Arc::clone(&state);
+                let loaded = tokio::task::spawn_blocking(move || {
+                    // Try loading from redb index first.
+                    match state_ref.artifact_store.load_all() {
+                        Ok(entries) if !entries.is_empty() => {
+                            let count = entries.len();
+                            for (key, meta) in entries {
+                                artifacts.insert(key, CachedArtifact::from_index(meta));
+                            }
+                            count
+                        }
+                        _ => {
+                            // Migration: load from .meta files, populate redb index.
+                            migrate_meta_files(&artifact_dir, &artifacts, &state_ref.artifact_store)
+                        }
+                    }
+                })
+                .await
+                .unwrap_or(0);
+                if loaded > 0 {
+                    tracing::info!(loaded, "background artifact loading complete");
+                }
+                state2.artifacts_loaded.store(true, Ordering::Release);
             });
         }
 
@@ -302,6 +460,51 @@ impl DaemonServer {
                             items_removed = items,
                             "memory eviction"
                         );
+                    }
+                }
+            });
+        }
+
+        // Start disk artifact GC background task.
+        {
+            let state = Arc::clone(&self.state);
+            let max_cache_size = zccache_core::config::Config::default().max_cache_size;
+            let interval_secs = zccache_core::config::Config::default().disk_gc_interval_secs;
+            tokio::spawn(async move {
+                // Run once immediately at startup to reclaim excess disk from Bug 5.
+                {
+                    let dir = state.artifact_dir.clone();
+                    let artifacts = state.artifacts.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::eviction::evict_disk_artifacts(&dir, &artifacts, max_cache_size)
+                    })
+                    .await;
+                    if let Ok((freed, removed)) = result {
+                        if removed > 0 {
+                            tracing::info!(
+                                freed_bytes = freed,
+                                artifacts_removed = removed,
+                                "initial disk GC"
+                            );
+                        }
+                    }
+                }
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                    let dir = state.artifact_dir.clone();
+                    let artifacts = state.artifacts.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::eviction::evict_disk_artifacts(&dir, &artifacts, max_cache_size)
+                    })
+                    .await;
+                    if let Ok((freed, removed)) = result {
+                        if removed > 0 {
+                            tracing::info!(
+                                freed_bytes = freed,
+                                artifacts_removed = removed,
+                                "disk GC"
+                            );
+                        }
                     }
                 }
             });
@@ -564,15 +767,7 @@ async fn handle_connection(
                 let cache_size_bytes: u64 = state
                     .artifacts
                     .iter()
-                    .flat_map(|entry| {
-                        entry
-                            .value()
-                            .artifact
-                            .outputs
-                            .iter()
-                            .map(|o| o.data.len() as u64)
-                            .collect::<Vec<_>>()
-                    })
+                    .map(|entry| entry.value().meta.total_size)
                     .sum();
                 let metadata_entries = state.cache_system.metadata().len() as u64;
                 (
@@ -849,6 +1044,9 @@ async fn handle_clear(state: &SharedState) -> Response {
         }
     }
 
+    // Clear redb artifact index.
+    state.artifact_store.clear().ok();
+
     // Delete on-disk depgraph snapshot.
     let _ = std::fs::remove_file(zccache_depgraph::depgraph_file_path());
 
@@ -1030,38 +1228,54 @@ async fn handle_link_ephemeral(
     // 5. Cache lookup
     if let Some(mut entry) = state.artifacts.get_mut(&key_hex) {
         entry.last_used = std::time::Instant::now();
-        let entry = entry.downgrade();
-        tracing::debug!(%key_hex, "link cache hit");
-        state.stats.record_link_hit();
+        // Load payloads from disk if not already loaded.
+        let loaded = ensure_payloads(&mut entry, &state.artifact_dir, &key_hex).is_some();
+        if loaded {
+            let payloads: Vec<Arc<Vec<u8>>> = entry.payloads.as_ref().unwrap().clone();
+            let names: Vec<String> = entry.meta.output_names.clone();
+            let exit_code = entry.meta.exit_code;
+            let stdout = entry.stdout.clone();
+            let stderr = entry.stderr.clone();
+            drop(entry); // Release DashMap lock
 
-        // Write cached output to disk
-        let output_path = if parsed_tool.output_file.is_absolute() {
-            parsed_tool.output_file.clone()
-        } else {
-            cwd_path.join(&parsed_tool.output_file)
-        };
-        for out in &entry.artifact.outputs {
-            let target = if entry.artifact.outputs.len() == 1 {
-                output_path.clone()
+            tracing::debug!(%key_hex, "link cache hit");
+            state.stats.record_link_hit();
+
+            // Write cached output to disk
+            let output_path = if parsed_tool.output_file.is_absolute() {
+                parsed_tool.output_file.clone()
             } else {
-                output_path.parent().unwrap_or(cwd_path).join(&out.name)
+                cwd_path.join(&parsed_tool.output_file)
             };
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).ok();
+            let mut write_ok = true;
+            for (i, payload) in payloads.iter().enumerate() {
+                let target = if payloads.len() == 1 {
+                    output_path.clone()
+                } else {
+                    output_path.parent().unwrap_or(cwd_path).join(&names[i])
+                };
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                if let Err(e) = std::fs::write(&target, &**payload) {
+                    tracing::warn!("failed to write cached output {}: {e}", target.display());
+                    write_ok = false;
+                    break;
+                }
             }
-            if let Err(e) = std::fs::write(&target, &*out.data) {
-                tracing::warn!("failed to write cached output {}: {e}", target.display());
-                return run_tool_passthrough(tool, args, cwd, env).await;
+            if write_ok {
+                return Response::LinkResult {
+                    exit_code,
+                    stdout,
+                    stderr,
+                    cached: true,
+                    warning: nd_warning,
+                };
             }
+            // Fall through to passthrough if write failed
+            return run_tool_passthrough(tool, args, cwd, env).await;
         }
-
-        return Response::LinkResult {
-            exit_code: entry.artifact.exit_code,
-            stdout: entry.artifact.stdout.clone(),
-            stderr: entry.artifact.stderr.clone(),
-            cached: true,
-            warning: nd_warning,
-        };
+        // Payloads missing — treat as cache miss, fall through
     }
 
     // 6. Cache miss — run the real tool
@@ -1136,10 +1350,28 @@ async fn handle_link_ephemeral(
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     tokio::task::spawn_blocking(move || {
-                        let meta_path = artifact_dir.join(format!("{kh}.meta"));
-                        if let Ok(encoded) = bincode::serialize(&artifact_clone) {
-                            std::fs::write(&meta_path, &encoded).ok();
+                        // Write data files for link artifacts.
+                        for (i, out) in artifact_clone.outputs.iter().enumerate() {
+                            let cache_path = artifact_dir.join(format!("{kh}_{i}"));
+                            std::fs::write(&cache_path, &*out.data).ok();
                         }
+                        // Insert into redb index.
+                        let meta = ArtifactIndex::new(
+                            artifact_clone
+                                .outputs
+                                .iter()
+                                .map(|o| o.name.clone())
+                                .collect(),
+                            artifact_clone
+                                .outputs
+                                .iter()
+                                .map(|o| o.data.len() as u64)
+                                .collect(),
+                            (*artifact_clone.stdout).clone(),
+                            (*artifact_clone.stderr).clone(),
+                            artifact_clone.exit_code,
+                        );
+                        state_ref.artifact_store.insert(&kh, &meta).ok();
                         state_ref
                             .in_flight_bytes
                             .fetch_sub(payload_size, Ordering::Relaxed);
@@ -1151,10 +1383,7 @@ async fn handle_link_ephemeral(
 
             state.artifacts.insert(
                 key_hex.clone(),
-                CachedArtifact {
-                    artifact,
-                    last_used: std::time::Instant::now(),
-                },
+                CachedArtifact::from_artifact_data(&artifact),
             );
             tracing::debug!(%key_hex, "link artifact cached");
         }
@@ -1554,48 +1783,51 @@ async fn handle_compile(
                     let artifact_key_hex = &fh_entry.artifact_key_hex;
                     if let Some(mut cached_ref) = state.artifacts.get_mut(artifact_key_hex) {
                         cached_ref.last_used = std::time::Instant::now();
-                        // Write output directly from the DashMap reference
-                        let mut write_ok = true;
-                        for (i, output) in cached_ref.artifact.outputs.iter().enumerate() {
-                            let out_path = if i == 0 {
-                                req_entry.output_path.clone()
-                            } else {
-                                cwd.join(&output.name)
-                            };
-                            let cache_file =
-                                state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                            if write_cached_output(&out_path, &cache_file, &output.data).is_err() {
-                                write_ok = false;
-                                break;
-                            }
-                        }
-                        if write_ok {
-                            let exit_code = cached_ref.artifact.exit_code;
-                            let stdout = cached_ref.artifact.stdout.clone();
-                            let stderr = cached_ref.artifact.stderr.clone();
-                            let artifact_bytes: u64 = cached_ref
-                                .artifact
-                                .outputs
-                                .iter()
-                                .map(|o| o.data.len() as u64)
-                                .sum();
+                        let loaded =
+                            ensure_payloads(&mut cached_ref, &state.artifact_dir, artifact_key_hex)
+                                .is_some();
+                        if loaded {
+                            let payloads: Vec<Arc<Vec<u8>>> =
+                                cached_ref.payloads.as_ref().unwrap().clone();
+                            let names: Vec<String> = cached_ref.meta.output_names.clone();
+                            let exit_code = cached_ref.meta.exit_code;
+                            let stdout = cached_ref.stdout.clone();
+                            let stderr = cached_ref.stderr.clone();
+                            let artifact_bytes: u64 = cached_ref.meta.total_size;
                             // Drop the DashMap reference before doing more work
                             drop(cached_ref);
 
-                            state.stats.record_compilation();
-                            let latency_ns = compile_start.elapsed().as_nanos() as u64;
-                            state.stats.record_hit(latency_ns, artifact_bytes);
-                            let src = req_entry.source_path.clone();
-                            record_session_stat(&state.sessions, &sid, move |t| {
-                                t.record_hit(src, latency_ns, artifact_bytes);
-                            });
+                            // Write output
+                            let mut write_ok = true;
+                            for (i, payload) in payloads.iter().enumerate() {
+                                let out_path = if i == 0 {
+                                    req_entry.output_path.clone()
+                                } else {
+                                    cwd.join(&names[i])
+                                };
+                                let cache_file =
+                                    state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                                if write_cached_output(&out_path, &cache_file, payload).is_err() {
+                                    write_ok = false;
+                                    break;
+                                }
+                            }
+                            if write_ok {
+                                state.stats.record_compilation();
+                                let latency_ns = compile_start.elapsed().as_nanos() as u64;
+                                state.stats.record_hit(latency_ns, artifact_bytes);
+                                let src = req_entry.source_path.clone();
+                                record_session_stat(&state.sessions, &sid, move |t| {
+                                    t.record_hit(src, latency_ns, artifact_bytes);
+                                });
 
-                            return Response::CompileResult {
-                                exit_code,
-                                stdout,
-                                stderr,
-                                cached: true,
-                            };
+                                return Response::CompileResult {
+                                    exit_code,
+                                    stdout,
+                                    stderr,
+                                    cached: true,
+                                };
+                            }
                         }
                     }
                 }
@@ -1716,90 +1948,97 @@ async fn handle_compile(
                     cached_ref.last_used = std::time::Instant::now();
                     let artifact_lookup_ns = t5.elapsed().as_nanos() as u64;
                     let t6 = std::time::Instant::now();
-                    let mut write_ok = true;
-                    for (i, output) in cached_ref.artifact.outputs.iter().enumerate() {
-                        let out_path = if i == 0 {
-                            output_path.clone()
-                        } else {
-                            cwd_path.join(&output.name)
-                        };
-                        let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                        if write_cached_output(&out_path, &cache_file, &output.data).is_err() {
-                            write_ok = false;
-                            break;
-                        }
-                    }
-                    if !write_ok {
-                        // Fall through to slow path on write failure
+                    let loaded =
+                        ensure_payloads(&mut cached_ref, &state.artifact_dir, artifact_key_hex)
+                            .is_some();
+                    if !loaded {
+                        // Fall through to slow path on payload load failure
                     } else {
-                        let write_output_ns = t6.elapsed().as_nanos() as u64;
-                        let exit_code = cached_ref.artifact.exit_code;
-                        let stdout = cached_ref.artifact.stdout.clone();
-                        let stderr = cached_ref.artifact.stderr.clone();
-                        let artifact_bytes: u64 = cached_ref
-                            .artifact
-                            .outputs
-                            .iter()
-                            .map(|o| o.data.len() as u64)
-                            .sum();
+                        let payloads: Vec<Arc<Vec<u8>>> =
+                            cached_ref.payloads.as_ref().unwrap().clone();
+                        let names: Vec<String> = cached_ref.meta.output_names.clone();
+                        let exit_code = cached_ref.meta.exit_code;
+                        let stdout = cached_ref.stdout.clone();
+                        let stderr = cached_ref.stderr.clone();
+                        let artifact_bytes: u64 = cached_ref.meta.total_size;
                         // Drop the DashMap reference before doing more work
                         drop(cached_ref);
 
-                        // Downgrade output metadata (file was re-written) but
-                        // DON'T advance the journal clock — the output content is
-                        // the same cached artifact, and advancing the global clock
-                        // would invalidate fast-hit entries for unrelated source
-                        // files in the same batch.
-                        state.cache_system.metadata().downgrade(&output_path);
+                        let mut write_ok = true;
+                        for (i, payload) in payloads.iter().enumerate() {
+                            let out_path = if i == 0 {
+                                output_path.clone()
+                            } else {
+                                cwd_path.join(&names[i])
+                            };
+                            let cache_file =
+                                state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                            if write_cached_output(&out_path, &cache_file, payload).is_err() {
+                                write_ok = false;
+                                break;
+                            }
+                        }
+                        if !write_ok {
+                            // Fall through to slow path on write failure
+                        } else {
+                            let write_output_ns = t6.elapsed().as_nanos() as u64;
 
-                        let t7 = std::time::Instant::now();
-                        let latency_ns = compile_start.elapsed().as_nanos() as u64;
-                        state.stats.record_hit(latency_ns, artifact_bytes);
-                        let src = source_path.clone();
-                        record_session_stat(&state.sessions, &sid, move |t| {
-                            t.record_hit(src, latency_ns, artifact_bytes);
-                        });
-                        write_session_log(
-                            &state.sessions,
-                            &sid,
-                            &format!(
-                                "[HIT_FAST] {} -> {}",
-                                source_path.display(),
-                                output_path.display()
-                            ),
-                        );
-                        let bookkeeping_ns = t7.elapsed().as_nanos() as u64;
+                            // Downgrade output metadata (file was re-written) but
+                            // DON'T advance the journal clock — the output content is
+                            // the same cached artifact, and advancing the global clock
+                            // would invalidate fast-hit entries for unrelated source
+                            // files in the same batch.
+                            state.cache_system.metadata().downgrade(&output_path);
 
-                        // Populate request-level cache for ultra-fast path
-                        let rfp = request_fingerprint(compiler_path, args, cwd);
-                        state.request_cache.insert(
-                            rfp,
-                            RequestCacheEntry {
-                                context_key,
-                                source_path: source_path.clone(),
-                                output_path: output_path.clone(),
-                            },
-                        );
+                            let t7 = std::time::Instant::now();
+                            let latency_ns = compile_start.elapsed().as_nanos() as u64;
+                            state.stats.record_hit(latency_ns, artifact_bytes);
+                            let src = source_path.clone();
+                            record_session_stat(&state.sessions, &sid, move |t| {
+                                t.record_hit(src, latency_ns, artifact_bytes);
+                            });
+                            write_session_log(
+                                &state.sessions,
+                                &sid,
+                                &format!(
+                                    "[HIT_FAST] {} -> {}",
+                                    source_path.display(),
+                                    output_path.display()
+                                ),
+                            );
+                            let bookkeeping_ns = t7.elapsed().as_nanos() as u64;
 
-                        let total_ns = compile_start.elapsed().as_nanos() as u64;
-                        state.profiler.record_hit(&HitPhases {
-                            parse_args_ns,
-                            build_context_ns,
-                            hash_source_ns: 0,
-                            hash_headers_ns: 0,
-                            depgraph_check_ns: 0,
-                            artifact_lookup_ns,
-                            write_output_ns,
-                            bookkeeping_ns,
-                            total_ns,
-                        });
+                            // Populate request-level cache for ultra-fast path
+                            let rfp = request_fingerprint(compiler_path, args, cwd);
+                            state.request_cache.insert(
+                                rfp,
+                                RequestCacheEntry {
+                                    context_key,
+                                    source_path: source_path.clone(),
+                                    output_path: output_path.clone(),
+                                },
+                            );
 
-                        return Response::CompileResult {
-                            exit_code,
-                            stdout,
-                            stderr,
-                            cached: true,
-                        };
+                            let total_ns = compile_start.elapsed().as_nanos() as u64;
+                            state.profiler.record_hit(&HitPhases {
+                                parse_args_ns,
+                                build_context_ns,
+                                hash_source_ns: 0,
+                                hash_headers_ns: 0,
+                                depgraph_check_ns: 0,
+                                artifact_lookup_ns,
+                                write_output_ns,
+                                bookkeeping_ns,
+                                total_ns,
+                            });
+
+                            return Response::CompileResult {
+                                exit_code,
+                                stdout,
+                                stderr,
+                                cached: true,
+                            };
+                        }
                     }
                 }
             }
@@ -1941,103 +2180,106 @@ async fn handle_compile(
                 cached_ref.last_used = std::time::Instant::now();
                 let artifact_lookup_ns = t5.elapsed().as_nanos() as u64;
 
-                // Write output directly from DashMap reference — avoids
-                // cloning the entire CachedArtifact (including .o data).
                 let t6 = std::time::Instant::now();
-                let mut write_ok = true;
-                for (i, output) in cached_ref.artifact.outputs.iter().enumerate() {
-                    let out_path = if i == 0 {
-                        output_path.clone()
-                    } else {
-                        cwd_path.join(&output.name)
-                    };
-                    let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                    if write_cached_output(&out_path, &cache_file, &output.data).is_err() {
-                        write_ok = false;
-                        break;
-                    }
-                }
-                if !write_ok {
-                    // Fall through to compile on write failure
+                let loaded =
+                    ensure_payloads(&mut cached_ref, &state.artifact_dir, &artifact_key_hex)
+                        .is_some();
+                if !loaded {
+                    // Fall through to compile on payload load failure
                 } else {
-                    let write_output_ns = t6.elapsed().as_nanos() as u64;
-                    let exit_code = cached_ref.artifact.exit_code;
-                    let stdout = cached_ref.artifact.stdout.clone();
-                    let stderr = cached_ref.artifact.stderr.clone();
-                    let artifact_bytes: u64 = cached_ref
-                        .artifact
-                        .outputs
-                        .iter()
-                        .map(|o| o.data.len() as u64)
-                        .sum();
+                    let payloads: Vec<Arc<Vec<u8>>> = cached_ref.payloads.as_ref().unwrap().clone();
+                    let names: Vec<String> = cached_ref.meta.output_names.clone();
+                    let exit_code = cached_ref.meta.exit_code;
+                    let stdout = cached_ref.stdout.clone();
+                    let stderr = cached_ref.stderr.clone();
+                    let artifact_bytes: u64 = cached_ref.meta.total_size;
                     drop(cached_ref);
 
-                    // Downgrade output metadata but don't advance journal
-                    // clock — same cached artifact content, advancing would
-                    // invalidate fast-hit entries for other source files.
-                    state.cache_system.metadata().downgrade(&output_path);
+                    let mut write_ok = true;
+                    for (i, payload) in payloads.iter().enumerate() {
+                        let out_path = if i == 0 {
+                            output_path.clone()
+                        } else {
+                            cwd_path.join(&names[i])
+                        };
+                        let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                        if write_cached_output(&out_path, &cache_file, payload).is_err() {
+                            write_ok = false;
+                            break;
+                        }
+                    }
+                    if !write_ok {
+                        // Fall through to compile on write failure
+                    } else {
+                        let write_output_ns = t6.elapsed().as_nanos() as u64;
 
-                    // ── Phase: bookkeeping ───────────────────────────────
-                    let t7 = std::time::Instant::now();
-                    let latency_ns = compile_start.elapsed().as_nanos() as u64;
-                    state.stats.record_hit(latency_ns, artifact_bytes);
-                    let src = source_path.clone();
-                    record_session_stat(&state.sessions, &sid, move |t| {
-                        t.record_hit(src, latency_ns, artifact_bytes);
-                    });
-                    write_session_log(
-                        &state.sessions,
-                        &sid,
-                        &format!(
-                            "[HIT] {} -> {}",
-                            source_path.display(),
-                            output_path.display()
-                        ),
-                    );
-                    let bookkeeping_ns = t7.elapsed().as_nanos() as u64;
+                        // Downgrade output metadata but don't advance journal
+                        // clock — same cached artifact content, advancing would
+                        // invalidate fast-hit entries for other source files.
+                        state.cache_system.metadata().downgrade(&output_path);
 
-                    // Populate fast-hit cache for future requests
-                    let current_clock = state.cache_system.current_clock();
-                    state.fast_hit_cache.insert(
-                        context_key,
-                        FastHitEntry {
-                            clock: current_clock,
-                            artifact_key_hex: artifact_key_hex.clone(),
-                            cached_at: std::time::Instant::now(),
-                        },
-                    );
+                        // ── Phase: bookkeeping ───────────────────────────────
+                        let t7 = std::time::Instant::now();
+                        let latency_ns = compile_start.elapsed().as_nanos() as u64;
+                        state.stats.record_hit(latency_ns, artifact_bytes);
+                        let src = source_path.clone();
+                        record_session_stat(&state.sessions, &sid, move |t| {
+                            t.record_hit(src, latency_ns, artifact_bytes);
+                        });
+                        write_session_log(
+                            &state.sessions,
+                            &sid,
+                            &format!(
+                                "[HIT] {} -> {}",
+                                source_path.display(),
+                                output_path.display()
+                            ),
+                        );
+                        let bookkeeping_ns = t7.elapsed().as_nanos() as u64;
 
-                    // Populate request-level cache for ultra-fast path
-                    let rfp = request_fingerprint(compiler_path, args, cwd);
-                    state.request_cache.insert(
-                        rfp,
-                        RequestCacheEntry {
+                        // Populate fast-hit cache for future requests
+                        let current_clock = state.cache_system.current_clock();
+                        state.fast_hit_cache.insert(
                             context_key,
-                            source_path: source_path.clone(),
-                            output_path: output_path.clone(),
-                        },
-                    );
+                            FastHitEntry {
+                                clock: current_clock,
+                                artifact_key_hex: artifact_key_hex.clone(),
+                                cached_at: std::time::Instant::now(),
+                            },
+                        );
 
-                    // Record phase profile
-                    let total_ns = compile_start.elapsed().as_nanos() as u64;
-                    state.profiler.record_hit(&HitPhases {
-                        parse_args_ns,
-                        build_context_ns,
-                        hash_source_ns,
-                        hash_headers_ns,
-                        depgraph_check_ns,
-                        artifact_lookup_ns,
-                        write_output_ns,
-                        bookkeeping_ns,
-                        total_ns,
-                    });
+                        // Populate request-level cache for ultra-fast path
+                        let rfp = request_fingerprint(compiler_path, args, cwd);
+                        state.request_cache.insert(
+                            rfp,
+                            RequestCacheEntry {
+                                context_key,
+                                source_path: source_path.clone(),
+                                output_path: output_path.clone(),
+                            },
+                        );
 
-                    return Response::CompileResult {
-                        exit_code,
-                        stdout,
-                        stderr,
-                        cached: true,
-                    };
+                        // Record phase profile
+                        let total_ns = compile_start.elapsed().as_nanos() as u64;
+                        state.profiler.record_hit(&HitPhases {
+                            parse_args_ns,
+                            build_context_ns,
+                            hash_source_ns,
+                            hash_headers_ns,
+                            depgraph_check_ns,
+                            artifact_lookup_ns,
+                            write_output_ns,
+                            bookkeeping_ns,
+                            total_ns,
+                        });
+
+                        return Response::CompileResult {
+                            exit_code,
+                            stdout,
+                            stderr,
+                            cached: true,
+                        };
+                    }
                 }
             }
             // Artifact key computed but no artifact stored yet — fall through to compile
@@ -2304,15 +2546,23 @@ async fn handle_compile(
                                 );
                             }
                         }
-                        let meta_path = artifact_dir.join(format!("{key_hex}.meta"));
-                        if let Ok(meta_bytes) = bincode::serialize(&artifact_clone) {
-                            if let Err(e) = std::fs::write(&meta_path, &meta_bytes) {
-                                tracing::warn!(
-                                    path = %meta_path.display(),
-                                    "failed to persist artifact meta: {e}"
-                                );
-                            }
-                        }
+                        // Insert into redb index.
+                        let meta = ArtifactIndex::new(
+                            artifact_clone
+                                .outputs
+                                .iter()
+                                .map(|o| o.name.clone())
+                                .collect(),
+                            artifact_clone
+                                .outputs
+                                .iter()
+                                .map(|o| o.data.len() as u64)
+                                .collect(),
+                            (*artifact_clone.stdout).clone(),
+                            (*artifact_clone.stderr).clone(),
+                            artifact_clone.exit_code,
+                        );
+                        state_ref.artifact_store.insert(&key_hex, &meta).ok();
                         state_ref
                             .in_flight_bytes
                             .fetch_sub(payload_size, Ordering::Relaxed);
@@ -2324,10 +2574,7 @@ async fn handle_compile(
 
             state.artifacts.insert(
                 artifact_key_hex,
-                CachedArtifact {
-                    artifact,
-                    last_used: std::time::Instant::now(),
-                },
+                CachedArtifact::from_artifact_data(&artifact),
             );
 
             let latency_ns = compile_start.elapsed().as_nanos() as u64;
@@ -2469,40 +2716,49 @@ fn check_unit_cache(
                 // so writes are already parallel across units.
                 if let Some(mut cached_ref) = state.artifacts.get_mut(artifact_key_hex) {
                     cached_ref.last_used = std::time::Instant::now();
-                    let mut artifact_bytes: u64 = 0;
-                    for (i, output) in cached_ref.artifact.outputs.iter().enumerate() {
-                        let out_path = if i == 0 {
-                            output_path.clone()
-                        } else {
-                            cwd_path.join(&output.name)
-                        };
-                        let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                        artifact_bytes += output.data.len() as u64;
-                        let _ = write_cached_output(&out_path, &cache_file, &output.data);
-                    }
-                    let stdout = cached_ref.artifact.stdout.clone();
-                    let stderr = cached_ref.artifact.stderr.clone();
-                    drop(cached_ref);
+                    let loaded =
+                        ensure_payloads(&mut cached_ref, &state.artifact_dir, artifact_key_hex)
+                            .is_some();
+                    if loaded {
+                        let payloads: Vec<Arc<Vec<u8>>> =
+                            cached_ref.payloads.as_ref().unwrap().clone();
+                        let names: Vec<String> = cached_ref.meta.output_names.clone();
+                        let artifact_bytes: u64 = cached_ref.meta.total_size;
+                        let stdout = cached_ref.stdout.clone();
+                        let stderr = cached_ref.stderr.clone();
+                        drop(cached_ref);
 
-                    state.stats.record_hit(0, artifact_bytes);
-                    state.profiler.record_hit(&HitPhases {
-                        parse_args_ns: 0,
-                        build_context_ns: t_ctx.as_nanos() as u64,
-                        hash_source_ns: 0,
-                        hash_headers_ns: 0,
-                        depgraph_check_ns: 0,
-                        artifact_lookup_ns: 0,
-                        write_output_ns: 0,
-                        bookkeeping_ns: 0,
-                        total_ns: t0.elapsed().as_nanos() as u64,
-                    });
-                    return UnitCacheResult::Hit {
-                        stdout,
-                        stderr,
-                        artifact_bytes,
-                        source_path,
-                        pending_writes: Vec::new(),
-                    };
+                        for (i, payload) in payloads.iter().enumerate() {
+                            let out_path = if i == 0 {
+                                output_path.clone()
+                            } else {
+                                cwd_path.join(&names[i])
+                            };
+                            let cache_file =
+                                state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                            let _ = write_cached_output(&out_path, &cache_file, payload);
+                        }
+
+                        state.stats.record_hit(0, artifact_bytes);
+                        state.profiler.record_hit(&HitPhases {
+                            parse_args_ns: 0,
+                            build_context_ns: t_ctx.as_nanos() as u64,
+                            hash_source_ns: 0,
+                            hash_headers_ns: 0,
+                            depgraph_check_ns: 0,
+                            artifact_lookup_ns: 0,
+                            write_output_ns: 0,
+                            bookkeeping_ns: 0,
+                            total_ns: t0.elapsed().as_nanos() as u64,
+                        });
+                        return UnitCacheResult::Hit {
+                            stdout,
+                            stderr,
+                            artifact_bytes,
+                            source_path,
+                            pending_writes: Vec::new(),
+                        };
+                    }
                 }
             }
         }
@@ -2557,57 +2813,60 @@ fn check_unit_cache(
         if let Some(mut cached_ref) = state.artifacts.get_mut(&artifact_key_hex) {
             cached_ref.last_used = std::time::Instant::now();
             let t_lookup = t0.elapsed();
-            // Write outputs directly from DashMap reference — eliminates
-            // cloning all .o data into PendingWrite. Each check_unit_cache
-            // runs in its own spawn_blocking task, so writes are parallel.
-            let mut artifact_bytes: u64 = 0;
-            for (i, output) in cached_ref.artifact.outputs.iter().enumerate() {
-                let out_path = if i == 0 {
-                    output_path.clone()
-                } else {
-                    cwd_path.join(&output.name)
+            let loaded =
+                ensure_payloads(&mut cached_ref, &state.artifact_dir, &artifact_key_hex).is_some();
+            if loaded {
+                let payloads: Vec<Arc<Vec<u8>>> = cached_ref.payloads.as_ref().unwrap().clone();
+                let names: Vec<String> = cached_ref.meta.output_names.clone();
+                let artifact_bytes: u64 = cached_ref.meta.total_size;
+                let stdout = cached_ref.stdout.clone();
+                let stderr = cached_ref.stderr.clone();
+                drop(cached_ref);
+
+                for (i, payload) in payloads.iter().enumerate() {
+                    let out_path = if i == 0 {
+                        output_path.clone()
+                    } else {
+                        cwd_path.join(&names[i])
+                    };
+                    let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                    let _ = write_cached_output(&out_path, &cache_file, payload);
+                }
+
+                state.stats.record_hit(0, artifact_bytes);
+
+                // Populate fast-hit cache for future requests
+                let current_clock = state.cache_system.current_clock();
+                state.fast_hit_cache.insert(
+                    context_key,
+                    FastHitEntry {
+                        clock: current_clock,
+                        artifact_key_hex: artifact_key_hex.clone(),
+                        cached_at: std::time::Instant::now(),
+                    },
+                );
+
+                let total_ns = t0.elapsed().as_nanos() as u64;
+                state.profiler.record_hit(&HitPhases {
+                    parse_args_ns: 0,
+                    build_context_ns: t_ctx.as_nanos() as u64,
+                    hash_source_ns: (t_hash_source - t_register).as_nanos() as u64,
+                    hash_headers_ns: (t_hash_headers - t_hash_source).as_nanos() as u64,
+                    depgraph_check_ns: (t_depgraph - t_hash_headers).as_nanos() as u64,
+                    artifact_lookup_ns: (t_lookup - t_depgraph).as_nanos() as u64,
+                    write_output_ns: 0,
+                    bookkeeping_ns: 0,
+                    total_ns,
+                });
+
+                return UnitCacheResult::Hit {
+                    stdout,
+                    stderr,
+                    artifact_bytes,
+                    source_path,
+                    pending_writes: Vec::new(),
                 };
-                let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                artifact_bytes += output.data.len() as u64;
-                let _ = write_cached_output(&out_path, &cache_file, &output.data);
             }
-            let stdout = cached_ref.artifact.stdout.clone();
-            let stderr = cached_ref.artifact.stderr.clone();
-            drop(cached_ref);
-
-            state.stats.record_hit(0, artifact_bytes);
-
-            // Populate fast-hit cache for future requests
-            let current_clock = state.cache_system.current_clock();
-            state.fast_hit_cache.insert(
-                context_key,
-                FastHitEntry {
-                    clock: current_clock,
-                    artifact_key_hex: artifact_key_hex.clone(),
-                    cached_at: std::time::Instant::now(),
-                },
-            );
-
-            let total_ns = t0.elapsed().as_nanos() as u64;
-            state.profiler.record_hit(&HitPhases {
-                parse_args_ns: 0,
-                build_context_ns: t_ctx.as_nanos() as u64,
-                hash_source_ns: (t_hash_source - t_register).as_nanos() as u64,
-                hash_headers_ns: (t_hash_headers - t_hash_source).as_nanos() as u64,
-                depgraph_check_ns: (t_depgraph - t_hash_headers).as_nanos() as u64,
-                artifact_lookup_ns: (t_lookup - t_depgraph).as_nanos() as u64,
-                write_output_ns: 0,
-                bookkeeping_ns: 0,
-                total_ns,
-            });
-
-            return UnitCacheResult::Hit {
-                stdout,
-                stderr,
-                artifact_bytes,
-                source_path,
-                pending_writes: Vec::new(),
-            };
         }
     }
 
@@ -2990,15 +3249,23 @@ async fn handle_compile_multi(
                                 );
                             }
                         }
-                        let meta_path = artifact_dir.join(format!("{key_hex}.meta"));
-                        if let Ok(meta_bytes) = bincode::serialize(&artifact_clone) {
-                            if let Err(e) = std::fs::write(&meta_path, &meta_bytes) {
-                                tracing::warn!(
-                                    path = %meta_path.display(),
-                                    "failed to persist artifact meta: {e}"
-                                );
-                            }
-                        }
+                        // Insert into redb index.
+                        let meta = ArtifactIndex::new(
+                            artifact_clone
+                                .outputs
+                                .iter()
+                                .map(|o| o.name.clone())
+                                .collect(),
+                            artifact_clone
+                                .outputs
+                                .iter()
+                                .map(|o| o.data.len() as u64)
+                                .collect(),
+                            (*artifact_clone.stdout).clone(),
+                            (*artifact_clone.stderr).clone(),
+                            artifact_clone.exit_code,
+                        );
+                        state_ref.artifact_store.insert(&key_hex, &meta).ok();
                         state_ref
                             .in_flight_bytes
                             .fetch_sub(payload_size, Ordering::Relaxed);
@@ -3010,10 +3277,7 @@ async fn handle_compile_multi(
 
             state.artifacts.insert(
                 artifact_key_hex.clone(),
-                CachedArtifact {
-                    artifact,
-                    last_used: std::time::Instant::now(),
-                },
+                CachedArtifact::from_artifact_data(&artifact),
             );
 
             // Populate fast-hit cache for future requests

@@ -158,6 +158,11 @@ impl CompileJournal {
     }
 }
 
+/// Maximum global journal size before rotation (50 MB).
+const JOURNAL_MAX_SIZE: u64 = 50 * 1024 * 1024;
+/// Maximum number of rotated journal files to keep.
+const JOURNAL_MAX_FILES: usize = 3;
+
 /// Background thread: receives journal messages and writes to files.
 fn journal_thread(
     mut rx: mpsc::UnboundedReceiver<JournalMessage>,
@@ -165,17 +170,28 @@ fn journal_thread(
     mut global_file: std::fs::File,
 ) {
     let mut session_files: HashMap<PathBuf, std::fs::File> = HashMap::new();
+    let mut current_size: u64 = global_path.metadata().map(|m| m.len()).unwrap_or(0);
 
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             JournalMessage::Entry { line, session_path } => {
+                // Rotate if over size limit.
+                if current_size > JOURNAL_MAX_SIZE {
+                    if let Some((new_file, new_size)) = rotate_journal(&global_path) {
+                        global_file = new_file;
+                        current_size = new_size;
+                    }
+                }
+
                 // Write to global journal.
+                let line_bytes = line.len() as u64 + 1; // +1 for newline
                 if writeln!(global_file, "{line}").is_err() {
                     if let Ok(f) = open_append(&global_path) {
                         global_file = f;
                         let _ = writeln!(global_file, "{line}");
                     }
                 }
+                current_size += line_bytes;
                 // Write to session journal if requested.
                 if let Some(ref path) = session_path {
                     let file = session_files.entry(path.clone()).or_insert_with(|| {
@@ -205,6 +221,53 @@ fn journal_thread(
                 session_files.remove(&path);
             }
         }
+    }
+}
+
+/// Rotate the global journal file: rename to timestamped backup, GC old backups.
+/// Returns the new file handle and initial size, or `None` on failure.
+fn rotate_journal(path: &Path) -> Option<(std::fs::File, u64)> {
+    let ts = crate::event_log::format_timestamp(std::time::SystemTime::now()).replace(':', "-");
+    let rotated = path.with_file_name(format!("compile_journal.jsonl.{ts}"));
+    // Rename current file to rotated name.
+    if fs::rename(path, &rotated).is_err() {
+        return None;
+    }
+    // Open a fresh file.
+    let file = open_append(path).ok()?;
+    gc_journal_files(path);
+    Some((file, 0))
+}
+
+/// Keep only the newest `JOURNAL_MAX_FILES` rotated journal files.
+fn gc_journal_files(path: &Path) {
+    let dir = match path.parent() {
+        Some(d) => d,
+        None => return,
+    };
+    let mut rotated: Vec<std::path::PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("compile_journal.jsonl.") {
+                Some(e.path())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if rotated.len() <= JOURNAL_MAX_FILES {
+        return;
+    }
+
+    // Sort lexicographically (timestamps sort correctly) — oldest first.
+    rotated.sort();
+    let to_remove = rotated.len() - JOURNAL_MAX_FILES;
+    for p in rotated.into_iter().take(to_remove) {
+        let _ = fs::remove_file(p);
     }
 }
 
@@ -1090,5 +1153,64 @@ mod tests {
         };
         let entry = JournalEntry::new(ctx, "miss", 0, 0);
         journal.log(&entry, Some(Path::new("/nonexistent/path.jsonl")));
+    }
+
+    #[test]
+    fn test_journal_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compile_journal.jsonl");
+
+        // Create a journal file that exceeds JOURNAL_MAX_SIZE equivalent
+        // by directly calling rotate_journal.
+        fs::write(&path, vec![b'x'; 100]).unwrap();
+        let result = rotate_journal(&path);
+        assert!(result.is_some());
+
+        // Original path should exist (fresh file).
+        assert!(path.exists());
+
+        // A rotated file should exist.
+        let rotated: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("compile_journal.jsonl.")
+            })
+            .collect();
+        assert_eq!(rotated.len(), 1);
+    }
+
+    #[test]
+    fn test_journal_gc_keeps_max_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compile_journal.jsonl");
+        fs::write(&path, b"current").unwrap();
+
+        // Create 5 rotated files (more than JOURNAL_MAX_FILES=3).
+        for i in 0..5 {
+            let rotated = dir.path().join(format!(
+                "compile_journal.jsonl.2026-03-{i:02}T00-00-00.000Z"
+            ));
+            fs::write(&rotated, format!("data-{i}")).unwrap();
+        }
+
+        gc_journal_files(&path);
+
+        let remaining: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("compile_journal.jsonl.")
+            })
+            .collect();
+        assert!(
+            remaining.len() <= JOURNAL_MAX_FILES,
+            "expected at most {JOURNAL_MAX_FILES} rotated files, got {}",
+            remaining.len()
+        );
     }
 }

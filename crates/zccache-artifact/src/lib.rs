@@ -5,6 +5,10 @@
 
 #![allow(clippy::missing_errors_doc)] // TODO: add error docs
 
+mod store;
+
+pub use store::{ArtifactIndex, ArtifactStore};
+
 use std::path::{Path, PathBuf};
 
 /// Configuration for the artifact store.
@@ -23,13 +27,11 @@ pub struct ArtifactStoreConfig {
 ///
 /// A redb database at `{cache_dir}/index.redb` tracks metadata
 /// and access times for eviction.
-#[derive(Debug)]
-pub struct ArtifactStore {
+pub struct ArtifactStoreLegacy {
     config: ArtifactStoreConfig,
-    // TODO: redb database handle
 }
 
-impl ArtifactStore {
+impl ArtifactStoreLegacy {
     /// Open or create an artifact store at the given configuration.
     ///
     /// Creates the cache directory if it does not exist.

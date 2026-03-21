@@ -20,8 +20,10 @@ pub struct Config {
     pub log_level: String,
     /// Maximum in-memory cache budget in bytes (default: 1 GB).
     pub max_memory_bytes: u64,
-    /// How often (in seconds) the eviction background task runs (default: 30).
+    /// How often (in seconds) the memory eviction background task runs (default: 30).
     pub eviction_interval_secs: u64,
+    /// How often (in seconds) the disk artifact GC task runs (default: 300).
+    pub disk_gc_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -35,6 +37,7 @@ impl Default for Config {
             log_level: String::from("info"),
             max_memory_bytes: 1_073_741_824, // 1 GB
             eviction_interval_secs: 30,
+            disk_gc_interval_secs: 300,
         }
     }
 }
@@ -143,6 +146,12 @@ mod tests {
         let dir = depgraph_dir();
         assert!(dir.ends_with("depgraph"));
         assert!(dir.starts_with(default_cache_dir()));
+    }
+
+    #[test]
+    fn disk_gc_interval_default() {
+        let config = Config::default();
+        assert_eq!(config.disk_gc_interval_secs, 300);
     }
 
     #[test]

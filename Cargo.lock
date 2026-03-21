@@ -1841,6 +1841,7 @@ dependencies = [
 name = "zccache-artifact"
 version = "1.0.33"
 dependencies = [
+ "bincode",
  "redb",
  "serde",
  "serde_json",
