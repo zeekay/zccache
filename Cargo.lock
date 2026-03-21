@@ -1839,7 +1839,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-artifact"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "bincode",
  "redb",
@@ -1854,7 +1854,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-ci"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "md5",
  "serde_json",
@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-cli"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "clap",
  "thiserror",
@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-compiler"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-core"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "serde",
  "thiserror",
@@ -1900,7 +1900,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-daemon"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "bincode",
  "clap",
@@ -1927,7 +1927,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-depgraph"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "blake3",
  "dashmap",
@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-fscache"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "dashmap",
  "serde",
@@ -1956,7 +1956,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-hash"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "blake3",
  "criterion",
@@ -1968,7 +1968,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-ipc"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "bytes",
  "serde",
@@ -1981,7 +1981,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-protocol"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "bincode",
  "bytes",
@@ -1992,7 +1992,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-test-support"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "tempfile",
  "tokio",
@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-watcher"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "notify",
  "tempfile",
