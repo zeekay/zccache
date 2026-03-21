@@ -145,7 +145,7 @@ fn is_compiler_driver(tool: &str) -> bool {
 /// for linking (gcc, clang). Both shared library and executable linking
 /// are cacheable.
 #[must_use]
-pub fn parse_linker_invocation(tool: &str, args: &[String]) -> ParsedLinkerInvocation {
+pub fn parse_linker_invocation(tool: &str, args: Vec<String>) -> ParsedLinkerInvocation {
     // Try direct linker first
     if let Some(family) = detect_family(tool) {
         return match family {
@@ -169,7 +169,7 @@ pub fn parse_linker_invocation(tool: &str, args: &[String]) -> ParsedLinkerInvoc
 ///
 /// Both shared library (`-shared` / `-dylib`) and executable linking are cacheable.
 /// `-shared` / `-dylib` are kept as cache-relevant flags since they affect output.
-fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: &[String]) -> ParsedLinkerInvocation {
+fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: Vec<String>) -> ParsedLinkerInvocation {
     if args.is_empty() {
         return ParsedLinkerInvocation::NonCacheable {
             reason: "no arguments".to_string(),
@@ -363,7 +363,7 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: &[String]) -> ParsedLink
         output_file,
         secondary_outputs,
         cache_relevant_flags,
-        original_args: args.to_vec(),
+        original_args: args,
         non_deterministic: has_build_id_uuid,
     })
 }
@@ -372,7 +372,7 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: &[String]) -> ParsedLink
 ///
 /// Both `/DLL` (DLL) and non-`/DLL` (executable) invocations are cacheable.
 /// `/DLL` is kept as a cache-relevant flag since it affects output type.
-fn parse_msvc_link(tool: &str, args: &[String]) -> ParsedLinkerInvocation {
+fn parse_msvc_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvocation {
     if args.is_empty() {
         return ParsedLinkerInvocation::NonCacheable {
             reason: "no arguments".to_string(),
@@ -386,7 +386,7 @@ fn parse_msvc_link(tool: &str, args: &[String]) -> ParsedLinkerInvocation {
     let mut has_deterministic = false;
     let mut secondary_outputs: Vec<PathBuf> = Vec::new();
 
-    for arg in args {
+    for arg in &args {
         let upper = arg.to_uppercase();
 
         // /DLL — DLL mode (cache-relevant: affects output type)
@@ -450,7 +450,7 @@ fn parse_msvc_link(tool: &str, args: &[String]) -> ParsedLinkerInvocation {
         output_file,
         secondary_outputs,
         cache_relevant_flags,
-        original_args: args.to_vec(),
+        original_args: args,
         non_deterministic: !has_deterministic,
     })
 }
@@ -476,7 +476,7 @@ fn is_linker_input(path: &str) -> bool {
 /// The compiler driver passes flags through to the linker internally,
 /// so we treat the full invocation as a link operation. `-shared` is kept as a
 /// cache-relevant flag since it affects output type.
-fn parse_compiler_driver_link(tool: &str, args: &[String]) -> ParsedLinkerInvocation {
+fn parse_compiler_driver_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvocation {
     if args.is_empty() {
         return ParsedLinkerInvocation::NonCacheable {
             reason: "no arguments".to_string(),
@@ -613,7 +613,7 @@ fn parse_compiler_driver_link(tool: &str, args: &[String]) -> ParsedLinkerInvoca
         output_file,
         secondary_outputs,
         cache_relevant_flags,
-        original_args: args.to_vec(),
+        original_args: args,
         non_deterministic: has_build_id_uuid,
     })
 }
@@ -681,7 +681,7 @@ mod tests {
     #[test]
     fn basic_shared_lib() {
         let result =
-            parse_linker_invocation("ld", &args(&["-shared", "-o", "libfoo.so", "a.o", "b.o"]));
+            parse_linker_invocation("ld", args(&["-shared", "-o", "libfoo.so", "a.o", "b.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::Ld);
@@ -699,7 +699,7 @@ mod tests {
     fn shared_lib_with_soname() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&[
+            args(&[
                 "-shared",
                 "-soname",
                 "libfoo.so.1",
@@ -722,7 +722,7 @@ mod tests {
     fn shared_lib_with_libraries() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&[
+            args(&[
                 "-shared",
                 "-o",
                 "libfoo.so",
@@ -746,7 +746,7 @@ mod tests {
     #[test]
     fn exe_link_cacheable() {
         // Executable linking (no -shared) should be cacheable
-        let result = parse_linker_invocation("ld", &args(&["-o", "a.out", "main.o"]));
+        let result = parse_linker_invocation("ld", args(&["-o", "a.out", "main.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::Ld);
@@ -760,7 +760,7 @@ mod tests {
 
     #[test]
     fn no_output_non_cacheable() {
-        let result = parse_linker_invocation("ld", &args(&["-shared", "a.o"]));
+        let result = parse_linker_invocation("ld", args(&["-shared", "a.o"]));
         assert!(matches!(
             result,
             ParsedLinkerInvocation::NonCacheable { .. }
@@ -769,7 +769,7 @@ mod tests {
 
     #[test]
     fn no_inputs_non_cacheable() {
-        let result = parse_linker_invocation("ld", &args(&["-shared", "-o", "libfoo.so"]));
+        let result = parse_linker_invocation("ld", args(&["-shared", "-o", "libfoo.so"]));
         assert!(matches!(
             result,
             ParsedLinkerInvocation::NonCacheable { .. }
@@ -778,7 +778,7 @@ mod tests {
 
     #[test]
     fn no_args_non_cacheable() {
-        let result = parse_linker_invocation("ld", &args(&[]));
+        let result = parse_linker_invocation("ld", args(&[]));
         assert!(matches!(
             result,
             ParsedLinkerInvocation::NonCacheable { .. }
@@ -789,7 +789,7 @@ mod tests {
     fn preserves_input_order() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&["-shared", "-o", "libfoo.so", "z.o", "a.o", "m.o"]),
+            args(&["-shared", "-o", "libfoo.so", "z.o", "a.o", "m.o"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -807,7 +807,7 @@ mod tests {
     fn build_id_uuid_is_non_deterministic() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&["-shared", "--build-id=uuid", "-o", "libfoo.so", "a.o"]),
+            args(&["-shared", "--build-id=uuid", "-o", "libfoo.so", "a.o"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -824,7 +824,7 @@ mod tests {
     fn build_id_sha1_is_deterministic() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&["-shared", "--build-id=sha1", "-o", "libfoo.so", "a.o"]),
+            args(&["-shared", "--build-id=sha1", "-o", "libfoo.so", "a.o"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -841,7 +841,7 @@ mod tests {
     fn build_id_none_is_deterministic() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&["-shared", "--build-id=none", "-o", "libfoo.so", "a.o"]),
+            args(&["-shared", "--build-id=none", "-o", "libfoo.so", "a.o"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn default_ld_is_deterministic() {
         // GNU ld without --build-id is deterministic (no random build ID inserted)
-        let result = parse_linker_invocation("ld", &args(&["-shared", "-o", "libfoo.so", "a.o"]));
+        let result = parse_linker_invocation("ld", args(&["-shared", "-o", "libfoo.so", "a.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert!(!c.non_deterministic);
@@ -868,7 +868,7 @@ mod tests {
     #[test]
     fn macos_dylib() {
         let result =
-            parse_linker_invocation("ld", &args(&["-dylib", "-o", "libfoo.dylib", "a.o", "b.o"]));
+            parse_linker_invocation("ld", args(&["-dylib", "-o", "libfoo.dylib", "a.o", "b.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.output_file, PathBuf::from("libfoo.dylib"));
@@ -883,7 +883,7 @@ mod tests {
     fn macos_dylib_with_install_name() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&[
+            args(&[
                 "-dylib",
                 "-install_name",
                 "@rpath/libfoo.dylib",
@@ -911,7 +911,7 @@ mod tests {
     fn lld_shared_lib() {
         let result = parse_linker_invocation(
             "ld.lld",
-            &args(&["-shared", "-o", "libfoo.so", "a.o", "b.o"]),
+            args(&["-shared", "-o", "libfoo.so", "a.o", "b.o"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -928,7 +928,7 @@ mod tests {
     fn with_linker_script() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&["-shared", "-T", "link.ld", "-o", "libfoo.so", "a.o"]),
+            args(&["-shared", "-T", "link.ld", "-o", "libfoo.so", "a.o"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -944,7 +944,7 @@ mod tests {
     fn with_version_script() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&[
+            args(&[
                 "-shared",
                 "--version-script=libfoo.map",
                 "-o",
@@ -967,7 +967,7 @@ mod tests {
     fn basic_msvc_dll() {
         let result = parse_linker_invocation(
             "link.exe",
-            &args(&["/DLL", "/OUT:foo.dll", "a.obj", "b.obj"]),
+            args(&["/DLL", "/OUT:foo.dll", "a.obj", "b.obj"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -986,7 +986,7 @@ mod tests {
     fn msvc_dll_with_deterministic() {
         let result = parse_linker_invocation(
             "link.exe",
-            &args(&["/DLL", "/DETERMINISTIC", "/OUT:foo.dll", "a.obj"]),
+            args(&["/DLL", "/DETERMINISTIC", "/OUT:foo.dll", "a.obj"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -999,7 +999,7 @@ mod tests {
     #[test]
     fn msvc_exe_cacheable() {
         // Executable linking (no /DLL) should be cacheable
-        let result = parse_linker_invocation("link.exe", &args(&["/OUT:foo.exe", "main.obj"]));
+        let result = parse_linker_invocation("link.exe", args(&["/OUT:foo.exe", "main.obj"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::MsvcLink);
@@ -1013,7 +1013,7 @@ mod tests {
     #[test]
     fn msvc_exe_default_output_name() {
         // Without /OUT: and without /DLL, defaults to first input with .exe extension
-        let result = parse_linker_invocation("link.exe", &args(&["main.obj", "util.obj"]));
+        let result = parse_linker_invocation("link.exe", args(&["main.obj", "util.obj"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.output_file, PathBuf::from("main.exe"));
@@ -1024,7 +1024,7 @@ mod tests {
 
     #[test]
     fn msvc_dll_no_inputs() {
-        let result = parse_linker_invocation("link.exe", &args(&["/DLL", "/OUT:foo.dll"]));
+        let result = parse_linker_invocation("link.exe", args(&["/DLL", "/OUT:foo.dll"]));
         assert!(matches!(
             result,
             ParsedLinkerInvocation::NonCacheable { .. }
@@ -1034,7 +1034,7 @@ mod tests {
     #[test]
     fn msvc_dll_default_output_name() {
         // Without /OUT:, defaults to first input with .dll extension
-        let result = parse_linker_invocation("link.exe", &args(&["/DLL", "a.obj", "b.obj"]));
+        let result = parse_linker_invocation("link.exe", args(&["/DLL", "a.obj", "b.obj"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.output_file, PathBuf::from("a.dll"));
@@ -1047,7 +1047,7 @@ mod tests {
     fn msvc_dll_preserves_input_order() {
         let result = parse_linker_invocation(
             "link.exe",
-            &args(&["/DLL", "/OUT:foo.dll", "z.obj", "a.obj", "m.obj"]),
+            args(&["/DLL", "/OUT:foo.dll", "z.obj", "a.obj", "m.obj"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -1063,7 +1063,7 @@ mod tests {
     fn msvc_dll_with_implib() {
         let result = parse_linker_invocation(
             "link.exe",
-            &args(&["/DLL", "/OUT:foo.dll", "/IMPLIB:foo.lib", "a.obj"]),
+            args(&["/DLL", "/OUT:foo.dll", "/IMPLIB:foo.lib", "a.obj"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -1081,7 +1081,7 @@ mod tests {
 
     #[test]
     fn msvc_dll_without_implib_no_secondary() {
-        let result = parse_linker_invocation("link.exe", &args(&["/DLL", "/OUT:foo.dll", "a.obj"]));
+        let result = parse_linker_invocation("link.exe", args(&["/DLL", "/OUT:foo.dll", "a.obj"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert!(c.secondary_outputs.is_empty());
@@ -1094,7 +1094,7 @@ mod tests {
     fn msvc_implib_dash_syntax() {
         let result = parse_linker_invocation(
             "link.exe",
-            &args(&["/DLL", "-IMPLIB:mylib.lib", "/OUT:mylib.dll", "a.obj"]),
+            args(&["/DLL", "-IMPLIB:mylib.lib", "/OUT:mylib.dll", "a.obj"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -1108,7 +1108,7 @@ mod tests {
 
     #[test]
     fn gnu_ld_no_secondary_outputs() {
-        let result = parse_linker_invocation("ld", &args(&["-shared", "-o", "libfoo.so", "a.o"]));
+        let result = parse_linker_invocation("ld", args(&["-shared", "-o", "libfoo.so", "a.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert!(c.secondary_outputs.is_empty());
@@ -1119,7 +1119,7 @@ mod tests {
 
     #[test]
     fn gcc_no_secondary_outputs() {
-        let result = parse_linker_invocation("gcc", &args(&["-shared", "-o", "libfoo.so", "a.o"]));
+        let result = parse_linker_invocation("gcc", args(&["-shared", "-o", "libfoo.so", "a.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert!(c.secondary_outputs.is_empty());
@@ -1132,7 +1132,7 @@ mod tests {
     fn msvc_dll_with_flags() {
         let result = parse_linker_invocation(
             "link.exe",
-            &args(&["/DLL", "/NOLOGO", "/MACHINE:X64", "/OUT:foo.dll", "a.obj"]),
+            args(&["/DLL", "/NOLOGO", "/MACHINE:X64", "/OUT:foo.dll", "a.obj"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -1148,7 +1148,7 @@ mod tests {
         // link.exe also accepts - prefix for flags
         let result = parse_linker_invocation(
             "link.exe",
-            &args(&["-DLL", "-OUT:foo.dll", "-DETERMINISTIC", "a.obj"]),
+            args(&["-DLL", "-OUT:foo.dll", "-DETERMINISTIC", "a.obj"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -1161,7 +1161,7 @@ mod tests {
 
     #[test]
     fn msvc_no_args() {
-        let result = parse_linker_invocation("link.exe", &args(&[]));
+        let result = parse_linker_invocation("link.exe", args(&[]));
         assert!(matches!(
             result,
             ParsedLinkerInvocation::NonCacheable { .. }
@@ -1172,8 +1172,7 @@ mod tests {
 
     #[test]
     fn unknown_tool_non_cacheable() {
-        let result =
-            parse_linker_invocation("rustc", &args(&["-shared", "-o", "libfoo.so", "a.o"]));
+        let result = parse_linker_invocation("rustc", args(&["-shared", "-o", "libfoo.so", "a.o"]));
         assert!(matches!(
             result,
             ParsedLinkerInvocation::NonCacheable { .. }
@@ -1186,7 +1185,7 @@ mod tests {
     fn cross_compile_ld() {
         let result = parse_linker_invocation(
             "x86_64-linux-gnu-ld",
-            &args(&["-shared", "-o", "libfoo.so", "a.o"]),
+            args(&["-shared", "-o", "libfoo.so", "a.o"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -1201,8 +1200,7 @@ mod tests {
 
     #[test]
     fn output_equals_syntax() {
-        let result =
-            parse_linker_invocation("ld", &args(&["-shared", "--output=libfoo.so", "a.o"]));
+        let result = parse_linker_invocation("ld", args(&["-shared", "--output=libfoo.so", "a.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.output_file, PathBuf::from("libfoo.so"));
@@ -1217,7 +1215,7 @@ mod tests {
     fn z_relro_and_now_flags() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&[
+            args(&[
                 "-shared",
                 "-z",
                 "relro",
@@ -1242,7 +1240,7 @@ mod tests {
     fn rpath_flag() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&["-shared", "-rpath", "/usr/lib", "-o", "libfoo.so", "a.o"]),
+            args(&["-shared", "-rpath", "/usr/lib", "-o", "libfoo.so", "a.o"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -1257,7 +1255,7 @@ mod tests {
     fn mixed_object_and_archive_inputs() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&["-shared", "-o", "libfoo.so", "a.o", "libbar.a", "c.o"]),
+            args(&["-shared", "-o", "libfoo.so", "a.o", "libbar.a", "c.o"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -1274,7 +1272,7 @@ mod tests {
     fn soname_equals_syntax() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&[
+            args(&[
                 "-shared",
                 "--soname=libfoo.so.1",
                 "-o",
@@ -1296,7 +1294,7 @@ mod tests {
     fn version_script_separate_args() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&[
+            args(&[
                 "-shared",
                 "--version-script",
                 "libfoo.map",
@@ -1319,7 +1317,7 @@ mod tests {
         // Multiple -shared flags are valid and shouldn't cause issues
         let result = parse_linker_invocation(
             "ld",
-            &args(&["-shared", "--shared", "-o", "libfoo.so", "a.o"]),
+            args(&["-shared", "--shared", "-o", "libfoo.so", "a.o"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -1333,7 +1331,7 @@ mod tests {
     fn wl_shared_inside_pass_through() {
         // -Wl,-shared inside a -Wl, pass-through should detect shared mode
         let result =
-            parse_linker_invocation("ld", &args(&["-Wl,-shared", "-o", "libfoo.so", "a.o"]));
+            parse_linker_invocation("ld", args(&["-Wl,-shared", "-o", "libfoo.so", "a.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.output_file, PathBuf::from("libfoo.so"));
@@ -1346,7 +1344,7 @@ mod tests {
     fn msvc_def_file_as_flag() {
         let result = parse_linker_invocation(
             "link.exe",
-            &args(&["/DLL", "/DEF:foo.def", "/OUT:foo.dll", "a.obj"]),
+            args(&["/DLL", "/DEF:foo.def", "/OUT:foo.dll", "a.obj"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -1358,7 +1356,7 @@ mod tests {
 
     #[test]
     fn msvc_case_insensitive_dll_flag() {
-        let result = parse_linker_invocation("link.exe", &args(&["/dll", "/out:foo.dll", "a.obj"]));
+        let result = parse_linker_invocation("link.exe", args(&["/dll", "/out:foo.dll", "a.obj"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.output_file, PathBuf::from("foo.dll"));
@@ -1389,7 +1387,7 @@ mod tests {
     #[test]
     fn gcc_shared_basic() {
         let result =
-            parse_linker_invocation("gcc", &args(&["-shared", "-o", "libfoo.so", "a.o", "b.o"]));
+            parse_linker_invocation("gcc", args(&["-shared", "-o", "libfoo.so", "a.o", "b.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::CompilerDriver);
@@ -1404,7 +1402,7 @@ mod tests {
     #[test]
     fn clang_shared_dll() {
         let result =
-            parse_linker_invocation("clang", &args(&["-shared", "-o", "foo.dll", "a.o", "b.o"]));
+            parse_linker_invocation("clang", args(&["-shared", "-o", "foo.dll", "a.o", "b.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::CompilerDriver);
@@ -1418,7 +1416,7 @@ mod tests {
     fn gpp_shared_with_flags() {
         let result = parse_linker_invocation(
             "g++",
-            &args(&["-shared", "-fPIC", "-O2", "-o", "libfoo.so", "a.o", "-lm"]),
+            args(&["-shared", "-fPIC", "-O2", "-o", "libfoo.so", "a.o", "-lm"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -1435,7 +1433,7 @@ mod tests {
     fn gcc_shared_wl_build_id_uuid_non_deterministic() {
         let result = parse_linker_invocation(
             "gcc",
-            &args(&["-shared", "-Wl,--build-id=uuid", "-o", "libfoo.so", "a.o"]),
+            args(&["-shared", "-Wl,--build-id=uuid", "-o", "libfoo.so", "a.o"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -1449,7 +1447,7 @@ mod tests {
     fn gcc_with_compile_flag_non_cacheable() {
         // gcc -c -shared means compile only (not link), should not be cached as link
         let result =
-            parse_linker_invocation("gcc", &args(&["-c", "-shared", "-o", "foo.o", "foo.c"]));
+            parse_linker_invocation("gcc", args(&["-c", "-shared", "-o", "foo.o", "foo.c"]));
         assert!(matches!(
             result,
             ParsedLinkerInvocation::NonCacheable { .. }
@@ -1459,7 +1457,7 @@ mod tests {
     #[test]
     fn gcc_exe_cacheable() {
         // gcc without -shared is executable linking — cacheable
-        let result = parse_linker_invocation("gcc", &args(&["-o", "a.out", "main.o"]));
+        let result = parse_linker_invocation("gcc", args(&["-o", "a.out", "main.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::CompilerDriver);
@@ -1473,7 +1471,7 @@ mod tests {
 
     #[test]
     fn gcc_shared_no_output_non_cacheable() {
-        let result = parse_linker_invocation("gcc", &args(&["-shared", "a.o"]));
+        let result = parse_linker_invocation("gcc", args(&["-shared", "a.o"]));
         assert!(matches!(
             result,
             ParsedLinkerInvocation::NonCacheable { .. }
@@ -1483,8 +1481,7 @@ mod tests {
     #[test]
     fn gcc_shared_no_object_inputs_non_cacheable() {
         // Source files (.c) are not valid linker inputs — need pre-compiled .o
-        let result =
-            parse_linker_invocation("gcc", &args(&["-shared", "-o", "libfoo.so", "foo.c"]));
+        let result = parse_linker_invocation("gcc", args(&["-shared", "-o", "libfoo.so", "foo.c"]));
         assert!(matches!(
             result,
             ParsedLinkerInvocation::NonCacheable { .. }
@@ -1495,7 +1492,7 @@ mod tests {
     fn cross_compile_gcc() {
         let result = parse_linker_invocation(
             "x86_64-w64-mingw32-gcc",
-            &args(&["-shared", "-o", "foo.dll", "a.o"]),
+            args(&["-shared", "-o", "foo.dll", "a.o"]),
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
@@ -1510,7 +1507,7 @@ mod tests {
     fn gcc_shared_with_wl_soname() {
         let result = parse_linker_invocation(
             "gcc",
-            &args(&[
+            args(&[
                 "-shared",
                 "-Wl,-soname,libfoo.so.1",
                 "-o",
@@ -1639,7 +1636,7 @@ mod tests {
     fn gnu_ld_out_implib_equals() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&[
+            args(&[
                 "-shared",
                 "--out-implib=libfoo.dll.a",
                 "-o",
@@ -1660,7 +1657,7 @@ mod tests {
     fn gnu_ld_out_implib_separate() {
         let result = parse_linker_invocation(
             "ld",
-            &args(&[
+            args(&[
                 "-shared",
                 "--out-implib",
                 "libfoo.dll.a",
@@ -1683,7 +1680,7 @@ mod tests {
         // Meson passes relative paths like ci/meson/native\fastled.dll.a
         let result = parse_linker_invocation(
             "ld",
-            &args(&[
+            args(&[
                 "-shared",
                 "--out-implib=ci/meson/native/fastled.dll.a",
                 "-o",
@@ -1708,7 +1705,7 @@ mod tests {
         // clang++ -shared -Wl,--out-implib=foo.dll.a -o foo.dll a.o
         let result = parse_linker_invocation(
             "clang++",
-            &args(&[
+            args(&[
                 "-shared",
                 "-Wl,--out-implib=foo.dll.a",
                 "-o",
@@ -1732,7 +1729,7 @@ mod tests {
         // clang++ -shared -Wl,--out-implib=ci/meson/native\fastled.dll.a -o fastled.dll a.o
         let result = parse_linker_invocation(
             "clang++",
-            &args(&[
+            args(&[
                 "-shared",
                 "-Wl,--start-group",
                 "-Wl,--out-implib=ci/meson/native\\fastled.dll.a",
@@ -1757,8 +1754,7 @@ mod tests {
     #[test]
     fn compiler_driver_no_implib_no_secondary() {
         // Without --out-implib, no secondary outputs
-        let result =
-            parse_linker_invocation("clang++", &args(&["-shared", "-o", "foo.dll", "a.o"]));
+        let result = parse_linker_invocation("clang++", args(&["-shared", "-o", "foo.dll", "a.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert!(c.secondary_outputs.is_empty());

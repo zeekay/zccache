@@ -546,53 +546,12 @@ async fn handle_connection(
         tracing::debug!(?request, "received request");
         state.last_activity.store(now_secs(), Ordering::Relaxed);
 
-        // Capture journal metadata from journalable requests before dispatch.
-        let journal_ctx: Option<JournalContext> = match &request {
-            Request::Compile {
-                compiler,
-                args,
-                cwd,
-                env,
-                session_id,
-            } => Some(JournalContext {
-                compiler: compiler.to_string_lossy().into_owned(),
-                args: args.clone(),
-                cwd: cwd.to_string_lossy().into_owned(),
-                env: env.clone(),
-                session_id: Some(session_id.clone()),
-            }),
-            Request::CompileEphemeral {
-                compiler,
-                args,
-                cwd,
-                env,
-                ..
-            } => Some(JournalContext {
-                compiler: compiler.to_string_lossy().into_owned(),
-                args: args.clone(),
-                cwd: cwd.to_string_lossy().into_owned(),
-                env: env.clone(),
-                session_id: None,
-            }),
-            Request::LinkEphemeral {
-                tool,
-                args,
-                cwd,
-                env,
-                ..
-            } => Some(JournalContext {
-                compiler: tool.to_string_lossy().into_owned(),
-                args: args.clone(),
-                cwd: cwd.to_string_lossy().into_owned(),
-                env: env.clone(),
-                session_id: None,
-            }),
-            _ => None,
-        };
-        let journal_start = journal_ctx.as_ref().map(|_| std::time::Instant::now());
-
-        let response = match request {
-            Request::Ping => Response::Pong,
+        // Dispatch request and capture journal metadata in the same match
+        // to move args/session_id into JournalContext without cloning.
+        // Only env needs cloning because handlers consume it.
+        let journal_start = std::time::Instant::now();
+        let (response, journal_ctx): (Response, Option<JournalContext>) = match request {
+            Request::Ping => (Response::Pong, None),
             Request::Shutdown => {
                 conn.send(&Response::ShuttingDown).await?;
                 state.shutdown.notify_one();
@@ -616,37 +575,46 @@ async fn handle_connection(
                     })
                     .sum();
                 let metadata_entries = state.cache_system.metadata().len() as u64;
-                Response::Status(zccache_protocol::DaemonStatus {
-                    version: zccache_core::VERSION.to_string(),
-                    artifact_count,
-                    cache_size_bytes,
-                    metadata_entries,
-                    uptime_secs: now_secs().saturating_sub(state.start_time),
-                    cache_hits: snap.hits,
-                    cache_misses: snap.misses,
-                    total_compilations: snap.compilations,
-                    non_cacheable: snap.non_cacheable,
-                    compile_errors: snap.compile_errors,
-                    time_saved_ms: snap.time_saved_ms(),
-                    total_links: snap.link_total,
-                    link_hits: snap.link_hits,
-                    link_misses: snap.link_misses,
-                    link_non_cacheable: snap.link_non_cacheable,
-                    dep_graph_contexts: dg.context_count as u64,
-                    dep_graph_files: dg.file_count as u64,
-                    sessions_total: snap.sessions_total,
-                    sessions_active: state.sessions.active_count() as u64,
-                    cache_dir: zccache_core::config::default_cache_dir(),
-                    dep_graph_version: zccache_depgraph::DEPGRAPH_VERSION,
-                    dep_graph_disk_size: zccache_depgraph::depgraph_file_path()
-                        .metadata()
-                        .map(|m| m.len())
-                        .unwrap_or(0),
-                })
+                (
+                    Response::Status(zccache_protocol::DaemonStatus {
+                        version: zccache_core::VERSION.to_string(),
+                        artifact_count,
+                        cache_size_bytes,
+                        metadata_entries,
+                        uptime_secs: now_secs().saturating_sub(state.start_time),
+                        cache_hits: snap.hits,
+                        cache_misses: snap.misses,
+                        total_compilations: snap.compilations,
+                        non_cacheable: snap.non_cacheable,
+                        compile_errors: snap.compile_errors,
+                        time_saved_ms: snap.time_saved_ms(),
+                        total_links: snap.link_total,
+                        link_hits: snap.link_hits,
+                        link_misses: snap.link_misses,
+                        link_non_cacheable: snap.link_non_cacheable,
+                        dep_graph_contexts: dg.context_count as u64,
+                        dep_graph_files: dg.file_count as u64,
+                        sessions_total: snap.sessions_total,
+                        sessions_active: state.sessions.active_count() as u64,
+                        cache_dir: zccache_core::config::default_cache_dir(),
+                        dep_graph_version: zccache_depgraph::DEPGRAPH_VERSION,
+                        dep_graph_disk_size: zccache_depgraph::depgraph_file_path()
+                            .metadata()
+                            .map(|m| m.len())
+                            .unwrap_or(0),
+                    }),
+                    None,
+                )
             }
-            Request::Lookup { .. } => Response::LookupResult(zccache_protocol::LookupResult::Miss),
-            Request::Store { .. } => Response::StoreResult(zccache_protocol::StoreResult::Stored),
-            Request::Clear => handle_clear(&state).await,
+            Request::Lookup { .. } => (
+                Response::LookupResult(zccache_protocol::LookupResult::Miss),
+                None,
+            ),
+            Request::Store { .. } => (
+                Response::StoreResult(zccache_protocol::StoreResult::Stored),
+                None,
+            ),
+            Request::Clear => (handle_clear(&state).await, None),
             Request::SessionStart {
                 client_pid,
                 working_dir,
@@ -655,15 +623,18 @@ async fn handle_connection(
                 journal_path,
             } => {
                 state.stats.record_session();
-                handle_session_start(
-                    &state,
-                    client_pid,
-                    &working_dir,
-                    log_file,
-                    track_stats,
-                    journal_path,
+                (
+                    handle_session_start(
+                        &state,
+                        client_pid,
+                        &working_dir,
+                        log_file,
+                        track_stats,
+                        journal_path,
+                    )
+                    .await,
+                    None,
                 )
-                .await
             }
             Request::Compile {
                 session_id,
@@ -671,7 +642,25 @@ async fn handle_connection(
                 cwd,
                 compiler,
                 env,
-            } => handle_compile(&state, &session_id, &args, &cwd, &compiler, env).await,
+            } => {
+                let ctx = JournalContext {
+                    compiler: compiler.to_string_lossy().into_owned(),
+                    args,
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    env: env.clone(),
+                    session_id: Some(session_id),
+                };
+                let resp = handle_compile(
+                    &state,
+                    ctx.session_id.as_deref().unwrap(),
+                    &ctx.args,
+                    &cwd,
+                    &compiler,
+                    env,
+                )
+                .await;
+                (resp, Some(ctx))
+            }
             Request::CompileEphemeral {
                 client_pid,
                 working_dir,
@@ -680,79 +669,93 @@ async fn handle_connection(
                 cwd,
                 env,
             } => {
-                handle_compile_ephemeral(
+                let ctx = JournalContext {
+                    compiler: compiler.to_string_lossy().into_owned(),
+                    args,
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    env: env.clone(),
+                    session_id: None,
+                };
+                let resp = handle_compile_ephemeral(
                     &state,
                     client_pid,
                     &working_dir,
                     &compiler,
-                    &args,
+                    &ctx.args,
                     &cwd,
                     env,
                 )
-                .await
+                .await;
+                (resp, Some(ctx))
             }
-            Request::SessionStats { session_id } => match session_id.parse::<SessionId>() {
-                Ok(sid) => {
-                    if let Some(session) = state.sessions.get(&sid) {
-                        let stats = session.stats_tracker.as_ref().map(|tracker| {
-                            let f = tracker.finalize(session.created_at);
-                            zccache_protocol::SessionStats {
-                                duration_ms: f.duration_ms,
-                                compilations: f.compilations,
-                                hits: f.hits,
-                                misses: f.misses,
-                                non_cacheable: f.non_cacheable,
-                                errors: f.errors,
-                                time_saved_ms: f.time_saved_ms,
-                                unique_sources: f.unique_sources,
-                                bytes_read: f.bytes_read,
-                                bytes_written: f.bytes_written,
+            Request::SessionStats { session_id } => (
+                match session_id.parse::<SessionId>() {
+                    Ok(sid) => {
+                        if let Some(session) = state.sessions.get(&sid) {
+                            let stats = session.stats_tracker.as_ref().map(|tracker| {
+                                let f = tracker.finalize(session.created_at);
+                                zccache_protocol::SessionStats {
+                                    duration_ms: f.duration_ms,
+                                    compilations: f.compilations,
+                                    hits: f.hits,
+                                    misses: f.misses,
+                                    non_cacheable: f.non_cacheable,
+                                    errors: f.errors,
+                                    time_saved_ms: f.time_saved_ms,
+                                    unique_sources: f.unique_sources,
+                                    bytes_read: f.bytes_read,
+                                    bytes_written: f.bytes_written,
+                                }
+                            });
+                            Response::SessionStatsResult { stats }
+                        } else {
+                            Response::Error {
+                                message: format!("unknown session: {session_id}"),
                             }
-                        });
-                        Response::SessionStatsResult { stats }
-                    } else {
-                        Response::Error {
-                            message: format!("unknown session: {session_id}"),
                         }
                     }
-                }
-                Err(_) => Response::Error {
-                    message: format!("invalid session ID: {session_id}"),
+                    Err(_) => Response::Error {
+                        message: format!("invalid session ID: {session_id}"),
+                    },
                 },
-            },
-            Request::SessionEnd { session_id } => match session_id.parse::<SessionId>() {
-                Ok(sid) => {
-                    if let Some(session) = state.sessions.end(&sid) {
-                        // Close the session journal file handle if one was open.
-                        if let Some(ref path) = session.journal_path {
-                            state.journal.close_session(path);
-                        }
-                        let stats = session.stats_tracker.map(|tracker| {
-                            let f = tracker.finalize(session.created_at);
-                            zccache_protocol::SessionStats {
-                                duration_ms: f.duration_ms,
-                                compilations: f.compilations,
-                                hits: f.hits,
-                                misses: f.misses,
-                                non_cacheable: f.non_cacheable,
-                                errors: f.errors,
-                                time_saved_ms: f.time_saved_ms,
-                                unique_sources: f.unique_sources,
-                                bytes_read: f.bytes_read,
-                                bytes_written: f.bytes_written,
+                None,
+            ),
+            Request::SessionEnd { session_id } => (
+                match session_id.parse::<SessionId>() {
+                    Ok(sid) => {
+                        if let Some(session) = state.sessions.end(&sid) {
+                            // Close the session journal file handle if one was open.
+                            if let Some(ref path) = session.journal_path {
+                                state.journal.close_session(path);
                             }
-                        });
-                        Response::SessionEnded { stats }
-                    } else {
-                        Response::Error {
-                            message: format!("unknown session: {session_id}"),
+                            let stats = session.stats_tracker.map(|tracker| {
+                                let f = tracker.finalize(session.created_at);
+                                zccache_protocol::SessionStats {
+                                    duration_ms: f.duration_ms,
+                                    compilations: f.compilations,
+                                    hits: f.hits,
+                                    misses: f.misses,
+                                    non_cacheable: f.non_cacheable,
+                                    errors: f.errors,
+                                    time_saved_ms: f.time_saved_ms,
+                                    unique_sources: f.unique_sources,
+                                    bytes_read: f.bytes_read,
+                                    bytes_written: f.bytes_written,
+                                }
+                            });
+                            Response::SessionEnded { stats }
+                        } else {
+                            Response::Error {
+                                message: format!("unknown session: {session_id}"),
+                            }
                         }
                     }
-                }
-                Err(_) => Response::Error {
-                    message: format!("invalid session ID: {session_id}"),
+                    Err(_) => Response::Error {
+                        message: format!("invalid session ID: {session_id}"),
+                    },
                 },
-            },
+                None,
+            ),
             Request::LinkEphemeral {
                 client_pid,
                 working_dir,
@@ -761,15 +764,31 @@ async fn handle_connection(
                 cwd,
                 env,
             } => {
-                handle_link_ephemeral(&state, client_pid, &working_dir, &tool, &args, &cwd, env)
-                    .await
+                let ctx = JournalContext {
+                    compiler: tool.to_string_lossy().into_owned(),
+                    args,
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    env: env.clone(),
+                    session_id: None,
+                };
+                let resp = handle_link_ephemeral(
+                    &state,
+                    client_pid,
+                    &working_dir,
+                    &tool,
+                    &ctx.args,
+                    &cwd,
+                    env,
+                )
+                .await;
+                (resp, Some(ctx))
             }
         };
 
         // Log to compile journal for journalable requests.
-        if let (Some(ctx), Some(start)) = (journal_ctx, journal_start) {
+        if let Some(ctx) = journal_ctx {
             if let Some((outcome, exit_code)) = extract_outcome(&response) {
-                let latency_ns = start.elapsed().as_nanos();
+                let latency_ns = journal_start.elapsed().as_nanos();
                 // Look up session journal path for per-session logging.
                 let session_journal_path = ctx.session_id.as_ref().and_then(|sid| {
                     sid.parse::<SessionId>().ok().and_then(|parsed| {
@@ -927,7 +946,7 @@ async fn handle_link_ephemeral(
         },
         ParsedArchiveInvocation::NonCacheable { reason: ar_reason } => {
             // Try linker parser
-            match parse_linker_invocation(tool.to_str().unwrap_or(""), args) {
+            match parse_linker_invocation(tool.to_str().unwrap_or(""), args.to_vec()) {
                 ParsedLinkerInvocation::Cacheable(c) => ParsedTool {
                     non_determinism_hint: match c.family {
                         zccache_compiler::parse_linker::LinkerFamily::MsvcLink => {
@@ -2078,8 +2097,8 @@ async fn handle_compile(
     let compiler_exec_ns = t_exec.elapsed().as_nanos() as u64;
 
     let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = output.stdout;
-    let stderr = output.stderr;
+    let stdout = Arc::new(output.stdout);
+    let stderr = Arc::new(output.stderr);
 
     if exit_code != 0 {
         state.stats.record_error();
@@ -2101,8 +2120,8 @@ async fn handle_compile(
                 tracing::warn!("failed to read output file {}: {e}", output_path.display());
                 return Response::CompileResult {
                     exit_code,
-                    stdout: Arc::new(stdout),
-                    stderr: Arc::new(stderr),
+                    stdout: Arc::clone(&stdout),
+                    stderr: Arc::clone(&stderr),
                     cached: false,
                 };
             }
@@ -2255,8 +2274,8 @@ async fn handle_compile(
                         .into_owned(),
                     data: Arc::new(output_data),
                 }],
-                stdout: Arc::new(stdout.clone()),
-                stderr: Arc::new(stderr.clone()),
+                stdout: Arc::clone(&stdout),
+                stderr: Arc::clone(&stderr),
                 exit_code,
             };
 
@@ -2348,8 +2367,8 @@ async fn handle_compile(
 
     Response::CompileResult {
         exit_code,
-        stdout: Arc::new(stdout),
-        stderr: Arc::new(stderr),
+        stdout,
+        stderr,
         cached: false,
     }
 }
