@@ -245,6 +245,7 @@ pub fn extract_outcome(response: &Response) -> Option<(&'static str, i32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -401,8 +402,8 @@ mod tests {
     fn test_extract_outcome_compile_hit() {
         let resp = Response::CompileResult {
             exit_code: 0,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: true,
         };
         assert_eq!(extract_outcome(&resp), Some(("hit", 0)));
@@ -412,8 +413,8 @@ mod tests {
     fn test_extract_outcome_compile_miss() {
         let resp = Response::CompileResult {
             exit_code: 0,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: false,
         };
         assert_eq!(extract_outcome(&resp), Some(("miss", 0)));
@@ -423,8 +424,8 @@ mod tests {
     fn test_extract_outcome_compile_error() {
         let resp = Response::CompileResult {
             exit_code: 1,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: false,
         };
         assert_eq!(extract_outcome(&resp), Some(("error", 1)));
@@ -434,8 +435,8 @@ mod tests {
     fn test_extract_outcome_link_hit() {
         let resp = Response::LinkResult {
             exit_code: 0,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: true,
             warning: None,
         };
@@ -446,8 +447,8 @@ mod tests {
     fn test_extract_outcome_link_miss() {
         let resp = Response::LinkResult {
             exit_code: 0,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: false,
             warning: None,
         };
@@ -476,8 +477,8 @@ mod tests {
         // exit_code != 0 takes priority over cached flag
         let resp = Response::CompileResult {
             exit_code: 1,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: true,
         };
         assert_eq!(extract_outcome(&resp), Some(("error", 1)));
@@ -487,8 +488,8 @@ mod tests {
     fn test_extract_outcome_link_cached_nonzero_exit() {
         let resp = Response::LinkResult {
             exit_code: 2,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: true,
             warning: None,
         };
@@ -499,8 +500,8 @@ mod tests {
     fn test_extract_outcome_link_error() {
         let resp = Response::LinkResult {
             exit_code: 1,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: false,
             warning: None,
         };
@@ -580,24 +581,24 @@ mod tests {
     fn test_extract_outcome_negative_exit_codes() {
         let resp_neg1 = Response::CompileResult {
             exit_code: -1,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: false,
         };
         assert_eq!(extract_outcome(&resp_neg1), Some(("error", -1)));
 
         let resp_min = Response::CompileResult {
             exit_code: i32::MIN,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: true,
         };
         assert_eq!(extract_outcome(&resp_min), Some(("error", i32::MIN)));
 
         let resp_link_neg = Response::LinkResult {
             exit_code: -1,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: false,
             warning: None,
         };
@@ -731,8 +732,6 @@ mod tests {
 
     #[test]
     fn test_concurrent_logging() {
-        use std::sync::Arc;
-
         let dir = tempfile::tempdir().unwrap();
         let journal = Arc::new(CompileJournal::new(dir.path().to_path_buf()));
 
@@ -999,8 +998,8 @@ mod tests {
     fn test_extract_outcome_i32_max_exit_code() {
         let resp = Response::CompileResult {
             exit_code: i32::MAX,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: false,
         };
         assert_eq!(extract_outcome(&resp), Some(("error", i32::MAX)));

@@ -35,6 +35,8 @@ pub(crate) struct MemorySnapshot {
     pub(crate) artifact_entries: usize,
     /// Total artifact payload bytes (actual, not estimated).
     pub(crate) artifact_payload_bytes: usize,
+    /// Bytes in spawn_blocking persistence tasks, not yet visible to eviction.
+    pub(crate) in_flight_bytes: usize,
     /// Total estimated bytes across all subsystems.
     pub(crate) total_bytes: usize,
 }
@@ -45,6 +47,7 @@ pub(crate) fn memory_snapshot(
     dep_graph: &DepGraph,
     fast_hit_cache: &DashMap<ContextKey, FastHitEntry>,
     artifacts: &DashMap<String, CachedArtifact>,
+    in_flight_bytes: usize,
 ) -> MemorySnapshot {
     let metadata_entries = cache_system.metadata().len();
     let journal_entries = cache_system.journal().last_change_len();
@@ -73,7 +76,8 @@ pub(crate) fn memory_snapshot(
         + depgraph_contexts * DEPGRAPH_CONTEXT_BYTES
         + fast_hit_entries * FAST_HIT_ENTRY_BYTES
         + artifact_entries * ARTIFACT_OVERHEAD_BYTES
-        + artifact_payload_bytes;
+        + artifact_payload_bytes
+        + in_flight_bytes;
 
     MemorySnapshot {
         metadata_entries,
@@ -83,6 +87,7 @@ pub(crate) fn memory_snapshot(
         fast_hit_entries,
         artifact_entries,
         artifact_payload_bytes,
+        in_flight_bytes,
         total_bytes,
     }
 }
@@ -105,8 +110,15 @@ pub(crate) fn evict_to_budget(
     dep_graph: &DepGraph,
     fast_hit_cache: &DashMap<ContextKey, FastHitEntry>,
     artifacts: &DashMap<String, CachedArtifact>,
+    in_flight_bytes: usize,
 ) -> (u64, usize) {
-    let snap = memory_snapshot(cache_system, dep_graph, fast_hit_cache, artifacts);
+    let snap = memory_snapshot(
+        cache_system,
+        dep_graph,
+        fast_hit_cache,
+        artifacts,
+        in_flight_bytes,
+    );
 
     if (snap.total_bytes as u64) <= budget_bytes {
         return (0, 0);
@@ -198,7 +210,7 @@ mod tests {
     #[test]
     fn snapshot_empty() {
         let (cs, dg, fh, art) = empty_caches();
-        let snap = memory_snapshot(&cs, &dg, &fh, &art);
+        let snap = memory_snapshot(&cs, &dg, &fh, &art, 0);
         assert_eq!(snap.total_bytes, 0);
         assert_eq!(snap.metadata_entries, 0);
         assert_eq!(snap.fast_hit_entries, 0);
@@ -219,7 +231,7 @@ mod tests {
             },
         );
 
-        let snap = memory_snapshot(&cs, &dg, &fh, &DashMap::new());
+        let snap = memory_snapshot(&cs, &dg, &fh, &DashMap::new(), 0);
         assert_eq!(snap.fast_hit_entries, 1);
         assert!(snap.total_bytes >= FAST_HIT_ENTRY_BYTES);
     }
@@ -227,7 +239,7 @@ mod tests {
     #[test]
     fn evict_noop_under_budget() {
         let (cs, dg, fh, art) = empty_caches();
-        let (freed, items) = evict_to_budget(1_073_741_824, &cs, &dg, &fh, &art);
+        let (freed, items) = evict_to_budget(1_073_741_824, &cs, &dg, &fh, &art, 0);
         assert_eq!(freed, 0);
         assert_eq!(items, 0);
     }
@@ -249,7 +261,7 @@ mod tests {
         }
 
         let budget = 1000; // Very small budget.
-        let (freed, items) = evict_to_budget(budget, &cs, &dg, &fh, &art);
+        let (freed, items) = evict_to_budget(budget, &cs, &dg, &fh, &art, 0);
         assert!(freed > 0);
         assert_eq!(items, 100); // All fast-hit entries evicted.
         assert!(fh.is_empty());
@@ -279,7 +291,7 @@ mod tests {
         cs.apply_changes(paths);
 
         let budget = 1000; // Very small budget.
-        let (freed, items) = evict_to_budget(budget, &cs, &dg, &fh, &art);
+        let (freed, items) = evict_to_budget(budget, &cs, &dg, &fh, &art, 0);
         assert!(freed > 0);
         assert!(items > 0);
         // Metadata should be reduced.
@@ -310,10 +322,56 @@ mod tests {
         }
 
         let budget = 1000; // Very small budget.
-        let (freed, items) = evict_to_budget(budget, &cs, &dg, &fh, &art);
+        let (freed, items) = evict_to_budget(budget, &cs, &dg, &fh, &art, 0);
         assert!(freed > 0);
         assert!(items > 0);
         // Depgraph contexts should be cleared (trim(ZERO) removes all).
         assert_eq!(dg.stats().context_count, 0);
+    }
+
+    #[test]
+    fn snapshot_includes_in_flight_bytes() {
+        let (cs, dg, fh, art) = empty_caches();
+        let snap = memory_snapshot(&cs, &dg, &fh, &art, 500_000);
+        assert_eq!(snap.in_flight_bytes, 500_000);
+        assert_eq!(snap.total_bytes, 500_000);
+    }
+
+    #[test]
+    fn in_flight_bytes_push_over_budget_triggers_eviction() {
+        let (cs, dg, fh, art) = empty_caches();
+
+        // Add fast-hit entries worth 100 * 200 = 20_000 bytes estimated.
+        for i in 0..100 {
+            fh.insert(
+                make_context_key(&format!("/tmp/inflight{i}.c")),
+                FastHitEntry {
+                    clock: zccache_fscache::Clock::ZERO,
+                    artifact_key_hex: String::new(),
+                    cached_at: Instant::now(),
+                },
+            );
+        }
+
+        // Budget of 100_000 — fast-hit alone (20_000) fits fine.
+        let (freed, items) = evict_to_budget(100_000, &cs, &dg, &fh, &art, 0);
+        assert_eq!(freed, 0);
+        assert_eq!(items, 0);
+
+        // Now add 90_000 in-flight bytes → total = 110_000 > 100_000 budget.
+        let (freed, items) = evict_to_budget(100_000, &cs, &dg, &fh, &art, 90_000);
+        assert!(freed > 0);
+        assert!(items > 0);
+        // Fast-hit entries should have been evicted to bring total under budget.
+        assert!(fh.is_empty());
+    }
+
+    #[test]
+    fn in_flight_bytes_alone_over_budget_evicts_nothing_when_caches_empty() {
+        let (cs, dg, fh, art) = empty_caches();
+        // In-flight bytes exceed budget but there's nothing to evict.
+        let (freed, items) = evict_to_budget(1000, &cs, &dg, &fh, &art, 50_000);
+        assert_eq!(freed, 0);
+        assert_eq!(items, 0);
     }
 }

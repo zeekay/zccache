@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// A request from client to daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -124,10 +125,10 @@ pub enum Response {
     CompileResult {
         /// Compiler exit code.
         exit_code: i32,
-        /// Captured stdout.
-        stdout: Vec<u8>,
-        /// Captured stderr.
-        stderr: Vec<u8>,
+        /// Captured stdout (Arc-wrapped to avoid copies on cache hits).
+        stdout: Arc<Vec<u8>>,
+        /// Captured stderr (Arc-wrapped to avoid copies on cache hits).
+        stderr: Arc<Vec<u8>>,
         /// Whether this was served from cache.
         cached: bool,
     },
@@ -140,10 +141,10 @@ pub enum Response {
     LinkResult {
         /// Tool exit code.
         exit_code: i32,
-        /// Captured stdout.
-        stdout: Vec<u8>,
-        /// Captured stderr.
-        stderr: Vec<u8>,
+        /// Captured stdout (Arc-wrapped to avoid copies on cache hits).
+        stdout: Arc<Vec<u8>>,
+        /// Captured stderr (Arc-wrapped to avoid copies on cache hits).
+        stderr: Arc<Vec<u8>>,
         /// Whether this was served from cache.
         cached: bool,
         /// Non-determinism warning (if tool invocation uses non-deterministic flags).
@@ -249,9 +250,9 @@ pub struct ArtifactData {
     /// The output files (filename to contents).
     pub outputs: Vec<ArtifactOutput>,
     /// Captured stdout from the compiler.
-    pub stdout: Vec<u8>,
+    pub stdout: Arc<Vec<u8>>,
     /// Captured stderr from the compiler.
-    pub stderr: Vec<u8>,
+    pub stderr: Arc<Vec<u8>>,
     /// Compiler exit code.
     pub exit_code: i32,
 }
@@ -286,8 +287,8 @@ pub struct SessionStats {
 pub struct ArtifactOutput {
     /// Relative filename (e.g., "foo.o").
     pub name: String,
-    /// File contents.
-    pub data: Vec<u8>,
+    /// File contents (Arc-wrapped to avoid deep copies during caching).
+    pub data: Arc<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -506,15 +507,15 @@ mod tests {
     fn link_result_roundtrip() {
         roundtrip(&Response::LinkResult {
             exit_code: 0,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: true,
             warning: None,
         });
         roundtrip(&Response::LinkResult {
             exit_code: 0,
-            stdout: vec![],
-            stderr: b"some warning".to_vec(),
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(b"some warning".to_vec()),
             cached: false,
             warning: Some("non-deterministic: missing D flag".into()),
         });
@@ -568,8 +569,8 @@ mod tests {
         roundtrip(&Response::ShuttingDown);
         roundtrip(&Response::CompileResult {
             exit_code: 0,
-            stdout: vec![],
-            stderr: vec![],
+            stdout: Arc::new(vec![]),
+            stderr: Arc::new(vec![]),
             cached: true,
         });
         roundtrip(&Response::Error {
@@ -608,4 +609,47 @@ mod tests {
 
     // Compile-time check: PROTOCOL_VERSION must be positive.
     const _: () = assert!(crate::PROTOCOL_VERSION > 0);
+
+    #[test]
+    fn artifact_clone_shares_payload_via_arc() {
+        let artifact = ArtifactData {
+            outputs: vec![ArtifactOutput {
+                name: "test.o".into(),
+                data: Arc::new(vec![1, 2, 3, 4]),
+            }],
+            stdout: Arc::new(vec![5, 6]),
+            stderr: Arc::new(vec![7, 8]),
+            exit_code: 0,
+        };
+
+        let cloned = artifact.clone();
+
+        // Arc::clone bumps refcount — both point to the same allocation.
+        assert!(Arc::ptr_eq(
+            &artifact.outputs[0].data,
+            &cloned.outputs[0].data
+        ));
+        assert!(Arc::ptr_eq(&artifact.stdout, &cloned.stdout));
+        assert!(Arc::ptr_eq(&artifact.stderr, &cloned.stderr));
+    }
+
+    #[test]
+    fn arc_vec_u8_roundtrip_matches_plain_vec() {
+        // Prove Arc<Vec<u8>> serializes identically to Vec<u8>.
+        let plain: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let arc_wrapped: Arc<Vec<u8>> = Arc::new(plain.clone());
+
+        let plain_bytes = bincode::serialize(&plain).unwrap();
+        let arc_bytes = bincode::serialize(&arc_wrapped).unwrap();
+        assert_eq!(
+            plain_bytes, arc_bytes,
+            "Arc<Vec<u8>> must serialize identically to Vec<u8>"
+        );
+
+        // Deserialize Arc bytes back as plain Vec and vice versa.
+        let decoded_plain: Vec<u8> = bincode::deserialize(&arc_bytes).unwrap();
+        let decoded_arc: Arc<Vec<u8>> = bincode::deserialize(&plain_bytes).unwrap();
+        assert_eq!(decoded_plain, plain);
+        assert_eq!(*decoded_arc, plain);
+    }
 }

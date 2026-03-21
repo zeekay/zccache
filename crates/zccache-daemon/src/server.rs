@@ -3,7 +3,7 @@
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use zccache_depgraph::{
@@ -103,6 +103,11 @@ struct SharedState {
     pch_source_map: DashMap<PathBuf, PathBuf>,
     /// JSONL compile journal for build replay.
     journal: CompileJournal,
+    /// Bytes currently in spawn_blocking persistence tasks, invisible to eviction.
+    in_flight_bytes: AtomicUsize,
+    /// Limits concurrent disk persistence tasks to prevent memory pileup
+    /// when disk I/O is slow and compilation requests are fast.
+    persist_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Pre-computed compile request data for the request-level fast path.
@@ -221,6 +226,8 @@ impl DaemonServer {
                 watched_raw_dirs: DashMap::new(),
                 pch_source_map: DashMap::new(),
                 journal: CompileJournal::new(zccache_core::config::log_dir()),
+                in_flight_bytes: AtomicUsize::new(0),
+                persist_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             }),
         })
     }
@@ -287,6 +294,7 @@ impl DaemonServer {
                         &state.dep_graph,
                         &state.fast_hit_cache,
                         &state.artifacts,
+                        state.in_flight_bytes.load(Ordering::Relaxed),
                     );
                     if items > 0 {
                         tracing::info!(
@@ -1022,7 +1030,7 @@ async fn handle_link_ephemeral(
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            if let Err(e) = std::fs::write(&target, &out.data) {
+            if let Err(e) = std::fs::write(&target, &*out.data) {
                 tracing::warn!("failed to write cached output {}: {e}", target.display());
                 return run_tool_passthrough(tool, args, cwd, env).await;
             }
@@ -1064,7 +1072,7 @@ async fn handle_link_ephemeral(
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned(),
-                data,
+                data: Arc::new(data),
             }];
 
             // Collect secondary outputs (e.g., MSVC import lib + .exp)
@@ -1081,7 +1089,7 @@ async fn handle_link_ephemeral(
                             .unwrap_or_default()
                             .to_string_lossy()
                             .into_owned(),
-                        data: sec_data,
+                        data: Arc::new(sec_data),
                     });
                 }
                 // Missing secondary outputs are silently skipped —
@@ -1095,16 +1103,30 @@ async fn handle_link_ephemeral(
                 exit_code: 0,
             };
 
-            // Persist to disk in background
+            // Persist to disk in background (Arc clone is O(1))
             {
                 let artifact_dir = state.artifact_dir.clone();
                 let kh = key_hex.clone();
                 let artifact_clone = artifact.clone();
-                tokio::task::spawn_blocking(move || {
-                    let meta_path = artifact_dir.join(format!("{kh}.meta"));
-                    if let Ok(encoded) = bincode::serialize(&artifact_clone) {
-                        std::fs::write(&meta_path, &encoded).ok();
-                    }
+                let payload_size: usize = artifact_clone.outputs.iter().map(|o| o.data.len()).sum();
+                state
+                    .in_flight_bytes
+                    .fetch_add(payload_size, Ordering::Relaxed);
+                let sem = Arc::clone(&state.persist_semaphore);
+                let state_ref = Arc::clone(state);
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    tokio::task::spawn_blocking(move || {
+                        let meta_path = artifact_dir.join(format!("{kh}.meta"));
+                        if let Ok(encoded) = bincode::serialize(&artifact_clone) {
+                            std::fs::write(&meta_path, &encoded).ok();
+                        }
+                        state_ref
+                            .in_flight_bytes
+                            .fetch_sub(payload_size, Ordering::Relaxed);
+                    })
+                    .await
+                    .ok();
                 });
             }
 
@@ -1171,8 +1193,8 @@ async fn run_tool_passthrough(
     match cmd.output() {
         Ok(output) => Response::LinkResult {
             exit_code: output.status.code().unwrap_or(1),
-            stdout: output.stdout,
-            stderr: output.stderr,
+            stdout: Arc::new(output.stdout),
+            stderr: Arc::new(output.stderr),
             cached: false,
             warning: None,
         },
@@ -2079,8 +2101,8 @@ async fn handle_compile(
                 tracing::warn!("failed to read output file {}: {e}", output_path.display());
                 return Response::CompileResult {
                     exit_code,
-                    stdout,
-                    stderr,
+                    stdout: Arc::new(stdout),
+                    stderr: Arc::new(stderr),
                     cached: false,
                 };
             }
@@ -2231,44 +2253,53 @@ async fn handle_compile(
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned(),
-                    data: output_data,
+                    data: Arc::new(output_data),
                 }],
-                stdout: stdout.clone(),
-                stderr: stderr.clone(),
+                stdout: Arc::new(stdout.clone()),
+                stderr: Arc::new(stderr.clone()),
                 exit_code,
             };
 
             let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
 
-            // Spawn disk persistence to background — the in-memory cache is
-            // immediately available for future hits; disk writes (for hardlink
-            // optimization and daemon restart persistence) don't need to block
-            // the response.
+            // Spawn disk persistence to background (Arc clone is O(1))
             {
                 let artifact_dir = state.artifact_dir.clone();
                 let key_hex = artifact_key_hex.clone();
                 let artifact_clone = artifact.clone();
-                tokio::task::spawn_blocking(move || {
-                    // Persist outputs to on-disk cache for hardlink optimization.
-                    for (i, out) in artifact_clone.outputs.iter().enumerate() {
-                        let cache_path = artifact_dir.join(format!("{key_hex}_{i}"));
-                        if let Err(e) = std::fs::write(&cache_path, &out.data) {
-                            tracing::warn!(
-                                path = %cache_path.display(),
-                                "failed to persist artifact output: {e}"
-                            );
+                let payload_size: usize = artifact_clone.outputs.iter().map(|o| o.data.len()).sum();
+                state
+                    .in_flight_bytes
+                    .fetch_add(payload_size, Ordering::Relaxed);
+                let sem = Arc::clone(&state.persist_semaphore);
+                let state_ref = Arc::clone(state_arc);
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    tokio::task::spawn_blocking(move || {
+                        for (i, out) in artifact_clone.outputs.iter().enumerate() {
+                            let cache_path = artifact_dir.join(format!("{key_hex}_{i}"));
+                            if let Err(e) = std::fs::write(&cache_path, &*out.data) {
+                                tracing::warn!(
+                                    path = %cache_path.display(),
+                                    "failed to persist artifact output: {e}"
+                                );
+                            }
                         }
-                    }
-                    // Persist .meta sidecar so artifacts survive daemon restarts.
-                    let meta_path = artifact_dir.join(format!("{key_hex}.meta"));
-                    if let Ok(meta_bytes) = bincode::serialize(&artifact_clone) {
-                        if let Err(e) = std::fs::write(&meta_path, &meta_bytes) {
-                            tracing::warn!(
-                                path = %meta_path.display(),
-                                "failed to persist artifact meta: {e}"
-                            );
+                        let meta_path = artifact_dir.join(format!("{key_hex}.meta"));
+                        if let Ok(meta_bytes) = bincode::serialize(&artifact_clone) {
+                            if let Err(e) = std::fs::write(&meta_path, &meta_bytes) {
+                                tracing::warn!(
+                                    path = %meta_path.display(),
+                                    "failed to persist artifact meta: {e}"
+                                );
+                            }
                         }
-                    }
+                        state_ref
+                            .in_flight_bytes
+                            .fetch_sub(payload_size, Ordering::Relaxed);
+                    })
+                    .await
+                    .ok();
                 });
             }
 
@@ -2317,8 +2348,8 @@ async fn handle_compile(
 
     Response::CompileResult {
         exit_code,
-        stdout,
-        stderr,
+        stdout: Arc::new(stdout),
+        stderr: Arc::new(stderr),
         cached: false,
     }
 }
@@ -2345,8 +2376,8 @@ struct PendingWrite {
 enum UnitCacheResult {
     /// Cache hit — output write is deferred for batching.
     Hit {
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
+        stdout: Arc<Vec<u8>>,
+        stderr: Arc<Vec<u8>>,
         artifact_bytes: u64,
         source_path: PathBuf,
         pending_writes: Vec<PendingWrite>,
@@ -2727,8 +2758,8 @@ async fn handle_compile_multi(
     if miss_sources.is_empty() {
         return Response::CompileResult {
             exit_code: 0,
-            stdout: all_stdout,
-            stderr: all_stderr,
+            stdout: Arc::new(all_stdout),
+            stderr: Arc::new(all_stderr),
             cached: true,
         };
     }
@@ -2799,8 +2830,8 @@ async fn handle_compile_multi(
         record_session_stat(&state.sessions, &sid, |t| t.record_error());
         return Response::CompileResult {
             exit_code,
-            stdout: all_stdout,
-            stderr: all_stderr,
+            stdout: Arc::new(all_stdout),
+            stderr: Arc::new(all_stderr),
             cached: false,
         };
     }
@@ -2907,40 +2938,54 @@ async fn handle_compile_multi(
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned(),
-                    data: output_data,
+                    data: Arc::new(output_data),
                 }],
-                stdout: Vec::new(),
-                stderr: Vec::new(),
+                stdout: Arc::new(Vec::new()),
+                stderr: Arc::new(Vec::new()),
                 exit_code: 0,
             };
 
             let artifact_key_hex = artifact_key.hash().to_hex();
             let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
 
-            // Spawn disk persistence to background (same as single-file path).
+            // Spawn disk persistence to background (Arc clone is O(1))
             {
                 let artifact_dir = state.artifact_dir.clone();
                 let key_hex = artifact_key_hex.clone();
                 let artifact_clone = artifact.clone();
-                tokio::task::spawn_blocking(move || {
-                    for (i, out) in artifact_clone.outputs.iter().enumerate() {
-                        let cache_path = artifact_dir.join(format!("{key_hex}_{i}"));
-                        if let Err(e) = std::fs::write(&cache_path, &out.data) {
-                            tracing::warn!(
-                                path = %cache_path.display(),
-                                "failed to persist artifact output: {e}"
-                            );
+                let payload_size: usize = artifact_clone.outputs.iter().map(|o| o.data.len()).sum();
+                state
+                    .in_flight_bytes
+                    .fetch_add(payload_size, Ordering::Relaxed);
+                let sem = Arc::clone(&state.persist_semaphore);
+                let state_ref = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    tokio::task::spawn_blocking(move || {
+                        for (i, out) in artifact_clone.outputs.iter().enumerate() {
+                            let cache_path = artifact_dir.join(format!("{key_hex}_{i}"));
+                            if let Err(e) = std::fs::write(&cache_path, &*out.data) {
+                                tracing::warn!(
+                                    path = %cache_path.display(),
+                                    "failed to persist artifact output: {e}"
+                                );
+                            }
                         }
-                    }
-                    let meta_path = artifact_dir.join(format!("{key_hex}.meta"));
-                    if let Ok(meta_bytes) = bincode::serialize(&artifact_clone) {
-                        if let Err(e) = std::fs::write(&meta_path, &meta_bytes) {
-                            tracing::warn!(
-                                path = %meta_path.display(),
-                                "failed to persist artifact meta: {e}"
-                            );
+                        let meta_path = artifact_dir.join(format!("{key_hex}.meta"));
+                        if let Ok(meta_bytes) = bincode::serialize(&artifact_clone) {
+                            if let Err(e) = std::fs::write(&meta_path, &meta_bytes) {
+                                tracing::warn!(
+                                    path = %meta_path.display(),
+                                    "failed to persist artifact meta: {e}"
+                                );
+                            }
                         }
-                    }
+                        state_ref
+                            .in_flight_bytes
+                            .fetch_sub(payload_size, Ordering::Relaxed);
+                    })
+                    .await
+                    .ok();
                 });
             }
 
@@ -2977,8 +3022,8 @@ async fn handle_compile_multi(
 
     Response::CompileResult {
         exit_code: 0,
-        stdout: all_stdout,
-        stderr: all_stderr,
+        stdout: Arc::new(all_stdout),
+        stderr: Arc::new(all_stderr),
         cached: false,
     }
 }
@@ -3003,8 +3048,8 @@ async fn run_compiler_direct(
             write_session_log(sessions, sid, &format!("[DIRECT] exit_code={exit_code}"));
             Response::CompileResult {
                 exit_code,
-                stdout: output.stdout,
-                stderr: output.stderr,
+                stdout: Arc::new(output.stdout),
+                stderr: Arc::new(output.stderr),
                 cached: false,
             }
         }

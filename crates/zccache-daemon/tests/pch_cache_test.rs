@@ -71,7 +71,7 @@ async fn compile_raw(
             cached,
             stderr,
             ..
-        }) => (exit_code, cached, stderr),
+        }) => (exit_code, cached, (*stderr).clone()),
         Some(Response::Error { message }) => panic!("compile error: {message}"),
         other => panic!("expected CompileResult, got: {other:?}"),
     }
