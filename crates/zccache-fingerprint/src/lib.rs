@@ -25,6 +25,9 @@ pub mod two_layer;
 
 pub use decision::{CacheDecision, RunReason};
 pub use error::{FingerprintError, Result};
-pub use hash_cache::HashCache;
+pub use hash_cache::{compute_aggregate_hash, HashCache};
 pub use scan::{walk_files, walk_files_glob, ScannedFile};
 pub use two_layer::TwoLayerCache;
+
+#[cfg(feature = "python")]
+mod python;

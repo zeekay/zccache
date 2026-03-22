@@ -6,9 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 
 
+[lib]
+name = "zccache_fingerprint"
+crate-type = ["cdylib", "lib"]
+
 [[bin]]
 name = "zccache-fingerprint"
 path = "src/main.rs"
+
+[features]
+default = []
+python = ["dep:pyo3"]
 
 [dependencies]
 clap = { workspace = true }
@@ -20,6 +28,7 @@ tracing = { workspace = true }
 walkdir = "2"
 fs2 = "0.4"
 globset = "0.4"
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

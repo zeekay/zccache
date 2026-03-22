@@ -27,8 +27,11 @@ Thumbs.db
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.so
 .venv/
 *.egg-info/
 dist/
 build/
 uv.lock
+.pytest_cache/

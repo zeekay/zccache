@@ -71,7 +71,66 @@ zccache-fingerprint --cache-file .cache/lint.json invalidate
 
 If `mark-failure` is called instead, the next `check` will always return "run needed".
 
-## Library
+## Python Bindings
+
+Install from PyPI:
+
+```bash
+pip install zccache-fingerprint
+```
+
+### Quick Start
+
+```python
+from zccache.fingerprint import Api, FingerprintResult, FingerprintManager
+
+# Hash a directory (Rust + blake3, fast)
+h = Api.hash_files("src", ["rs", "toml"], [".git", "target"])
+
+# Glob-based scanning
+h = Api.hash_files_glob(".", ["src/**/*.rs", "Cargo.toml"], ["target/**"])
+
+# Per-file hashes
+for path, hash in Api.walk_and_hash("src", ["rs"]):
+    print(f"{path}: {hash}")
+
+# Convenience: parse "**/*.h,**/*.cpp" glob strings
+h = Api.hash_directory("src", "**/*.h,**/*.cpp,**/*.hpp")
+
+# Full fingerprint with timing
+result = Api.fingerprint_code_base("src")
+print(result.hash, result.elapsed_seconds)
+```
+
+### Cache Management
+
+```python
+from pathlib import Path
+from zccache.fingerprint import Api, FingerprintResult, FingerprintManager
+
+mgr = FingerprintManager(cache_dir=Path(".cache"), build_mode="debug")
+
+should_run = mgr.check("my_tests", lambda: FingerprintResult(
+    hash=Api.hash_files("src", ["rs"], [".git", "target"])
+))
+
+if should_run:
+    run_tests()
+    mgr.update_test_metadata("my_tests", num_tests_run=42, num_tests_passed=42, duration_seconds=1.5)
+    mgr.save_all("success")
+```
+
+### Building from Source
+
+```bash
+cd crates/zccache-fingerprint
+uv venv .venv
+uv pip install maturin pytest --python .venv/Scripts/python.exe
+.venv/Scripts/python.exe -m maturin develop --features python
+.venv/Scripts/python.exe -m pytest python/tests/ -v
+```
+
+## Rust Library
 
 The crate also exports its API for use as a Rust library:
 

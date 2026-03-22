@@ -5,6 +5,31 @@ use crate::error::Result;
 use crate::persist::{self, HashCacheData};
 use crate::scan::ScannedFile;
 
+/// Compute an aggregate blake3 hash over a sorted list of files.
+///
+/// Each file contributes its relative path and content to the hash. Domain
+/// separation and a file-count trailer prevent ambiguity and detect
+/// empty ↔ non-empty transitions.
+pub fn compute_aggregate_hash(files: &[ScannedFile]) -> Result<String> {
+    let mut hasher = zccache_hash::StreamHasher::new();
+    // Domain separation.
+    hasher.update(b"zccache-fingerprint-v1");
+
+    // Files are already sorted by relative path from walk_files().
+    for file in files {
+        hasher.update(file.relative.as_bytes());
+        hasher.update(b"\0");
+        let content = std::fs::read(&file.absolute)?;
+        hasher.update(&content);
+    }
+
+    // Include file count to detect empty → non-empty transitions.
+    hasher.update(b"\0file_count:");
+    hasher.update(files.len().to_le_bytes().as_slice());
+
+    Ok(hasher.finalize().to_hex())
+}
+
 /// Aggregate fingerprint cache: single blake3 hash of an entire file set.
 ///
 /// Suited for operations where the decision is all-or-nothing (e.g., "run all
@@ -116,23 +141,7 @@ impl HashCache {
     }
 
     fn compute_hash(&self, files: &[ScannedFile]) -> Result<String> {
-        let mut hasher = zccache_hash::StreamHasher::new();
-        // Domain separation.
-        hasher.update(b"zccache-fingerprint-v1");
-
-        // Files are already sorted by relative path from walk_files().
-        for file in files {
-            hasher.update(file.relative.as_bytes());
-            hasher.update(b"\0");
-            let content = std::fs::read(&file.absolute)?;
-            hasher.update(&content);
-        }
-
-        // Include file count to detect empty → non-empty transitions.
-        hasher.update(b"\0file_count:");
-        hasher.update(files.len().to_le_bytes().as_slice());
-
-        Ok(hasher.finalize().to_hex())
+        compute_aggregate_hash(files)
     }
 }
 
