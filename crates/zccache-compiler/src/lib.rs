@@ -78,6 +78,10 @@ pub struct CacheableCompilation {
     pub output_file: PathBuf,
     /// The full original argument list — always passed to the compiler as-is.
     pub original_args: Arc<[String]>,
+    /// Flags not recognized by the parser but still part of the invocation.
+    /// Preserved for completeness and consistency with the linker/archiver/
+    /// depgraph parsers which all track unknown flags.
+    pub unknown_flags: Vec<String>,
 }
 
 /// Check if a `-x` language value is a header language (PCH generation).
@@ -158,6 +162,8 @@ const FLAGS_WITH_VALUE: &[&str] = &[
     "-U",
     "-I",
     "-isystem",
+    "-iquote",
+    "-idirafter",
     "-include",
     "-include-pch",
     "-isysroot",
@@ -169,6 +175,9 @@ const FLAGS_WITH_VALUE: &[&str] = &[
     "-std",
     "-x",
     "-arch",
+    "-Xclang",
+    "-mllvm",
+    "--serialize-diagnostics",
 ];
 
 /// Parse a compiler invocation's arguments to determine cacheability.
@@ -184,6 +193,7 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     let mut source_files: Vec<(String, usize, bool)> = Vec::new();
     let mut output_file: Option<String> = None;
     let mut header_mode = false;
+    let mut unknown_flags: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -208,12 +218,17 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             continue;
         }
 
-        // -o takes the next arg as output file
+        // -o takes the next arg as output file, or -o<path> (concatenated)
         if arg == "-o" {
-            i += 1;
-            if i < args.len() {
-                output_file = Some(args[i].clone());
+            if let Some(next) = args.get(i + 1) {
+                output_file = Some(next.clone());
+                i += 2;
+            } else {
+                i += 1;
             }
+            continue;
+        } else if let Some(path) = arg.strip_prefix("-o") {
+            output_file = Some(path.to_string());
             i += 1;
             continue;
         }
@@ -227,8 +242,9 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             continue;
         }
 
-        // Any flag starting with - (including unknown flags) — skip
+        // Any flag starting with - (including unknown flags) — preserve
         if arg.starts_with('-') {
+            unknown_flags.push(arg.clone());
             i += 1;
             continue;
         }
@@ -271,6 +287,7 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
                 source_file: PathBuf::from(src),
                 output_file: PathBuf::from(default_output(src, family, *is_header)),
                 original_args: Arc::clone(&shared_args),
+                unknown_flags: unknown_flags.clone(),
             })
             .collect();
         return ParsedInvocation::MultiFile {
@@ -290,6 +307,7 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
         source_file: PathBuf::from(source),
         output_file: PathBuf::from(output),
         original_args: Arc::from(args.to_vec()),
+        unknown_flags,
     })
 }
 
@@ -844,6 +862,145 @@ mod tests {
         match result {
             ParsedInvocation::Cacheable(c) => {
                 assert_eq!(c.output_file, PathBuf::from("foo.o"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    // ─── Concatenated -o flag tests ──────────────────────────────────
+
+    #[test]
+    fn concatenated_o_flag_parsed() {
+        // `-obuild/foo.o` (no space) is valid for clang/gcc and must be recognized.
+        let result = parse_invocation("clang", &args(&["-c", "foo.cpp", "-obuild/foo.o"]));
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.output_file, PathBuf::from("build/foo.o"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concatenated_o_flag_pch() {
+        // PCH compilation with concatenated -o must preserve the build directory path.
+        // This is the root cause of BUG_LINKER.md: `-opath` was silently dropped
+        // as an unknown flag, causing default_output() to be used instead.
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-header", "pch.h", "-obuild/pch.h.pch"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.output_file, PathBuf::from("build/pch.h.pch"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    // ─── Unknown flags preservation tests ────────────────────────────
+
+    #[test]
+    fn all_flags_preserved() {
+        // Every arg must be accounted for: either recognized by the parser
+        // (source, output, known flag) or captured in unknown_flags.
+        // Nothing is silently dropped.
+        let input = args(&[
+            "-c",
+            "foo.cpp",
+            "-o",
+            "foo.o",
+            "-Wall",
+            "-Wextra",
+            "-O2",
+            "-Xclang",
+            "-fno-spell-checking",
+            "-std=c++17",
+            "-DFOO=bar",
+            "-I/usr/include",
+            "-isystem",
+            "/usr/local/include",
+            "-unknown-future-flag",
+        ]);
+        let result = parse_invocation("clang++", &input);
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
+                assert_eq!(c.output_file, PathBuf::from("foo.o"));
+                // Unknown flags are preserved, not dropped
+                assert!(c.unknown_flags.contains(&"-Wall".to_string()));
+                assert!(c.unknown_flags.contains(&"-Wextra".to_string()));
+                assert!(c.unknown_flags.contains(&"-O2".to_string()));
+                assert!(c
+                    .unknown_flags
+                    .contains(&"-unknown-future-flag".to_string()));
+                // Concatenated known flags end up in unknown_flags
+                // (parser only extracts -o value; -D/-I/-std with joined
+                // values are not in FLAGS_WITH_VALUE so they go here)
+                assert!(c.unknown_flags.contains(&"-std=c++17".to_string()));
+                assert!(c.unknown_flags.contains(&"-DFOO=bar".to_string()));
+                assert!(c.unknown_flags.contains(&"-I/usr/include".to_string()));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xclang_value_not_misidentified_as_source() {
+        // -Xclang takes the next arg as a pass-through value.
+        // Without FLAGS_WITH_VALUE coverage, the value could be
+        // misidentified as a source file.
+        let result = parse_invocation(
+            "clang++",
+            &args(&[
+                "-c",
+                "foo.cpp",
+                "-Xclang",
+                "-fno-spell-checking",
+                "-o",
+                "foo.o",
+            ]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
+                // Only one source file — -fno-spell-checking must NOT be treated as source
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mllvm_value_not_misidentified_as_source() {
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-c", "foo.cpp", "-mllvm", "-some-llvm-opt", "-o", "foo.o"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    // ─── PCH output path mismatch repro (BUG_LINKER.md) ─────────────
+
+    #[test]
+    fn pch_output_path_mismatch_repro() {
+        // Repro for BUG_LINKER.md: when no -o is provided for a nested
+        // source header, default_output() returns filename-only which
+        // doesn't match where clang actually writes (next to source).
+        // The caller (build system) should always provide -o; the parser
+        // must recognize all forms of -o (space-separated and concatenated).
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-header", "src/fl/fx/2d/flowfield_q31.h"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.output_file, PathBuf::from("flowfield_q31.h.pch"));
+                assert_eq!(c.source_file, PathBuf::from("src/fl/fx/2d/flowfield_q31.h"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
