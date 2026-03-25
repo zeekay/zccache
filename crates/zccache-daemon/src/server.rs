@@ -1257,8 +1257,8 @@ async fn handle_link_ephemeral(
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent).ok();
                 }
-                if let Err(e) = std::fs::write(&target, &**payload) {
-                    tracing::warn!("failed to write cached output {}: {e}", target.display());
+                let cache_file = state.artifact_dir.join(format!("{key_hex}_{i}"));
+                if write_cached_output(&target, &cache_file, payload).is_err() {
                     write_ok = false;
                     break;
                 }
@@ -1634,13 +1634,16 @@ fn build_compile_context(
 /// 2. If that fails, remove existing output and retry hardlink (2 syscalls)
 /// 3. Fall back to fs::write from memory (1 syscall)
 fn write_cached_output(out_path: &Path, cache_file: &Path, data: &[u8]) -> std::io::Result<()> {
-    // Ultra-fast path: if output already exists with matching size, it was
-    // written by a previous warm hit (hardlink or copy). Skip the write
-    // entirely — one stat() is cheaper than remove + hardlink.
-    if let Ok(meta) = std::fs::metadata(out_path) {
-        if meta.len() == data.len() as u64 {
-            return Ok(());
-        }
+    // Fast path: if output is already a hardlink to the cache file (same
+    // file identity), skip the write entirely. This is the common case
+    // during incremental builds where the same artifact is hit repeatedly.
+    //
+    // NOTE: We compare file identity (inode/volume+index), NOT file size.
+    // Two different compilations can produce .o files with identical sizes
+    // but different content (alignment, padding). A size-only check would
+    // leave a stale .o on disk, causing linker errors downstream.
+    if same_file(out_path, cache_file) {
+        return Ok(());
     }
     // Fast path: hardlink directly (works when out_path doesn't exist yet)
     if std::fs::hard_link(cache_file, out_path).is_ok() {
@@ -1653,6 +1656,68 @@ fn write_cached_output(out_path: &Path, cache_file: &Path, data: &[u8]) -> std::
     }
     // Hardlink failed entirely (cross-device, no cache file) — copy from memory
     std::fs::write(out_path, data)
+}
+
+/// Check if two paths refer to the same file (hardlink check).
+///
+/// Returns `false` if either file doesn't exist or the check fails.
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    get_file_id(a)
+        .zip(get_file_id(b))
+        .map(|(ia, ib)| ia == ib)
+        .unwrap_or(false)
+}
+
+/// Returns (volume_serial, file_index_high, file_index_low) for a path.
+#[cfg(windows)]
+fn get_file_id(path: &Path) -> Option<(u32, u32, u32)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            0, // no access needed, just metadata
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return None;
+        }
+
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        let ok = GetFileInformationByHandle(handle, &mut info);
+        CloseHandle(handle);
+
+        if ok == 0 {
+            return None;
+        }
+
+        Some((
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ))
+    }
 }
 
 /// Expand response file references with caching.
@@ -3997,5 +4062,102 @@ mod tests {
         let pch_map: DashMap<PathBuf, PathBuf> = DashMap::new();
         let result = resolve_pch_source(Path::new("/build/foo.o"), &pch_map);
         assert_eq!(result, None);
+    }
+
+    // ── write_cached_output staleness tests ────────────────────────────
+
+    /// Regression test: write_cached_output must overwrite an existing output
+    /// file even when the existing file has the same size as the cached data.
+    ///
+    /// This reproduces the linker staleness bug where a header change produces
+    /// a .o of the same size but different content — the old size-only check
+    /// skipped the write, leaving a stale .o on disk with missing symbols.
+    #[test]
+    fn write_cached_output_overwrites_same_size_different_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("output.o");
+        let cache = dir.path().join("cached.o");
+
+        // Simulate: output.o exists from a previous compilation (version A).
+        let old_content = b"AAAA_symbols_v1_xxxx";
+        std::fs::write(&out, old_content).unwrap();
+
+        // Simulate: cache file has new content (version B) — same size, different bytes.
+        let new_content = b"BBBB_symbols_v2_yyyy";
+        assert_eq!(
+            old_content.len(),
+            new_content.len(),
+            "test requires same size"
+        );
+        std::fs::write(&cache, new_content).unwrap();
+
+        // write_cached_output must replace the stale output with the cached content.
+        write_cached_output(&out, &cache, new_content).unwrap();
+
+        let result = std::fs::read(&out).unwrap();
+        assert_eq!(
+            result, new_content,
+            "output must contain new content, not stale old content"
+        );
+    }
+
+    /// write_cached_output correctly creates the output when it doesn't exist.
+    #[test]
+    fn write_cached_output_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("output.o");
+        let cache = dir.path().join("cached.o");
+
+        let content = b"fresh object file data";
+        std::fs::write(&cache, content).unwrap();
+
+        write_cached_output(&out, &cache, content).unwrap();
+
+        let result = std::fs::read(&out).unwrap();
+        assert_eq!(result, content.as_slice());
+    }
+
+    /// write_cached_output falls back to memory copy when cache file is missing.
+    #[test]
+    fn write_cached_output_fallback_to_memory_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("output.o");
+        let cache = dir.path().join("nonexistent_cache.o");
+
+        let content = b"data from memory";
+
+        write_cached_output(&out, &cache, content).unwrap();
+
+        let result = std::fs::read(&out).unwrap();
+        assert_eq!(result, content.as_slice());
+    }
+
+    /// write_cached_output skips the write when output is already a hardlink
+    /// to the cache file (same file identity). This is the fast path for
+    /// repeated cache hits with the same artifact key.
+    #[test]
+    fn write_cached_output_skips_when_already_hardlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cached.o");
+        let out = dir.path().join("output.o");
+
+        let content = b"cached artifact content";
+        std::fs::write(&cache, content).unwrap();
+
+        // First write: creates hardlink
+        write_cached_output(&out, &cache, content).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), content.as_slice());
+
+        // Verify they are the same file (hardlink).
+        assert!(
+            same_file(&out, &cache),
+            "output should be a hardlink to cache file after first write"
+        );
+
+        // Second write: should detect hardlink and skip.
+        // (If it didn't skip, it would still produce correct content,
+        //  but the test verifies the optimization path exists.)
+        write_cached_output(&out, &cache, content).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), content.as_slice());
     }
 }

@@ -102,7 +102,7 @@ pub fn detect_family(compiler: &str) -> CompilerFamily {
         Some((stem, _)) => stem,
         None => basename,
     };
-    if name.contains("clang") {
+    if name.contains("clang") || name == "emcc" || name == "em++" {
         CompilerFamily::Clang
     } else if name.eq_ignore_ascii_case("cl") {
         CompilerFamily::Msvc
@@ -737,6 +737,16 @@ mod tests {
         assert_eq!(detect_family("/usr/bin/clang"), CompilerFamily::Clang);
         assert_eq!(detect_family("gcc"), CompilerFamily::Gcc);
         assert_eq!(detect_family("g++"), CompilerFamily::Gcc);
+    }
+
+    #[test]
+    fn detect_emcc_family() {
+        assert_eq!(detect_family("emcc"), CompilerFamily::Clang);
+        assert_eq!(detect_family("em++"), CompilerFamily::Clang);
+        assert_eq!(detect_family("/usr/bin/emcc"), CompilerFamily::Clang);
+        assert_eq!(detect_family("emcc.exe"), CompilerFamily::Clang);
+        // emcc supports -MD -MF (same as clang)
+        assert!(CompilerFamily::Clang.supports_depfile());
     }
 
     #[test]

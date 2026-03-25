@@ -124,13 +124,14 @@ fn detect_family(tool: &str) -> Option<LinkerFamily> {
         return Some(LinkerFamily::MsvcLink);
     }
 
-    // LLVM lld variants: lld, ld.lld, ld.lld-17, lld-17, etc.
+    // LLVM lld variants: lld, ld.lld, ld.lld-17, lld-17, wasm-ld, etc.
     // Check full_name first for dotted names, then stem for simple names.
     // Must come before GNU ld to avoid "ld.lld" matching as "ld".
     if full_name == "ld.lld"
         || full_name.starts_with("ld.lld-")
         || stem == "lld"
         || stem.starts_with("lld-")
+        || stem == "wasm-ld"
     {
         return Some(LinkerFamily::Lld);
     }
@@ -151,8 +152,8 @@ fn is_compiler_driver(tool: &str) -> bool {
         .and_then(|s| s.to_str())
         .unwrap_or(tool);
 
-    // clang++, clang-17, x86_64-w64-mingw32-gcc, etc.
-    matches!(stem, "cc" | "c++")
+    // clang++, clang-17, x86_64-w64-mingw32-gcc, emcc, em++, etc.
+    matches!(stem, "cc" | "c++" | "emcc" | "em++")
         || stem == "gcc"
         || stem == "g++"
         || stem.ends_with("-gcc")
@@ -669,6 +670,17 @@ mod tests {
         assert_eq!(detect_family("ld.lld"), Some(LinkerFamily::Lld));
         assert_eq!(detect_family("ld.lld-17"), Some(LinkerFamily::Lld));
         assert_eq!(detect_family("/usr/bin/lld"), Some(LinkerFamily::Lld));
+    }
+
+    #[test]
+    fn detect_wasm_ld() {
+        assert_eq!(detect_family("wasm-ld"), Some(LinkerFamily::Lld));
+        assert_eq!(detect_family("wasm-ld.exe"), Some(LinkerFamily::Lld));
+        assert_eq!(detect_family("/usr/bin/wasm-ld"), Some(LinkerFamily::Lld));
+        assert_eq!(
+            detect_family("C:\\emsdk\\upstream\\bin\\wasm-ld.exe"),
+            Some(LinkerFamily::Lld)
+        );
     }
 
     #[test]
@@ -1400,9 +1412,56 @@ mod tests {
         assert!(is_compiler_driver("/usr/bin/gcc"));
         assert!(is_compiler_driver("x86_64-w64-mingw32-gcc"));
         assert!(is_compiler_driver("x86_64-w64-mingw32-g++"));
+        assert!(is_compiler_driver("emcc"));
+        assert!(is_compiler_driver("em++"));
+        assert!(is_compiler_driver("/usr/bin/emcc"));
         assert!(!is_compiler_driver("ld"));
         assert!(!is_compiler_driver("ar"));
         assert!(!is_compiler_driver("rustc"));
+    }
+
+    #[test]
+    fn is_link_invocation_emcc() {
+        // emcc without -c is a link invocation (compiler driver linking)
+        assert!(is_link_invocation(
+            "emcc",
+            &args(&["-o", "output.js", "a.o", "b.o"])
+        ));
+        assert!(is_link_invocation(
+            "em++",
+            &args(&["-o", "output.html", "main.o"])
+        ));
+        // emcc with -c is NOT a link invocation (compile only)
+        assert!(!is_link_invocation(
+            "emcc",
+            &args(&["-c", "foo.c", "-o", "foo.o"])
+        ));
+    }
+
+    #[test]
+    fn wasm_ld_cacheable() {
+        let result = parse_linker_invocation("wasm-ld", args(&["-o", "output.wasm", "a.o", "b.o"]));
+        match result {
+            ParsedLinkerInvocation::Cacheable(c) => {
+                assert_eq!(c.family, LinkerFamily::Lld);
+                assert_eq!(c.output_file, PathBuf::from("output.wasm"));
+                assert_eq!(c.input_files.len(), 2);
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emcc_link_cacheable() {
+        let result = parse_linker_invocation("emcc", args(&["-o", "output.js", "a.o", "b.o"]));
+        match result {
+            ParsedLinkerInvocation::Cacheable(c) => {
+                assert_eq!(c.family, LinkerFamily::CompilerDriver);
+                assert_eq!(c.output_file, PathBuf::from("output.js"));
+                assert_eq!(c.input_files.len(), 2);
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
     }
 
     #[test]
