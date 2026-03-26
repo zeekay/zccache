@@ -111,13 +111,27 @@ pub fn is_link_invocation(tool: &str, args: &[String]) -> bool {
 }
 
 /// Detect the linker family from the tool path/name.
-fn detect_family(tool: &str) -> Option<LinkerFamily> {
-    let path = std::path::Path::new(tool);
+/// Extract the filename from a tool path, handling both `/` and `\` separators
+/// so that Windows-style paths work correctly on all platforms.
+fn cross_platform_file_name(tool: &str) -> &str {
+    tool.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(tool)
+}
 
-    // Get the full filename (e.g., "ld.lld", "ld.bfd") for dotted-name checks,
-    // and the stem (e.g., "ld", "link") for simple-name checks.
-    let full_name = path.file_name().and_then(|s| s.to_str()).unwrap_or(tool);
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(tool);
+/// Extract the stem (filename without last extension) from a filename.
+fn file_stem(filename: &str) -> &str {
+    match filename.rfind('.') {
+        Some(pos) if pos > 0 => &filename[..pos],
+        _ => filename,
+    }
+}
+
+fn detect_family(tool: &str) -> Option<LinkerFamily> {
+    // Handle both `/` and `\` as path separators so Windows-style paths
+    // (e.g. "C:\emsdk\upstream\bin\wasm-ld.exe") work on all platforms.
+    let full_name = cross_platform_file_name(tool);
+    let stem = file_stem(full_name);
 
     // MSVC link.exe (case-insensitive) — check stem so "link.exe" matches
     if stem.eq_ignore_ascii_case("link") {
@@ -147,10 +161,7 @@ fn detect_family(tool: &str) -> Option<LinkerFamily> {
 
 /// Check if a tool name is a compiler driver (gcc, g++, clang, clang++, cc, c++).
 fn is_compiler_driver(tool: &str) -> bool {
-    let stem = std::path::Path::new(tool)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(tool);
+    let stem = file_stem(cross_platform_file_name(tool));
 
     // clang++, clang-17, x86_64-w64-mingw32-gcc, emcc, em++, etc.
     matches!(stem, "cc" | "c++" | "emcc" | "em++")
