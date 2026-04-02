@@ -10,6 +10,7 @@ pub mod crash;
 pub mod event_log;
 pub mod eviction;
 pub mod server;
+pub mod side_effect;
 pub mod stats;
 
 pub use event_log::EventLogger;

@@ -1282,6 +1282,18 @@ async fn handle_link_ephemeral(
     tracing::debug!(%key_hex, "link cache miss");
     state.stats.record_link_miss();
 
+    // Compute output path early (needed for pre-link directory snapshot).
+    let output_path = if parsed_tool.output_file.is_absolute() {
+        parsed_tool.output_file.clone()
+    } else {
+        cwd_path.join(&parsed_tool.output_file)
+    };
+    let output_dir = output_path.parent().unwrap_or(cwd_path);
+
+    // Snapshot the output directory before the link so we can detect
+    // side-effect files (e.g., runtime DLLs deployed by compiler wrappers).
+    let dir_snapshot = crate::side_effect::snapshot_directory(output_dir);
+
     let result = run_tool_passthrough(tool, args, cwd, env).await;
 
     // 7. If successful, cache the output
@@ -1292,11 +1304,6 @@ async fn handle_link_ephemeral(
         ..
     } = result
     {
-        let output_path = if parsed_tool.output_file.is_absolute() {
-            parsed_tool.output_file.clone()
-        } else {
-            cwd_path.join(&parsed_tool.output_file)
-        };
         if let Ok(data) = std::fs::read(&output_path) {
             let mut outputs = vec![ArtifactOutput {
                 name: parsed_tool
@@ -1327,6 +1334,38 @@ async fn handle_link_ephemeral(
                 }
                 // Missing secondary outputs are silently skipped —
                 // e.g., .exp may not always be generated.
+            }
+
+            // Detect side-effect files deployed by compiler wrapper post-link hooks
+            // (e.g., ASan runtime DLLs copied next to the output binary).
+            let primary_name = parsed_tool
+                .output_file
+                .file_name()
+                .unwrap_or_default()
+                .to_os_string();
+            let already_captured: std::collections::HashSet<std::ffi::OsString> = outputs
+                .iter()
+                .map(|o| std::ffi::OsString::from(&o.name))
+                .collect();
+            if let Ok(side_effects) = crate::side_effect::detect_side_effects(
+                &dir_snapshot,
+                output_dir,
+                &primary_name,
+                &already_captured,
+            ) {
+                for se in &side_effects {
+                    if let Ok(data) = std::fs::read(&se.path) {
+                        tracing::debug!(
+                            file = %se.file_name.to_string_lossy(),
+                            size = data.len(),
+                            "caching side-effect file"
+                        );
+                        outputs.push(ArtifactOutput {
+                            name: se.file_name.to_string_lossy().into_owned(),
+                            data: Arc::new(data),
+                        });
+                    }
+                }
             }
 
             let artifact = ArtifactData {

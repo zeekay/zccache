@@ -114,9 +114,7 @@ pub fn is_link_invocation(tool: &str, args: &[String]) -> bool {
 /// Extract the filename from a tool path, handling both `/` and `\` separators
 /// so that Windows-style paths work correctly on all platforms.
 fn cross_platform_file_name(tool: &str) -> &str {
-    tool.rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(tool)
+    tool.rsplit(['/', '\\']).next().unwrap_or(tool)
 }
 
 /// Extract the stem (filename without last extension) from a filename.
