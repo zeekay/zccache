@@ -169,6 +169,12 @@ pub fn prepare_depfile(
     }
 
     // No user dep flags: inject -MD -MF <tmpfile>.
+    // Re-create tmpdir if it was deleted (e.g. by Windows temp cleanup)
+    // while the daemon is still running. Without this, the compiler fails
+    // with "error opening ... no such file or directory".
+    if !tmpdir.exists() {
+        let _ = std::fs::create_dir_all(tmpdir);
+    }
     static DEPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
     let unique = DEPFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let stem = output_file

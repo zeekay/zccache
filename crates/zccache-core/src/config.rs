@@ -60,6 +60,62 @@ pub fn tmp_dir() -> PathBuf {
     default_cache_dir().join("tmp")
 }
 
+/// Returns the base directory for compiler-injected depfiles.
+///
+/// Each daemon instance creates a `{pid}-{instance}` subdirectory here.
+/// Stale subdirectories from dead daemon processes are cleaned on startup.
+#[must_use]
+pub fn depfile_dir() -> PathBuf {
+    tmp_dir().join("depfiles")
+}
+
+/// Remove stale depfile directories from previous (dead) daemon instances.
+///
+/// Scans [`depfile_dir()`] for subdirectories matching `{pid}-{instance}`.
+/// If the PID is no longer alive (per `is_alive`), removes the directory.
+/// Returns the number of directories cleaned up.
+pub fn cleanup_stale_depfile_dirs<F>(is_alive: F) -> usize
+where
+    F: Fn(u32) -> bool,
+{
+    let base = depfile_dir();
+    let entries = match std::fs::read_dir(&base) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+
+    let mut cleaned = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let pid: u32 = match name.split('-').next().and_then(|s| s.parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        if !is_alive(pid) {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    cleaned += 1;
+                    tracing::info!(path = %path.display(), "removed stale depfile dir");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "failed to remove stale depfile dir: {e}"
+                    );
+                }
+            }
+        }
+    }
+    cleaned
+}
+
 /// Returns the directory for serialized dependency graph storage (future).
 #[must_use]
 pub fn depgraph_dir() -> PathBuf {
@@ -146,6 +202,86 @@ mod tests {
         let dir = depgraph_dir();
         assert!(dir.ends_with("depgraph"));
         assert!(dir.starts_with(default_cache_dir()));
+    }
+
+    #[test]
+    fn depfile_dir_under_tmp() {
+        let dir = depfile_dir();
+        assert!(dir.ends_with("depfiles"));
+        assert!(dir.starts_with(tmp_dir()));
+    }
+
+    #[test]
+    fn cleanup_stale_depfile_dirs_removes_dead() {
+        let base = tempfile::tempdir().unwrap();
+        let depfiles = base.path().join("depfiles");
+        std::fs::create_dir_all(&depfiles).unwrap();
+
+        // Create a "dead" dir (PID 99999999 unlikely alive).
+        std::fs::create_dir(depfiles.join("99999999-0")).unwrap();
+        // Create a non-matching dir (should be left alone).
+        std::fs::create_dir(depfiles.join("not-a-pid")).unwrap();
+
+        let entries = std::fs::read_dir(&depfiles).unwrap();
+        let dirs: Vec<_> = entries.flatten().collect();
+        assert_eq!(dirs.len(), 2);
+
+        // Use a custom is_alive that says nothing is alive.
+        let cleaned = cleanup_stale_with_base(&depfiles, |_| false);
+        assert_eq!(cleaned, 1); // only the parseable one removed
+
+        // "not-a-pid" should still exist.
+        assert!(depfiles.join("not-a-pid").is_dir());
+        assert!(!depfiles.join("99999999-0").exists());
+    }
+
+    #[test]
+    fn cleanup_stale_depfile_dirs_skips_alive() {
+        let base = tempfile::tempdir().unwrap();
+        let depfiles = base.path().join("depfiles");
+        std::fs::create_dir_all(&depfiles).unwrap();
+        std::fs::create_dir(depfiles.join("12345-0")).unwrap();
+
+        let cleaned = cleanup_stale_with_base(&depfiles, |_| true);
+        assert_eq!(cleaned, 0);
+        assert!(depfiles.join("12345-0").is_dir());
+    }
+
+    #[test]
+    fn cleanup_stale_depfile_dirs_empty() {
+        // Non-existent directory returns 0.
+        let cleaned = cleanup_stale_with_base(std::path::Path::new("/nonexistent/path"), |_| false);
+        assert_eq!(cleaned, 0);
+    }
+
+    /// Test helper: runs cleanup logic against an arbitrary base dir.
+    fn cleanup_stale_with_base<F>(base: &std::path::Path, is_alive: F) -> usize
+    where
+        F: Fn(u32) -> bool,
+    {
+        let entries = match std::fs::read_dir(base) {
+            Ok(entries) => entries,
+            Err(_) => return 0,
+        };
+        let mut cleaned = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            let pid: u32 = match name.split('-').next().and_then(|s| s.parse().ok()) {
+                Some(p) => p,
+                None => continue,
+            };
+            if !is_alive(pid) && std::fs::remove_dir_all(&path).is_ok() {
+                cleaned += 1;
+            }
+        }
+        cleaned
     }
 
     #[test]

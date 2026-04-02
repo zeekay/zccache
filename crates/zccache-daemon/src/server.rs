@@ -317,10 +317,8 @@ impl DaemonServer {
                 profiler: PhaseProfiler::new(),
                 artifact_dir,
                 depfile_tmpdir: {
-                    let dir = std::env::temp_dir().join(format!(
-                        "zccache-depfiles-{}-{instance}",
-                        std::process::id()
-                    ));
+                    let dir = zccache_core::config::depfile_dir()
+                        .join(format!("{}-{instance}", std::process::id()));
                     std::fs::create_dir_all(&dir).ok();
                     dir
                 },
@@ -382,6 +380,15 @@ impl DaemonServer {
             // Also remove stale daemon.lock.bak if present.
             let legacy_lock = zccache_core::config::default_cache_dir().join("daemon.lock.bak");
             let _ = std::fs::remove_file(&legacy_lock);
+        }
+
+        // Clean up stale depfile directories from dead daemon instances.
+        {
+            let cleaned =
+                zccache_core::config::cleanup_stale_depfile_dirs(zccache_ipc::is_process_alive);
+            if cleaned > 0 {
+                tracing::info!(cleaned, "cleaned stale depfile directories");
+            }
         }
 
         self.start_watcher_pipeline().await;
@@ -555,6 +562,9 @@ impl DaemonServer {
                         ),
                         Err(e) => tracing::warn!("depgraph save failed: {e}"),
                     }
+
+                    // Clean up our own depfile temp directory.
+                    let _ = std::fs::remove_dir_all(&self.state.depfile_tmpdir);
 
                     return Ok(());
                 }
