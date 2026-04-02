@@ -9,8 +9,8 @@ Two benchmarks:
   - perf_response_file: large nested response files (~283 expanded args)
 
 Usage:
-    uv run perf               # run all benchmarks
-    uv run perf --nocapture   # (default) show output as it runs
+    ./perf               # run all benchmarks
+    ./perf --nocapture   # (default) show output as it runs
 """
 
 import subprocess

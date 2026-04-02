@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$(git rev-parse --show-toplevel)\" && uv run ci/hooks/tool_guard.py",
+            "command": "uv run python ci/hooks/tool_guard.py",
             "timeout": 5
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$(git rev-parse --show-toplevel)\" && uv run ci/hooks/readme_guard.py",
+            "command": "uv run python ci/hooks/readme_guard.py",
             "timeout": 5
           }
         ]
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$(git rev-parse --show-toplevel)\" && uv run ci/hooks/check-on-start.py",
+            "command": "uv run python ci/hooks/check-on-start.py",
             "timeout": 10
           }
         ]
@@ -40,12 +40,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$(git rev-parse --show-toplevel)\" && uv run cargo fmt --all",
+            "command": "uv run cargo fmt --all",
             "timeout": 60
           },
           {
             "type": "command",
-            "command": "cd \"$(git rev-parse --show-toplevel)\" && uv run check_on_stop",
+            "command": "uv run cargo run -p zccache-ci",
             "timeout": 600
           }
         ]

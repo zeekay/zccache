@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse hook: blocks bare Rust commands and bare python/pip.
 
-All cargo/rustc/rustfmt must go through uv run (trampoline ensures correct toolchain).
+All cargo/rustc/rustfmt must go through uv run (.env PATH ensures correct toolchain).
 All python must go through uv (ensures correct environment).
 
 Exit codes:
@@ -63,7 +63,7 @@ def check_command(command):
             return (
                 first_word,
                 f"Use `uv run {first_word} ...` instead of bare `{first_word}`. "
-                f"The uv trampoline ensures the correct Rust toolchain is used.",
+                f"The .env file ensures the correct Rust toolchain is on PATH.",
             )
 
         if first_word in PYTHON_TOOLS:

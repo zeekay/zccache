@@ -5,11 +5,11 @@
 """Run workspace tests.
 
 Usage:
-    uv run test                          # unit tests only (fast, no compiler needed)
-    uv run test --integration            # integration tests only (need clang)
-    uv run test --full                   # unit + integration + stress tests
-    uv run test -p zccache-hash          # single crate
-    uv run test -p zccache-hash -- name  # single test by name
+    ./test                          # unit tests only (fast, no compiler needed)
+    ./test --integration            # integration tests only (need clang)
+    ./test --full                   # unit + integration + stress tests
+    ./test -p zccache-hash          # single crate
+    ./test -p zccache-hash -- name  # single test by name
 """
 
 import subprocess

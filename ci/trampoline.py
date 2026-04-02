@@ -1,8 +1,9 @@
 """Rust toolchain trampolines.
 
-Ensures the rustup-managed toolchain is on PATH before executing
-the real Rust tool. Registered as project scripts in pyproject.toml
-so they can be invoked via `uv run cargo ...`, `uv run rustfmt ...`, etc.
+Helper functions that prepend .cargo/bin to PATH before executing Rust tools.
+The primary PATH setup is now handled by `.env` (auto-loaded by `uv run`).
+These trampolines are used by the remaining project scripts (`run_zccache`,
+`run_zccache_daemon`) which wrap `cargo run` invocations.
 """
 
 import os

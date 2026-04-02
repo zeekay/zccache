@@ -7,15 +7,8 @@ requires-python = ">=3.9"
 dependencies = []
 
 [project.scripts]
-cargo = "ci.trampoline:cargo"
-rustc = "ci.trampoline:rustc"
-rustfmt = "ci.trampoline:rustfmt"
-clippy-driver = "ci.trampoline:clippy_driver"
 run_zccache = "ci.trampoline:run_zccache"
 run_zccache_daemon = "ci.trampoline:run_zccache_daemon"
-check_on_stop = "ci.trampoline:check_on_stop"
-test = "ci.trampoline:test"
-perf = "ci.trampoline:perf"
 
 [build-system]
 requires = ["setuptools>=64"]

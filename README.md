@@ -39,7 +39,7 @@ with aggressive file metadata caching and filesystem watching.
 > All args passed via nested response files: `flags.rsp` -> `@warnings.rsp` + `@defines.rsp`.
 > 200 `-D` defines + 50 `-I` paths + 30 warning flags = ~283 total expanded args per compile.
 
-Run the benchmark yourself: `uv run perf`
+Run the benchmark yourself: `./perf`
 
 ### Install
 

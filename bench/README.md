@@ -7,7 +7,7 @@ Performance comparison between bare clang, sccache, and zccache.
 Compiles a synthetic template-heavy C++ file, measuring cold/warm cache performance.
 
 ```bash
-uv run perf
+./perf
 ```
 
 ## Meson+Ninja full-project benchmark
@@ -44,7 +44,7 @@ uv run python ci/meson_bench.py ~/dev/fastled10 -j 8
 > which means the `-o` output paths differ between runs. This prevents cache hits
 > across scenarios. In real-world use (same build directory, `ninja -t clean && ninja`),
 > zccache warm rebuild takes **~725ms** (vs 9.3s cold) with a 42.9% hit rate and
-> ~14.5s time saved. The single-file benchmark (`uv run perf`) demonstrates the
+> ~14.5s time saved. The single-file benchmark (`./perf`) demonstrates the
 > true warm-cache speedup: **43x faster than sccache, 324x faster than bare clang**.
 
 ### How cache hits work with ninja

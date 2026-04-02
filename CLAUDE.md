@@ -4,7 +4,7 @@ zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md 
 
 ## Essential Rules
 
-- **Always use `uv run` to execute Rust commands.** Bare cargo/rustc are blocked by hook. Trampolines in `pyproject.toml` ensure the correct toolchain.
+- **Always use `uv run` to execute Rust commands.** Bare cargo/rustc are blocked by hook. `.env` prepends `.cargo/bin` to PATH so `uv run cargo` finds the rustup toolchain.
 - **Always use `uv` for Python.** Bare `python`/`pip` are blocked by hook. Use `uv run ...` or `uv pip ...`.
 - MSRV: 1.75 | Edition: 2021 | Toolchain: stable (clippy + rustfmt)
 - CI: Linux, macOS, Windows. All warnings denied (`RUSTFLAGS="-D warnings"`)
@@ -13,16 +13,16 @@ zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md 
 ## Commands
 
 ```bash
-uv run test                 # unit tests only (fast, no compiler needed)
-uv run test --integration   # integration tests only (need clang on PATH)
-uv run test --full          # unit + integration + stress + perf tests
-uv run test -p <crate> -- <test_name>
+./test                      # unit tests only (fast, no compiler needed)
+./test --integration        # integration tests only (need clang on PATH)
+./test --full               # unit + integration + stress + perf tests
+./test -p <crate> -- <test_name>
 uv run cargo check --workspace --all-targets
 uv run cargo clippy --workspace --all-targets -- -D warnings
 uv run cargo fmt --all
 RUSTDOCFLAGS="-D warnings" uv run cargo doc --workspace --no-deps
 uv run cargo bench -p zccache-hash
-uv run perf                 # performance benchmark (zccache vs sccache vs bare clang)
+./perf                      # performance benchmark (zccache vs sccache vs bare clang)
 ```
 
 ## Distribution
@@ -58,18 +58,18 @@ uv run python ci/build_dist.py --skip-build
 
 ## Hooks (enforced automatically)
 
-Hooks are in `ci/hooks/` (Python) and `crates/zccache-ci` (Rust), invoked via `uv run`:
+Hooks are in `ci/hooks/` (Python) and `crates/zccache-ci` (Rust):
 
 - **PreToolUse**: `ci/hooks/tool_guard.py` blocks bare Rust commands (must use `uv run`) and bare `python`/`pip` (must use `uv`)
 - **PostToolUse**: `ci/hooks/lint.py` auto-formats + runs clippy on edited .rs files
 - **PostToolUse**: `ci/hooks/readme_guard.py` errors if directory lacks README.md
 - **SessionStart**: `ci/hooks/check-on-start.py` captures git fingerprint
-- **Stop**: `zccache-ci` (Rust binary) runs lint + unit tests in parallel (skips if no changes)
+- **Stop**: `cargo run -p zccache-ci` runs lint + unit tests in parallel (skips if no changes)
 
 ## Language Policy
 
 - **Python is only for CI scripts, packaging, and hooks.** All tests, benchmarks, and application logic must be written in Rust.
-- `uv run` is required only because hooks enforce it for toolchain management — it is not an endorsement of Python for project code.
+- `uv run` is required for Rust commands because hooks enforce it — `.env` sets the correct toolchain PATH. It is not an endorsement of Python for project code.
 - When in doubt, write it in Rust.
 
 ## Development Philosophy: TDD
