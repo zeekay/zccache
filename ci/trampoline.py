@@ -89,6 +89,10 @@ def run_zccache_daemon():
     _run_cargo_bin("zccache-daemon")
 
 
+def run_zccache_fingerprint():
+    _run_cargo_bin("zccache-fingerprint")
+
+
 def check_on_stop():
     _run_cargo_bin("zccache-ci")
 

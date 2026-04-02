@@ -1,6 +1,6 @@
 [project]
 name = "zccache"
-version = "1.1.4"
+version = "1.1.5"
 description = "A high-performance local compiler cache daemon"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -9,6 +9,7 @@ dependencies = []
 [project.scripts]
 run_zccache = "ci.trampoline:run_zccache"
 run_zccache_daemon = "ci.trampoline:run_zccache_daemon"
+run_zccache_fingerprint = "ci.trampoline:run_zccache_fingerprint"
 
 [build-system]
 requires = ["setuptools>=64"]
