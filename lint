@@ -18,6 +18,13 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
 
+def _clean_env():
+    """Return env with VIRTUAL_ENV removed to avoid uv mismatch warnings."""
+    env = os.environ.copy()
+    env.pop("VIRTUAL_ENV", None)
+    return env
+
+
 def run_cmd(cmd):
     """Run a command rooted at the project directory."""
     return subprocess.run(
@@ -26,6 +33,7 @@ def run_cmd(cmd):
         encoding="utf-8",
         errors="replace",
         cwd=str(SCRIPT_DIR),
+        env=_clean_env(),
     )
 
 
@@ -88,7 +96,7 @@ def lint_workspace():
         return result.returncode
 
     # Doc check (catches unclosed HTML tags, broken intra-doc links, etc.)
-    env = os.environ.copy()
+    env = _clean_env()
     env["RUSTDOCFLAGS"] = "-D warnings"
     result = subprocess.run(
         ["uv", "run", "cargo", "doc", "--workspace", "--no-deps"],

@@ -12,11 +12,19 @@ Usage:
     ./test -p zccache-hash -- name  # single test by name
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
+
+
+def _clean_env():
+    """Return env with VIRTUAL_ENV removed to avoid uv mismatch warnings."""
+    env = os.environ.copy()
+    env.pop("VIRTUAL_ENV", None)
+    return env
 
 
 def main():
@@ -56,6 +64,7 @@ def main():
         encoding="utf-8",
         errors="replace",
         cwd=str(SCRIPT_DIR),
+        env=_clean_env(),
     )
     return result.returncode
 
