@@ -1476,8 +1476,23 @@ async fn run_tool_passthrough(
     cwd: &Path,
     env: Option<Vec<(String, String)>>,
 ) -> Response {
+    let tmp_dir = std::env::temp_dir();
+    let _rsp_guard =
+        match zccache_compiler::response_file::write_response_file_if_needed(args, &tmp_dir) {
+            Ok(guard) => guard,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("failed to write response file for {}: {e}", tool.display()),
+                };
+            }
+        };
+
     let mut cmd = std::process::Command::new(tool);
-    cmd.args(args);
+    if let Some(ref rsp) = _rsp_guard {
+        cmd.arg(rsp.at_arg());
+    } else {
+        cmd.args(args);
+    }
     cmd.current_dir(cwd);
 
     if let Some(env_vars) = env {
@@ -2434,10 +2449,36 @@ async fn handle_compile(
         &state.depfile_tmpdir,
     );
 
+    // Combine expanded_args + extra_args for response-file length check.
+    // Only allocates when extra_args is non-empty.
+    let combined_args;
+    let rsp_args: &[String] = if extra_args.is_empty() {
+        &expanded_args
+    } else {
+        combined_args = [expanded_args.as_slice(), extra_args.as_slice()].concat();
+        &combined_args
+    };
+
+    let _rsp_guard = match zccache_compiler::response_file::write_response_file_if_needed(
+        rsp_args,
+        &state.depfile_tmpdir,
+    ) {
+        Ok(guard) => guard,
+        Err(e) => {
+            return Response::Error {
+                message: format!("failed to write response file: {e}"),
+            };
+        }
+    };
+
     let mut cmd = tokio::process::Command::new(&compiler);
-    cmd.args(&expanded_args).current_dir(cwd);
-    if !extra_args.is_empty() {
-        cmd.args(&extra_args);
+    if let Some(ref rsp) = _rsp_guard {
+        cmd.arg(rsp.at_arg()).current_dir(cwd);
+    } else {
+        cmd.args(&expanded_args).current_dir(cwd);
+        if !extra_args.is_empty() {
+            cmd.args(&extra_args);
+        }
     }
     apply_client_env(&mut cmd, &client_env);
     let result = cmd.output().await;
@@ -3199,8 +3240,24 @@ async fn handle_compile_multi(
         compiler_args.push("-MD".to_string());
     }
 
+    let _rsp_guard = match zccache_compiler::response_file::write_response_file_if_needed(
+        &compiler_args,
+        &state.depfile_tmpdir,
+    ) {
+        Ok(guard) => guard,
+        Err(e) => {
+            return Response::Error {
+                message: format!("failed to write response file: {e}"),
+            };
+        }
+    };
+
     let mut cmd = tokio::process::Command::new(&compiler);
-    cmd.args(&compiler_args).current_dir(&cwd_path);
+    if let Some(ref rsp) = _rsp_guard {
+        cmd.arg(rsp.at_arg()).current_dir(&cwd_path);
+    } else {
+        cmd.args(&compiler_args).current_dir(&cwd_path);
+    }
     apply_client_env(&mut cmd, &client_env);
     let result = cmd.output().await;
 
@@ -3434,8 +3491,23 @@ async fn run_compiler_direct(
     sid: &SessionId,
     client_env: &Option<Vec<(String, String)>>,
 ) -> Response {
+    let tmp_dir = std::env::temp_dir();
+    let _rsp_guard =
+        match zccache_compiler::response_file::write_response_file_if_needed(args, &tmp_dir) {
+            Ok(guard) => guard,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("failed to write response file: {e}"),
+                };
+            }
+        };
+
     let mut cmd = tokio::process::Command::new(compiler);
-    cmd.args(args).current_dir(cwd);
+    if let Some(ref rsp) = _rsp_guard {
+        cmd.arg(rsp.at_arg()).current_dir(cwd);
+    } else {
+        cmd.args(args).current_dir(cwd);
+    }
     apply_client_env(&mut cmd, client_env);
     let result = cmd.output().await;
 

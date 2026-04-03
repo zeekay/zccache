@@ -190,6 +190,91 @@ fn expand_recursive(
     Ok(result)
 }
 
+/// Maximum command-line length (in bytes) before we spill to a response file.
+/// Windows `CreateProcess` has a 32,767 character limit. We use a conservative
+/// threshold to account for the compiler path, env block, and quoting overhead.
+const MAX_CMDLINE_LEN: usize = 30_000;
+
+/// Atomic counter for unique response file names.
+static RSP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Format arguments as response file content with proper quoting.
+///
+/// Each argument is written on its own line. Arguments containing spaces,
+/// double quotes, or starting with `@` are double-quoted to prevent the
+/// compiler from misinterpreting them. Inside quotes, `"` and `\` are
+/// backslash-escaped.
+fn format_rsp_content(args: &[String]) -> String {
+    let estimated_len: usize = args.iter().map(|a| a.len() + 3).sum();
+    let mut content = String::with_capacity(estimated_len);
+    for arg in args {
+        if arg.contains(' ') || arg.contains('"') || arg.starts_with('@') {
+            content.push('"');
+            for ch in arg.chars() {
+                if ch == '"' || ch == '\\' {
+                    content.push('\\');
+                }
+                content.push(ch);
+            }
+            content.push('"');
+        } else {
+            content.push_str(arg);
+        }
+        content.push('\n');
+    }
+    content
+}
+
+/// If the total length of `args` exceeds the Windows command-line limit, write
+/// them to a temporary `.rsp` file and return a single `@path` argument.
+/// Otherwise return `None` (caller should pass args directly).
+///
+/// The returned [`TempResponseFile`] keeps the temporary file alive via RAII.
+/// Drop it after the compiler process finishes.
+#[cfg(windows)]
+pub fn write_response_file_if_needed(
+    args: &[String],
+    tmp_dir: &Path,
+) -> std::io::Result<Option<TempResponseFile>> {
+    let estimated_len: usize = args.iter().map(|a| a.len() + 3).sum();
+    if estimated_len < MAX_CMDLINE_LEN {
+        return Ok(None);
+    }
+
+    let id = RSP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let rsp_path = tmp_dir.join(format!("zccache_{}_{}.rsp", std::process::id(), id));
+    std::fs::write(&rsp_path, format_rsp_content(args))?;
+
+    Ok(Some(TempResponseFile { path: rsp_path }))
+}
+
+/// No-op on non-Windows platforms (command-line length is not an issue).
+#[cfg(not(windows))]
+pub fn write_response_file_if_needed(
+    _args: &[String],
+    _tmp_dir: &Path,
+) -> std::io::Result<Option<TempResponseFile>> {
+    Ok(None)
+}
+
+/// RAII guard for a temporary response file. Deletes the file on drop.
+pub struct TempResponseFile {
+    pub path: PathBuf,
+}
+
+impl TempResponseFile {
+    /// Returns the `@path` argument to pass to the compiler.
+    pub fn at_arg(&self) -> String {
+        format!("@{}", self.path.display())
+    }
+}
+
+impl Drop for TempResponseFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,5 +714,83 @@ mod tests {
             matches!(err, ResponseFileError::TooDeep { .. }),
             "expected TooDeep, got: {err}"
         );
+    }
+
+    // ── format_rsp_content / write_response_file tests ──
+
+    #[test]
+    fn format_rsp_simple_args() {
+        let args = s(&["-c", "foo.cpp", "-O2"]);
+        let content = format_rsp_content(&args);
+        assert_eq!(content, "-c\nfoo.cpp\n-O2\n");
+    }
+
+    #[test]
+    fn format_rsp_quotes_spaces() {
+        let args = s(&["-I/path with spaces/include", "-c"]);
+        let content = format_rsp_content(&args);
+        assert_eq!(content, "\"-I/path with spaces/include\"\n-c\n");
+    }
+
+    #[test]
+    fn format_rsp_escapes_quotes() {
+        let args = s(&[r#"-DMSG="hello""#]);
+        let content = format_rsp_content(&args);
+        assert_eq!(content, "\"-DMSG=\\\"hello\\\"\"\n");
+    }
+
+    #[test]
+    fn format_rsp_escapes_backslash_in_quoted() {
+        let args = s(&[r"-IC:\path with spaces\include"]);
+        let content = format_rsp_content(&args);
+        assert_eq!(content, "\"-IC:\\\\path with spaces\\\\include\"\n");
+    }
+
+    #[test]
+    fn format_rsp_quotes_at_prefix() {
+        // Args starting with @ must be quoted to prevent the compiler
+        // from interpreting them as nested response file references.
+        let args = s(&["@rpath/lib", "-c"]);
+        let content = format_rsp_content(&args);
+        assert_eq!(content, "\"@rpath/lib\"\n-c\n");
+    }
+
+    #[test]
+    fn format_rsp_roundtrip() {
+        // Write -> parse should recover the original args
+        let args = s(&[
+            "-c",
+            "foo.cpp",
+            "-I/path with spaces",
+            r#"-DMSG="hello""#,
+            "@rpath/lib",
+            "-O2",
+            r"-IC:\Users\include",
+        ]);
+        let content = format_rsp_content(&args);
+        let parsed = parse_response_file_content(&content);
+        assert_eq!(parsed, args);
+    }
+
+    #[test]
+    fn temp_response_file_at_arg() {
+        let path = PathBuf::from("/tmp/test.rsp");
+        let rsp = TempResponseFile { path };
+        assert_eq!(rsp.at_arg(), "@/tmp/test.rsp");
+        std::mem::forget(rsp);
+    }
+
+    #[test]
+    fn temp_response_file_cleanup_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let rsp_path = dir.path().join("test.rsp");
+        std::fs::write(&rsp_path, "test").unwrap();
+        assert!(rsp_path.exists());
+
+        let rsp = TempResponseFile {
+            path: rsp_path.clone(),
+        };
+        drop(rsp);
+        assert!(!rsp_path.exists());
     }
 }

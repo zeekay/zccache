@@ -35,6 +35,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 DIST_DIR = ROOT / "dist"
@@ -64,17 +65,18 @@ PLATFORMS: dict[str, list[str]] = {
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+def run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
     log(f"  $ {' '.join(cmd)}")
     return subprocess.run(cmd, check=True, **kwargs)
 
 
 def run_capture(cmd: list[str]) -> str:
-    result = run(cmd, capture_output=True, text=True)
+    result: subprocess.CompletedProcess[str] = run(cmd, capture_output=True, text=True)
     return result.stdout.strip()
 
 
@@ -117,6 +119,7 @@ def record_hash(data: bytes) -> str:
 # Step 1: PyPI version pre-check
 # ---------------------------------------------------------------------------
 
+
 def check_pypi_version(name: str, version: str) -> None:
     """Fail fast if this version already exists on PyPI."""
     log(f"\n=== Step 1: Pre-check PyPI for {name} {version} ===")
@@ -127,7 +130,7 @@ def check_pypi_version(name: str, version: str) -> None:
         existing = set(data.get("releases", {}).keys())
         if version in existing:
             log(f"  ERROR: {name} {version} already exists on PyPI.")
-            log(f"  Bump the version in pyproject.toml before publishing.")
+            log("  Bump the version in pyproject.toml before publishing.")
             sys.exit(1)
         log(f"  {name} {version} is available (existing: {', '.join(sorted(existing)) or 'none'})")
     except urllib.error.HTTPError as e:
@@ -136,12 +139,13 @@ def check_pypi_version(name: str, version: str) -> None:
         else:
             log(f"  WARNING: PyPI check failed (HTTP {e.code}), continuing anyway")
     except (urllib.error.URLError, TimeoutError):
-        log(f"  WARNING: Could not reach PyPI, continuing anyway")
+        log("  WARNING: Could not reach PyPI, continuing anyway")
 
 
 # ---------------------------------------------------------------------------
 # Step 2: Trigger GitHub Actions build
 # ---------------------------------------------------------------------------
+
 
 def trigger_and_wait(repo: str) -> int:
     """Trigger build workflow on HEAD, wait for completion, return run ID."""
@@ -152,14 +156,22 @@ def trigger_and_wait(repo: str) -> int:
     log(f"  Branch: {branch} ({head_sha[:12]})")
 
     # Snapshot existing runs to detect the new one
-    existing_raw = run_capture([
-        "gh", "run", "list",
-        "--repo", repo,
-        "--workflow", WORKFLOW_FILE,
-        "--limit", "1",
-        "--json", "databaseId",
-    ])
-    existing_ids = {r["databaseId"] for r in json.loads(existing_raw)} if existing_raw else set()
+    existing_raw = run_capture(
+        [
+            "gh",
+            "run",
+            "list",
+            "--repo",
+            repo,
+            "--workflow",
+            WORKFLOW_FILE,
+            "--limit",
+            "1",
+            "--json",
+            "databaseId",
+        ]
+    )
+    existing_ids: set[int] = {r["databaseId"] for r in json.loads(existing_raw)} if existing_raw else set()
 
     # Trigger
     log(f"  Triggering {WORKFLOW_FILE} on {branch}...")
@@ -170,13 +182,21 @@ def trigger_and_wait(repo: str) -> int:
     run_id = None
     for _ in range(30):
         time.sleep(2)
-        result = run_capture([
-            "gh", "run", "list",
-            "--repo", repo,
-            "--workflow", WORKFLOW_FILE,
-            "--limit", "5",
-            "--json", "databaseId,status",
-        ])
+        result = run_capture(
+            [
+                "gh",
+                "run",
+                "list",
+                "--repo",
+                repo,
+                "--workflow",
+                WORKFLOW_FILE,
+                "--limit",
+                "5",
+                "--json",
+                "databaseId,status",
+            ]
+        )
         for r in json.loads(result):
             if r["databaseId"] not in existing_ids:
                 run_id = r["databaseId"]
@@ -195,11 +215,18 @@ def trigger_and_wait(repo: str) -> int:
     timeout = 1800
     start = time.time()
     while time.time() - start < timeout:
-        result = run_capture([
-            "gh", "run", "view", str(run_id),
-            "--repo", repo,
-            "--json", "status,conclusion",
-        ])
+        result = run_capture(
+            [
+                "gh",
+                "run",
+                "view",
+                str(run_id),
+                "--repo",
+                repo,
+                "--json",
+                "status,conclusion",
+            ]
+        )
         data = json.loads(result)
 
         if data["status"] == "completed":
@@ -223,6 +250,7 @@ def trigger_and_wait(repo: str) -> int:
 # Step 3: Download artifacts
 # ---------------------------------------------------------------------------
 
+
 def download_artifacts(repo: str, run_id: int) -> None:
     """Download build artifacts and organize into dist/."""
     log(f"\n=== Step 3: Download artifacts from run {run_id} ===")
@@ -236,10 +264,12 @@ def download_artifacts(repo: str, run_id: int) -> None:
     run(["gh", "run", "download", str(run_id), "--repo", repo, "--dir", str(tmp)])
 
     found = 0
+    missing: list[str] = []
     for artifact_name, subdir in ARTIFACT_MAP.items():
         src = tmp / artifact_name
         if not src.exists():
-            log(f"  WARNING: Missing {artifact_name}")
+            log(f"  MISSING: {artifact_name}")
+            missing.append(artifact_name)
             continue
 
         dest = DIST_DIR / subdir
@@ -258,14 +288,16 @@ def download_artifacts(repo: str, run_id: int) -> None:
     shutil.rmtree(tmp)
     log(f"  {found}/{len(ARTIFACT_MAP)} platforms downloaded")
 
-    if found == 0:
-        log("  ERROR: No artifacts downloaded.")
+    if missing:
+        log(f"  ERROR: Missing artifacts for: {', '.join(missing)}")
+        log("  All platforms must build successfully before publishing.")
         sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
 # Step 4: Build wheels
 # ---------------------------------------------------------------------------
+
 
 def build_wheel(
     name: str,
@@ -290,29 +322,15 @@ def build_wheel(
     data_dir = f"{name_norm}-{version}.data"
     dist_info = f"{name_norm}-{version}.dist-info"
 
-    metadata = (
-        f"Metadata-Version: 2.1\n"
-        f"Name: {name}\n"
-        f"Version: {version}\n"
-        f"Summary: {summary}\n"
-        f"Requires-Python: {requires_python}\n"
-    )
+    metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\nSummary: {summary}\nRequires-Python: {requires_python}\n"
     if readme:
         metadata += f"Description-Content-Type: text/markdown\n\n{readme}\n"
 
-    wheel_meta = (
-        f"Wheel-Version: 1.0\n"
-        f"Generator: zccache-publish\n"
-        f"Root-Is-Purelib: false\n"
-    )
+    wheel_meta = "Wheel-Version: 1.0\nGenerator: zccache-publish\nRoot-Is-Purelib: false\n"
     for pt in plat_tags:
         wheel_meta += f"Tag: py3-none-{pt}\n"
 
-    exec_perms = (
-        stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
-        | stat.S_IRGRP | stat.S_IXGRP
-        | stat.S_IROTH | stat.S_IXOTH
-    )
+    exec_perms = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
 
     WHEEL_DIR.mkdir(parents=True, exist_ok=True)
     wheel_path = WHEEL_DIR / wheel_filename
@@ -372,8 +390,9 @@ def build_all_wheels(name: str, version: str, summary: str, requires_python: str
 # Step 5: Upload
 # ---------------------------------------------------------------------------
 
+
 def upload_wheels(wheels: list[Path], name: str, version: str) -> None:
-    log(f"\n=== Step 5: Upload to PyPI ===")
+    log("\n=== Step 5: Upload to PyPI ===")
     upload_cmd = ["uv", "publish"]
     upload_cmd.extend(str(w) for w in sorted(wheels))
     run(upload_cmd)
@@ -381,8 +400,51 @@ def upload_wheels(wheels: list[Path], name: str, version: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step 6: Post-upload verification
+# ---------------------------------------------------------------------------
+
+
+def verify_pypi_wheels(name: str, version: str, expected_wheels: list[Path]) -> None:
+    """Poll PyPI until all uploaded wheels are visible (CDN propagation)."""
+    log("\n=== Step 6: Verify wheels on PyPI ===")
+
+    expected_filenames = {w.name for w in expected_wheels}
+    url = f"https://pypi.org/pypi/{name}/{version}/json"
+    timeout = 300  # 5 minutes
+    interval = 10
+    start = time.time()
+    available: set[str] = set()
+
+    while time.time() - start < timeout:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read())
+            available = {f["filename"] for f in data.get("urls", [])}
+            missing = expected_filenames - available
+            if not missing:
+                elapsed = int(time.time() - start)
+                log(f"  All {len(expected_filenames)} wheels verified on PyPI ({elapsed}s)")
+                return
+            elapsed = int(time.time() - start)
+            log(f"  [{elapsed}s] Waiting for {len(missing)} wheel(s): {', '.join(sorted(missing))}")
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+            elapsed = int(time.time() - start)
+            log(f"  [{elapsed}s] PyPI check failed ({e}), retrying...")
+
+        time.sleep(interval)
+
+    log(f"  ERROR: After {timeout}s, these wheels are still not visible on PyPI:")
+    for f in sorted(expected_filenames - available):
+        log(f"    - {f}")
+    log("  The upload may have partially failed or CDN propagation is unusually slow.")
+    log(f"  Check https://pypi.org/project/{name}/{version}/#files manually.")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build and publish zccache to PyPI")
@@ -406,7 +468,8 @@ def main() -> None:
         # produce binaries with stale version strings baked in.
         dirty = subprocess.run(
             ["git", "status", "--porcelain"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         ).stdout.strip()
         if dirty:
             log(f"ERROR: Working tree is dirty. Commit and push before publishing.\n{dirty}")
@@ -432,11 +495,13 @@ def main() -> None:
 
     # Step 5: Upload
     if args.dry_run:
-        log(f"\n=== Step 5: Upload (skipped — dry run) ===")
+        log("\n=== Step 5: Upload (skipped — dry run) ===")
         for w in wheels:
             log(f"  {w.name}")
     else:
         upload_wheels(wheels, name, version)
+        # Step 6: Verify all wheels are visible on PyPI (CDN propagation)
+        verify_pypi_wheels(name, version, wheels)
 
     log("\n=== Done ===")
 
