@@ -740,6 +740,186 @@ fn run_passthrough(args: &[String]) -> ExitCode {
     }
 }
 
+// ─── Rustfmt caching ───────────────────────────────────────────────────────
+
+/// Run rustfmt with format caching.
+///
+/// Files whose content hash is already in the format cache are skipped entirely,
+/// preserving their mtime and avoiding unnecessary downstream rebuilds.
+/// After formatting, the new content hash of each file is stored in the cache.
+fn run_rustfmt_cached(rustfmt_path: &Path, args: &[String], cwd: &Path) -> ExitCode {
+    use zccache_compiler::parse_rustfmt::{find_rustfmt_config, parse_rustfmt_invocation};
+
+    let parsed = match parse_rustfmt_invocation(args) {
+        Some(p) => p,
+        None => {
+            // --help, --version, or stdin mode: pass through
+            return run_tool_direct(rustfmt_path, args);
+        }
+    };
+
+    // Build format context: rustfmt binary identity + config + flags.
+    // Changes to any of these invalidate the entire format cache scope.
+    let context_hash = {
+        let mut hasher = zccache_hash::StreamHasher::new();
+        hasher.update(b"zccache-fmt-v1");
+
+        // Hash rustfmt binary content for version identity
+        if let Ok(bin_hash) = zccache_hash::hash_file(rustfmt_path) {
+            hasher.update(bin_hash.as_bytes());
+        } else {
+            hasher.update(b"unknown-binary");
+        }
+
+        // Hash config file content (if found)
+        let config_path = parsed
+            .config_path
+            .clone()
+            .or_else(|| find_rustfmt_config(cwd));
+        if let Some(ref cfg) = config_path {
+            if let Ok(cfg_hash) = zccache_hash::hash_file(cfg) {
+                hasher.update(cfg_hash.as_bytes());
+            }
+        }
+
+        // Hash flags (edition, --check, etc.)
+        for flag in &parsed.flags {
+            hasher.update(flag.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        hasher.finalize().to_hex()
+    };
+
+    // Format cache directory: {cache_dir}/fmt/{context_hash}/
+    let cache_dir = zccache_core::config::default_cache_dir()
+        .join("fmt")
+        .join(&context_hash);
+
+    // Ensure cache dir exists
+    let _ = std::fs::create_dir_all(&cache_dir);
+
+    // Resolve source files to absolute paths and check cache (parallel)
+    use rayon::prelude::*;
+
+    let results: Vec<(PathBuf, bool, Option<zccache_hash::ContentHash>)> = parsed
+        .source_files
+        .par_iter()
+        .map(|src| {
+            let abs = if src.is_absolute() {
+                src.clone()
+            } else {
+                cwd.join(src)
+            };
+            let (is_hit, hash) = match zccache_hash::hash_file(&abs) {
+                Ok(content_hash) => {
+                    let marker = cache_dir.join(content_hash.to_hex());
+                    (marker.exists(), Some(content_hash))
+                }
+                Err(_) => (false, None),
+            };
+            (abs, is_hit, hash)
+        })
+        .collect();
+
+    let mut miss_files: Vec<PathBuf> = Vec::new();
+    let mut all_files: Vec<(PathBuf, bool, Option<zccache_hash::ContentHash>)> = Vec::new();
+    for (abs, is_hit, hash) in results {
+        if !is_hit {
+            miss_files.push(abs.clone());
+        }
+        all_files.push((abs, is_hit, hash));
+    }
+
+    // All files are cache hits — skip rustfmt entirely (mtime preserved!)
+    if miss_files.is_empty() {
+        if parsed.check_mode {
+            // --check: all files are known-formatted → exit 0
+            return ExitCode::SUCCESS;
+        }
+        // Normal mode: all files already formatted → nothing to do
+        return ExitCode::SUCCESS;
+    }
+
+    // Run rustfmt on miss files only (normal mode) or all files (--check mode)
+    let exit_code = if parsed.check_mode {
+        // --check mode: run on miss files only; if all would pass, we
+        // already returned above. For misses, we must run to determine
+        // if they're formatted.
+        run_rustfmt_on_files(rustfmt_path, args, &miss_files, &parsed)
+    } else {
+        // Normal mode: run on miss files only
+        run_rustfmt_on_files(rustfmt_path, args, &miss_files, &parsed)
+    };
+
+    let exit_i32 = match exit_code {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("zccache: failed to run rustfmt: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // On success (exit 0), store new content hashes in format cache
+    if exit_i32 == 0 {
+        // For --check mode with exit 0: the miss files were already formatted
+        // (we just didn't know it). Reuse the hash from the lookup phase.
+        // For normal mode with exit 0: files were reformatted. Must re-hash.
+        for (abs, was_hit, cached_hash) in &all_files {
+            if *was_hit {
+                continue; // Already in cache
+            }
+            let new_hash = if parsed.check_mode {
+                *cached_hash
+            } else {
+                zccache_hash::hash_file(abs).ok()
+            };
+            if let Some(h) = new_hash {
+                let marker = cache_dir.join(h.to_hex());
+                let _ = std::fs::write(&marker, b"");
+            }
+        }
+    }
+
+    exit_code_from_i32(exit_i32)
+}
+
+/// Run rustfmt on a specific set of files, reconstructing the argument list.
+fn run_rustfmt_on_files(
+    rustfmt_path: &Path,
+    original_args: &[String],
+    files: &[PathBuf],
+    parsed: &zccache_compiler::parse_rustfmt::ParsedRustfmt,
+) -> Result<i32, std::io::Error> {
+    // Reconstruct args: flags + the miss files (not the original file list)
+    let mut cmd = std::process::Command::new(rustfmt_path);
+    cmd.args(&parsed.flags);
+    for f in files {
+        cmd.arg(f);
+    }
+
+    // Suppress original args' source files — we pass our filtered list above.
+    // But we need to preserve any non-file, non-flag args. In practice,
+    // flags + files covers everything.
+    let _ = original_args; // intentionally unused — we reconstruct from parsed
+
+    let status = cmd.status()?;
+    Ok(status.code().unwrap_or(1))
+}
+
+/// Run a tool directly and return its exit code.
+fn run_tool_direct(tool: &Path, args: &[String]) -> ExitCode {
+    match std::process::Command::new(tool).args(args).status() {
+        Ok(status) => exit_code_from_i32(status.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!("zccache: failed to run {}: {e}", tool.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+// ─── Wrap (compiler wrapper) ───────────────────────────────────────────────
+
 /// Wrap a compiler or tool invocation.
 ///
 /// `args` is the full command: ["clang++", "-c", "foo.cpp", "-o", "foo.o"]
@@ -774,6 +954,11 @@ fn run_wrap(args: &[String]) -> ExitCode {
 
     let client_env: Vec<(String, String)> = std::env::vars().collect();
     let endpoint = resolve_endpoint(None);
+
+    // Check if this is a rustfmt invocation — handle via format cache path
+    if zccache_compiler::detect_family(&args[0]).is_formatter() {
+        return run_rustfmt_cached(&wrapped_tool, &tool_args, &cwd);
+    }
 
     // Check if this is an archiver or linker tool (including gcc -shared)
     if zccache_compiler::parse_archiver::is_archiver(&args[0])

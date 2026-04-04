@@ -2547,45 +2547,41 @@ async fn handle_compile(
         verdict = zccache_depgraph::CacheVerdict::Cold;
         diag_reason = "cold_skip".to_string();
     } else {
-        if let Some(includes) = state.dep_graph.get_includes(&context_key) {
-            for header in &includes {
-                // For PCH binaries in the include list, hash the source header instead.
-                let hash_path = resolve_pch_source(header, &state.pch_source_map)
-                    .unwrap_or_else(|| header.clone());
-                match hash_file(&state.cache_system, &hash_path, snap_clock) {
+        // Hash includes + force-includes in parallel (PCH-aware).
+        {
+            use rayon::prelude::*;
+            let includes = state.dep_graph.get_includes(&context_key);
+            let include_iter = includes
+                .iter()
+                .flat_map(|v| v.iter().map(|h| (h, "header_hash_fail")));
+            let force_iter = ctx
+                .force_includes
+                .iter()
+                .map(|h| (h, "force_include_hash_fail"));
+            let all_paths: Vec<_> = include_iter.chain(force_iter).collect();
+
+            let results: Vec<_> = all_paths
+                .par_iter()
+                .map(|(header, label)| {
+                    let hash_path = resolve_pch_source(header, &state.pch_source_map)
+                        .unwrap_or_else(|| (*header).clone());
+                    let result = hash_file(&state.cache_system, &hash_path, snap_clock);
+                    ((*header).clone(), hash_path, result, *label)
+                })
+                .collect();
+
+            for (header, hash_path, result, label) in results {
+                match result {
                     Ok(h) => {
-                        hash_map.insert(header.clone(), h);
+                        hash_map.insert(header, h);
                     }
                     Err(e) => {
                         write_session_log(
                             &state.sessions,
                             &sid,
-                            &format!("[DIAG] header_hash_fail: {} error={e}", hash_path.display()),
+                            &format!("[DIAG] {label}: {} error={e}", hash_path.display()),
                         );
                     }
-                }
-            }
-        }
-        // Hash force-included files (PCH, -include) so their content
-        // is part of the artifact key.
-        // For PCH binaries (.pch/.gch), hash the SOURCE header instead — PCH
-        // binaries are not bit-reproducible (clang embeds timestamps).
-        for fi in &ctx.force_includes {
-            let hash_path =
-                resolve_pch_source(fi, &state.pch_source_map).unwrap_or_else(|| fi.clone());
-            match hash_file(&state.cache_system, &hash_path, snap_clock) {
-                Ok(h) => {
-                    hash_map.insert(fi.clone(), h);
-                }
-                Err(e) => {
-                    write_session_log(
-                        &state.sessions,
-                        &sid,
-                        &format!(
-                            "[DIAG] force_include_hash_fail: {} error={e}",
-                            hash_path.display()
-                        ),
-                    );
                 }
             }
         }
@@ -3309,21 +3305,24 @@ fn check_unit_cache(
     };
     let t_hash_source = t0.elapsed();
 
-    // Hash known headers
+    // Hash known headers + force-includes in parallel
     let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
     hash_map.insert(source_path.clone(), source_hash);
-    if let Some(includes) = state.dep_graph.get_includes(&context_key) {
-        for header in &includes {
-            if let Ok(h) = hash_file(&state.cache_system, header, snap_clock) {
-                hash_map.insert(header.clone(), h);
-            }
-        }
-    }
-    // Hash force-included files (PCH, -include) so their content
-    // is part of the artifact key.
-    for fi in &ctx.force_includes {
-        if let Ok(h) = hash_file(&state.cache_system, fi, snap_clock) {
-            hash_map.insert(fi.clone(), h);
+    {
+        use rayon::prelude::*;
+        let includes = state.dep_graph.get_includes(&context_key);
+        let include_iter = includes.iter().flat_map(|v| v.iter());
+        let all_paths: Vec<&PathBuf> = include_iter.chain(ctx.force_includes.iter()).collect();
+        let hashes: Vec<_> = all_paths
+            .par_iter()
+            .filter_map(|path| {
+                hash_file(&state.cache_system, path, snap_clock)
+                    .ok()
+                    .map(|h| ((*path).clone(), h))
+            })
+            .collect();
+        for (path, h) in hashes {
+            hash_map.insert(path, h);
         }
     }
     let t_hash_headers = t0.elapsed();
@@ -3741,16 +3740,21 @@ async fn handle_compile_multi(
             watch_directories(&state, &dep_dirs).await;
         }
 
-        // Hash all files
-        let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
-        if let Ok(h) = hash_file(&state.cache_system, source_path, snap_clock) {
-            hash_map.insert(source_path.clone(), h);
-        }
-        for header in &scan_result.resolved {
-            if let Ok(h) = hash_file(&state.cache_system, header, snap_clock) {
-                hash_map.insert(header.clone(), h);
-            }
-        }
+        // Hash all files (source + headers) in parallel
+        let hash_map: HashMap<PathBuf, ContentHash> = {
+            use rayon::prelude::*;
+            let all_paths: Vec<&PathBuf> = std::iter::once(source_path)
+                .chain(scan_result.resolved.iter())
+                .collect();
+            all_paths
+                .par_iter()
+                .filter_map(|path| {
+                    hash_file(&state.cache_system, path, snap_clock)
+                        .ok()
+                        .map(|h| ((*path).clone(), h))
+                })
+                .collect()
+        };
 
         // Store artifact
         let get_hash = |p: &Path| hash_map.get(p).copied();

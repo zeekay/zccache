@@ -7,6 +7,7 @@
 
 pub mod parse_archiver;
 pub mod parse_linker;
+pub mod parse_rustfmt;
 pub mod response_file;
 
 use std::path::PathBuf;
@@ -23,6 +24,8 @@ pub enum CompilerFamily {
     Msvc,
     /// Rust compiler (rustc)
     Rustc,
+    /// Rust formatter (rustfmt) — not a compiler, but cacheable as a tool.
+    Rustfmt,
 }
 
 impl CompilerFamily {
@@ -34,14 +37,20 @@ impl CompilerFamily {
     }
 
     /// Default PCH output extension (without dot) for this compiler family.
-    /// Returns `None` for MSVC (uses /Yc + /Fp mechanism instead) and Rustc.
+    /// Returns `None` for MSVC (uses /Yc + /Fp mechanism instead), Rustc, and Rustfmt.
     #[must_use]
     pub fn pch_extension(&self) -> Option<&'static str> {
         match self {
             CompilerFamily::Gcc => Some("gch"),
             CompilerFamily::Clang => Some("pch"),
-            CompilerFamily::Msvc | CompilerFamily::Rustc => None,
+            CompilerFamily::Msvc | CompilerFamily::Rustc | CompilerFamily::Rustfmt => None,
         }
+    }
+
+    /// Whether this is a formatter tool (not a compiler).
+    #[must_use]
+    pub fn is_formatter(&self) -> bool {
+        matches!(self, CompilerFamily::Rustfmt)
     }
 }
 
@@ -104,7 +113,13 @@ pub fn detect_family(compiler: &str) -> CompilerFamily {
         Some((stem, _)) => stem,
         None => basename,
     };
-    if name == "rustc" || name.starts_with("rustc-") {
+    if name == "rustfmt" || name.starts_with("rustfmt-") {
+        CompilerFamily::Rustfmt
+    } else if name == "rustc"
+        || name.starts_with("rustc-")
+        || name == "clippy-driver"
+        || name.starts_with("clippy-driver-")
+    {
         CompilerFamily::Rustc
     } else if name.contains("clang") || name == "emcc" || name == "em++" {
         CompilerFamily::Clang
@@ -193,8 +208,15 @@ const FLAGS_WITH_VALUE: &[&str] = &[
 /// the compiler. The compiler always receives the exact original args.
 #[must_use]
 pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
+    let family = detect_family(compiler);
+    // Rustfmt is not a compiler — reject here, CLI handles it separately.
+    if family == CompilerFamily::Rustfmt {
+        return ParsedInvocation::NonCacheable {
+            reason: "rustfmt is handled via the format cache path, not compile cache".to_string(),
+        };
+    }
     // Rustc has a completely different invocation model — dispatch early.
-    if detect_family(compiler) == CompilerFamily::Rustc {
+    if family == CompilerFamily::Rustc {
         return parse_rustc_invocation(compiler, args);
     }
 
@@ -1568,6 +1590,96 @@ mod tests {
         // the compilation IS cacheable. The --test flag is in unknown_flags which
         // is part of the cache key, so different --test values produce different keys.
         // This is correct: `--test` with `--crate-type lib` is a valid cacheable invocation.
+        assert!(matches!(result, ParsedInvocation::Cacheable(_)));
+    }
+
+    // ─── clippy-driver detection and caching tests ──────────────────
+
+    #[test]
+    fn detect_clippy_driver_family() {
+        assert_eq!(detect_family("clippy-driver"), CompilerFamily::Rustc);
+        assert_eq!(
+            detect_family(
+                "/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/clippy-driver"
+            ),
+            CompilerFamily::Rustc
+        );
+        assert_eq!(
+            detect_family("C:\\Users\\user\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\bin\\clippy-driver.exe"),
+            CompilerFamily::Rustc
+        );
+    }
+
+    #[test]
+    fn detect_clippy_driver_versioned() {
+        // Versioned clippy-driver (e.g., from rustup with custom toolchains)
+        assert_eq!(detect_family("clippy-driver-1.78"), CompilerFamily::Rustc);
+    }
+
+    #[test]
+    fn clippy_driver_cacheable_lib() {
+        // cargo clippy invokes: clippy-driver --crate-type lib --crate-name foo src/lib.rs ...
+        let result = parse_invocation(
+            "clippy-driver",
+            &args(&[
+                "--crate-name",
+                "mycrate",
+                "--crate-type",
+                "lib",
+                "--emit=metadata,dep-info",
+                "--out-dir",
+                "target/debug/deps",
+                "-C",
+                "extra-filename=-abc123",
+                "src/lib.rs",
+            ]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.family, CompilerFamily::Rustc);
+                assert_eq!(c.source_file, PathBuf::from("src/lib.rs"));
+                // metadata-only emit → .rmeta extension
+                assert!(c.output_file.to_str().unwrap().ends_with(".rmeta"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clippy_driver_non_cacheable_bin() {
+        // Binary crate type is not cacheable (same as rustc)
+        let result = parse_invocation(
+            "clippy-driver",
+            &args(&[
+                "--crate-name",
+                "mybin",
+                "--crate-type",
+                "bin",
+                "src/main.rs",
+            ]),
+        );
+        assert!(matches!(result, ParsedInvocation::NonCacheable { .. }));
+    }
+
+    #[test]
+    fn clippy_driver_with_lint_flags() {
+        // clippy-specific lint flags are standard rustc -W/-A/-D flags
+        let result = parse_invocation(
+            "clippy-driver",
+            &args(&[
+                "--crate-name",
+                "mycrate",
+                "--crate-type",
+                "lib",
+                "-W",
+                "clippy::all",
+                "-D",
+                "clippy::unwrap_used",
+                "-A",
+                "clippy::too_many_arguments",
+                "src/lib.rs",
+            ]),
+        );
         assert!(matches!(result, ParsedInvocation::Cacheable(_)));
     }
 }

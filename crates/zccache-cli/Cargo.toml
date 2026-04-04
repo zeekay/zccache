@@ -14,8 +14,10 @@ clap = { workspace = true }
 thiserror = { workspace = true }
 zccache-core = { path = "../zccache-core" }
 zccache-compiler = { path = "../zccache-compiler" }
+zccache-hash = { path = "../zccache-hash" }
 zccache-protocol = { path = "../zccache-protocol" }
 zccache-ipc = { path = "../zccache-ipc" }
+rayon = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true }
