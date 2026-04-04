@@ -4,7 +4,7 @@ zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md 
 
 ## Essential Rules
 
-- **Always use `uv run` to execute Rust commands.** Bare cargo/rustc are blocked by hook. `.env` prepends `.cargo/bin` to PATH so `uv run cargo` finds the rustup toolchain.
+- **Always use the project-root trampolines** (`_cargo`, `_rustc`, `_rustfmt`) to execute Rust commands. Bare cargo/rustc and `uv run cargo` are blocked by hook. Trampolines prepend `.cargo/bin` to PATH so the rustup toolchain is always used. Usage: `./_cargo check --workspace`.
 - **Always use `uv` for Python.** Bare `python`/`pip` are blocked by hook. Use `uv run ...` or `uv pip ...`.
 - MSRV: 1.75 | Edition: 2021 | Toolchain: stable (clippy + rustfmt)
 - CI: Linux, macOS, Windows. All warnings denied (`RUSTFLAGS="-D warnings"`)
@@ -17,11 +17,11 @@ zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md 
 ./test --integration        # integration tests only (need clang on PATH)
 ./test --full               # unit + integration + stress + perf tests
 ./test -p <crate> -- <test_name>
-uv run cargo check --workspace --all-targets
-uv run cargo clippy --workspace --all-targets -- -D warnings
-uv run cargo fmt --all
-RUSTDOCFLAGS="-D warnings" uv run cargo doc --workspace --no-deps
-uv run cargo bench -p zccache-hash
+./_cargo check --workspace --all-targets
+./_cargo clippy --workspace --all-targets -- -D warnings
+./_cargo fmt --all
+RUSTDOCFLAGS="-D warnings" ./_cargo doc --workspace --no-deps
+./_cargo bench -p zccache-hash
 ./perf                      # performance benchmark (zccache vs sccache vs bare clang)
 ```
 
@@ -69,7 +69,7 @@ Hooks are in `ci/hooks/` (Python) and `crates/zccache-ci` (Rust):
 ## Language Policy
 
 - **Python is only for CI scripts, packaging, and hooks.** All tests, benchmarks, and application logic must be written in Rust.
-- `uv run` is required for Rust commands because hooks enforce it — `.env` sets the correct toolchain PATH. It is not an endorsement of Python for project code.
+- Trampolines (`_cargo`, `_rustc`, `_rustfmt`) are required for Rust commands because hooks enforce it — they prepend `.cargo/bin` to PATH ensuring the rustup toolchain. This is not an endorsement of Python for project code.
 - When in doubt, write it in Rust.
 
 ## Development Philosophy: TDD

@@ -44,10 +44,9 @@ def main():
     if not os.path.isfile(file_path):
         return 0
 
-    # Delegate to ./lint in single-file mode
-    lint_script = str(PROJECT_ROOT / "lint")
+    # Delegate to ci.lint in single-file mode
     result = subprocess.run(
-        ["uv", "run", "--script", lint_script, file_path],
+        ["uv", "run", "python", "-m", "ci.lint", file_path],
         capture_output=True,
         text=True,
         encoding="utf-8",

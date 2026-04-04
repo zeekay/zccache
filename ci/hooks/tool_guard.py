@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """PreToolUse hook: blocks bare Rust commands and bare python/pip.
 
-All cargo/rustc/rustfmt must go through uv run (.env PATH ensures correct toolchain).
+All cargo/rustc/rustfmt must go through the project-root trampolines
+(_cargo, _rustc, _rustfmt) which prepend .cargo/bin to PATH ensuring
+the rustup toolchain is always used.
+
 All python must go through uv (ensures correct environment).
 
 Exit codes:
@@ -15,6 +18,9 @@ import sys
 
 RUST_TOOLS = {"cargo", "rustc", "rustfmt", "clippy-driver", "cargo-clippy", "cargo-fmt"}
 PYTHON_TOOLS = {"python", "python3", "pip", "pip3"}
+
+# Trampoline scripts at project root that normalize the toolchain PATH
+RUST_TRAMPOLINES = {"_cargo", "_rustc", "_rustfmt"}
 
 ALLOWED_PREFIXES = ("uv run ", "uv pip ")
 
@@ -34,14 +40,32 @@ DENY_PYTHON_IN_CODE = (
 )
 
 
+def _first_word(seg):
+    """Extract the first word (command name) from a segment."""
+    words = seg.split()
+    return words[0] if words else ""
+
+
+def _resolve_uv_run_tool(seg):
+    """If seg starts with 'uv run', return the tool being invoked.
+
+    Handles both 'uv run cargo ...' and 'uv run --script ./_cargo ...' forms.
+    """
+    # 'uv run --script ./_cargo ...' — trampoline invocation, return the script name
+    m = re.match(r"uv\s+run\s+--script\s+(\S+)", seg)
+    if m:
+        return m.group(1)
+    # 'uv run cargo ...' — bare tool
+    m = re.match(r"uv\s+run\s+(\S+)", seg)
+    return m.group(1) if m else None
+
+
 def check_command(command):
     """Check a command string for forbidden bare invocations.
 
     Returns (tool, reason) if forbidden, None if allowed.
     """
     # ── Global check: block .py scripts in bench/ or tests/ dirs ─────
-    # Catches all forms: uv run python bench/x.py, uv run bench/x.py,
-    # uv run --script bench/x.py, ./bench/x.py, python tests/x.py, etc.
     if FORBIDDEN_SCRIPT_DIRS.search(command):
         return ("python", DENY_PYTHON_IN_CODE)
 
@@ -53,30 +77,58 @@ def check_command(command):
         if not seg:
             continue
 
-        # Skip if properly wrapped with uv
-        if any(seg.startswith(p) for p in ALLOWED_PREFIXES):
+        first = _first_word(seg)
+
+        # Allow trampoline scripts (with or without ./ prefix)
+        bare = first.lstrip("./")
+        if bare in RUST_TRAMPOLINES:
             continue
 
-        first_word = seg.split()[0] if seg.split() else ""
+        # Block `uv run cargo/rustc/...` — must use _cargo/_rustc trampolines
+        if seg.startswith("uv run ") or seg.startswith("uv  run "):
+            tool = _resolve_uv_run_tool(seg)
+            if tool is None:
+                continue
+            # Allow trampoline invocations: uv run --script ./_cargo
+            tool_bare = tool.lstrip("./")
+            if tool_bare in RUST_TRAMPOLINES:
+                continue
+            # Block direct Rust tool invocations via uv run
+            if tool in RUST_TOOLS:
+                trampoline = f"_{tool}" if f"_{tool}" in RUST_TRAMPOLINES else "_cargo"
+                return (
+                    tool,
+                    f"Use `./{trampoline} ...` instead of `uv run {tool} ...`. "
+                    f"Trampolines ensure the correct rustup toolchain is on PATH.",
+                )
+            # Other uv run commands are fine (uv run python, uv run --script, etc.)
+            continue
 
-        if first_word in RUST_TOOLS:
+        # Allow uv pip
+        if seg.startswith("uv pip "):
+            continue
+
+        # Block bare Rust tools
+        if first in RUST_TOOLS:
+            trampoline = f"_{first}" if f"_{first}" in RUST_TRAMPOLINES else "_cargo"
             return (
-                first_word,
-                f"Use `uv run {first_word} ...` instead of bare `{first_word}`. "
-                f"The .env file ensures the correct Rust toolchain is on PATH.",
+                first,
+                f"Use `./{trampoline} ...` instead of bare `{first}`. "
+                f"Trampolines ensure the correct rustup toolchain is on PATH.",
             )
 
-        if first_word in PYTHON_TOOLS:
-            if first_word.startswith("pip"):
+        # Block bare Python tools
+        if first in PYTHON_TOOLS:
+            if first.startswith("pip"):
                 suggestion = f"uv pip {' '.join(seg.split()[1:])}" if len(seg.split()) > 1 else "uv pip ..."
                 return (
-                    first_word,
-                    f"Use `{suggestion}` instead of bare `{first_word}`. "
+                    first,
+                    f"Use `{suggestion}` instead of bare `{first}`. "
                     f"All pip operations must go through uv.",
                 )
             return (
-                first_word,
-                f"Use `uv run ...` instead of bare `{first_word}`. "
+                first,
+                f"Use `uv run ...` instead of bare `{first}`. "
                 f"All Python must be executed through uv.",
             )
 

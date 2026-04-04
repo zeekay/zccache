@@ -286,7 +286,7 @@ mod tests {
         }
         let all = store.load_all().unwrap();
         assert_eq!(all.len(), 3);
-        let loaded_keys: Vec<&str> = all.iter().map(|(k, _)| k.as_str()).collect();
+        let loaded_keys: Vec<&str> = all.iter().map(|(k, _): &(String, _)| k.as_str()).collect();
         for key in &keys {
             assert!(loaded_keys.contains(key));
         }

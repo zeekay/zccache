@@ -1,7 +1,3 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.10"
-# ///
 """Run performance benchmarks (zccache vs sccache vs bare clang).
 
 Two benchmarks:
@@ -13,24 +9,19 @@ Usage:
     ./perf --nocapture   # (default) show output as it runs
 """
 
-import os
 import subprocess
 import sys
 from pathlib import Path
 
+from ci.env import activate, clean_env
+
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 
 
-def _clean_env():
-    """Return env with VIRTUAL_ENV removed to avoid uv mismatch warnings."""
-    env = os.environ.copy()
-    env.pop("VIRTUAL_ENV", None)
-    return env
-
-
 def main():
+    activate()
     cmd = [
-        "uv", "run", "cargo", "test",
+        "cargo", "test",
         "-p", "zccache-daemon",
         "--test", "perf_bench_test",
         "--",
@@ -45,7 +36,7 @@ def main():
         encoding="utf-8",
         errors="replace",
         cwd=str(SCRIPT_DIR),
-        env=_clean_env(),
+        env=clean_env(),
     )
     return result.returncode
 

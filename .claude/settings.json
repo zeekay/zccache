@@ -29,8 +29,13 @@
         "hooks": [
           {
             "type": "command",
+            "command": "uv run python -m ci.sccache_setup",
+            "timeout": 15
+          },
+          {
+            "type": "command",
             "command": "uv run python ci/hooks/check-on-start.py",
-            "timeout": 10
+            "timeout": 15
           }
         ]
       }
@@ -40,12 +45,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run cargo fmt --all",
+            "command": "./_cargo fmt --all",
             "timeout": 60
           },
           {
             "type": "command",
-            "command": "uv run cargo run -p zccache-ci",
+            "command": "./_cargo run -p zccache-ci",
             "timeout": 600
           }
         ]

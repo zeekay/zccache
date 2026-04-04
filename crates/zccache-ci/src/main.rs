@@ -224,6 +224,23 @@ fn run_streaming(root: &Path, cmd: &[String], label: &str) -> (i32, bool) {
 // Main
 // ---------------------------------------------------------------------------
 
+/// Prepend ~/.cargo/bin to PATH so all spawned cargo/rustc calls use rustup.
+fn activate_rustup_toolchain() {
+    let home = if cfg!(windows) {
+        env::var("USERPROFILE").ok()
+    } else {
+        env::var("HOME").ok()
+    };
+    if let Some(home) = home {
+        let cargo_bin = PathBuf::from(home).join(".cargo").join("bin");
+        if cargo_bin.is_dir() {
+            let sep = if cfg!(windows) { ";" } else { ":" };
+            let current = env::var("PATH").unwrap_or_default();
+            env::set_var("PATH", format!("{}{sep}{current}", cargo_bin.display()));
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let root = project_root();
 
@@ -232,18 +249,21 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Ensure all spawned cargo/rustc processes find the rustup toolchain
+    activate_rustup_toolchain();
+
     // Kill any running daemon so cargo can replace the exe on Windows
     kill_daemon();
 
     eprintln!("Running full workspace checks (changes detected)");
 
     // Run lint first. If it fails, skip tests entirely.
-    let lint_script = root.join("lint").to_string_lossy().to_string();
     let lint_cmd: Vec<String> = vec![
         "uv".into(),
         "run".into(),
-        "--script".into(),
-        lint_script,
+        "python".into(),
+        "-m".into(),
+        "ci.lint".into(),
         "--fix".into(),
     ];
     let (lint_rc, lint_timeout) = run_streaming(&root, &lint_cmd, "Lint");
@@ -259,8 +279,6 @@ fn main() -> ExitCode {
 
     // Doc check (catches unclosed HTML tags, broken intra-doc links, etc.)
     let doc_cmd: Vec<String> = vec![
-        "uv".into(),
-        "run".into(),
         "cargo".into(),
         "doc".into(),
         "--workspace".into(),
@@ -283,8 +301,6 @@ fn main() -> ExitCode {
     // Exclude zccache-daemon: its server tests start a real daemon with
     // IPC + file watcher and are effectively integration tests.
     let test_cmd: Vec<String> = vec![
-        "uv".into(),
-        "run".into(),
         "cargo".into(),
         "test".into(),
         "--workspace".into(),

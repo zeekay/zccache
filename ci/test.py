@@ -1,7 +1,3 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.10"
-# ///
 """Run workspace tests.
 
 Usage:
@@ -12,23 +8,18 @@ Usage:
     ./test -p zccache-hash -- name  # single test by name
 """
 
-import os
 import subprocess
 import sys
 from pathlib import Path
 
+from ci.env import activate, clean_env
+
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 
 
-def _clean_env():
-    """Return env with VIRTUAL_ENV removed to avoid uv mismatch warnings."""
-    env = os.environ.copy()
-    env.pop("VIRTUAL_ENV", None)
-    return env
-
-
 def main():
-    cmd = ["uv", "run", "cargo", "test"]
+    activate()
+    cmd = ["cargo", "test"]
 
     args = sys.argv[1:]
     full = "--full" in args
@@ -64,7 +55,7 @@ def main():
         encoding="utf-8",
         errors="replace",
         cwd=str(SCRIPT_DIR),
-        env=_clean_env(),
+        env=clean_env(),
     )
     return result.returncode
 
