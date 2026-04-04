@@ -28,8 +28,8 @@ jobs:
             os: ubuntu-latest
             binary_ext: ""
             cross: true
-            linker: aarch64-linux-musl-gcc
-            strip: aarch64-linux-musl-strip
+            linker: aarch64-unknown-linux-musl-gcc
+            strip: aarch64-unknown-linux-musl-strip
 
           - target: x86_64-apple-darwin
             os: macos-14
@@ -63,15 +63,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
-      # Linux musl aarch64 cross-compilation toolchain
+      # Linux musl aarch64 cross-compilation toolchain (from GitHub-hosted mirror;
+      # musl.cc blocks GitHub Actions IPs: github.com/orgs/community/discussions/27906)
       - name: Install musl cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
-          curl --retry 5 --retry-delay 3 --retry-all-errors -fsSL \
-            -o aarch64-linux-musl-cross.tgz \
-            https://musl.cc/aarch64-linux-musl-cross.tgz
-          tar xzf aarch64-linux-musl-cross.tgz
-          echo "$PWD/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+          curl -fsSL -o aarch64-unknown-linux-musl.tar.xz \
+            https://github.com/cross-tools/musl-cross/releases/download/20250929/aarch64-unknown-linux-musl.tar.xz
+          tar xJf aarch64-unknown-linux-musl.tar.xz
+          echo "$PWD/aarch64-unknown-linux-musl/bin" >> $GITHUB_PATH
 
       # Set cross-compilation linker via target-specific env var
       - name: Configure cross-compilation linker
