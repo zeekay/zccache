@@ -193,9 +193,11 @@ fn expand_recursive(
 /// Maximum command-line length (in bytes) before we spill to a response file.
 /// Windows `CreateProcess` has a 32,767 character limit. We use a conservative
 /// threshold to account for the compiler path, env block, and quoting overhead.
+#[cfg(windows)]
 const MAX_CMDLINE_LEN: usize = 30_000;
 
 /// Atomic counter for unique response file names.
+#[cfg(windows)]
 static RSP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Format arguments as response file content with proper quoting.
@@ -204,6 +206,7 @@ static RSP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// double quotes, or starting with `@` are double-quoted to prevent the
 /// compiler from misinterpreting them. Inside quotes, `"` and `\` are
 /// backslash-escaped.
+#[cfg(windows)]
 fn format_rsp_content(args: &[String]) -> String {
     let estimated_len: usize = args.iter().map(|a| a.len() + 3).sum();
     let mut content = String::with_capacity(estimated_len);

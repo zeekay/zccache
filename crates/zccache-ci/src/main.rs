@@ -60,14 +60,27 @@ fn session_fingerprint(root: &Path) -> Option<String> {
     v.get("fingerprint")?.as_str().map(String::from)
 }
 
-fn should_skip(root: &Path) -> bool {
+/// Returns `Skip` when repo is totally clean, `QuickCheck` when dirty files
+/// exist but haven't changed this session, or `Full` when new changes detected.
+fn check_level(root: &Path) -> CheckLevel {
     match current_fingerprint(root) {
-        None => true, // no changes right now
+        None => CheckLevel::Skip, // repo is clean
         Some(current) => match session_fingerprint(root) {
-            None => false,                       // repo was clean at start → changes are new
-            Some(session) => current == session, // same → no changes this session
+            None => CheckLevel::Full, // repo was clean at start → changes are new
+            Some(session) if current == session => CheckLevel::QuickCheck, // pre-existing dirty files
+            Some(_) => CheckLevel::Full, // fingerprint changed → new changes this session
         },
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum CheckLevel {
+    /// No uncommitted changes — skip everything.
+    Skip,
+    /// Dirty files exist but unchanged this session — run `cargo check` only.
+    QuickCheck,
+    /// New changes detected — full lint + doc + tests.
+    Full,
 }
 
 // ---------------------------------------------------------------------------
@@ -244,8 +257,10 @@ fn activate_rustup_toolchain() {
 fn main() -> ExitCode {
     let root = project_root();
 
-    if should_skip(&root) {
-        eprintln!("Skipping stop checks (no changes during this session)");
+    let level = check_level(&root);
+
+    if level == CheckLevel::Skip {
+        eprintln!("Skipping stop checks (no uncommitted changes)");
         return ExitCode::SUCCESS;
     }
 
@@ -254,6 +269,29 @@ fn main() -> ExitCode {
 
     // Kill any running daemon so cargo can replace the exe on Windows
     kill_daemon();
+
+    if level == CheckLevel::QuickCheck {
+        eprintln!("Pre-existing dirty files — running cargo check");
+        let check_cmd: Vec<String> = vec![
+            "uv".into(),
+            "run".into(),
+            "cargo".into(),
+            "check".into(),
+            "--workspace".into(),
+            "--all-targets".into(),
+        ];
+        let (rc, timed_out) = run_streaming(&root, &check_cmd, "Quick check");
+        if timed_out {
+            eprintln!("Quick check timed out");
+            return ExitCode::from(2);
+        }
+        if rc != 0 {
+            eprintln!("Quick check failed — uncommitted files do not compile");
+            return ExitCode::from(2);
+        }
+        eprintln!("Quick check passed");
+        return ExitCode::SUCCESS;
+    }
 
     eprintln!("Running full workspace checks (changes detected)");
 
