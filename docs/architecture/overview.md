@@ -132,7 +132,7 @@ enum Request {
     SessionEnd { session_id },
     SessionStats { session_id },           // query mid-session stats (non-destructive)
     CompileEphemeral { client_pid, working_dir, compiler, args, cwd, env },
-    LinkEphemeral { client_pid, working_dir, tool, args, cwd, env },
+    LinkEphemeral { client_pid, tool, args, cwd, env },
 }
 
 enum Response {

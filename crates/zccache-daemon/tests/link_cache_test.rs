@@ -51,7 +51,7 @@ async fn test_ar_cache_miss_then_hit() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: ar_path.to_string_lossy().into_owned().into(),
             args: vec![
                 "rcsD".to_string(),
@@ -96,7 +96,7 @@ async fn test_ar_cache_miss_then_hit() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: ar_path.to_string_lossy().into_owned().into(),
             args: vec![
                 "rcsD".to_string(),
@@ -168,7 +168,7 @@ async fn test_ar_cache_invalidated_on_input_change() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: ar_path.to_string_lossy().into_owned().into(),
             args: make_args(&output_lib, tmp.path()),
             cwd: tmp.path().to_string_lossy().into_owned().into(),
@@ -200,7 +200,7 @@ async fn test_ar_cache_invalidated_on_input_change() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: ar_path.to_string_lossy().into_owned().into(),
             args: make_args(&output_lib, tmp.path()),
             cwd: tmp.path().to_string_lossy().into_owned().into(),
@@ -254,7 +254,7 @@ async fn test_ar_non_deterministic_warning() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: ar_path.to_string_lossy().into_owned().into(),
             args: vec![
                 "rcs".to_string(),
@@ -330,7 +330,7 @@ async fn test_ar_non_cacheable_passthrough() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: ar_path.to_string_lossy().into_owned().into(),
             args: vec!["t".to_string(), lib_path.to_string_lossy().into_owned()],
             cwd: tmp.path().to_string_lossy().into_owned().into(),
@@ -385,7 +385,7 @@ async fn test_link_stats_in_status() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: ar_path.to_string_lossy().into_owned().into(),
             args: vec![
                 "rcsD".to_string(),

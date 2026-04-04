@@ -82,8 +82,6 @@ pub enum Request {
     LinkEphemeral {
         /// Client process ID.
         client_pid: u32,
-        /// Client working directory.
-        working_dir: PathBuf,
         /// Path to the linker/archiver tool (ar, ld, lib.exe, link.exe, etc.).
         tool: PathBuf,
         /// Tool arguments (e.g., ["rcs", "libfoo.a", "a.o", "b.o"]).
@@ -532,7 +530,6 @@ mod tests {
     fn link_ephemeral_roundtrip() {
         roundtrip(&Request::LinkEphemeral {
             client_pid: 5555,
-            working_dir: PathBuf::from("/home/user/project"),
             tool: PathBuf::from("/usr/bin/ar"),
             args: vec!["rcs".into(), "libfoo.a".into(), "a.o".into(), "b.o".into()],
             cwd: PathBuf::from("/home/user/project/build"),
@@ -540,7 +537,6 @@ mod tests {
         });
         roundtrip(&Request::LinkEphemeral {
             client_pid: 1,
-            working_dir: PathBuf::from("."),
             tool: PathBuf::from("lib.exe"),
             args: vec!["/OUT:foo.lib".into(), "a.obj".into()],
             cwd: PathBuf::from("."),
@@ -654,8 +650,8 @@ mod tests {
 
     // Compile-time check: PROTOCOL_VERSION must be positive.
     const _: () = assert!(crate::PROTOCOL_VERSION > 0);
-    // Compile-time check: PROTOCOL_VERSION == 4 after fingerprint additions.
-    const _FINGERPRINT_VERSION: () = assert!(crate::PROTOCOL_VERSION == 4);
+    // Compile-time check: PROTOCOL_VERSION == 5 after LinkEphemeral working_dir removal.
+    const _FINGERPRINT_VERSION: () = assert!(crate::PROTOCOL_VERSION == 5);
 
     #[test]
     fn fingerprint_check_roundtrip() {

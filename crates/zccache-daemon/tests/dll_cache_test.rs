@@ -81,7 +81,7 @@ async fn test_dll_cache_miss_then_hit() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: gcc_path.to_string_lossy().into_owned().into(),
             args: make_args(&output_dll, tmp.path()),
             cwd: tmp.path().to_string_lossy().into_owned().into(),
@@ -120,7 +120,7 @@ async fn test_dll_cache_miss_then_hit() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: gcc_path.to_string_lossy().into_owned().into(),
             args: make_args(&output_dll, tmp.path()),
             cwd: tmp.path().to_string_lossy().into_owned().into(),
@@ -193,7 +193,7 @@ async fn test_dll_cache_invalidated_on_input_change() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: gcc_path.to_string_lossy().into_owned().into(),
             args: make_args(&output_dll, tmp.path()),
             cwd: tmp.path().to_string_lossy().into_owned().into(),
@@ -230,7 +230,7 @@ async fn test_dll_cache_invalidated_on_input_change() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: gcc_path.to_string_lossy().into_owned().into(),
             args: make_args(&output_dll, tmp.path()),
             cwd: tmp.path().to_string_lossy().into_owned().into(),
@@ -293,7 +293,7 @@ async fn test_dll_non_deterministic_warning() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: gcc_path.to_string_lossy().into_owned().into(),
             args: vec![
                 "-shared".to_string(),
@@ -380,7 +380,7 @@ async fn test_exe_cache_miss_then_hit() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: gcc_path.to_string_lossy().into_owned().into(),
             args: make_args(&output_exe, tmp.path()),
             cwd: tmp.path().to_string_lossy().into_owned().into(),
@@ -415,7 +415,7 @@ async fn test_exe_cache_miss_then_hit() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: gcc_path.to_string_lossy().into_owned().into(),
             args: make_args(&output_exe, tmp.path()),
             cwd: tmp.path().to_string_lossy().into_owned().into(),
@@ -504,7 +504,7 @@ async fn test_clang_link_cache_miss_then_hit() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: clang.to_string_lossy().into_owned().into(),
             args: make_args(&output_exe, tmp.path()),
             cwd: tmp.path().to_string_lossy().into_owned().into(),
@@ -538,7 +538,7 @@ async fn test_clang_link_cache_miss_then_hit() {
     client
         .send(&Request::LinkEphemeral {
             client_pid: std::process::id(),
-            working_dir: tmp.path().to_string_lossy().into_owned().into(),
+
             tool: clang.to_string_lossy().into_owned().into(),
             args: make_args(&output_exe, tmp.path()),
             cwd: tmp.path().to_string_lossy().into_owned().into(),

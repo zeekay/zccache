@@ -21,6 +21,21 @@ use crate::compile_journal::{extract_outcome, CompileJournal, JournalContext, Jo
 use crate::fingerprint::FingerprintManager;
 use crate::stats::{HitPhases, MissPhases, PhaseProfiler, StatsCollector};
 
+/// RAII guard that decrements `in_flight_bytes` on drop, even during panic unwind.
+/// Prevents permanent counter inflation if a `spawn_blocking` task panics.
+struct InFlightGuard {
+    state: Arc<SharedState>,
+    size: usize,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.state
+            .in_flight_bytes
+            .fetch_sub(self.size, Ordering::Relaxed);
+    }
+}
+
 /// Cached result of a verified cache hit, enabling zero-hash fast path.
 ///
 /// When the journal clock hasn't advanced since the last verified hit for a
@@ -549,7 +564,9 @@ impl DaemonServer {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(300)).await;
                     let path = zccache_depgraph::depgraph_file_path();
-                    std::fs::create_dir_all(path.parent().unwrap()).ok();
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).ok();
+                    }
                     match zccache_depgraph::save_to_file(&state.dep_graph, &path) {
                         Ok(()) => tracing::debug!("periodic depgraph save"),
                         Err(e) => tracing::warn!("periodic depgraph save failed: {e}"),
@@ -579,7 +596,9 @@ impl DaemonServer {
                     // Save depgraph to disk before exiting.
                     let start = std::time::Instant::now();
                     let path = zccache_depgraph::depgraph_file_path();
-                    std::fs::create_dir_all(path.parent().unwrap()).ok();
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).ok();
+                    }
                     match zccache_depgraph::save_to_file(&self.state.dep_graph, &path) {
                         Ok(()) => tracing::info!(
                             elapsed_ms = start.elapsed().as_millis() as u64,
@@ -989,7 +1008,6 @@ async fn handle_connection(
             ),
             Request::LinkEphemeral {
                 client_pid,
-                working_dir,
                 tool,
                 args,
                 cwd,
@@ -1002,16 +1020,8 @@ async fn handle_connection(
                     env: env.clone(),
                     session_id: None,
                 };
-                let resp = handle_link_ephemeral(
-                    &state,
-                    client_pid,
-                    &working_dir,
-                    &tool,
-                    &ctx.args,
-                    &cwd,
-                    env,
-                )
-                .await;
+                let resp =
+                    handle_link_ephemeral(&state, client_pid, &tool, &ctx.args, &cwd, env).await;
                 (resp, Some(ctx))
             }
             Request::FingerprintCheck {
@@ -1187,7 +1197,6 @@ async fn handle_compile_ephemeral(
 async fn handle_link_ephemeral(
     state: &Arc<SharedState>,
     _client_pid: u32,
-    _working_dir: &Path,
     tool: &Path,
     args: &[String],
     cwd: &Path,
@@ -1470,19 +1479,21 @@ async fn handle_link_ephemeral(
                 state
                     .in_flight_bytes
                     .fetch_add(payload_size, Ordering::Relaxed);
+                let guard = InFlightGuard {
+                    state: Arc::clone(state),
+                    size: payload_size,
+                };
                 let sem = Arc::clone(&state.persist_semaphore);
                 let state_ref = Arc::clone(state);
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     tokio::task::spawn_blocking(move || {
+                        let _guard = guard;
                         for (i, payload) in payloads.iter().enumerate() {
                             let cache_path = artifact_dir.join(format!("{kh}_{i}"));
                             std::fs::write(&cache_path, &**payload).ok();
                         }
                         state_ref.artifact_store.insert(&kh, &persist_meta).ok();
-                        state_ref
-                            .in_flight_bytes
-                            .fetch_sub(payload_size, Ordering::Relaxed);
                     })
                     .await
                     .ok();
@@ -3119,11 +3130,16 @@ async fn handle_compile(
                 state
                     .in_flight_bytes
                     .fetch_add(payload_size, Ordering::Relaxed);
+                let guard = InFlightGuard {
+                    state: Arc::clone(state_arc),
+                    size: payload_size,
+                };
                 let sem = Arc::clone(&state.persist_semaphore);
                 let state_ref = Arc::clone(state_arc);
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     tokio::task::spawn_blocking(move || {
+                        let _guard = guard;
                         for (i, payload) in payloads.iter().enumerate() {
                             let cache_path = artifact_dir.join(format!("{key_hex}_{i}"));
                             if let Err(e) = std::fs::write(&cache_path, &**payload) {
@@ -3137,9 +3153,6 @@ async fn handle_compile(
                             .artifact_store
                             .insert(&key_hex, &persist_meta)
                             .ok();
-                        state_ref
-                            .in_flight_bytes
-                            .fetch_sub(payload_size, Ordering::Relaxed);
                     })
                     .await
                     .ok();
@@ -3840,11 +3853,16 @@ async fn handle_compile_multi(
                 state
                     .in_flight_bytes
                     .fetch_add(payload_size, Ordering::Relaxed);
+                let guard = InFlightGuard {
+                    state: Arc::clone(&state),
+                    size: payload_size,
+                };
                 let sem = Arc::clone(&state.persist_semaphore);
                 let state_ref = Arc::clone(&state);
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     tokio::task::spawn_blocking(move || {
+                        let _guard = guard;
                         for (i, payload) in payloads.iter().enumerate() {
                             let cache_path = artifact_dir.join(format!("{key_hex}_{i}"));
                             if let Err(e) = std::fs::write(&cache_path, &**payload) {
@@ -3858,9 +3876,6 @@ async fn handle_compile_multi(
                             .artifact_store
                             .insert(&key_hex, &persist_meta)
                             .ok();
-                        state_ref
-                            .in_flight_bytes
-                            .fetch_sub(payload_size, Ordering::Relaxed);
                     })
                     .await
                     .ok();

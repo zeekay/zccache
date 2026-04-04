@@ -363,9 +363,10 @@ async fn cmd_stop(endpoint: &str) -> ExitCode {
         }
     };
 
-    conn.send(&zccache_protocol::Request::Shutdown)
-        .await
-        .unwrap();
+    if let Err(e) = conn.send(&zccache_protocol::Request::Shutdown).await {
+        eprintln!("zccache: failed to send to daemon: {e}");
+        return ExitCode::FAILURE;
+    }
     let recv_result = match conn.recv().await {
         Ok(r) => r,
         Err(e) => {
@@ -398,7 +399,10 @@ async fn cmd_status(endpoint: &str) -> ExitCode {
         }
     };
 
-    conn.send(&zccache_protocol::Request::Status).await.unwrap();
+    if let Err(e) = conn.send(&zccache_protocol::Request::Status).await {
+        eprintln!("zccache: failed to send to daemon: {e}");
+        return ExitCode::FAILURE;
+    }
     let recv_result = match conn.recv().await {
         Ok(r) => r,
         Err(e) => {
@@ -505,7 +509,10 @@ async fn cmd_clear(endpoint: &str) -> ExitCode {
         }
     };
 
-    conn.send(&zccache_protocol::Request::Clear).await.unwrap();
+    if let Err(e) = conn.send(&zccache_protocol::Request::Clear).await {
+        eprintln!("zccache: failed to send to daemon: {e}");
+        return ExitCode::FAILURE;
+    }
     let recv_result = match conn.recv().await {
         Ok(r) => r,
         Err(e) => {
@@ -563,15 +570,19 @@ async fn cmd_session_start(
         }
     };
 
-    conn.send(&zccache_protocol::Request::SessionStart {
-        client_pid: std::process::id(),
-        working_dir: cwd.to_path_buf(),
-        log_file: log.map(Path::to_path_buf),
-        track_stats,
-        journal_path: journal,
-    })
-    .await
-    .unwrap();
+    if let Err(e) = conn
+        .send(&zccache_protocol::Request::SessionStart {
+            client_pid: std::process::id(),
+            working_dir: cwd.to_path_buf(),
+            log_file: log.map(Path::to_path_buf),
+            track_stats,
+            journal_path: journal,
+        })
+        .await
+    {
+        eprintln!("zccache: failed to send to daemon: {e}");
+        return ExitCode::FAILURE;
+    }
 
     let recv_result = match conn.recv().await {
         Ok(r) => r,
@@ -630,11 +641,15 @@ async fn cmd_session_end(endpoint: &str, session_id: String) -> ExitCode {
         }
     };
 
-    conn.send(&zccache_protocol::Request::SessionEnd {
-        session_id: session_id.clone(),
-    })
-    .await
-    .unwrap();
+    if let Err(e) = conn
+        .send(&zccache_protocol::Request::SessionEnd {
+            session_id: session_id.clone(),
+        })
+        .await
+    {
+        eprintln!("zccache: failed to send to daemon: {e}");
+        return ExitCode::FAILURE;
+    }
 
     let recv_result = match conn.recv().await {
         Ok(r) => r,
@@ -691,11 +706,15 @@ async fn cmd_session_stats(endpoint: &str, session_id: String) -> ExitCode {
         }
     };
 
-    conn.send(&zccache_protocol::Request::SessionStats {
-        session_id: session_id.clone(),
-    })
-    .await
-    .unwrap();
+    if let Err(e) = conn
+        .send(&zccache_protocol::Request::SessionStats {
+            session_id: session_id.clone(),
+        })
+        .await
+    {
+        eprintln!("zccache: failed to send to daemon: {e}");
+        return ExitCode::FAILURE;
+    }
 
     let recv_result = match conn.recv().await {
         Ok(r) => r,
@@ -1212,6 +1231,11 @@ fn run_wrap(args: &[String]) -> ExitCode {
     let client_env: Vec<(String, String)> = std::env::vars().collect();
     let endpoint = resolve_endpoint(None);
 
+    // Release the CWD handle on the build directory. On Windows, a process's
+    // CWD holds an implicit kernel handle that prevents the directory from
+    // being deleted. We've captured everything we need into local variables.
+    let _ = std::env::set_current_dir(std::env::temp_dir());
+
     // Check if this is a rustfmt invocation — handle via format cache path
     if zccache_compiler::detect_family(&args[0]).is_formatter() {
         return run_rustfmt_cached(&wrapped_tool, &tool_args, &cwd);
@@ -1293,15 +1317,19 @@ async fn cmd_compile(
         }
     };
 
-    conn.send(&zccache_protocol::Request::Compile {
-        session_id: session_id.to_string(),
-        args,
-        cwd,
-        compiler,
-        env: Some(client_env),
-    })
-    .await
-    .unwrap();
+    if let Err(e) = conn
+        .send(&zccache_protocol::Request::Compile {
+            session_id: session_id.to_string(),
+            args,
+            cwd,
+            compiler,
+            env: Some(client_env),
+        })
+        .await
+    {
+        eprintln!("zccache: failed to send to daemon: {e}");
+        return ExitCode::FAILURE;
+    }
 
     let recv_result = match conn.recv().await {
         Ok(r) => r,
@@ -1360,16 +1388,20 @@ async fn cmd_compile_ephemeral(
         }
     };
 
-    conn.send(&zccache_protocol::Request::CompileEphemeral {
-        client_pid: std::process::id(),
-        working_dir: cwd.clone(),
-        compiler: compiler.to_path_buf(),
-        args,
-        cwd,
-        env: Some(client_env),
-    })
-    .await
-    .unwrap();
+    if let Err(e) = conn
+        .send(&zccache_protocol::Request::CompileEphemeral {
+            client_pid: std::process::id(),
+            working_dir: cwd.clone(),
+            compiler: compiler.to_path_buf(),
+            args,
+            cwd,
+            env: Some(client_env),
+        })
+        .await
+    {
+        eprintln!("zccache: failed to send to daemon: {e}");
+        return ExitCode::FAILURE;
+    }
 
     let recv_result = match conn.recv().await {
         Ok(r) => r,
@@ -1425,16 +1457,19 @@ async fn cmd_link_ephemeral(
         }
     };
 
-    conn.send(&zccache_protocol::Request::LinkEphemeral {
-        client_pid: std::process::id(),
-        working_dir: cwd.clone(),
-        tool: tool.to_path_buf(),
-        args,
-        cwd,
-        env: Some(client_env),
-    })
-    .await
-    .unwrap();
+    if let Err(e) = conn
+        .send(&zccache_protocol::Request::LinkEphemeral {
+            client_pid: std::process::id(),
+            tool: tool.to_path_buf(),
+            args,
+            cwd,
+            env: Some(client_env),
+        })
+        .await
+    {
+        eprintln!("zccache: failed to send to daemon: {e}");
+        return ExitCode::FAILURE;
+    }
 
     let recv_result = match conn.recv().await {
         Ok(r) => r,
