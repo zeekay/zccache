@@ -1022,6 +1022,9 @@ async fn handle_connection(
                 include_globs,
                 exclude,
             } => {
+                // Register watcher BEFORE check so events arriving during
+                // the scan are not lost.
+                watch_directory(&state, &root).await;
                 let result = state.fingerprint.check(
                     &cache_file,
                     &cache_type,
@@ -1030,8 +1033,6 @@ async fn handle_connection(
                     &include_globs,
                     &exclude,
                 );
-                // Register watcher on root so future changes are tracked.
-                watch_directory(&state, &root).await;
                 (
                     Response::FingerprintCheckResult {
                         decision: result.decision,

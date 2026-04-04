@@ -129,21 +129,46 @@ impl FingerprintManager {
             cache_file: canon_cf,
         };
 
-        // Fast path: existing watch that is clean.
+        // Fast path: existing watch — branch on dirty/status.
         if let Some(watch) = self.watches.get(&key) {
-            if !watch.dirty && watch.status == "success" {
-                tracing::debug!("fingerprint check: skip (in-memory, not dirty)");
-                return FpCheckResult {
-                    decision: "skip".into(),
-                    reason: None,
-                    changed_files: vec![],
-                };
-            }
-            if watch.dirty {
+            let dirty = watch.dirty;
+            let status = watch.status.clone();
+            let changed_snapshot: Vec<String> = watch.dirty_files.iter().cloned().collect();
+            let gen = watch.generation;
+            drop(watch);
+
+            if !dirty && status == "success" {
+                // Verify against filesystem to catch missed watcher events.
+                if let Some(mut w) = self.watches.get_mut(&key) {
+                    let changed = Self::verify_filesystem(&mut w);
+                    if changed.is_empty() {
+                        tracing::debug!("fingerprint check: skip (verified, not dirty)");
+                        return FpCheckResult {
+                            decision: "skip".into(),
+                            reason: None,
+                            changed_files: vec![],
+                        };
+                    }
+                    // Watcher missed these changes — update state.
+                    let new_gen = w.generation + 1;
+                    w.generation = new_gen;
+                    w.dirty = true;
+                    for f in &changed {
+                        w.dirty_files.insert(f.clone());
+                    }
+                    w.status = "pending".into();
+                    w.checked_generation = new_gen;
+                    drop(w);
+                    tracing::debug!("fingerprint check: run (verified, content changed)");
+                    return FpCheckResult {
+                        decision: "run".into(),
+                        reason: Some("content changed".into()),
+                        changed_files: changed,
+                    };
+                }
+                // Watch disappeared between get/get_mut — fall through to rescan.
+            } else if dirty {
                 // Bug A fix: collect the actual dirty file paths.
-                let changed: Vec<String> = watch.dirty_files.iter().cloned().collect();
-                let gen = watch.generation;
-                drop(watch);
                 // Mark as pending and snapshot the generation (Bug B fix).
                 if let Some(mut w) = self.watches.get_mut(&key) {
                     w.status = "pending".into();
@@ -153,12 +178,9 @@ impl FingerprintManager {
                 return FpCheckResult {
                     decision: "run".into(),
                     reason: Some("content changed".into()),
-                    changed_files: changed,
+                    changed_files: changed_snapshot,
                 };
-            }
-            if watch.status == "failure" {
-                let gen = watch.generation;
-                drop(watch);
+            } else if status == "failure" {
                 if let Some(mut w) = self.watches.get_mut(&key) {
                     w.status = "pending".into();
                     w.checked_generation = gen;
@@ -169,16 +191,16 @@ impl FingerprintManager {
                     reason: Some("previous failure".into()),
                     changed_files: vec![],
                 };
+            } else {
+                // Bug C fix: status is "pending" (initial scan done, not yet marked).
+                // Return "run" without doing a wasteful full rescan.
+                tracing::debug!("fingerprint check: run (pending)");
+                return FpCheckResult {
+                    decision: "run".into(),
+                    reason: Some("pending".into()),
+                    changed_files: vec![],
+                };
             }
-            // Bug C fix: status is "pending" (initial scan done, not yet marked).
-            // Return "run" without doing a wasteful full rescan.
-            drop(watch);
-            tracing::debug!("fingerprint check: run (pending)");
-            return FpCheckResult {
-                decision: "run".into(),
-                reason: Some("pending".into()),
-                changed_files: vec![],
-            };
         }
 
         // No existing watch — do initial scan.
@@ -366,6 +388,41 @@ impl FingerprintManager {
             let exclude_refs: Vec<&str> = exclude.iter().map(|s| s.as_str()).collect();
             zccache_fingerprint::walk_files(root, &ext_refs, &exclude_refs)
         }
+    }
+
+    /// Re-stat all tracked files and return relative paths where content changed.
+    /// Updates mtime/size in-place for smart touches (same content, new mtime).
+    fn verify_filesystem(watch: &mut WatchState) -> Vec<String> {
+        let mut changed = Vec::new();
+        let root = watch.root.clone();
+        for (rel_path, tracked) in watch.files.iter_mut() {
+            let abs = root.join(rel_path);
+            let mtime = zccache_fingerprint::persist::mtime_ns(&abs).unwrap_or(0);
+            let size = zccache_fingerprint::persist::file_size(&abs).unwrap_or(0);
+            if mtime == tracked.mtime_ns && size == tracked.size {
+                continue; // Layer 1: fast skip
+            }
+            // Layer 2: mtime/size changed — re-hash to confirm.
+            let hash_hex = match zccache_hash::hash_file(&abs) {
+                Ok(h) => h.to_hex(),
+                Err(_) => {
+                    changed.push(rel_path.clone());
+                    continue;
+                }
+            };
+            if hash_hex != tracked.hash_hex {
+                // Content genuinely changed.
+                tracked.mtime_ns = mtime;
+                tracked.size = size;
+                tracked.hash_hex = hash_hex;
+                changed.push(rel_path.clone());
+            } else {
+                // Smart touch — only mtime/size changed, content same.
+                tracked.mtime_ns = mtime;
+                tracked.size = size;
+            }
+        }
+        changed
     }
 
     /// Number of active watches (for status/diagnostics).
@@ -715,6 +772,59 @@ mod tests {
             result.decision, "skip",
             "mark_success with canonical path must match watch created with non-canonical path"
         );
+    }
+
+    #[test]
+    fn verify_catches_missed_watcher_events() {
+        // Regression test for BUGS.md: daemon fp check misses in-place edits
+        // when watcher events are not delivered (no on_batch call).
+        let src = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        create_file(src.path(), "a.rs", "original");
+
+        let cache_file = cache_dir.path().join("fp.json");
+        let mgr = FingerprintManager::new();
+
+        mgr.check(&cache_file, "two-layer", src.path(), &[], &[], &[]);
+        mgr.mark_success(&cache_file);
+
+        // Modify file WITHOUT calling on_batch (simulates missed watcher event).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        create_file(src.path(), "a.rs", "modified");
+
+        // Must detect the change via filesystem verification.
+        let result = mgr.check(&cache_file, "two-layer", src.path(), &[], &[], &[]);
+        assert_eq!(
+            result.decision, "run",
+            "must detect change without on_batch"
+        );
+        assert!(
+            result.changed_files.iter().any(|f| f.contains("a.rs")),
+            "changed_files should contain a.rs, got {:?}",
+            result.changed_files
+        );
+    }
+
+    #[test]
+    fn verify_smart_touch_still_skips() {
+        // Smart touch (same content, new mtime) should still return "skip".
+        let src = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        create_file(src.path(), "a.rs", "stable");
+
+        let cache_file = cache_dir.path().join("fp.json");
+        let mgr = FingerprintManager::new();
+
+        mgr.check(&cache_file, "two-layer", src.path(), &[], &[], &[]);
+        mgr.mark_success(&cache_file);
+
+        // Rewrite same content (mtime changes, content doesn't).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        create_file(src.path(), "a.rs", "stable");
+
+        // Filesystem verify should detect mtime change, re-hash, find same content → skip.
+        let result = mgr.check(&cache_file, "two-layer", src.path(), &[], &[], &[]);
+        assert_eq!(result.decision, "skip", "smart touch must not trigger run");
     }
 
     #[test]
