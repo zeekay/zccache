@@ -148,6 +148,58 @@ fn build_dir_exclude_set(exclude: &[&str]) -> Result<GlobSet> {
     })
 }
 
+/// Extract literal directory prefixes from glob include patterns for directory pruning.
+///
+/// Given `["src/platforms/wasm/compiler/**/*", "ci/docker_utils/avr8js/**/*"]`,
+/// returns `Some(["src/platforms/wasm/compiler", "ci/docker_utils/avr8js"])`.
+///
+/// Returns `None` if any pattern has no extractable directory prefix (e.g., `**/*.ts`),
+/// meaning include-based directory pruning cannot safely be applied.
+fn extract_include_dir_prefixes(include: &[&str]) -> Option<Vec<String>> {
+    if include.is_empty() {
+        return None;
+    }
+    let mut prefixes = Vec::new();
+    for pattern in include {
+        let pat = pattern.replace('\\', "/");
+        let wildcard_pos = pat.find(['*', '?', '[', '{']).unwrap_or(pat.len());
+        let prefix = &pat[..wildcard_pos];
+        let dir_prefix = match prefix.rfind('/') {
+            Some(pos) => &prefix[..pos],
+            None => "",
+        };
+        if dir_prefix.is_empty() {
+            return None; // Can't prune — pattern might match in any directory
+        }
+        prefixes.push(dir_prefix.to_string());
+    }
+    Some(prefixes)
+}
+
+/// Check whether a directory should be kept during include-based pruning.
+///
+/// Returns `true` if the directory is an ancestor of any include prefix
+/// (on the path toward it) or a descendant (inside the targeted subtree).
+fn dir_matches_include_prefixes(rel_dir: &str, prefixes: &[String]) -> bool {
+    for prefix in prefixes {
+        let p = prefix.as_str();
+        if p == rel_dir {
+            return true;
+        }
+        // Directory is ancestor of prefix: "src" for prefix "src/platforms/wasm/compiler"
+        if p.len() > rel_dir.len() && p.starts_with(rel_dir) && p.as_bytes()[rel_dir.len()] == b'/'
+        {
+            return true;
+        }
+        // Directory is descendant of prefix: "src/platforms/wasm/compiler/sub" for prefix "src/platforms/wasm/compiler"
+        if rel_dir.len() > p.len() && rel_dir.starts_with(p) && rel_dir.as_bytes()[p.len()] == b'/'
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Walk a directory tree, selecting files by glob patterns.
 ///
 /// - `include`: glob patterns for files to include (e.g. `["src/**/*.rs", "Cargo.toml"]`).
@@ -174,21 +226,25 @@ pub fn walk_files_glob(
     // that don't end with "/**" (and thus weren't caught by process_read_dir).
     let has_non_dir_excludes = exclude.iter().any(|p| !p.ends_with("/**"));
 
+    let include_dir_prefixes = extract_include_dir_prefixes(include);
+
     let mut files = Vec::new();
 
-    // Clone root for the Send + Sync closure.
+    // Clone for the Send + Sync closure.
     let prune_root = root.clone();
     let prune_dir_exclude_set = dir_exclude_set.clone();
+    let prune_include_prefixes = include_dir_prefixes;
 
     let walker = jwalk::WalkDir::new(&root)
         .follow_links(false)
         .skip_hidden(false)
         .sort(true)
         .process_read_dir(move |_depth, _path, _state, children| {
-            if prune_dir_exclude_set.is_empty() {
+            let has_exclude = !prune_dir_exclude_set.is_empty();
+            let has_include = prune_include_prefixes.is_some();
+            if !has_exclude && !has_include {
                 return;
             }
-            // Prune directories matching dir_exclude_set.
             children.retain(|entry| {
                 if let Ok(ref e) = entry {
                     if e.file_type.is_dir() {
@@ -196,8 +252,13 @@ pub fn walk_files_glob(
                         if let Ok(rel) = abs.strip_prefix(&prune_root) {
                             if rel.components().next().is_some() {
                                 let rel_str = normalize_slashes(rel);
-                                if prune_dir_exclude_set.is_match(&rel_str) {
+                                if has_exclude && prune_dir_exclude_set.is_match(&rel_str) {
                                     return false;
+                                }
+                                if let Some(ref prefixes) = prune_include_prefixes {
+                                    if !dir_matches_include_prefixes(&rel_str, prefixes) {
+                                        return false;
+                                    }
                                 }
                             }
                         }
@@ -668,6 +729,105 @@ mod tests {
         let bad = dir.path().join("nope");
         let result = walk_files_glob(&bad, &[], &[]);
         assert!(result.is_err());
+    }
+
+    // ── Include-based directory pruning tests ───────────────────
+
+    #[test]
+    fn extract_prefixes_simple() {
+        let p = extract_include_dir_prefixes(&["src/platforms/wasm/compiler/**/*"]);
+        assert_eq!(p, Some(vec!["src/platforms/wasm/compiler".to_string()]));
+    }
+
+    #[test]
+    fn extract_prefixes_multiple() {
+        let p = extract_include_dir_prefixes(&[
+            "src/platforms/wasm/compiler/**/*",
+            "ci/docker_utils/avr8js/**/*",
+        ]);
+        assert_eq!(
+            p,
+            Some(vec![
+                "src/platforms/wasm/compiler".to_string(),
+                "ci/docker_utils/avr8js".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn extract_prefixes_wildcard_root_returns_none() {
+        // Pattern like "**/*.rs" has no directory prefix — can't prune
+        assert_eq!(extract_include_dir_prefixes(&["**/*.rs"]), None);
+    }
+
+    #[test]
+    fn extract_prefixes_mixed_returns_none() {
+        // If any pattern can't be pruned, return None
+        assert_eq!(extract_include_dir_prefixes(&["src/**/*.rs", "*.py"]), None);
+    }
+
+    #[test]
+    fn extract_prefixes_empty_returns_none() {
+        assert_eq!(extract_include_dir_prefixes(&[]), None);
+    }
+
+    #[test]
+    fn dir_prefix_match_ancestor() {
+        let prefixes = vec!["src/platforms/wasm/compiler".to_string()];
+        assert!(dir_matches_include_prefixes("src", &prefixes));
+        assert!(dir_matches_include_prefixes("src/platforms", &prefixes));
+        assert!(dir_matches_include_prefixes(
+            "src/platforms/wasm",
+            &prefixes
+        ));
+        assert!(dir_matches_include_prefixes(
+            "src/platforms/wasm/compiler",
+            &prefixes
+        ));
+    }
+
+    #[test]
+    fn dir_prefix_match_descendant() {
+        let prefixes = vec!["src/platforms/wasm/compiler".to_string()];
+        assert!(dir_matches_include_prefixes(
+            "src/platforms/wasm/compiler/subdir",
+            &prefixes
+        ));
+    }
+
+    #[test]
+    fn dir_prefix_no_match() {
+        let prefixes = vec!["src/platforms/wasm/compiler".to_string()];
+        assert!(!dir_matches_include_prefixes("tests", &prefixes));
+        assert!(!dir_matches_include_prefixes("node_modules", &prefixes));
+        assert!(!dir_matches_include_prefixes("src/other", &prefixes));
+        // "srcs" should NOT match "src" prefix
+        assert!(!dir_matches_include_prefixes("srcs", &prefixes));
+    }
+
+    #[test]
+    fn glob_include_prunes_unrelated_dirs() {
+        let dir = TempDir::new().unwrap();
+        create_file(dir.path(), "src/wasm/a.rs", "ok");
+        create_file(dir.path(), "unrelated/big/tree/b.rs", "skip");
+        create_file(dir.path(), "node_modules/pkg/c.js", "skip");
+
+        let files = walk_files_glob(dir.path(), &["src/wasm/**/*"], &[]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative, "src/wasm/a.rs");
+    }
+
+    #[test]
+    fn glob_include_multiple_prefixes() {
+        let dir = TempDir::new().unwrap();
+        create_file(dir.path(), "src/wasm/a.rs", "ok");
+        create_file(dir.path(), "ci/tools/b.py", "ok");
+        create_file(dir.path(), "unrelated/c.txt", "skip");
+
+        let files = walk_files_glob(dir.path(), &["src/wasm/**/*", "ci/tools/**/*"], &[]).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(rels(&files).contains(&"src/wasm/a.rs"));
+        assert!(rels(&files).contains(&"ci/tools/b.py"));
     }
 
     #[test]
