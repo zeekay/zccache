@@ -153,7 +153,14 @@ fn run_mark(
     cache_type: &CacheType,
     success: bool,
 ) -> Result<ExitCode, FingerprintError> {
-    match (cache_type, success) {
+    // Auto-detect cache type from pending file so users don't need to pass
+    // --cache-type on mark-success/mark-failure (fixes #1 in BUGS.md).
+    let cache_type = match zccache_fingerprint::detect_pending_type(cache_file) {
+        Some("hash") => CacheType::Hash,
+        Some("two-layer") => CacheType::TwoLayer,
+        _ => cache_type.clone(),
+    };
+    match (&cache_type, success) {
         (CacheType::Hash, true) => HashCache::new(cache_file.to_path_buf()).mark_success()?,
         (CacheType::Hash, false) => HashCache::new(cache_file.to_path_buf()).mark_failure()?,
         (CacheType::TwoLayer, true) => {

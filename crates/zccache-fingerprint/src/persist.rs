@@ -89,6 +89,38 @@ pub fn read_pending<T: serde::de::DeserializeOwned>(cache_path: &Path) -> Result
     file_lock::with_shared_lock(cache_path, || read_json_inner(&pending_path(cache_path)))
 }
 
+/// Detect which cache type wrote a pending file.
+///
+/// Returns `"hash"` for [`HashCacheData`] or `"two-layer"` for [`TwoLayerData`],
+/// based on discriminating JSON keys. Returns `None` if the pending file
+/// doesn't exist or can't be identified.
+pub fn detect_pending_type(cache_path: &Path) -> Option<&'static str> {
+    file_lock::with_shared_lock(cache_path, || {
+        let pending = pending_path(cache_path);
+        let content = match std::fs::read_to_string(&pending) {
+            Ok(c) => c,
+            Err(_) => return Ok(None),
+        };
+        let value: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let obj = match value.as_object() {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        if obj.contains_key("hash") && obj.contains_key("file_count") {
+            Ok(Some("hash"))
+        } else if obj.contains_key("files") {
+            Ok(Some("two-layer"))
+        } else {
+            Ok(None)
+        }
+    })
+    .ok()
+    .flatten()
+}
+
 /// Promote `.pending` → cache file (atomic rename).
 pub fn promote_pending(cache_path: &Path) -> Result<()> {
     file_lock::with_exclusive_lock(cache_path, || promote_pending_inner(cache_path))
@@ -460,6 +492,40 @@ mod tests {
 
         let result: Option<HashCacheData> = read_json(&path).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn detect_pending_type_hash() {
+        let dir = TempDir::new().unwrap();
+        let cache = dir.path().join("fp.json");
+        let data = HashCacheData::new("abc".to_string(), "pending", 5);
+        write_pending(&cache, &data).unwrap();
+        assert_eq!(detect_pending_type(&cache), Some("hash"));
+    }
+
+    #[test]
+    fn detect_pending_type_two_layer() {
+        let dir = TempDir::new().unwrap();
+        let cache = dir.path().join("fp.json");
+        let data = TwoLayerData::new("pending", BTreeMap::new());
+        write_pending(&cache, &data).unwrap();
+        assert_eq!(detect_pending_type(&cache), Some("two-layer"));
+    }
+
+    #[test]
+    fn detect_pending_type_none_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let cache = dir.path().join("fp.json");
+        assert_eq!(detect_pending_type(&cache), None);
+    }
+
+    #[test]
+    fn detect_pending_type_none_when_corrupt() {
+        let dir = TempDir::new().unwrap();
+        let cache = dir.path().join("fp.json");
+        let pending = cache.with_extension("pending");
+        std::fs::write(&pending, "not json").unwrap();
+        assert_eq!(detect_pending_type(&cache), None);
     }
 
     #[test]
