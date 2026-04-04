@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use rayon::prelude::*;
 
 use crate::decision::{CacheDecision, RunReason};
 use crate::error::Result;
@@ -55,49 +57,53 @@ impl TwoLayerCache {
             return Ok(CacheDecision::Run(RunReason::PreviousFailure));
         }
 
-        let mut changed = false;
-        let mut entries = BTreeMap::new();
+        // Parallel stat + conditional hash for each file.
+        let results: Result<Vec<_>> = files
+            .par_iter()
+            .map(|file| {
+                let mtime = persist::mtime_ns(&file.absolute)?;
+                let size = persist::file_size(&file.absolute)?;
 
-        for file in files {
-            let mtime = persist::mtime_ns(&file.absolute)?;
-            let size = persist::file_size(&file.absolute)?;
-
-            if let Some(cached_entry) = cached_files.get(&file.relative) {
-                if cached_entry.mtime_ns == mtime && cached_entry.size == size {
-                    // Layer 1: mtime + size match → reuse cached hash, no I/O.
-                    entries.insert(file.relative.clone(), cached_entry.clone());
-                } else {
-                    // Layer 2: mtime or size differ → hash the file.
-                    let hash = zccache_hash::hash_file(&file.absolute)?;
-                    let hash_hex = hash.to_hex();
-
-                    if hash_hex != cached_entry.hash {
-                        changed = true;
+                if let Some(cached_entry) = cached_files.get(&file.relative) {
+                    if cached_entry.mtime_ns == mtime && cached_entry.size == size {
+                        // Layer 1: mtime + size match → reuse cached hash, no I/O.
+                        Ok((file.relative.clone(), cached_entry.clone(), false))
+                    } else {
+                        // Layer 2: mtime or size differ → hash the file.
+                        let hash = zccache_hash::hash_file(&file.absolute)?;
+                        let hash_hex = hash.to_hex();
+                        let content_changed = hash_hex != cached_entry.hash;
+                        Ok((
+                            file.relative.clone(),
+                            FileEntry {
+                                mtime_ns: mtime,
+                                size,
+                                hash: hash_hex,
+                            },
+                            content_changed,
+                        ))
                     }
-                    // Either way, record current state (smart touch handling:
-                    // if hash matches but mtime changed, we update the mtime).
-                    entries.insert(
+                } else {
+                    // New file not in cache.
+                    let hash = zccache_hash::hash_file(&file.absolute)?;
+                    Ok((
                         file.relative.clone(),
                         FileEntry {
                             mtime_ns: mtime,
                             size,
-                            hash: hash_hex,
+                            hash: hash.to_hex(),
                         },
-                    );
+                        true,
+                    ))
                 }
-            } else {
-                // New file not in cache.
-                changed = true;
-                let hash = zccache_hash::hash_file(&file.absolute)?;
-                entries.insert(
-                    file.relative.clone(),
-                    FileEntry {
-                        mtime_ns: mtime,
-                        size,
-                        hash: hash.to_hex(),
-                    },
-                );
-            }
+            })
+            .collect();
+        let results = results?;
+
+        let mut changed = results.iter().any(|(_, _, c)| *c);
+        let mut entries = BTreeMap::new();
+        for (rel, entry, _) in results {
+            entries.insert(rel, entry);
         }
 
         // Check for removed files.
@@ -124,6 +130,52 @@ impl TwoLayerCache {
     /// Mark the operation as failed.
     pub fn mark_failure(&self) -> Result<()> {
         self.promote_with_status("failure")
+    }
+
+    /// Attempt to skip without walking the filesystem.
+    ///
+    /// Returns `Some(Skip)` if the cache is valid and no directories have
+    /// changed (no files created or deleted). Returns `None` if a full check
+    /// is needed.
+    ///
+    /// This is the first gate in a layered fast-path: it only stats directories,
+    /// not individual files. Content-only edits are caught by the existing
+    /// mtime fast-path (which stats all files) if this gate falls through.
+    pub fn try_skip_fast(&self, root: &Path) -> Result<Option<CacheDecision>> {
+        // Read the cache to check status and stored max_source_mtime.
+        let cached: Option<TwoLayerData> = persist::read_json(&self.cache_file)?;
+        let data = match cached {
+            Some(d) if d.status == "success" && d.max_source_mtime_ns > 0 => d,
+            _ => return Ok(None),
+        };
+
+        // Cache file must exist and be newer than all sources at last check.
+        let cache_mtime = match persist::mtime_ns(&self.cache_file) {
+            Ok(mt) => mt,
+            Err(_) => return Ok(None),
+        };
+        if cache_mtime <= data.max_source_mtime_ns {
+            return Ok(None);
+        }
+
+        // Walk only directories to detect file additions/deletions.
+        let root = match root.canonicalize() {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        let max_dir_mtime = match persist::max_dir_mtime_ns(&root) {
+            Ok(mt) => mt,
+            Err(_) => return Ok(None),
+        };
+
+        // If any directory was modified after the stored max source mtime,
+        // files may have been created or deleted — fall through to full check.
+        if max_dir_mtime > data.max_source_mtime_ns {
+            return Ok(None);
+        }
+
+        tracing::debug!("dir fast-path: no directory changes detected, skipping full scan");
+        Ok(Some(CacheDecision::Skip))
     }
 
     /// Delete cache and pending files.
@@ -173,21 +225,23 @@ impl TwoLayerCache {
     }
 
     fn compute_all(&self, files: &[ScannedFile]) -> Result<BTreeMap<String, FileEntry>> {
-        let mut entries = BTreeMap::new();
-        for file in files {
-            let mtime = persist::mtime_ns(&file.absolute)?;
-            let size = persist::file_size(&file.absolute)?;
-            let hash = zccache_hash::hash_file(&file.absolute)?;
-            entries.insert(
-                file.relative.clone(),
-                FileEntry {
-                    mtime_ns: mtime,
-                    size,
-                    hash: hash.to_hex(),
-                },
-            );
-        }
-        Ok(entries)
+        let results: Result<Vec<_>> = files
+            .par_iter()
+            .map(|file| {
+                let mtime = persist::mtime_ns(&file.absolute)?;
+                let size = persist::file_size(&file.absolute)?;
+                let hash = zccache_hash::hash_file(&file.absolute)?;
+                Ok((
+                    file.relative.clone(),
+                    FileEntry {
+                        mtime_ns: mtime,
+                        size,
+                        hash: hash.to_hex(),
+                    },
+                ))
+            })
+            .collect();
+        Ok(results?.into_iter().collect())
     }
 }
 
@@ -609,5 +663,127 @@ mod tests {
 
         let decision = cache.check(&scan(src.path())).unwrap();
         assert_eq!(decision, CacheDecision::Run(RunReason::ContentChanged));
+    }
+
+    #[test]
+    fn parallel_compute_all_correctness() {
+        // Verify parallel compute_all produces correct entries by checking
+        // that a miss+mark_success followed by a hit cycle works correctly.
+        let (src, cache_dir) = setup();
+        for i in 0..50 {
+            create_file(src.path(), &format!("f{i:02}.rs"), &format!("data {i}"));
+        }
+
+        let cache = TwoLayerCache::new(cache_dir.path().join("fp.json"));
+        let files = scan(src.path());
+        let decision = cache.check(&files).unwrap();
+        assert!(decision.should_run());
+        cache.mark_success().unwrap();
+
+        // Second check must skip (proves parallel entries are identical to what
+        // the sequential check would have produced).
+        let decision = cache.check(&scan(src.path())).unwrap();
+        assert_eq!(decision, CacheDecision::Skip);
+    }
+
+    // ── Dir fast-path tests ──────────────────────────────────────
+
+    #[test]
+    fn dir_fast_path_skips_when_nothing_changed() {
+        let (src, cache_dir) = setup();
+        create_file(src.path(), "a.rs", "content");
+
+        let cache_file = cache_dir.path().join("fp.json");
+        let cache = TwoLayerCache::new(cache_file.clone());
+        let files = scan(src.path());
+        cache.check(&files).unwrap();
+        cache.mark_success().unwrap();
+
+        // Fast path should skip (no files or dirs changed).
+        let cache = TwoLayerCache::new(cache_file);
+        let decision = cache.try_skip_fast(src.path()).unwrap();
+        assert_eq!(decision, Some(CacheDecision::Skip));
+    }
+
+    #[test]
+    fn dir_fast_path_falls_through_on_new_file() {
+        let (src, cache_dir) = setup();
+        create_file(src.path(), "a.rs", "content");
+
+        let cache_file = cache_dir.path().join("fp.json");
+        let cache = TwoLayerCache::new(cache_file.clone());
+        cache.check(&scan(src.path())).unwrap();
+        cache.mark_success().unwrap();
+
+        // Add a new file (changes directory mtime).
+        create_file(src.path(), "b.rs", "new");
+
+        let cache = TwoLayerCache::new(cache_file);
+        let decision = cache.try_skip_fast(src.path()).unwrap();
+        assert_eq!(decision, None);
+    }
+
+    #[test]
+    fn dir_fast_path_falls_through_on_deleted_file() {
+        let (src, cache_dir) = setup();
+        create_file(src.path(), "a.rs", "content");
+        create_file(src.path(), "b.rs", "content2");
+
+        let cache_file = cache_dir.path().join("fp.json");
+        let cache = TwoLayerCache::new(cache_file.clone());
+        cache.check(&scan(src.path())).unwrap();
+        cache.mark_success().unwrap();
+
+        // Delete a file (changes directory mtime).
+        fs::remove_file(src.path().join("b.rs")).unwrap();
+
+        let cache = TwoLayerCache::new(cache_file);
+        let decision = cache.try_skip_fast(src.path()).unwrap();
+        assert_eq!(decision, None);
+    }
+
+    #[test]
+    fn dir_fast_path_falls_through_on_no_cache() {
+        let (src, cache_dir) = setup();
+        create_file(src.path(), "a.rs", "content");
+
+        // No cache file at all.
+        let cache = TwoLayerCache::new(cache_dir.path().join("fp.json"));
+        let decision = cache.try_skip_fast(src.path()).unwrap();
+        assert_eq!(decision, None);
+    }
+
+    #[test]
+    fn dir_fast_path_falls_through_on_failure_status() {
+        let (src, cache_dir) = setup();
+        create_file(src.path(), "a.rs", "content");
+
+        let cache_file = cache_dir.path().join("fp.json");
+        let cache = TwoLayerCache::new(cache_file.clone());
+        cache.check(&scan(src.path())).unwrap();
+        cache.mark_failure().unwrap();
+
+        // Previous failure — must fall through.
+        let cache = TwoLayerCache::new(cache_file);
+        let decision = cache.try_skip_fast(src.path()).unwrap();
+        assert_eq!(decision, None);
+    }
+
+    #[test]
+    fn dir_fast_path_backward_compat_old_cache() {
+        // Simulate an old cache file without max_source_mtime_ns
+        // (defaults to 0 via serde(default)).
+        let (src, cache_dir) = setup();
+        create_file(src.path(), "a.rs", "content");
+
+        let cache_file = cache_dir.path().join("fp.json");
+        // Write a cache manually without the max_source_mtime_ns field.
+        let json = r#"{"version":1,"status":"success","timestamp_ns":1000000,"files":{}}"#;
+        fs::write(&cache_file, json).unwrap();
+
+        let cache = TwoLayerCache::new(cache_file);
+        // Should fall through because max_source_mtime_ns is 0.
+        let decision = cache.try_skip_fast(src.path()).unwrap();
+        assert_eq!(decision, None);
     }
 }

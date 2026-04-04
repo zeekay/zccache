@@ -183,18 +183,26 @@ mod tests {
         let handle = tokio::spawn(async move { r.run(&c).await });
 
         recovery.on_overflow();
-        // Yield to let the task enter the select.
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
 
-        // Build event triggers immediate rescan.
-        recovery.on_build_event();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Retry build_trigger until the spawned task has entered the select!
+        // and registered its notified() future. Two yield_now() calls are not
+        // enough under CI load — the notification is lost if sent before the
+        // listener awaits. Retrying is safe: on_build_event is a no-op once
+        // pending becomes false after a successful rescan.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // Give the spawned task a chance to progress.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            recovery.on_build_event();
 
-        assert_eq!(
-            cache.metadata().get(&path).unwrap().confidence,
-            Confidence::High
-        );
+            if cache.metadata().get(&path).unwrap().confidence == Confidence::High {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for build-triggered rescan"
+            );
+        }
 
         handle.abort();
     }

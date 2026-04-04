@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
 use zccache_hash::ContentHash;
 
@@ -187,7 +188,7 @@ impl DepGraph {
     /// Reconstruct a `DepGraph` from a deserialized snapshot.
     pub fn from_snapshot(snap: DepGraphSnapshot) -> Self {
         let files: DashMap<PathBuf, FileEntry> = DashMap::new();
-        for f in snap.files {
+        snap.files.into_par_iter().for_each(|f| {
             let path = PathBuf::from(&f.path);
             let includes = f
                 .includes
@@ -212,10 +213,10 @@ impl DepGraph {
                     scanned_at: Instant::now(),
                 },
             );
-        }
+        });
 
         let contexts: DashMap<ContextKey, ContextEntry> = DashMap::new();
-        for c in snap.contexts {
+        snap.contexts.into_par_iter().for_each(|c| {
             let key = ContextKey::from_raw(c.context_key);
             let context = CompileContext {
                 source_file: PathBuf::from(&c.source_file),
@@ -249,7 +250,7 @@ impl DepGraph {
                 },
             };
             contexts.insert(key, entry);
-        }
+        });
 
         DepGraph::from_maps(files, contexts)
     }

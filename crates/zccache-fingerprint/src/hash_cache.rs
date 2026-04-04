@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use rayon::prelude::*;
 
 use crate::decision::{CacheDecision, RunReason};
 use crate::error::Result;
@@ -11,16 +13,23 @@ use crate::scan::ScannedFile;
 /// separation and a file-count trailer prevent ambiguity and detect
 /// empty ↔ non-empty transitions.
 pub fn compute_aggregate_hash(files: &[ScannedFile]) -> Result<String> {
+    // Phase 1: Read all file contents in parallel (I/O bound).
+    let contents: std::result::Result<Vec<Vec<u8>>, std::io::Error> = files
+        .par_iter()
+        .map(|file| std::fs::read(&file.absolute))
+        .collect();
+    let contents = contents?;
+
+    // Phase 2: Hash sequentially to preserve order-dependent aggregate hash.
     let mut hasher = zccache_hash::StreamHasher::new();
     // Domain separation.
     hasher.update(b"zccache-fingerprint-v1");
 
     // Files are already sorted by relative path from walk_files().
-    for file in files {
+    for (file, content) in files.iter().zip(contents.iter()) {
         hasher.update(file.relative.as_bytes());
         hasher.update(b"\0");
-        let content = std::fs::read(&file.absolute)?;
-        hasher.update(&content);
+        hasher.update(content);
     }
 
     // Include file count to detect empty → non-empty transitions.
@@ -61,6 +70,7 @@ impl HashCache {
 
         let current_hash = self.compute_hash(files)?;
         let file_count = files.len();
+        let max_source_mtime = persist::max_mtime_ns(files).unwrap_or(0);
 
         let cached: Option<HashCacheData> = persist::read_json(&self.cache_file)?;
 
@@ -76,7 +86,8 @@ impl HashCache {
         };
 
         // Write pending with current state regardless of decision.
-        let pending = HashCacheData::new(current_hash, "pending", file_count);
+        let pending =
+            HashCacheData::with_max_mtime(current_hash, "pending", file_count, max_source_mtime);
         persist::write_pending(&self.cache_file, &pending)?;
 
         Ok(decision)
@@ -90,6 +101,41 @@ impl HashCache {
     /// Mark the operation as failed.
     pub fn mark_failure(&self) -> Result<()> {
         self.promote_with_status("failure")
+    }
+
+    /// Attempt to skip without walking the filesystem.
+    ///
+    /// Same logic as `TwoLayerCache::try_skip_fast` — see that method's docs.
+    pub fn try_skip_fast(&self, root: &Path) -> Result<Option<CacheDecision>> {
+        let cached: Option<HashCacheData> = persist::read_json(&self.cache_file)?;
+        let data = match cached {
+            Some(d) if d.status == "success" && d.max_source_mtime_ns > 0 => d,
+            _ => return Ok(None),
+        };
+
+        let cache_mtime = match persist::mtime_ns(&self.cache_file) {
+            Ok(mt) => mt,
+            Err(_) => return Ok(None),
+        };
+        if cache_mtime <= data.max_source_mtime_ns {
+            return Ok(None);
+        }
+
+        let root = match root.canonicalize() {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        let max_dir_mtime = match persist::max_dir_mtime_ns(&root) {
+            Ok(mt) => mt,
+            Err(_) => return Ok(None),
+        };
+
+        if max_dir_mtime > data.max_source_mtime_ns {
+            return Ok(None);
+        }
+
+        tracing::debug!("dir fast-path: no directory changes detected, skipping full scan");
+        Ok(Some(CacheDecision::Skip))
     }
 
     /// Delete cache and pending files.
@@ -589,5 +635,22 @@ mod tests {
 
         let decision = cache.check(&scan_dir(src.path())).unwrap();
         assert_eq!(decision, CacheDecision::Run(RunReason::ContentChanged));
+    }
+
+    #[test]
+    fn parallel_aggregate_hash_deterministic() {
+        // Hash the same file set multiple times; parallel reads must produce
+        // the same aggregate hash every time.
+        let (src, _) = setup();
+        for i in 0..100 {
+            create_file(src.path(), &format!("f{i:03}.rs"), &format!("content {i}"));
+        }
+        let files = scan_dir(src.path());
+
+        let h1 = compute_aggregate_hash(&files).unwrap();
+        let h2 = compute_aggregate_hash(&files).unwrap();
+        let h3 = compute_aggregate_hash(&files).unwrap();
+        assert_eq!(h1, h2);
+        assert_eq!(h2, h3);
     }
 }

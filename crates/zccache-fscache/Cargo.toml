@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 dashmap = { workspace = true }
+rayon = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 zccache-core = { path = "../zccache-core" }

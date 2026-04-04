@@ -27,6 +27,10 @@ pub struct TwoLayerData {
     pub status: String,
     pub timestamp_ns: u64,
     pub files: BTreeMap<String, FileEntry>,
+    /// Maximum source file mtime at the time of the last check.
+    /// Used by the dir-mtime fast-path to skip re-scanning.
+    #[serde(default)]
+    pub max_source_mtime_ns: u64,
 }
 
 /// On-disk format for `HashCache`.
@@ -37,15 +41,21 @@ pub struct HashCacheData {
     pub status: String,
     pub timestamp_ns: u64,
     pub file_count: usize,
+    /// Maximum source file mtime at the time of the last check.
+    /// Used by the dir-mtime fast-path to skip re-scanning.
+    #[serde(default)]
+    pub max_source_mtime_ns: u64,
 }
 
 impl TwoLayerData {
     pub fn new(status: &str, files: BTreeMap<String, FileEntry>) -> Self {
+        let max_source_mtime_ns = files.values().map(|e| e.mtime_ns).max().unwrap_or(0);
         Self {
             version: CACHE_VERSION,
             status: status.to_string(),
             timestamp_ns: now_ns(),
             files,
+            max_source_mtime_ns,
         }
     }
 }
@@ -58,6 +68,23 @@ impl HashCacheData {
             status: status.to_string(),
             timestamp_ns: now_ns(),
             file_count,
+            max_source_mtime_ns: 0,
+        }
+    }
+
+    pub fn with_max_mtime(
+        hash: String,
+        status: &str,
+        file_count: usize,
+        max_source_mtime_ns: u64,
+    ) -> Self {
+        Self {
+            version: CACHE_VERSION,
+            hash,
+            status: status.to_string(),
+            timestamp_ns: now_ns(),
+            file_count,
+            max_source_mtime_ns,
         }
     }
 }
@@ -157,7 +184,7 @@ fn read_json_inner<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option
 }
 
 fn write_atomic_inner<T: Serialize>(path: &Path, data: &T) -> Result<()> {
-    let json = serde_json::to_string_pretty(data)?;
+    let json = serde_json::to_string(data)?;
     let tmp = tmp_path(path);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -221,6 +248,26 @@ pub fn mtime_ns(path: &Path) -> std::io::Result<u64> {
 
 pub fn file_size(path: &Path) -> std::io::Result<u64> {
     Ok(std::fs::metadata(path)?.len())
+}
+
+/// Return the maximum mtime across all directories under `root`.
+/// Walks only directories (not files) — much faster than walking all files.
+pub fn max_dir_mtime_ns(root: &Path) -> std::io::Result<u64> {
+    let mut max = mtime_ns(root)?;
+    for entry in jwalk::WalkDir::new(root)
+        .follow_links(false)
+        .skip_hidden(false)
+        .sort(false)
+    {
+        let entry = entry.map_err(std::io::Error::other)?;
+        if entry.file_type.is_dir() {
+            let mt = mtime_ns(&entry.path())?;
+            if mt > max {
+                max = mt;
+            }
+        }
+    }
+    Ok(max)
 }
 
 /// Return the maximum mtime (in nanoseconds) across a set of files.
@@ -526,6 +573,19 @@ mod tests {
         let pending = cache.with_extension("pending");
         std::fs::write(&pending, "not json").unwrap();
         assert_eq!(detect_pending_type(&cache), None);
+    }
+
+    #[test]
+    fn write_atomic_produces_compact_json() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("compact.json");
+        let data = HashCacheData::new("abc".to_string(), "success", 5);
+        write_atomic(&path, &data).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains('\n'),
+            "expected compact JSON, got newlines: {content}"
+        );
     }
 
     #[test]

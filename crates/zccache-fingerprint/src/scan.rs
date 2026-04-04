@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -31,36 +32,46 @@ pub fn walk_files(
         message: format!("cannot canonicalize root: {e}"),
     })?;
 
+    // Owned set for the Send + Sync closure.
+    let exclude_set: HashSet<String> = exclude_dirs.iter().map(|s| s.to_string()).collect();
+
     let mut files = Vec::new();
 
-    let walker = walkdir::WalkDir::new(&root).follow_links(false);
+    let walker = jwalk::WalkDir::new(&root)
+        .follow_links(false)
+        .skip_hidden(false)
+        .sort(true)
+        .process_read_dir(move |_depth, _path, _state, children| {
+            // Prune excluded directories so they are never descended into.
+            children.retain(|entry| {
+                if let Ok(ref e) = entry {
+                    if e.file_type.is_dir() {
+                        if let Some(name) = e.file_name.to_str() {
+                            if exclude_set.contains(name) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            });
+        });
 
     for entry in walker {
         let entry = entry.map_err(|e| FingerprintError::Scan {
             path: root.clone(),
-            message: format!("walkdir error: {e}"),
+            message: format!("jwalk error: {e}"),
         })?;
 
-        // Skip excluded directories.
-        if entry.file_type().is_dir() {
-            if let Some(name) = entry.file_name().to_str() {
-                if exclude_dirs.contains(&name) {
-                    // Unfortunately walkdir doesn't support skip_current_dir()
-                    // from a borrowed iterator, so we filter instead.
-                    continue;
-                }
-            }
+        if !entry.file_type.is_file() {
             continue;
         }
 
-        if !entry.file_type().is_file() {
-            continue;
-        }
+        let abs = entry.path();
 
         // Filter by extension.
         if !extensions.is_empty() {
-            let matches = entry
-                .path()
+            let matches = abs
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .is_some_and(|ext| extensions.iter().any(|&e| e.eq_ignore_ascii_case(ext)));
@@ -69,27 +80,12 @@ pub fn walk_files(
             }
         }
 
-        // Check if any ancestor is excluded.
-        let abs = entry.path().to_path_buf();
         let rel = abs
             .strip_prefix(&root)
             .map_err(|_| FingerprintError::Scan {
                 path: abs.clone(),
                 message: "path is not under root".to_string(),
             })?;
-
-        // Skip files inside excluded directories.
-        let in_excluded = rel.components().any(|c| {
-            if let std::path::Component::Normal(name) = c {
-                if let Some(name_str) = name.to_str() {
-                    return exclude_dirs.contains(&name_str);
-                }
-            }
-            false
-        });
-        if in_excluded {
-            continue;
-        }
 
         let relative = normalize_slashes(rel);
 
@@ -105,10 +101,16 @@ pub fn walk_files(
 
 /// Normalize a relative path to forward slashes for cross-platform determinism.
 fn normalize_slashes(rel: &Path) -> String {
-    rel.components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut result = String::with_capacity(rel.as_os_str().len());
+    let mut first = true;
+    for c in rel.components() {
+        if !first {
+            result.push('/');
+        }
+        first = false;
+        result.push_str(&c.as_os_str().to_string_lossy());
+    }
+    result
 }
 
 fn build_globset(patterns: &[&str]) -> Result<GlobSet> {
@@ -168,38 +170,54 @@ pub fn walk_files_glob(
     let include_set = build_globset(include)?;
     let exclude_set = build_globset(exclude)?;
     let dir_exclude_set = build_dir_exclude_set(exclude)?;
+    // Only run the expensive ancestor check when there are exclude patterns
+    // that don't end with "/**" (and thus weren't caught by process_read_dir).
+    let has_non_dir_excludes = exclude.iter().any(|p| !p.ends_with("/**"));
 
     let mut files = Vec::new();
 
-    let walker = walkdir::WalkDir::new(&root)
+    // Clone root for the Send + Sync closure.
+    let prune_root = root.clone();
+    let prune_dir_exclude_set = dir_exclude_set.clone();
+
+    let walker = jwalk::WalkDir::new(&root)
         .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            if entry.file_type().is_dir() {
-                if let Ok(rel) = entry.path().strip_prefix(&root) {
-                    // Skip the root directory itself (empty relative path).
-                    if rel.components().next().is_some() {
-                        let rel_str = normalize_slashes(rel);
-                        if !dir_exclude_set.is_empty() && dir_exclude_set.is_match(&rel_str) {
-                            return false;
+        .skip_hidden(false)
+        .sort(true)
+        .process_read_dir(move |_depth, _path, _state, children| {
+            if prune_dir_exclude_set.is_empty() {
+                return;
+            }
+            // Prune directories matching dir_exclude_set.
+            children.retain(|entry| {
+                if let Ok(ref e) = entry {
+                    if e.file_type.is_dir() {
+                        let abs = e.path();
+                        if let Ok(rel) = abs.strip_prefix(&prune_root) {
+                            if rel.components().next().is_some() {
+                                let rel_str = normalize_slashes(rel);
+                                if prune_dir_exclude_set.is_match(&rel_str) {
+                                    return false;
+                                }
+                            }
                         }
                     }
                 }
-            }
-            true
+                true
+            });
         });
 
     for entry in walker {
         let entry = entry.map_err(|e| FingerprintError::Scan {
             path: root.clone(),
-            message: format!("walkdir error: {e}"),
+            message: format!("jwalk error: {e}"),
         })?;
 
-        if !entry.file_type().is_file() {
+        if !entry.file_type.is_file() {
             continue;
         }
 
-        let abs = entry.path().to_path_buf();
+        let abs = entry.path();
         let rel = abs
             .strip_prefix(&root)
             .map_err(|_| FingerprintError::Scan {
@@ -220,8 +238,9 @@ pub fn walk_files_glob(
         }
 
         // Ancestor exclude check — file inside excluded directory
-        // (handles excludes that don't end with /** so filter_entry didn't catch them).
-        if !exclude_set.is_empty() {
+        // (handles excludes that don't end with /** so process_read_dir didn't catch them).
+        // Skip entirely when all excludes are /**-style (already handled above).
+        if has_non_dir_excludes && !exclude_set.is_empty() {
             let in_excluded = rel
                 .ancestors()
                 .skip(1) // skip the file itself

@@ -121,26 +121,36 @@ fn migrate_meta_files(
     artifacts: &DashMap<String, CachedArtifact>,
     store: &ArtifactStore,
 ) -> usize {
-    let mut count = 0usize;
-    if let Ok(entries) = std::fs::read_dir(artifact_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("meta") {
-                continue;
-            }
-            let Ok(data) = std::fs::read(&path) else {
-                continue;
-            };
-            let Ok(artifact) = bincode::deserialize::<ArtifactData>(&data) else {
-                continue;
-            };
+    use rayon::prelude::*;
+
+    // Collect .meta file paths first.
+    let meta_paths: Vec<std::path::PathBuf> = match std::fs::read_dir(artifact_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("meta"))
+            .collect(),
+        Err(_) => return 0,
+    };
+
+    if meta_paths.is_empty() {
+        return 0;
+    }
+
+    // Parallel phase: read, deserialize, and write data files.
+    // Each .meta file is fully independent for I/O.
+    let migrated: Vec<(String, CachedArtifact, std::path::PathBuf)> = meta_paths
+        .par_iter()
+        .filter_map(|path| {
+            let data = std::fs::read(path).ok()?;
+            let artifact = bincode::deserialize::<ArtifactData>(&data).ok()?;
             let stem = path
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
 
-            // Write {key}_0, {key}_1, ... data files if missing (link artifacts).
+            // Write {key}_0, {key}_1, ... data files if missing.
             for (i, out) in artifact.outputs.iter().enumerate() {
                 let data_path = artifact_dir.join(format!("{stem}_{i}"));
                 if !data_path.exists() {
@@ -148,16 +158,20 @@ fn migrate_meta_files(
                 }
             }
 
-            // Insert into redb index.
             let cached = CachedArtifact::from_artifact_data(&artifact);
-            store.insert(&stem, &cached.meta).ok();
-            artifacts.insert(stem, cached);
-            count += 1;
+            Some((stem, cached, path.clone()))
+        })
+        .collect();
 
-            // Delete the .meta file.
-            std::fs::remove_file(&path).ok();
-        }
+    // Sequential phase: insert into redb (single writer) and DashMap,
+    // then delete old .meta files.
+    let count = migrated.len();
+    for (stem, cached, meta_path) in migrated {
+        store.insert(&stem, &cached.meta).ok();
+        artifacts.insert(stem, cached);
+        std::fs::remove_file(&meta_path).ok();
     }
+
     if count > 0 {
         tracing::info!(count, "migrated legacy .meta files to redb index");
     }
@@ -1047,11 +1061,13 @@ async fn handle_clear(state: &SharedState) -> Response {
     state.stats.reset();
     state.profiler.reset();
 
-    // Delete on-disk artifact files.
+    // Delete on-disk artifact files in parallel.
     if let Ok(entries) = std::fs::read_dir(&state.artifact_dir) {
-        for entry in entries.flatten() {
-            let _ = std::fs::remove_file(entry.path());
-        }
+        use rayon::prelude::*;
+        let paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        paths.par_iter().for_each(|p| {
+            let _ = std::fs::remove_file(p);
+        });
     }
 
     // Clear redb artifact index.

@@ -8,6 +8,7 @@
 //! artifact directory.
 
 use dashmap::DashMap;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
@@ -259,19 +260,27 @@ pub(crate) fn evict_disk_artifacts(
     let mut bytes_freed: u64 = 0;
     let mut artifacts_removed: usize = 0;
 
+    // Collect artifacts that need eviction (sequential — must respect LRU order).
+    let mut to_evict: Vec<DiskArtifact> = Vec::new();
     for artifact in sorted {
         if to_free == 0 {
             break;
         }
-        // Delete all files in this artifact group.
-        for file in &artifact.files {
-            let _ = std::fs::remove_file(file);
-        }
-        // Remove from in-memory DashMap.
-        artifacts.remove(&artifact.key);
         bytes_freed += artifact.total_size;
         to_free = to_free.saturating_sub(artifact.total_size);
         artifacts_removed += 1;
+        to_evict.push(artifact);
+    }
+
+    // Delete files in parallel across all evicted artifacts.
+    let all_files: Vec<&std::path::PathBuf> = to_evict.iter().flat_map(|a| &a.files).collect();
+    all_files.par_iter().for_each(|file| {
+        let _ = std::fs::remove_file(file);
+    });
+
+    // Remove from in-memory DashMap.
+    for artifact in &to_evict {
+        artifacts.remove(&artifact.key);
     }
 
     (bytes_freed, artifacts_removed)

@@ -1,6 +1,7 @@
 //! File metadata types and cache implementation.
 
 use dashmap::DashMap;
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -99,13 +100,35 @@ impl MetadataCache {
     ///
     /// Returns the number of entries promoted back to High confidence.
     pub fn rescan_all(&self) -> usize {
+        // Collect Low-confidence keys so we can stat them in parallel
+        // without holding DashMap shard locks during I/O.
+        let low_keys: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| e.confidence == Confidence::Low)
+            .map(|e| e.key().clone())
+            .collect();
+
+        if low_keys.is_empty() {
+            return 0;
+        }
+
+        // Parallel stat: each file is independent.
+        let results: Vec<(PathBuf, SystemTime, u64)> = low_keys
+            .par_iter()
+            .filter_map(|path| {
+                Self::stat_file(path)
+                    .ok()
+                    .map(|fresh| (path.clone(), fresh.mtime, fresh.size))
+            })
+            .collect();
+
+        // Apply promotions back (fast, in-memory only).
         let mut promoted = 0;
-        for mut entry in self.entries.iter_mut() {
-            if entry.confidence != Confidence::Low {
-                continue;
-            }
-            if let Ok(fresh) = Self::stat_file(entry.key()) {
-                if fresh.mtime == entry.mtime && fresh.size == entry.size {
+        for (path, mtime, size) in results {
+            if let Some(mut entry) = self.entries.get_mut(&path) {
+                if entry.confidence == Confidence::Low && entry.mtime == mtime && entry.size == size
+                {
                     entry.confidence = Confidence::High;
                     entry.last_verified = Instant::now();
                     promoted += 1;

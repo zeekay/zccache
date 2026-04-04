@@ -122,6 +122,21 @@ fn run_check(
     include: &[String],
     exclude: &[String],
 ) -> Result<ExitCode, FingerprintError> {
+    // Try dir-mtime fast-path first (no file walking needed).
+    let fast = match cache_type {
+        CacheType::Hash => HashCache::new(cache_file.to_path_buf()).try_skip_fast(root)?,
+        CacheType::TwoLayer => TwoLayerCache::new(cache_file.to_path_buf()).try_skip_fast(root)?,
+    };
+    if let Some(decision) = fast {
+        eprintln!("{decision}");
+        return Ok(if decision.should_skip() {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
+
+    // Full path: walk files and check.
     let files = if !include.is_empty() {
         let inc: Vec<&str> = include.iter().map(String::as_str).collect();
         let exc: Vec<&str> = exclude.iter().map(String::as_str).collect();
