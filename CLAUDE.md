@@ -40,10 +40,10 @@ uv run python ci/build_dist.py --run-id <run_id>
 uv run python ci/build_dist.py --skip-build
 ```
 
-- **Workflow**: `.github/workflows/build.yml` (workflow_dispatch, 5 targets)
+- **Workflow**: `.github/workflows/build.yml` (workflow_dispatch, 6 targets)
 - **Script**: `ci/build_dist.py` — orchestrates `gh` CLI to trigger, wait, download, organize
 - **Output**: `dist/` with per-platform subdirs + `manifest.json` (gitignored)
-- **Targets**: linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64, windows-x86_64
+- **Targets**: linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64, windows-x86_64, windows-arm64
 
 ### Publishing
 

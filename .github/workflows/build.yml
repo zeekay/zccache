@@ -43,6 +43,10 @@ jobs:
             os: windows-latest
             binary_ext: ".exe"
 
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            binary_ext: ".exe"
+
     steps:
       - uses: actions/checkout@v4
         with:

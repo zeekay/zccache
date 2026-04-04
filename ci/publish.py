@@ -50,6 +50,7 @@ ARTIFACT_MAP: dict[str, str] = {
     "binaries-x86_64-apple-darwin": "macos-x86_64",
     "binaries-aarch64-apple-darwin": "macos-aarch64",
     "binaries-x86_64-pc-windows-msvc": "windows-x86_64",
+    "binaries-aarch64-pc-windows-msvc": "windows-arm64",
 }
 
 # dist/ subdir -> wheel platform tags
@@ -59,6 +60,7 @@ PLATFORMS: dict[str, list[str]] = {
     "macos-x86_64": ["macosx_10_12_x86_64"],
     "macos-aarch64": ["macosx_11_0_arm64"],
     "windows-x86_64": ["win_amd64"],
+    "windows-arm64": ["win_arm64"],
 }
 
 

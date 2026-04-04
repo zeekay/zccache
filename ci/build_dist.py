@@ -43,6 +43,10 @@ TARGETS = {
         "wheel_plat": "win_amd64",
         "subdir": "windows-x86_64",
     },
+    "binaries-aarch64-pc-windows-msvc": {
+        "wheel_plat": "win_arm64",
+        "subdir": "windows-arm64",
+    },
 }
 
 WORKFLOW_FILE = "build.yml"
