@@ -158,16 +158,17 @@ impl TwoLayerCache {
     }
 
     fn promote_with_status(&self, status: &str) -> Result<()> {
-        if let Some(mut data) = persist::read_pending::<TwoLayerData>(&self.cache_file)? {
-            data.status = status.to_string();
-            data.timestamp_ns = persist::now_ns();
-            persist::write_atomic(&self.cache_file, &data)?;
-            let pending = self.cache_file.with_extension("pending");
-            let _ = std::fs::remove_file(pending);
-        } else {
-            // No pending file — just promote if it exists.
-            persist::promote_pending(&self.cache_file)?;
-        }
+        let mut data =
+            persist::read_pending::<TwoLayerData>(&self.cache_file)?.ok_or_else(|| {
+                crate::error::FingerprintError::NoPendingData {
+                    path: self.cache_file.clone(),
+                }
+            })?;
+        data.status = status.to_string();
+        data.timestamp_ns = persist::now_ns();
+        persist::write_atomic(&self.cache_file, &data)?;
+        let pending = self.cache_file.with_extension("pending");
+        let _ = std::fs::remove_file(pending);
         Ok(())
     }
 
@@ -193,7 +194,7 @@ impl TwoLayerCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan;
+    use crate::{persist, scan};
     use std::fs;
     use tempfile::TempDir;
 
@@ -411,18 +412,53 @@ mod tests {
     }
 
     #[test]
-    fn mark_success_without_prior_check() {
-        // Should be a no-op, not a crash.
+    fn mark_success_without_prior_check_errors() {
         let (_src, cache_dir) = setup();
         let cache = TwoLayerCache::new(cache_dir.path().join("fp.json"));
-        cache.mark_success().unwrap();
+        let err = cache.mark_success().unwrap_err();
+        assert!(
+            matches!(err, crate::error::FingerprintError::NoPendingData { .. }),
+            "expected NoPendingData, got: {err}"
+        );
     }
 
     #[test]
-    fn mark_failure_without_prior_check() {
+    fn mark_failure_without_prior_check_errors() {
         let (_src, cache_dir) = setup();
         let cache = TwoLayerCache::new(cache_dir.path().join("fp.json"));
+        let err = cache.mark_failure().unwrap_err();
+        assert!(
+            matches!(err, crate::error::FingerprintError::NoPendingData { .. }),
+            "expected NoPendingData, got: {err}"
+        );
+    }
+
+    #[test]
+    fn mark_success_writes_success_status() {
+        let (src, cache_dir) = setup();
+        create_file(src.path(), "a.rs", "fn main() {}");
+
+        let cache_path = cache_dir.path().join("fp.json");
+        let cache = TwoLayerCache::new(cache_path.clone());
+        cache.check(&scan(src.path())).unwrap();
+        cache.mark_success().unwrap();
+
+        let data: persist::TwoLayerData = persist::read_json(&cache_path).unwrap().unwrap();
+        assert_eq!(data.status, "success");
+    }
+
+    #[test]
+    fn mark_failure_writes_failure_status() {
+        let (src, cache_dir) = setup();
+        create_file(src.path(), "a.rs", "fn main() {}");
+
+        let cache_path = cache_dir.path().join("fp.json");
+        let cache = TwoLayerCache::new(cache_path.clone());
+        cache.check(&scan(src.path())).unwrap();
         cache.mark_failure().unwrap();
+
+        let data: persist::TwoLayerData = persist::read_json(&cache_path).unwrap().unwrap();
+        assert_eq!(data.status, "failure");
     }
 
     #[test]

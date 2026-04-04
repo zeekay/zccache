@@ -11,6 +11,9 @@ pub enum FingerprintError {
 
     #[error("scan error in {path}: {message}")]
     Scan { path: PathBuf, message: String },
+
+    #[error("no pending data for {path}: run `check` before `mark-success`/`mark-failure`")]
+    NoPendingData { path: PathBuf },
 }
 
 pub type Result<T> = std::result::Result<T, FingerprintError>;
