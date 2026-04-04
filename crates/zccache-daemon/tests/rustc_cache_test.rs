@@ -6,6 +6,9 @@
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
+#[cfg(unix)]
+type ClientConn = zccache_ipc::IpcConnection;
+#[cfg(windows)]
 type ClientConn = zccache_ipc::IpcClientConnection;
 
 async fn start_daemon() -> (
