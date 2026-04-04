@@ -78,11 +78,30 @@ The difference comes from **architecture**, not better caching:
 | **IPC model** | Subprocess per invocation (fork + exec + connect) | Persistent daemon, single IPC message per compile |
 | **Cache lookup** | Client hashes inputs, sends to server, server checks disk | Daemon has inputs in memory (file watcher + metadata cache) |
 | **On hit** | Server reads artifact from disk, sends back via IPC | Daemon hardlinks cached file to output path (1 syscall) |
+| **Multi-file** | Compiles every file (no multi-file cache support) | Parallel per-file cache lookups, only misses go to the compiler |
 | **Per-hit cost** | ~170ms (process spawn + hash + disk I/O + IPC) | ~1ms (in-memory lookup + hardlink) |
 
-sccache was designed for **distributed** caching (S3, GCS, Redis) where network
-latency dwarfs local overhead. zccache is designed for **local-first** use where
-every millisecond of wrapper overhead matters.
+**Architecture enhancements that make the difference:**
+
+- **Filesystem watcher** — a background `notify` watcher tracks file changes in real time, so the daemon already knows whether inputs are dirty before you even invoke a compile. No redundant stat/hash work on hit.
+- **In-memory metadata cache** — file sizes, mtimes, and content hashes live in a lock-free `DashMap`. Cache key computation is a memory lookup, not disk I/O.
+- **Single-roundtrip IPC** — each compile is one length-prefixed bincode message over a Unix socket (or named pipe on Windows). No subprocess spawning, no repeated handshakes.
+- **Hardlink delivery** — cache hits are served by hardlinking the cached artifact to the output path — a single syscall instead of reading + writing the file contents.
+- **Multi-file fast path** — when a build system passes N source files in one invocation, zccache checks all N against the cache in parallel, serves hits immediately, and batches only the misses into a single compiler process.
+
+**Broader tool coverage** — zccache supports modes that other compiler caches don't:
+
+| Mode | Description |
+|------|-------------|
+| **Multi-file compilation** | `clang++ -c a.cpp b.cpp c.cpp` — per-file caching with parallel lookups |
+| **Response files** | Nested `.rsp` files with hundreds of flags — fully expanded and cached |
+| **clang-tidy** | Static analysis results cached and replayed |
+| **include-what-you-use** | IWYU output cached per translation unit |
+| **Emscripten (emcc/em++)** | WebAssembly compilation cached end-to-end |
+| **wasm-ld** | WebAssembly linking cached |
+| **rustfmt** | Formatting results cached |
+| **clippy** | Lint results cached |
+| **Rust check & build** | `cargo check` and `cargo build` with extern crate content hashing |
 
 ## Install
 
