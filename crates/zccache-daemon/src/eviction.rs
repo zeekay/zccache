@@ -503,7 +503,9 @@ mod tests {
             ),
             stdout: std::sync::Arc::new(Vec::new()),
             stderr: std::sync::Arc::new(Vec::new()),
-            payloads: Some(vec![std::sync::Arc::new(vec![0u8; payload_size])]),
+            payloads: Some(std::sync::Arc::from(vec![std::sync::Arc::new(
+                vec![0u8; payload_size],
+            )])),
             last_used: Instant::now(),
         }
     }

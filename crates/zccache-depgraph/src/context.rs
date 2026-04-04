@@ -4,7 +4,7 @@
 //! and maps to an include list. The artifact key incorporates content
 //! hashes of all files for artifact store lookup.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use zccache_hash::ContentHash;
 
@@ -81,22 +81,22 @@ pub struct CompileContext {
 }
 
 impl CompileContext {
-    /// Build a `CompileContext` from parsed arguments.
+    /// Build a `CompileContext` from parsed arguments (consumes the args to avoid cloning).
     #[must_use]
-    pub fn from_parsed_args(args: &ParsedArgs) -> Self {
-        let mut defines = args.defines.clone();
+    pub fn from_parsed_args(args: ParsedArgs) -> Self {
+        let mut defines = args.defines;
         defines.sort();
-        let mut flags = args.flags.clone();
+        let mut flags = args.flags;
         flags.sort();
-        let mut unknown_flags = args.unknown_flags.clone();
+        let mut unknown_flags = args.unknown_flags;
         unknown_flags.sort();
 
         Self {
-            source_file: args.source_file.clone(),
-            include_search: args.include_search.clone(),
+            source_file: args.source_file,
+            include_search: args.include_search,
             defines,
             flags,
-            force_includes: args.force_includes.clone(),
+            force_includes: args.force_includes,
             unknown_flags,
         }
     }
@@ -175,9 +175,9 @@ impl CompileContext {
 /// The artifact key uniquely identifies a specific compilation output.
 /// `file_hashes` should contain `(path, content_hash)` pairs for the
 /// source file and all resolved headers, sorted by path.
-pub fn compute_artifact_key(
+pub fn compute_artifact_key<P: AsRef<Path> + Ord>(
     context_key: &ContextKey,
-    file_hashes: &mut [(PathBuf, ContentHash)],
+    file_hashes: &mut [(P, ContentHash)],
 ) -> ArtifactKey {
     // Sort by path for determinism.
     file_hashes.sort_by(|a, b| a.0.cmp(&b.0));
@@ -188,7 +188,7 @@ pub fn compute_artifact_key(
     hasher.update(b"\0");
 
     for (path, hash) in file_hashes.iter() {
-        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update(path.as_ref().to_string_lossy().as_bytes());
         hasher.update(b"\0");
         hasher.update(hash.as_bytes());
         hasher.update(b"\0");
@@ -426,9 +426,9 @@ impl RustcCompileContext {
 ///
 /// Like `compute_artifact_key` for C/C++, but also incorporates
 /// extern crate content hashes (analogous to header content hashes).
-pub fn compute_rustc_artifact_key(
+pub fn compute_rustc_artifact_key<P: AsRef<Path> + Ord>(
     context_key: &ContextKey,
-    file_hashes: &mut [(PathBuf, ContentHash)],
+    file_hashes: &mut [(P, ContentHash)],
     extern_hashes: &mut [(String, ContentHash)],
 ) -> ArtifactKey {
     file_hashes.sort_by(|a, b| a.0.cmp(&b.0));
@@ -441,7 +441,7 @@ pub fn compute_rustc_artifact_key(
 
     // Source + dependency file hashes.
     for (path, hash) in file_hashes.iter() {
-        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update(path.as_ref().to_string_lossy().as_bytes());
         hasher.update(b"\0");
         hasher.update(hash.as_bytes());
         hasher.update(b"\0");
@@ -586,7 +586,7 @@ mod tests {
             dep_flags: UserDepFlags::default(),
             unknown_flags: vec!["--zzz".into(), "--aaa".into()],
         };
-        let ctx = CompileContext::from_parsed_args(&args);
+        let ctx = CompileContext::from_parsed_args(args);
         assert_eq!(ctx.defines, vec!["AAA", "ZZZ"]);
         assert_eq!(ctx.flags, vec!["-O2", "-Wall"]);
         assert_eq!(ctx.unknown_flags, vec!["--aaa", "--zzz"]);

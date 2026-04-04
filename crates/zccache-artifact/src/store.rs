@@ -5,6 +5,7 @@
 //! loaded lazily on cache hit.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
@@ -19,13 +20,16 @@ const ARTIFACTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("arti
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactIndex {
     /// Output filenames, e.g. `["foo.o"]`.
-    pub output_names: Vec<String>,
+    /// Arc-wrapped so cache-hit clones are O(1) refcount bumps.
+    pub output_names: Arc<[String]>,
     /// Output file sizes in bytes (parallel to `output_names`).
     pub output_sizes: Vec<u64>,
     /// Captured compiler stdout.
-    pub stdout: Vec<u8>,
+    /// Arc-wrapped so clones between CachedArtifact and persist tasks are O(1).
+    pub stdout: Arc<Vec<u8>>,
     /// Captured compiler stderr.
-    pub stderr: Vec<u8>,
+    /// Arc-wrapped so clones between CachedArtifact and persist tasks are O(1).
+    pub stderr: Arc<Vec<u8>>,
     /// Compiler exit code.
     pub exit_code: i32,
     /// Sum of all output file sizes (for eviction budget accounting).
@@ -39,8 +43,8 @@ impl ArtifactIndex {
     pub fn new(
         output_names: Vec<String>,
         output_sizes: Vec<u64>,
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
+        stdout: impl Into<Arc<Vec<u8>>>,
+        stderr: impl Into<Arc<Vec<u8>>>,
         exit_code: i32,
     ) -> Self {
         let total_size = output_sizes.iter().sum();
@@ -49,10 +53,10 @@ impl ArtifactIndex {
             .unwrap_or_default()
             .as_secs();
         Self {
-            output_names,
+            output_names: Arc::from(output_names),
             output_sizes,
-            stdout,
-            stderr,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
             exit_code,
             total_size,
             stored_at_secs,
@@ -215,10 +219,10 @@ mod tests {
         let meta = sample_meta();
         store.insert("abc123", &meta).unwrap();
         let loaded = store.get("abc123").unwrap().unwrap();
-        assert_eq!(loaded.output_names, vec!["foo.o"]);
+        assert_eq!(&*loaded.output_names, &["foo.o".to_string()]);
         assert_eq!(loaded.output_sizes, vec![1234]);
-        assert_eq!(loaded.stdout, b"compiler stdout");
-        assert_eq!(loaded.stderr, b"compiler stderr");
+        assert_eq!(&*loaded.stdout, b"compiler stdout");
+        assert_eq!(&*loaded.stderr, b"compiler stderr");
         assert_eq!(loaded.exit_code, 0);
         assert_eq!(loaded.total_size, 1234);
     }
@@ -238,7 +242,7 @@ mod tests {
         store.insert("key", &meta2).unwrap();
         assert_eq!(store.len().unwrap(), 1);
         let loaded = store.get("key").unwrap().unwrap();
-        assert_eq!(loaded.output_names, vec!["b.o"]);
+        assert_eq!(&*loaded.output_names, &["b.o".to_string()]);
         assert_eq!(loaded.exit_code, 1);
     }
 
@@ -325,7 +329,7 @@ mod tests {
         assert_eq!(loaded.output_names.len(), 2);
         assert_eq!(loaded.output_sizes, vec![50000, 2000]);
         assert_eq!(loaded.total_size, 52000);
-        assert_eq!(loaded.stderr, b"warning: unused variable");
+        assert_eq!(&*loaded.stderr, b"warning: unused variable");
     }
 
     #[test]

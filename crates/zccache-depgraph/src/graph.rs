@@ -216,11 +216,11 @@ impl DepGraph {
             };
         }
 
-        // All headers fresh. Compute artifact key.
-        let mut file_hashes = Vec::new();
+        // All headers fresh. Compute artifact key (using &Path to avoid PathBuf clones).
+        let mut file_hashes: Vec<(&Path, ContentHash)> = Vec::new();
 
         if let Some(h) = get_hash(&entry.context.source_file) {
-            file_hashes.push((entry.context.source_file.clone(), h));
+            file_hashes.push((&entry.context.source_file, h));
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
             return CacheVerdict::Cold;
@@ -228,7 +228,7 @@ impl DepGraph {
 
         for header in &entry.resolved_includes {
             if let Some(h) = get_hash(header) {
-                file_hashes.push((header.clone(), h));
+                file_hashes.push((header, h));
             } else {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 return CacheVerdict::Cold;
@@ -237,7 +237,7 @@ impl DepGraph {
         // Hash force-included files (PCH content must affect artifact key).
         for fi in &entry.context.force_includes {
             if let Some(h) = get_hash(fi) {
-                file_hashes.push((fi.clone(), h));
+                file_hashes.push((fi, h));
             } else {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 return CacheVerdict::Cold;
@@ -649,7 +649,7 @@ impl DepGraph {
             .iter()
             .map(|cmd| {
                 let parsed = cmd.parse();
-                let mut ctx = CompileContext::from_parsed_args(&parsed);
+                let mut ctx = CompileContext::from_parsed_args(parsed);
 
                 // Merge system includes into the context's search paths.
                 // These go into the `system` field, appended after any

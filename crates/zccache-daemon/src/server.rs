@@ -50,7 +50,8 @@ pub(crate) struct CachedArtifact {
     pub(crate) stdout: Arc<Vec<u8>>,
     pub(crate) stderr: Arc<Vec<u8>>,
     /// Lazily-loaded output payloads. `None` = not yet loaded from disk.
-    pub(crate) payloads: Option<Vec<Arc<Vec<u8>>>>,
+    /// Arc-wrapped so cache-hit clones are O(1) refcount bumps.
+    pub(crate) payloads: Option<Arc<[Arc<Vec<u8>>]>>,
     /// When this artifact was last used (inserted or returned as a hit).
     pub(crate) last_used: std::time::Instant,
 }
@@ -65,23 +66,29 @@ impl CachedArtifact {
                 .iter()
                 .map(|o| o.data.len() as u64)
                 .collect(),
-            (*artifact.stdout).clone(),
-            (*artifact.stderr).clone(),
+            Arc::clone(&artifact.stdout),
+            Arc::clone(&artifact.stderr),
             artifact.exit_code,
         );
         Self {
             meta,
-            stdout: artifact.stdout.clone(),
-            stderr: artifact.stderr.clone(),
-            payloads: Some(artifact.outputs.iter().map(|o| o.data.clone()).collect()),
+            stdout: Arc::clone(&artifact.stdout),
+            stderr: Arc::clone(&artifact.stderr),
+            payloads: Some(Arc::from(
+                artifact
+                    .outputs
+                    .iter()
+                    .map(|o| Arc::clone(&o.data))
+                    .collect::<Vec<_>>(),
+            )),
             last_used: std::time::Instant::now(),
         }
     }
 
     /// Create from index metadata (lazy — payloads not loaded yet).
-    fn from_index(mut meta: ArtifactIndex) -> Self {
-        let stdout = Arc::new(std::mem::take(&mut meta.stdout));
-        let stderr = Arc::new(std::mem::take(&mut meta.stderr));
+    fn from_index(meta: ArtifactIndex) -> Self {
+        let stdout = Arc::clone(&meta.stdout);
+        let stderr = Arc::clone(&meta.stderr);
         Self {
             meta,
             stdout,
@@ -110,7 +117,7 @@ fn ensure_payloads<'a>(
                 Err(_) => return None,
             }
         }
-        cached.payloads = Some(payloads);
+        cached.payloads = Some(Arc::from(payloads));
     }
     cached.payloads.as_deref()
 }
@@ -1301,8 +1308,8 @@ async fn handle_link_ephemeral(
         // Load payloads from disk if not already loaded.
         let loaded = ensure_payloads(&mut entry, &state.artifact_dir, &key_hex).is_some();
         if loaded {
-            let payloads: Vec<Arc<Vec<u8>>> = entry.payloads.as_ref().unwrap().clone();
-            let names: Vec<String> = entry.meta.output_names.clone();
+            let payloads = Arc::clone(entry.payloads.as_ref().unwrap());
+            let names = Arc::clone(&entry.meta.output_names);
             let exit_code = entry.meta.exit_code;
             let stdout = entry.stdout.clone();
             let stderr = entry.stderr.clone();
@@ -1445,12 +1452,20 @@ async fn handle_link_ephemeral(
                 exit_code: 0,
             };
 
-            // Persist to disk in background (Arc clone is O(1))
+            // Build CachedArtifact once (no deep copies — all Arc clones).
+            let cached = CachedArtifact::from_artifact_data(&artifact);
+
+            // Persist to disk in background (meta.clone() is cheap — Arc fields only).
             {
                 let artifact_dir = state.artifact_dir.clone();
                 let kh = key_hex.clone();
-                let artifact_clone = artifact.clone();
-                let payload_size: usize = artifact_clone.outputs.iter().map(|o| o.data.len()).sum();
+                let persist_meta = cached.meta.clone();
+                let payloads: Vec<Arc<Vec<u8>>> = artifact
+                    .outputs
+                    .iter()
+                    .map(|o| Arc::clone(&o.data))
+                    .collect();
+                let payload_size: usize = payloads.iter().map(|p| p.len()).sum();
                 state
                     .in_flight_bytes
                     .fetch_add(payload_size, Ordering::Relaxed);
@@ -1459,28 +1474,11 @@ async fn handle_link_ephemeral(
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     tokio::task::spawn_blocking(move || {
-                        // Write data files for link artifacts.
-                        for (i, out) in artifact_clone.outputs.iter().enumerate() {
+                        for (i, payload) in payloads.iter().enumerate() {
                             let cache_path = artifact_dir.join(format!("{kh}_{i}"));
-                            std::fs::write(&cache_path, &*out.data).ok();
+                            std::fs::write(&cache_path, &**payload).ok();
                         }
-                        // Insert into redb index.
-                        let meta = ArtifactIndex::new(
-                            artifact_clone
-                                .outputs
-                                .iter()
-                                .map(|o| o.name.clone())
-                                .collect(),
-                            artifact_clone
-                                .outputs
-                                .iter()
-                                .map(|o| o.data.len() as u64)
-                                .collect(),
-                            (*artifact_clone.stdout).clone(),
-                            (*artifact_clone.stderr).clone(),
-                            artifact_clone.exit_code,
-                        );
-                        state_ref.artifact_store.insert(&kh, &meta).ok();
+                        state_ref.artifact_store.insert(&kh, &persist_meta).ok();
                         state_ref
                             .in_flight_bytes
                             .fetch_sub(payload_size, Ordering::Relaxed);
@@ -1490,10 +1488,7 @@ async fn handle_link_ephemeral(
                 });
             }
 
-            state.artifacts.insert(
-                key_hex.clone(),
-                CachedArtifact::from_artifact_data(&artifact),
-            );
+            state.artifacts.insert(key_hex.clone(), cached);
             tracing::debug!(%key_hex, "link artifact cached");
         }
     }
@@ -1753,7 +1748,7 @@ fn build_compile_context(
         _ => zccache_depgraph::args::parse_gnu_args(&compilation.original_args, cwd),
     };
     let dep_flags = parsed.dep_flags.clone();
-    let mut ctx = CompileContext::from_parsed_args(&parsed);
+    let mut ctx = CompileContext::from_parsed_args(parsed);
 
     // For multi-file compilations, the parsed source_file might be wrong
     // (it picks the first source from original_args). Override with the
@@ -2263,9 +2258,8 @@ async fn handle_compile(
                             ensure_payloads(&mut cached_ref, &state.artifact_dir, artifact_key_hex)
                                 .is_some();
                         if loaded {
-                            let payloads: Vec<Arc<Vec<u8>>> =
-                                cached_ref.payloads.as_ref().unwrap().clone();
-                            let names: Vec<String> = cached_ref.meta.output_names.clone();
+                            let payloads = Arc::clone(cached_ref.payloads.as_ref().unwrap());
+                            let names = Arc::clone(&cached_ref.meta.output_names);
                             let exit_code = cached_ref.meta.exit_code;
                             let stdout = cached_ref.stdout.clone();
                             let stderr = cached_ref.stderr.clone();
@@ -2446,9 +2440,8 @@ async fn handle_compile(
                     if !loaded {
                         // Fall through to slow path on payload load failure
                     } else {
-                        let payloads: Vec<Arc<Vec<u8>>> =
-                            cached_ref.payloads.as_ref().unwrap().clone();
-                        let names: Vec<String> = cached_ref.meta.output_names.clone();
+                        let payloads = Arc::clone(cached_ref.payloads.as_ref().unwrap());
+                        let names = Arc::clone(&cached_ref.meta.output_names);
                         let exit_code = cached_ref.meta.exit_code;
                         let stdout = cached_ref.stdout.clone();
                         let stderr = cached_ref.stderr.clone();
@@ -2680,8 +2673,8 @@ async fn handle_compile(
                 if !loaded {
                     // Fall through to compile on payload load failure
                 } else {
-                    let payloads: Vec<Arc<Vec<u8>>> = cached_ref.payloads.as_ref().unwrap().clone();
-                    let names: Vec<String> = cached_ref.meta.output_names.clone();
+                    let payloads = Arc::clone(cached_ref.payloads.as_ref().unwrap());
+                    let names = Arc::clone(&cached_ref.meta.output_names);
                     let exit_code = cached_ref.meta.exit_code;
                     let stdout = cached_ref.stdout.clone();
                     let stderr = cached_ref.stderr.clone();
@@ -3091,12 +3084,20 @@ async fn handle_compile(
 
             let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
 
-            // Spawn disk persistence to background (Arc clone is O(1))
+            // Build CachedArtifact once (no deep copies — all Arc clones).
+            let cached = CachedArtifact::from_artifact_data(&artifact);
+
+            // Spawn disk persistence to background (meta.clone() is cheap — Arc fields only).
             {
                 let artifact_dir = state.artifact_dir.clone();
                 let key_hex = artifact_key_hex.clone();
-                let artifact_clone = artifact.clone();
-                let payload_size: usize = artifact_clone.outputs.iter().map(|o| o.data.len()).sum();
+                let persist_meta = cached.meta.clone();
+                let payloads: Vec<Arc<Vec<u8>>> = artifact
+                    .outputs
+                    .iter()
+                    .map(|o| Arc::clone(&o.data))
+                    .collect();
+                let payload_size: usize = payloads.iter().map(|p| p.len()).sum();
                 state
                     .in_flight_bytes
                     .fetch_add(payload_size, Ordering::Relaxed);
@@ -3105,32 +3106,19 @@ async fn handle_compile(
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     tokio::task::spawn_blocking(move || {
-                        for (i, out) in artifact_clone.outputs.iter().enumerate() {
+                        for (i, payload) in payloads.iter().enumerate() {
                             let cache_path = artifact_dir.join(format!("{key_hex}_{i}"));
-                            if let Err(e) = std::fs::write(&cache_path, &*out.data) {
+                            if let Err(e) = std::fs::write(&cache_path, &**payload) {
                                 tracing::warn!(
                                     path = %cache_path.display(),
                                     "failed to persist artifact output: {e}"
                                 );
                             }
                         }
-                        // Insert into redb index.
-                        let meta = ArtifactIndex::new(
-                            artifact_clone
-                                .outputs
-                                .iter()
-                                .map(|o| o.name.clone())
-                                .collect(),
-                            artifact_clone
-                                .outputs
-                                .iter()
-                                .map(|o| o.data.len() as u64)
-                                .collect(),
-                            (*artifact_clone.stdout).clone(),
-                            (*artifact_clone.stderr).clone(),
-                            artifact_clone.exit_code,
-                        );
-                        state_ref.artifact_store.insert(&key_hex, &meta).ok();
+                        state_ref
+                            .artifact_store
+                            .insert(&key_hex, &persist_meta)
+                            .ok();
                         state_ref
                             .in_flight_bytes
                             .fetch_sub(payload_size, Ordering::Relaxed);
@@ -3140,10 +3128,7 @@ async fn handle_compile(
                 });
             }
 
-            state.artifacts.insert(
-                artifact_key_hex,
-                CachedArtifact::from_artifact_data(&artifact),
-            );
+            state.artifacts.insert(artifact_key_hex, cached);
 
             let latency_ns = compile_start.elapsed().as_nanos() as u64;
             state.stats.record_miss(latency_ns, artifact_bytes);
@@ -3291,9 +3276,8 @@ fn check_unit_cache(
                         ensure_payloads(&mut cached_ref, &state.artifact_dir, artifact_key_hex)
                             .is_some();
                     if loaded {
-                        let payloads: Vec<Arc<Vec<u8>>> =
-                            cached_ref.payloads.as_ref().unwrap().clone();
-                        let names: Vec<String> = cached_ref.meta.output_names.clone();
+                        let payloads = Arc::clone(cached_ref.payloads.as_ref().unwrap());
+                        let names = Arc::clone(&cached_ref.meta.output_names);
                         let artifact_bytes: u64 = cached_ref.meta.total_size;
                         let stdout = cached_ref.stdout.clone();
                         let stderr = cached_ref.stderr.clone();
@@ -3390,8 +3374,8 @@ fn check_unit_cache(
             let loaded =
                 ensure_payloads(&mut cached_ref, &state.artifact_dir, &artifact_key_hex).is_some();
             if loaded {
-                let payloads: Vec<Arc<Vec<u8>>> = cached_ref.payloads.as_ref().unwrap().clone();
-                let names: Vec<String> = cached_ref.meta.output_names.clone();
+                let payloads = Arc::clone(cached_ref.payloads.as_ref().unwrap());
+                let names = Arc::clone(&cached_ref.meta.output_names);
                 let artifact_bytes: u64 = cached_ref.meta.total_size;
                 let stdout = cached_ref.stdout.clone();
                 let stderr = cached_ref.stderr.clone();
@@ -3482,7 +3466,7 @@ async fn handle_compile_multi(
             }
             _ => zccache_depgraph::args::parse_gnu_args(&first.original_args, &cwd_path),
         };
-        let mut base = CompileContext::from_parsed_args(&parsed);
+        let mut base = CompileContext::from_parsed_args(parsed);
         for path in &system_includes {
             if !base.include_search.system.contains(path) {
                 base.include_search.system.push(path.clone());
@@ -3821,12 +3805,20 @@ async fn handle_compile_multi(
             let artifact_key_hex = artifact_key.hash().to_hex();
             let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
 
-            // Spawn disk persistence to background (Arc clone is O(1))
+            // Build CachedArtifact once (no deep copies — all Arc clones).
+            let cached = CachedArtifact::from_artifact_data(&artifact);
+
+            // Spawn disk persistence to background (meta.clone() is cheap — Arc fields only).
             {
                 let artifact_dir = state.artifact_dir.clone();
                 let key_hex = artifact_key_hex.clone();
-                let artifact_clone = artifact.clone();
-                let payload_size: usize = artifact_clone.outputs.iter().map(|o| o.data.len()).sum();
+                let persist_meta = cached.meta.clone();
+                let payloads: Vec<Arc<Vec<u8>>> = artifact
+                    .outputs
+                    .iter()
+                    .map(|o| Arc::clone(&o.data))
+                    .collect();
+                let payload_size: usize = payloads.iter().map(|p| p.len()).sum();
                 state
                     .in_flight_bytes
                     .fetch_add(payload_size, Ordering::Relaxed);
@@ -3835,32 +3827,19 @@ async fn handle_compile_multi(
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     tokio::task::spawn_blocking(move || {
-                        for (i, out) in artifact_clone.outputs.iter().enumerate() {
+                        for (i, payload) in payloads.iter().enumerate() {
                             let cache_path = artifact_dir.join(format!("{key_hex}_{i}"));
-                            if let Err(e) = std::fs::write(&cache_path, &*out.data) {
+                            if let Err(e) = std::fs::write(&cache_path, &**payload) {
                                 tracing::warn!(
                                     path = %cache_path.display(),
                                     "failed to persist artifact output: {e}"
                                 );
                             }
                         }
-                        // Insert into redb index.
-                        let meta = ArtifactIndex::new(
-                            artifact_clone
-                                .outputs
-                                .iter()
-                                .map(|o| o.name.clone())
-                                .collect(),
-                            artifact_clone
-                                .outputs
-                                .iter()
-                                .map(|o| o.data.len() as u64)
-                                .collect(),
-                            (*artifact_clone.stdout).clone(),
-                            (*artifact_clone.stderr).clone(),
-                            artifact_clone.exit_code,
-                        );
-                        state_ref.artifact_store.insert(&key_hex, &meta).ok();
+                        state_ref
+                            .artifact_store
+                            .insert(&key_hex, &persist_meta)
+                            .ok();
                         state_ref
                             .in_flight_bytes
                             .fetch_sub(payload_size, Ordering::Relaxed);
@@ -3870,10 +3849,7 @@ async fn handle_compile_multi(
                 });
             }
 
-            state.artifacts.insert(
-                artifact_key_hex.clone(),
-                CachedArtifact::from_artifact_data(&artifact),
-            );
+            state.artifacts.insert(artifact_key_hex.clone(), cached);
 
             // Populate fast-hit cache for future requests
             let current_clock = state.cache_system.current_clock();

@@ -317,13 +317,18 @@ mod tests {
         recovery.on_overflow();
         recovery.on_overflow();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Should have recovered despite multiple signals.
-        assert_eq!(
-            cache.metadata().get(&path).unwrap().confidence,
-            Confidence::High
-        );
+        // Poll until the rescan completes — fixed sleeps are racy under CI load.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if cache.metadata().get(&path).unwrap().confidence == Confidence::High {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for overflow recovery rescan"
+            );
+        }
 
         handle.abort();
     }
