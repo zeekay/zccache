@@ -206,7 +206,7 @@ static RSP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// double quotes, or starting with `@` are double-quoted to prevent the
 /// compiler from misinterpreting them. Inside quotes, `"` and `\` are
 /// backslash-escaped.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn format_rsp_content(args: &[String]) -> String {
     let estimated_len: usize = args.iter().map(|a| a.len() + 3).sum();
     let mut content = String::with_capacity(estimated_len);

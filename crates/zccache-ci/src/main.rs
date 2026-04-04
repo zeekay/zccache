@@ -254,6 +254,20 @@ fn activate_rustup_toolchain() {
     }
 }
 
+/// Check whether a rustup cross-compilation target is installed.
+fn is_target_installed(target: &str) -> bool {
+    Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .map(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|line| line.trim() == target)
+        })
+        .unwrap_or(false)
+}
+
 fn main() -> ExitCode {
     let root = project_root();
 
@@ -313,6 +327,38 @@ fn main() -> ExitCode {
     if lint_rc != 0 {
         eprintln!("Lint failed — skipping tests");
         return ExitCode::from(2);
+    }
+
+    // Cross-compile check: on Windows, verify code also compiles for Linux.
+    // Catches #[cfg(windows)]-gated code called from cross-platform tests/code,
+    // which local-only clippy/check cannot detect.
+    if cfg!(windows) {
+        let target = "x86_64-unknown-linux-gnu";
+        if is_target_installed(target) {
+            let xcheck_cmd: Vec<String> = vec![
+                "cargo".into(),
+                "check".into(),
+                "--target".into(),
+                target.into(),
+                "--workspace".into(),
+                "--all-targets".into(),
+            ];
+            let (xcheck_rc, xcheck_timeout) =
+                run_streaming(&root, &xcheck_cmd, "Cross-compile check (Linux)");
+            if xcheck_timeout {
+                eprintln!("Cross-compile check timed out — skipping remaining checks");
+                return ExitCode::from(2);
+            }
+            if xcheck_rc != 0 {
+                eprintln!("Cross-compile check failed — code does not compile for Linux");
+                return ExitCode::from(2);
+            }
+        } else {
+            eprintln!(
+                "Skipping cross-compile check: target {target} not installed. \
+                 Run `rustup target add {target}` to enable."
+            );
+        }
     }
 
     // Doc check (catches unclosed HTML tags, broken intra-doc links, etc.)
