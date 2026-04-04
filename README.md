@@ -228,6 +228,24 @@ never serialize on a global lock.
 - Correct under heavy parallel compilation (no stale cache hits)
 - Simple deployment (single binary)
 
+## Tool Compatibility
+
+zccache works as a drop-in wrapper for these compilers and tools:
+
+**Clang Toolchain:**
+[![clang](https://img.shields.io/badge/clang-supported-brightgreen?logo=llvm)](https://clang.llvm.org/)
+[![clang-tidy](https://img.shields.io/badge/clang--tidy-supported-brightgreen?logo=llvm)](https://clang.llvm.org/extra/clang-tidy/)
+[![IWYU](https://img.shields.io/badge/IWYU-supported-brightgreen?logo=llvm)](https://include-what-you-use.org/)
+
+**Emscripten / WebAssembly:**
+[![emcc](https://img.shields.io/badge/emcc-supported-brightgreen?logo=webassembly)](https://emscripten.org/)
+[![wasm-ld](https://img.shields.io/badge/wasm--ld-supported-brightgreen?logo=webassembly)](https://lld.llvm.org/WebAssembly.html)
+
+**Rust Toolchain:**
+[![rustc](https://img.shields.io/badge/rustc-supported-brightgreen?logo=rust)](https://www.rust-lang.org/)
+[![rustfmt](https://img.shields.io/badge/rustfmt-supported-brightgreen?logo=rust)](https://github.com/rust-lang/rustfmt)
+[![clippy](https://img.shields.io/badge/clippy-supported-brightgreen?logo=rust)](https://github.com/rust-lang/rust-clippy)
+
 ## Architecture
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full system design.
