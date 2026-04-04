@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -117,6 +118,91 @@ def trigger_workflow(repo: str, ref: str) -> int:
     sys.exit(1)
 
 
+def download_failed_logs(repo: str, run_id: int) -> list[Path]:
+    """Download logs for failed jobs, organized per target.
+
+    Returns a list of log file paths that were saved.
+    """
+    print(f"\n==> Downloading logs for failed jobs in run {run_id}", file=sys.stderr)
+
+    logs_dir = DIST_DIR / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Identify which jobs failed
+    try:
+        jobs_raw = run_capture([
+            "gh", "run", "view", str(run_id),
+            "--repo", repo,
+            "--json", "jobs",
+        ])
+        jobs = json.loads(jobs_raw).get("jobs", [])
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        jobs = []
+
+    failed_jobs: dict[str, str] = {}  # job name -> target triple
+    for job in jobs:
+        if job.get("conclusion") == "failure":
+            name = job.get("name", "")
+            # Extract target triple from job name like "Build (x86_64-unknown-linux-gnu)"
+            m = re.search(r"\(([^)]+)\)", name)
+            target = m.group(1) if m else name
+            failed_jobs[name] = target
+
+    if not failed_jobs:
+        print("  No failed jobs found in run metadata.", file=sys.stderr)
+        return []
+
+    print(f"  Failed targets: {', '.join(failed_jobs.values())}", file=sys.stderr)
+
+    # Download the failed logs (tab-delimited: job\tstep\tlog_line)
+    try:
+        result = subprocess.run(
+            ["gh", "run", "view", str(run_id), "--repo", repo, "--log-failed"],
+            capture_output=True, text=True, timeout=120,
+        )
+        raw_output = result.stdout or result.stderr or ""
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"  WARNING: Could not download logs: {e}", file=sys.stderr)
+        return []
+
+    # Group log lines by job name
+    per_job: dict[str, list[str]] = {name: [] for name in failed_jobs}
+    for line in raw_output.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) >= 2:
+            job_name = parts[0]
+            log_line = parts[2] if len(parts) == 3 else parts[1]
+            if job_name in per_job:
+                per_job[job_name].append(log_line)
+            else:
+                # Fuzzy match — gh sometimes abbreviates job names
+                for known in per_job:
+                    if known.startswith(job_name) or job_name.startswith(known):
+                        per_job[known].append(log_line)
+                        break
+
+    # Save per-target log files and display
+    saved: list[Path] = []
+    preview_lines = 30
+    for job_name, target in failed_jobs.items():
+        lines = per_job.get(job_name, [])
+        log_file = logs_dir / f"failed-{target}-{run_id}.log"
+        log_file.write_text("\n".join(lines) + "\n" if lines else "(no log output)\n", encoding="utf-8")
+        saved.append(log_file)
+
+        print(f"\n  --- {target} ({len(lines)} lines) ---", file=sys.stderr)
+        print(f"  Log: {log_file}", file=sys.stderr)
+        if len(lines) > preview_lines:
+            print(f"  ... (showing last {preview_lines} of {len(lines)} lines)", file=sys.stderr)
+            for l in lines[-preview_lines:]:
+                print(f"  | {l}", file=sys.stderr)
+        else:
+            for l in lines:
+                print(f"  | {l}", file=sys.stderr)
+
+    return saved
+
+
 def wait_for_run(repo: str, run_id: int, timeout: int) -> None:
     """Wait for a workflow run to complete."""
     print(f"\n==> Waiting for run {run_id} to complete (timeout: {timeout}s)", file=sys.stderr)
@@ -140,6 +226,7 @@ def wait_for_run(repo: str, run_id: int, timeout: int) -> None:
             else:
                 print(f"ERROR: Run finished with conclusion: {conclusion}", file=sys.stderr)
                 print(f"  See: https://github.com/{repo}/actions/runs/{run_id}", file=sys.stderr)
+                download_failed_logs(repo, run_id)
                 sys.exit(1)
 
         secs = int(time.time() - (deadline - timeout))
