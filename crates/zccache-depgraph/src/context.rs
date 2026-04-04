@@ -224,8 +224,9 @@ pub struct RustcCompileContext {
     pub target: Option<String>,
     /// `--cap-lints` value.
     pub cap_lints: Option<String>,
-    /// Extern crate names (sorted, just the names — paths are for content hashing).
-    pub extern_names: Vec<String>,
+    /// Extern crate `(name, path)` pairs, sorted. Paths included so that
+    /// `--extern a=v1.rlib` and `--extern a=v2.rlib` get different context keys.
+    pub extern_crates: Vec<(String, String)>,
     /// Sorted lint flags (`-A`, `-W`, `-D`, `-F`).
     pub lint_flags: Vec<String>,
     /// Sorted unknown flags.
@@ -253,8 +254,12 @@ impl RustcCompileContext {
         crate_types.sort();
         let mut emit_types = args.emit_types.clone();
         emit_types.sort();
-        let mut extern_names: Vec<String> = args.externs.iter().map(|e| e.name.clone()).collect();
-        extern_names.sort();
+        let mut extern_crates: Vec<(String, String)> = args
+            .externs
+            .iter()
+            .map(|e| (e.name.clone(), e.path.to_string_lossy().into_owned()))
+            .collect();
+        extern_crates.sort();
         let mut remap_path_prefixes = args.remap_path_prefixes.clone();
         remap_path_prefixes.sort();
 
@@ -281,7 +286,7 @@ impl RustcCompileContext {
             codegen_flags: args.codegen_flags.clone(),
             target: args.target.clone(),
             cap_lints: args.cap_lints.clone(),
-            extern_names,
+            extern_crates,
             lint_flags: args.lint_flags.clone(),
             unknown_flags: args.unknown_flags.clone(),
             remap_path_prefixes,
@@ -373,10 +378,13 @@ impl RustcCompileContext {
             hasher.update(b"\0");
         }
 
-        // Extern crate names (sorted — paths excluded, content-hashed separately).
+        // Extern crate (name, path) pairs — path included so different
+        // --extern a=v1.rlib vs --extern a=v2.rlib get different context keys.
         hasher.update(b"externs\0");
-        for name in &self.extern_names {
+        for (name, path) in &self.extern_crates {
             hasher.update(name.as_bytes());
+            hasher.update(b"=");
+            hasher.update(path.as_bytes());
             hasher.update(b"\0");
         }
 
@@ -645,7 +653,7 @@ mod tests {
             codegen_flags: Vec::new(),
             target: None,
             cap_lints: None,
-            extern_names: Vec::new(),
+            extern_crates: Vec::new(),
             lint_flags: Vec::new(),
             unknown_flags: Vec::new(),
             remap_path_prefixes: Vec::new(),
@@ -722,11 +730,24 @@ mod tests {
     }
 
     #[test]
-    fn rustc_extern_names_affect_key() {
+    fn rustc_extern_crates_affect_key() {
         let ctx1 = make_rustc_context("/src/lib.rs", "2021");
         let mut ctx2 = make_rustc_context("/src/lib.rs", "2021");
-        ctx2.extern_names = vec!["serde".to_string()];
+        ctx2.extern_crates = vec![("serde".into(), "/deps/libserde.rlib".into())];
         assert_ne!(ctx1.context_key(), ctx2.context_key());
+    }
+
+    #[test]
+    fn rustc_different_extern_paths_different_key() {
+        let mut ctx1 = make_rustc_context("/src/lib.rs", "2021");
+        ctx1.extern_crates = vec![("a".into(), "/deps/liba_v1.rlib".into())];
+        let mut ctx2 = make_rustc_context("/src/lib.rs", "2021");
+        ctx2.extern_crates = vec![("a".into(), "/deps/liba_v2.rlib".into())];
+        assert_ne!(
+            ctx1.context_key(),
+            ctx2.context_key(),
+            "different extern paths must produce different context keys"
+        );
     }
 
     #[test]
@@ -772,8 +793,10 @@ mod tests {
         assert_eq!(ctx.crate_types, vec!["lib", "rlib"]);
         // Emit types sorted
         assert_eq!(ctx.emit_types, vec!["dep-info", "link"]);
-        // Extern names extracted and sorted
-        assert_eq!(ctx.extern_names, vec!["log", "serde"]);
+        // Extern crates extracted and sorted by name
+        assert_eq!(ctx.extern_crates.len(), 2);
+        assert_eq!(ctx.extern_crates[0].0, "log");
+        assert_eq!(ctx.extern_crates[1].0, "serde");
     }
 
     #[test]
