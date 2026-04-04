@@ -31,6 +31,17 @@ jobs:
             linker: aarch64-unknown-linux-musl-gcc
             strip: aarch64-unknown-linux-musl-strip
 
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary_ext: ""
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary_ext: ""
+            cross: true
+            linker: aarch64-linux-gnu-gcc
+            strip: aarch64-linux-gnu-strip
+
           - target: x86_64-apple-darwin
             os: macos-14
             binary_ext: ""
@@ -76,6 +87,13 @@ jobs:
             https://github.com/cross-tools/musl-cross/releases/download/20250929/aarch64-unknown-linux-musl.tar.xz
           tar xJf aarch64-unknown-linux-musl.tar.xz
           echo "$PWD/aarch64-unknown-linux-musl/bin" >> $GITHUB_PATH
+
+      # Linux GNU aarch64 cross-compilation toolchain
+      - name: Install GNU cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
       # Set cross-compilation linker via target-specific env var
       - name: Configure cross-compilation linker

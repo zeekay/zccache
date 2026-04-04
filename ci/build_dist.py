@@ -31,6 +31,14 @@ TARGETS = {
         "wheel_plat": "musllinux_1_2_aarch64",
         "subdir": "linux-aarch64",
     },
+    "binaries-x86_64-unknown-linux-gnu": {
+        "wheel_plat": "manylinux_2_17_x86_64",
+        "subdir": "linux-x86_64-gnu",
+    },
+    "binaries-aarch64-unknown-linux-gnu": {
+        "wheel_plat": "manylinux_2_17_aarch64",
+        "subdir": "linux-aarch64-gnu",
+    },
     "binaries-x86_64-apple-darwin": {
         "wheel_plat": "macosx_10_12_x86_64",
         "subdir": "macos-x86_64",

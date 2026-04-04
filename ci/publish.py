@@ -47,6 +47,8 @@ WORKFLOW_FILE = "build.yml"
 ARTIFACT_MAP: dict[str, str] = {
     "binaries-x86_64-unknown-linux-musl": "linux-x86_64",
     "binaries-aarch64-unknown-linux-musl": "linux-aarch64",
+    "binaries-x86_64-unknown-linux-gnu": "linux-x86_64-gnu",
+    "binaries-aarch64-unknown-linux-gnu": "linux-aarch64-gnu",
     "binaries-x86_64-apple-darwin": "macos-x86_64",
     "binaries-aarch64-apple-darwin": "macos-aarch64",
     "binaries-x86_64-pc-windows-msvc": "windows-x86_64",
@@ -57,6 +59,8 @@ ARTIFACT_MAP: dict[str, str] = {
 PLATFORMS: dict[str, list[str]] = {
     "linux-x86_64": ["musllinux_1_2_x86_64"],
     "linux-aarch64": ["musllinux_1_2_aarch64"],
+    "linux-x86_64-gnu": ["manylinux_2_17_x86_64"],
+    "linux-aarch64-gnu": ["manylinux_2_17_aarch64"],
     "macos-x86_64": ["macosx_10_12_x86_64"],
     "macos-aarch64": ["macosx_11_0_arm64"],
     "windows-x86_64": ["win_amd64"],
