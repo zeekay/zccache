@@ -14,7 +14,60 @@ with aggressive file metadata caching and filesystem watching.
 
 ## Performance
 
+### Warm cache speedup (higher is better)
+
+| Benchmark | zccache vs sccache | zccache vs bare compiler |
+|:----------|-------------------:|-------------------------:|
+| **C++ single-file** | **32x** | **236x** |
+| **C++ multi-file** | **695x** | **696x** |
+| **C++ response-file (single)** | **33x** | **267x** |
+| **C++ response-file (multi)** | **669x** | **648x** |
+| **Rust build** | **193x** | **148x** |
+| **Rust check** | **121x** | **76x** |
+
+> 50 files per benchmark, median of 5 warm trials. Run it yourself: `./perf`
+
+---
+
+### C++ Benchmark: 50 C++ files, 5 warm trials
+
+<details>
+<summary>Full results — single-file & multi-file</summary>
+
+| Scenario | Bare Clang | sccache | zccache | vs sccache | vs bare clang |
+|:---------|----------:|--------:|--------:|-----------:|--------------:|
+| Single-file, Cold | 12.641s | 20.632s | 13.430s | 1.5x faster | 1.1x slower |
+| Single-file, Warm | 11.705s | 1.576s | **0.050s** | **32x faster** | **236x faster** |
+| Multi-file, Cold | 11.358s | 11.759s | 12.867s | 1.1x slower | 1.1x slower |
+| Multi-file, Warm | 11.553s | 11.530s | **0.017s** | **695x faster** | **696x faster** |
+
+> **Cold** = first compile (empty cache). **Warm** = median of 5 subsequent runs.
+> Single-file = 50 sequential `clang++ -c unit.cpp` invocations. Multi-file = one `clang++ -c *.cpp` invocation.
+> sccache cannot cache multi-file compilations — its "warm" multi-file time is a full recompile.
+
+</details>
+
+<details>
+<summary>Full results — response-file (~283 expanded args)</summary>
+
+| Scenario | Bare Clang | sccache | zccache | vs sccache | vs bare clang |
+|:---------|----------:|--------:|--------:|-----------:|--------------:|
+| Single-file RSP, Cold | 12.063s | 20.607s | 14.087s | 1.5x faster | 1.2x slower |
+| Single-file RSP, Warm | 12.540s | 1.558s | **0.047s** | **33x faster** | **267x faster** |
+| Multi-file RSP, Cold | 13.030s | 25.303s | 13.975s | 1.8x faster | 1.1x slower |
+| Multi-file RSP, Warm | 12.049s | 12.434s | **0.019s** | **669x faster** | **648x faster** |
+
+> All args passed via nested response files: `flags.rsp` -> `@warnings.rsp` + `@defines.rsp`.
+> 200 `-D` defines + 50 `-I` paths + 30 warning flags = ~283 total expanded args per compile.
+
+</details>
+
+---
+
 ### Rust Benchmark: 50 .rs files, 5 warm trials
+
+<details>
+<summary>Full results — build & check</summary>
 
 | Scenario | Bare rustc | sccache | zccache | vs sccache | vs bare rustc |
 |:---------|----------:|--------:|--------:|-----------:|--------------:|
@@ -31,7 +84,11 @@ with aggressive file metadata caching and filesystem watching.
 > sccache gets cache hits but each hit still costs ~170ms subprocess overhead.
 > zccache serves hits in ~1ms via in-process IPC — no subprocess, no re-hashing.
 
-#### Why is zccache 120-193x faster than sccache on warm hits?
+</details>
+
+---
+
+### Why is zccache so much faster on warm hits?
 
 The difference comes from **architecture**, not better caching:
 
@@ -46,34 +103,7 @@ sccache was designed for **distributed** caching (S3, GCS, Redis) where network
 latency dwarfs local overhead. zccache is designed for **local-first** use where
 every millisecond of wrapper overhead matters.
 
-### C++ Benchmark: 50 C++ files, 5 warm trials
-
-| Scenario | Bare Clang | sccache | zccache | vs sccache | vs bare clang |
-|:---------|----------:|--------:|--------:|-----------:|--------------:|
-| Single-file, Cold | 12.641s | 20.632s | 13.430s | 1.5x faster | 1.1x slower |
-| Single-file, Warm | 11.705s | 1.576s | **0.050s** | **32x faster** | **236x faster** |
-| Multi-file, Cold | 11.358s | 11.759s | 12.867s | 1.1x slower | 1.1x slower |
-| Multi-file, Warm | 11.553s | 11.530s | **0.017s** | **695x faster** | **696x faster** |
-
-> **Cold** = first compile (empty cache). **Warm** = median of 5 subsequent runs.
-> Single-file = 50 sequential `clang++ -c unit.cpp` invocations. Multi-file = one `clang++ -c *.cpp` invocation.
-> sccache cannot cache multi-file compilations — its "warm" multi-file time is a full recompile.
-
-### Response-file benchmark: 50 C++ files, ~283 expanded args, 5 warm trials
-
-| Scenario | Bare Clang | sccache | zccache | vs sccache | vs bare clang |
-|:---------|----------:|--------:|--------:|-----------:|--------------:|
-| Single-file RSP, Cold | 12.063s | 20.607s | 14.087s | 1.5x faster | 1.2x slower |
-| Single-file RSP, Warm | 12.540s | 1.558s | **0.047s** | **33x faster** | **267x faster** |
-| Multi-file RSP, Cold | 13.030s | 25.303s | 13.975s | 1.8x faster | 1.1x slower |
-| Multi-file RSP, Warm | 12.049s | 12.434s | **0.019s** | **669x faster** | **648x faster** |
-
-> All args passed via nested response files: `flags.rsp` -> `@warnings.rsp` + `@defines.rsp`.
-> 200 `-D` defines + 50 `-I` paths + 30 warning flags = ~283 total expanded args per compile.
-
-Run the benchmark yourself: `./perf`
-
-### Install
+## Install
 
 ```bash
 pip install zccache
