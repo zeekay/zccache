@@ -11,7 +11,7 @@ use zccache_fingerprint::{
 /// Answers "has this set of files changed since the last successful operation?"
 /// using blake3 content hashing with mtime fast-paths.
 #[derive(Debug, Parser)]
-#[command(name = "zccache-fingerprint", version, about)]
+#[command(name = "zccache-fp", version, about)]
 struct Cli {
     /// Path to the cache file (e.g., .cache/lint.json).
     #[arg(long)]

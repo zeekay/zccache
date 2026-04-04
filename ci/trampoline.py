@@ -90,7 +90,7 @@ def run_zccache_daemon():
 
 
 def run_zccache_fingerprint():
-    _run_cargo_bin("zccache-fingerprint")
+    _run_cargo_bin("zccache-fp")
 
 
 def check_on_stop():

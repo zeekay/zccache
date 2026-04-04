@@ -11,7 +11,7 @@ name = "zccache_fingerprint"
 crate-type = ["cdylib", "lib"]
 
 [[bin]]
-name = "zccache-fingerprint"
+name = "zccache-fp"
 path = "src/main.rs"
 
 [features]

@@ -75,16 +75,16 @@ jobs:
           mkdir -p staging
           cp target/${{ matrix.target }}/release/zccache${{ matrix.binary_ext }} staging/
           cp target/${{ matrix.target }}/release/zccache-daemon${{ matrix.binary_ext }} staging/
-          cp target/${{ matrix.target }}/release/zccache-fingerprint${{ matrix.binary_ext }} staging/
+          cp target/${{ matrix.target }}/release/zccache-fp${{ matrix.binary_ext }} staging/
           # Strip binaries (reduces size significantly)
           if command -v strip &> /dev/null && [ -z "${{ matrix.cross }}" ]; then
             strip staging/zccache${{ matrix.binary_ext }} || true
             strip staging/zccache-daemon${{ matrix.binary_ext }} || true
-            strip staging/zccache-fingerprint${{ matrix.binary_ext }} || true
+            strip staging/zccache-fp${{ matrix.binary_ext }} || true
           elif [ "${{ matrix.cross }}" = "true" ]; then
             aarch64-linux-gnu-strip staging/zccache || true
             aarch64-linux-gnu-strip staging/zccache-daemon || true
-            aarch64-linux-gnu-strip staging/zccache-fingerprint || true
+            aarch64-linux-gnu-strip staging/zccache-fp || true
           fi
 
       - name: Upload artifacts
