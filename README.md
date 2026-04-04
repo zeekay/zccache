@@ -4,14 +4,21 @@
 [![macOS](https://github.com/zackees/zccache/actions/workflows/ci-macos.yml/badge.svg)](https://github.com/zackees/zccache/actions/workflows/ci-macos.yml)
 [![Windows](https://github.com/zackees/zccache/actions/workflows/ci-windows.yml/badge.svg)](https://github.com/zackees/zccache/actions/workflows/ci-windows.yml)
 
+![C/C++](https://img.shields.io/badge/C%2FC%2B%2B-555?logo=c%2B%2B&logoColor=white)
 [![clang](https://img.shields.io/badge/clang-supported-brightgreen?logo=llvm)](https://clang.llvm.org/)
+[![clang++](https://img.shields.io/badge/clang++-supported-brightgreen?logo=llvm)](https://clang.llvm.org/)
 [![clang-tidy](https://img.shields.io/badge/clang--tidy-supported-brightgreen?logo=llvm)](https://clang.llvm.org/extra/clang-tidy/)
 [![IWYU](https://img.shields.io/badge/IWYU-supported-brightgreen?logo=llvm)](https://include-what-you-use.org/)
-[![emcc](https://img.shields.io/badge/emcc-supported-brightgreen?logo=webassembly)](https://emscripten.org/)
-[![wasm-ld](https://img.shields.io/badge/wasm--ld-supported-brightgreen?logo=webassembly)](https://lld.llvm.org/WebAssembly.html)
+
+![Rust](https://img.shields.io/badge/Rust-555?logo=rust&logoColor=white)
 [![rustc](https://img.shields.io/badge/rustc-supported-brightgreen?logo=rust)](https://www.rust-lang.org/)
-[![rustfmt](https://img.shields.io/badge/rustfmt-supported-brightgreen?logo=rust)](https://github.com/rust-lang/rustfmt)
 [![clippy](https://img.shields.io/badge/clippy-supported-brightgreen?logo=rust)](https://github.com/rust-lang/rust-clippy)
+[![rustfmt](https://img.shields.io/badge/rustfmt-supported-brightgreen?logo=rust)](https://github.com/rust-lang/rustfmt)
+
+![Emscripten](https://img.shields.io/badge/Emscripten-555?logo=webassembly&logoColor=white)
+[![emcc](https://img.shields.io/badge/emcc-supported-brightgreen?logo=webassembly)](https://emscripten.org/)
+[![em++](https://img.shields.io/badge/em++-supported-brightgreen?logo=webassembly)](https://emscripten.org/)
+[![wasm-ld](https://img.shields.io/badge/wasm--ld-supported-brightgreen?logo=webassembly)](https://lld.llvm.org/WebAssembly.html)
 
 ### A blazing fast compiler cache for C/C++ and Rust
 
@@ -23,75 +30,40 @@ with aggressive file metadata caching and filesystem watching.
 
 ## Performance
 
-### Warm cache speedup (higher is better)
+50 files per benchmark, median of 5 trials. Run it yourself: `./perf`
 
-| Benchmark | zccache vs sccache | zccache vs bare compiler |
-|:----------|-------------------:|-------------------------:|
-| **C++ single-file** | **32x** | **236x** |
-| **C++ multi-file** | **695x** | **696x** |
-| **C++ response-file (single)** | **33x** | **267x** |
-| **C++ response-file (multi)** | **669x** | **648x** |
-| **Rust build** | **193x** | **148x** |
-| **Rust check** | **121x** | **76x** |
+### Cache Hit (warm cache)
 
-> 50 files per benchmark, median of 5 warm trials. Run it yourself: `./perf`
+| Benchmark | Bare Compiler | sccache | zccache | vs sccache | vs bare |
+|:----------|-------------:|--------:|--------:|-----------:|--------:|
+| **C++ single-file** | 11.705s | 1.576s | **0.050s** | **32x** | **236x** |
+| **C++ multi-file** | 11.553s | 11.530s | **0.017s** | **695x** | **696x** |
+| **C++ response-file (single)** | 12.540s | 1.558s | **0.047s** | **33x** | **267x** |
+| **C++ response-file (multi)** | 12.049s | 12.434s | **0.019s** | **669x** | **648x** |
+| **Rust build** | 6.592s | 8.604s | **0.045s** | **193x** | **148x** |
+| **Rust check** | 3.716s | 5.922s | **0.049s** | **121x** | **76x** |
 
----
+### Cache Miss (cold compile)
 
-### C++ Benchmark: 50 C++ files, 5 warm trials
-
-<details>
-<summary>Full results — single-file & multi-file</summary>
-
-| Scenario | Bare Clang | sccache | zccache | vs sccache | vs bare clang |
-|:---------|----------:|--------:|--------:|-----------:|--------------:|
-| Single-file, Cold | 12.641s | 20.632s | 13.430s | 1.5x faster | 1.1x slower |
-| Single-file, Warm | 11.705s | 1.576s | **0.050s** | **32x faster** | **236x faster** |
-| Multi-file, Cold | 11.358s | 11.759s | 12.867s | 1.1x slower | 1.1x slower |
-| Multi-file, Warm | 11.553s | 11.530s | **0.017s** | **695x faster** | **696x faster** |
-
-> **Cold** = first compile (empty cache). **Warm** = median of 5 subsequent runs.
-> Single-file = 50 sequential `clang++ -c unit.cpp` invocations. Multi-file = one `clang++ -c *.cpp` invocation.
-> sccache cannot cache multi-file compilations — its "warm" multi-file time is a full recompile.
-
-</details>
+| Benchmark | Bare Compiler | sccache | zccache | vs sccache | vs bare |
+|:----------|-------------:|--------:|--------:|-----------:|--------:|
+| C++ single-file | 12.641s | 20.632s | 13.430s | 1.5x | 0.9x |
+| C++ multi-file | 11.358s | 11.759s | 12.867s | 0.9x | 0.9x |
+| C++ response-file (single) | 12.063s | 20.607s | 14.087s | 1.5x | 0.9x |
+| C++ response-file (multi) | 13.030s | 25.303s | 13.975s | 1.8x | 0.9x |
+| Rust build | 7.119s | 10.023s | 8.507s | 1.2x | 0.8x |
+| Rust check | 4.289s | 7.056s | 5.060s | 1.4x | 0.8x |
 
 <details>
-<summary>Full results — response-file (~283 expanded args)</summary>
+<summary>Benchmark details</summary>
 
-| Scenario | Bare Clang | sccache | zccache | vs sccache | vs bare clang |
-|:---------|----------:|--------:|--------:|-----------:|--------------:|
-| Single-file RSP, Cold | 12.063s | 20.607s | 14.087s | 1.5x faster | 1.2x slower |
-| Single-file RSP, Warm | 12.540s | 1.558s | **0.047s** | **33x faster** | **267x faster** |
-| Multi-file RSP, Cold | 13.030s | 25.303s | 13.975s | 1.8x faster | 1.1x slower |
-| Multi-file RSP, Warm | 12.049s | 12.434s | **0.019s** | **669x faster** | **648x faster** |
-
-> All args passed via nested response files: `flags.rsp` -> `@warnings.rsp` + `@defines.rsp`.
-> 200 `-D` defines + 50 `-I` paths + 30 warning flags = ~283 total expanded args per compile.
-
-</details>
-
----
-
-### Rust Benchmark: 50 .rs files, 5 warm trials
-
-<details>
-<summary>Full results — build & check</summary>
-
-| Scenario | Bare rustc | sccache | zccache | vs sccache | vs bare rustc |
-|:---------|----------:|--------:|--------:|-----------:|--------------:|
-| Build, Cold | 7.119s | 10.023s | 8.507s | 1.2x faster | 1.2x slower |
-| Build, Warm | 6.592s | 8.604s | **0.045s** | **193x faster** | **148x faster** |
-| Check, Cold | 4.289s | 7.056s | 5.060s | 1.4x faster | 1.2x slower |
-| Check, Warm | 3.716s | 5.922s | **0.049s** | **121x faster** | **76x faster** |
-
-> **Build** = `--emit=dep-info,metadata,link` (cargo build). **Check** = `--emit=dep-info,metadata` (cargo check).
-> **Cold** = first compile (empty cache). **Warm** = median of 5 subsequent runs.
-> Each file is an independent `rustc --crate-type lib` invocation with `--out-dir`
-> (same flags cargo passes).
->
-> sccache gets cache hits but each hit still costs ~170ms subprocess overhead.
-> zccache serves hits in ~1ms via in-process IPC — no subprocess, no re-hashing.
+- **Single-file** = 50 sequential `clang++ -c unit.cpp` invocations
+- **Multi-file** = one `clang++ -c *.cpp` invocation (sccache cannot cache these — its "warm" time is a full recompile)
+- **Response-file** = args via nested `.rsp` files: 200 `-D` defines + 50 `-I` paths + 30 warning flags (~283 expanded args)
+- **Rust build** = `--emit=dep-info,metadata,link` (cargo build)
+- **Rust check** = `--emit=dep-info,metadata` (cargo check)
+- **Cold** = first compile (empty cache). **Warm** = median of 5 subsequent runs.
+- sccache gets cache hits but each hit still costs ~170ms subprocess overhead. zccache serves hits in ~1ms via in-process IPC.
 
 </details>
 
