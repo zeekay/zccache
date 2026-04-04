@@ -2138,6 +2138,7 @@ dependencies = [
  "zccache-compiler",
  "zccache-core",
  "zccache-depgraph",
+ "zccache-fingerprint",
  "zccache-fscache",
  "zccache-hash",
  "zccache-ipc",

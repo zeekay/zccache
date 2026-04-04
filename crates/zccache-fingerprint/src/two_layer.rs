@@ -134,48 +134,13 @@ impl TwoLayerCache {
 
     /// Attempt to skip without walking the filesystem.
     ///
-    /// Returns `Some(Skip)` if the cache is valid and no directories have
-    /// changed (no files created or deleted). Returns `None` if a full check
-    /// is needed.
-    ///
-    /// This is the first gate in a layered fast-path: it only stats directories,
-    /// not individual files. Content-only edits are caught by the existing
-    /// mtime fast-path (which stats all files) if this gate falls through.
-    pub fn try_skip_fast(&self, root: &Path) -> Result<Option<CacheDecision>> {
-        // Read the cache to check status and stored max_source_mtime.
-        let cached: Option<TwoLayerData> = persist::read_json(&self.cache_file)?;
-        let data = match cached {
-            Some(d) if d.status == "success" && d.max_source_mtime_ns > 0 => d,
-            _ => return Ok(None),
-        };
-
-        // Cache file must exist and be newer than all sources at last check.
-        let cache_mtime = match persist::mtime_ns(&self.cache_file) {
-            Ok(mt) => mt,
-            Err(_) => return Ok(None),
-        };
-        if cache_mtime <= data.max_source_mtime_ns {
-            return Ok(None);
-        }
-
-        // Walk only directories to detect file additions/deletions.
-        let root = match root.canonicalize() {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
-        };
-        let max_dir_mtime = match persist::max_dir_mtime_ns(&root) {
-            Ok(mt) => mt,
-            Err(_) => return Ok(None),
-        };
-
-        // If any directory was modified after the stored max source mtime,
-        // files may have been created or deleted — fall through to full check.
-        if max_dir_mtime > data.max_source_mtime_ns {
-            return Ok(None);
-        }
-
-        tracing::debug!("dir fast-path: no directory changes detected, skipping full scan");
-        Ok(Some(CacheDecision::Skip))
+    /// Always returns `None` — the directory-level mtime optimization was
+    /// removed because directory mtimes on NTFS and ext4 only change on
+    /// file create/delete, not on in-place content edits. This caused
+    /// false cache hits (see BUGS.md). The per-file `try_mtime_fast_path()`
+    /// inside `check()` is the correct fast-path.
+    pub fn try_skip_fast(&self, _root: &Path) -> Result<Option<CacheDecision>> {
+        Ok(None)
     }
 
     /// Delete cache and pending files.
@@ -687,26 +652,11 @@ mod tests {
     }
 
     // ── Dir fast-path tests ──────────────────────────────────────
+    // try_skip_fast() was disabled (always returns None) because directory-level
+    // mtimes on NTFS/ext4 don't reflect in-place content edits (BUGS.md).
 
     #[test]
-    fn dir_fast_path_skips_when_nothing_changed() {
-        let (src, cache_dir) = setup();
-        create_file(src.path(), "a.rs", "content");
-
-        let cache_file = cache_dir.path().join("fp.json");
-        let cache = TwoLayerCache::new(cache_file.clone());
-        let files = scan(src.path());
-        cache.check(&files).unwrap();
-        cache.mark_success().unwrap();
-
-        // Fast path should skip (no files or dirs changed).
-        let cache = TwoLayerCache::new(cache_file);
-        let decision = cache.try_skip_fast(src.path()).unwrap();
-        assert_eq!(decision, Some(CacheDecision::Skip));
-    }
-
-    #[test]
-    fn dir_fast_path_falls_through_on_new_file() {
+    fn try_skip_fast_always_returns_none() {
         let (src, cache_dir) = setup();
         create_file(src.path(), "a.rs", "content");
 
@@ -715,75 +665,34 @@ mod tests {
         cache.check(&scan(src.path())).unwrap();
         cache.mark_success().unwrap();
 
-        // Add a new file (changes directory mtime).
-        create_file(src.path(), "b.rs", "new");
-
+        // try_skip_fast is disabled — always falls through to per-file check.
         let cache = TwoLayerCache::new(cache_file);
         let decision = cache.try_skip_fast(src.path()).unwrap();
         assert_eq!(decision, None);
     }
 
     #[test]
-    fn dir_fast_path_falls_through_on_deleted_file() {
+    fn in_place_edit_detected_after_mark_success() {
+        // Regression test for BUGS.md: in-place edits must NOT be missed.
         let (src, cache_dir) = setup();
-        create_file(src.path(), "a.rs", "content");
-        create_file(src.path(), "b.rs", "content2");
+        create_file(src.path(), "a.rs", "original");
 
         let cache_file = cache_dir.path().join("fp.json");
         let cache = TwoLayerCache::new(cache_file.clone());
         cache.check(&scan(src.path())).unwrap();
         cache.mark_success().unwrap();
 
-        // Delete a file (changes directory mtime).
-        fs::remove_file(src.path().join("b.rs")).unwrap();
+        // In-place edit (directory mtime does NOT change, but file mtime does).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        create_file(src.path(), "a.rs", "modified");
 
+        // try_skip_fast must not skip.
         let cache = TwoLayerCache::new(cache_file);
         let decision = cache.try_skip_fast(src.path()).unwrap();
         assert_eq!(decision, None);
-    }
 
-    #[test]
-    fn dir_fast_path_falls_through_on_no_cache() {
-        let (src, cache_dir) = setup();
-        create_file(src.path(), "a.rs", "content");
-
-        // No cache file at all.
-        let cache = TwoLayerCache::new(cache_dir.path().join("fp.json"));
-        let decision = cache.try_skip_fast(src.path()).unwrap();
-        assert_eq!(decision, None);
-    }
-
-    #[test]
-    fn dir_fast_path_falls_through_on_failure_status() {
-        let (src, cache_dir) = setup();
-        create_file(src.path(), "a.rs", "content");
-
-        let cache_file = cache_dir.path().join("fp.json");
-        let cache = TwoLayerCache::new(cache_file.clone());
-        cache.check(&scan(src.path())).unwrap();
-        cache.mark_failure().unwrap();
-
-        // Previous failure — must fall through.
-        let cache = TwoLayerCache::new(cache_file);
-        let decision = cache.try_skip_fast(src.path()).unwrap();
-        assert_eq!(decision, None);
-    }
-
-    #[test]
-    fn dir_fast_path_backward_compat_old_cache() {
-        // Simulate an old cache file without max_source_mtime_ns
-        // (defaults to 0 via serde(default)).
-        let (src, cache_dir) = setup();
-        create_file(src.path(), "a.rs", "content");
-
-        let cache_file = cache_dir.path().join("fp.json");
-        // Write a cache manually without the max_source_mtime_ns field.
-        let json = r#"{"version":1,"status":"success","timestamp_ns":1000000,"files":{}}"#;
-        fs::write(&cache_file, json).unwrap();
-
-        let cache = TwoLayerCache::new(cache_file);
-        // Should fall through because max_source_mtime_ns is 0.
-        let decision = cache.try_skip_fast(src.path()).unwrap();
-        assert_eq!(decision, None);
+        // Full check must detect the change.
+        let decision = cache.check(&scan(src.path())).unwrap();
+        assert_eq!(decision, CacheDecision::Run(RunReason::ContentChanged));
     }
 }

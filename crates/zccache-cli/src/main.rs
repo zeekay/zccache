@@ -106,6 +106,63 @@ enum Commands {
         #[arg(long)]
         clear: bool,
     },
+    /// Fingerprint-based file change detection.
+    ///
+    /// Answers "have files changed since the last successful operation?" by
+    /// querying the daemon's in-memory watch state (<1ms on cache hit).
+    #[command(name = "fp")]
+    Fp {
+        /// Path to the cache file (e.g., .cache/lint.json).
+        #[arg(long)]
+        cache_file: PathBuf,
+
+        /// Cache algorithm: hash or two-layer.
+        #[arg(long, default_value = "two-layer")]
+        cache_type: String,
+
+        /// IPC endpoint (default: platform-specific).
+        #[arg(long)]
+        endpoint: Option<String>,
+
+        #[command(subcommand)]
+        fp_command: FpCommands,
+    },
+}
+
+/// Fingerprint subcommands.
+#[derive(Debug, Subcommand)]
+enum FpCommands {
+    /// Check if files have changed since last success.
+    ///
+    /// Exit 0 = operation should run (files changed).
+    /// Exit 1 = skip (no changes detected).
+    Check {
+        /// Root directory to scan (default: current directory).
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+
+        /// File extensions to include (without dot, e.g., "rs", "cpp").
+        /// Cannot be used with --include.
+        #[arg(long, conflicts_with = "include")]
+        ext: Vec<String>,
+
+        /// Glob patterns for files to include (e.g., "**/*.rs").
+        /// Cannot be used with --ext.
+        #[arg(long, conflicts_with = "ext")]
+        include: Vec<String>,
+
+        /// Patterns or directory names to exclude.
+        #[arg(long)]
+        exclude: Vec<String>,
+    },
+    /// Mark the previous check as successful.
+    #[command(name = "mark-success")]
+    MarkSuccess,
+    /// Mark the previous check as failed.
+    #[command(name = "mark-failure")]
+    MarkFailure,
+    /// Invalidate the cache (delete all state).
+    Invalidate,
 }
 
 /// Known subcommand names for auto-detect.
@@ -120,6 +177,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "session-end",
     "session-stats",
     "crashes",
+    "fp",
     "help",
     "--help",
     "-h",
@@ -251,6 +309,33 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         Commands::Crashes { clear } => cmd_crashes(clear),
+        Commands::Fp {
+            cache_file,
+            cache_type,
+            endpoint,
+            fp_command,
+        } => {
+            let endpoint = resolve_endpoint(endpoint.as_deref());
+            match fp_command {
+                FpCommands::Check {
+                    root,
+                    ext,
+                    include,
+                    exclude,
+                } => run_async(cmd_fp_check(
+                    &endpoint,
+                    &cache_file,
+                    &cache_type,
+                    &root,
+                    &ext,
+                    &include,
+                    &exclude,
+                )),
+                FpCommands::MarkSuccess => run_async(cmd_fp_mark(&endpoint, &cache_file, true)),
+                FpCommands::MarkFailure => run_async(cmd_fp_mark(&endpoint, &cache_file, false)),
+                FpCommands::Invalidate => run_async(cmd_fp_invalidate(&endpoint, &cache_file)),
+            }
+        }
     }
 }
 
@@ -716,6 +801,178 @@ fn cmd_crashes(clear: bool) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+// ─── Fingerprint subcommands ──────────────────────────────────────────────
+
+async fn cmd_fp_check(
+    endpoint: &str,
+    cache_file: &Path,
+    cache_type: &str,
+    root: &Path,
+    ext: &[String],
+    include: &[String],
+    exclude: &[String],
+) -> ExitCode {
+    if let Err(e) = ensure_daemon(endpoint).await {
+        eprintln!("zccache fp: failed to start daemon: {e}");
+        return ExitCode::from(2);
+    }
+
+    let mut conn = match connect(endpoint).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("zccache fp: cannot connect to daemon: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let request = zccache_protocol::Request::FingerprintCheck {
+        cache_file: cache_file.to_path_buf(),
+        cache_type: cache_type.to_string(),
+        root: root.to_path_buf(),
+        extensions: ext.to_vec(),
+        include_globs: include.to_vec(),
+        exclude: exclude.to_vec(),
+    };
+
+    if let Err(e) = conn.send(&request).await {
+        eprintln!("zccache fp: send error: {e}");
+        return ExitCode::from(2);
+    }
+
+    match conn.recv::<zccache_protocol::Response>().await {
+        Ok(Some(zccache_protocol::Response::FingerprintCheckResult {
+            decision,
+            reason,
+            changed_files,
+        })) => {
+            if decision == "skip" {
+                eprintln!("zccache fp: skip (no changes)");
+                ExitCode::from(1)
+            } else {
+                let reason_str = reason.as_deref().unwrap_or("unknown");
+                if changed_files.is_empty() {
+                    eprintln!("zccache fp: run ({reason_str})");
+                } else {
+                    eprintln!(
+                        "zccache fp: run ({reason_str}, {} file(s) changed)",
+                        changed_files.len()
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+        }
+        Ok(Some(zccache_protocol::Response::Error { message })) => {
+            eprintln!("zccache fp: daemon error: {message}");
+            ExitCode::from(2)
+        }
+        Ok(other) => {
+            eprintln!("zccache fp: unexpected response: {other:?}");
+            ExitCode::from(2)
+        }
+        Err(e) => {
+            eprintln!("zccache fp: recv error: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+async fn cmd_fp_mark(endpoint: &str, cache_file: &Path, success: bool) -> ExitCode {
+    if let Err(e) = ensure_daemon(endpoint).await {
+        eprintln!("zccache fp: failed to start daemon: {e}");
+        return ExitCode::from(2);
+    }
+
+    let mut conn = match connect(endpoint).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("zccache fp: cannot connect to daemon: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let request = if success {
+        zccache_protocol::Request::FingerprintMarkSuccess {
+            cache_file: cache_file.to_path_buf(),
+        }
+    } else {
+        zccache_protocol::Request::FingerprintMarkFailure {
+            cache_file: cache_file.to_path_buf(),
+        }
+    };
+
+    if let Err(e) = conn.send(&request).await {
+        eprintln!("zccache fp: send error: {e}");
+        return ExitCode::from(2);
+    }
+
+    match conn.recv::<zccache_protocol::Response>().await {
+        Ok(Some(zccache_protocol::Response::FingerprintAck)) => {
+            let label = if success {
+                "mark-success"
+            } else {
+                "mark-failure"
+            };
+            eprintln!("zccache fp: {label}");
+            ExitCode::SUCCESS
+        }
+        Ok(Some(zccache_protocol::Response::Error { message })) => {
+            eprintln!("zccache fp: daemon error: {message}");
+            ExitCode::from(2)
+        }
+        Ok(other) => {
+            eprintln!("zccache fp: unexpected response: {other:?}");
+            ExitCode::from(2)
+        }
+        Err(e) => {
+            eprintln!("zccache fp: recv error: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+async fn cmd_fp_invalidate(endpoint: &str, cache_file: &Path) -> ExitCode {
+    if let Err(e) = ensure_daemon(endpoint).await {
+        eprintln!("zccache fp: failed to start daemon: {e}");
+        return ExitCode::from(2);
+    }
+
+    let mut conn = match connect(endpoint).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("zccache fp: cannot connect to daemon: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let request = zccache_protocol::Request::FingerprintInvalidate {
+        cache_file: cache_file.to_path_buf(),
+    };
+
+    if let Err(e) = conn.send(&request).await {
+        eprintln!("zccache fp: send error: {e}");
+        return ExitCode::from(2);
+    }
+
+    match conn.recv::<zccache_protocol::Response>().await {
+        Ok(Some(zccache_protocol::Response::FingerprintAck)) => {
+            eprintln!("zccache fp: invalidated");
+            ExitCode::SUCCESS
+        }
+        Ok(Some(zccache_protocol::Response::Error { message })) => {
+            eprintln!("zccache fp: daemon error: {message}");
+            ExitCode::from(2)
+        }
+        Ok(other) => {
+            eprintln!("zccache fp: unexpected response: {other:?}");
+            ExitCode::from(2)
+        }
+        Err(e) => {
+            eprintln!("zccache fp: recv error: {e}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 // ─── Wrap (compiler wrapper) ───────────────────────────────────────────────

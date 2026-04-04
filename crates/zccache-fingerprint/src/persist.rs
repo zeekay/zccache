@@ -250,26 +250,6 @@ pub fn file_size(path: &Path) -> std::io::Result<u64> {
     Ok(std::fs::metadata(path)?.len())
 }
 
-/// Return the maximum mtime across all directories under `root`.
-/// Walks only directories (not files) — much faster than walking all files.
-pub fn max_dir_mtime_ns(root: &Path) -> std::io::Result<u64> {
-    let mut max = mtime_ns(root)?;
-    for entry in jwalk::WalkDir::new(root)
-        .follow_links(false)
-        .skip_hidden(false)
-        .sort(false)
-    {
-        let entry = entry.map_err(std::io::Error::other)?;
-        if entry.file_type.is_dir() {
-            let mt = mtime_ns(&entry.path())?;
-            if mt > max {
-                max = mt;
-            }
-        }
-    }
-    Ok(max)
-}
-
 /// Return the maximum mtime (in nanoseconds) across a set of files.
 /// Returns 0 if the file list is empty.
 pub fn max_mtime_ns(files: &[crate::scan::ScannedFile]) -> std::io::Result<u64> {

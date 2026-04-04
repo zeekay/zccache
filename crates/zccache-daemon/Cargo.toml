@@ -33,6 +33,7 @@ zccache-watcher = { path = "../zccache-watcher" }
 zccache-hash = { path = "../zccache-hash" }
 zccache-compiler = { path = "../zccache-compiler" }
 zccache-depgraph = { path = "../zccache-depgraph" }
+zccache-fingerprint = { path = "../zccache-fingerprint" }
 dashmap = { workspace = true }
 rayon = { workspace = true }
 bincode = { workspace = true }

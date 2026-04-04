@@ -18,6 +18,7 @@ use zccache_protocol::{ArtifactData, ArtifactOutput, Request, Response};
 use zccache_watcher::{NotifyWatcher, SettleBuffer, SettledEvent};
 
 use crate::compile_journal::{extract_outcome, CompileJournal, JournalContext, JournalEntry};
+use crate::fingerprint::FingerprintManager;
 use crate::stats::{HitPhases, MissPhases, PhaseProfiler, StatsCollector};
 
 /// Cached result of a verified cache hit, enabling zero-hash fast path.
@@ -246,6 +247,8 @@ struct SharedState {
     artifact_store: ArtifactStore,
     /// Whether the background artifact loading has completed.
     artifacts_loaded: AtomicBool,
+    /// Fingerprint manager: tracks per-watch dirty state for `zccache fp` commands.
+    fingerprint: FingerprintManager,
 }
 
 /// Pre-computed compile request data for the request-level fast path.
@@ -347,6 +350,7 @@ impl DaemonServer {
                 persist_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
                 artifact_store,
                 artifacts_loaded: AtomicBool::new(false),
+                fingerprint: FingerprintManager::new(),
             }),
         })
     }
@@ -650,6 +654,7 @@ impl DaemonServer {
                                     p.display()
                                 );
                             }
+                            state.fingerprint.on_batch(&changed, &removed);
                             state
                                 .cache_system
                                 .apply_changes_with_removals(changed, removed);
@@ -1001,6 +1006,45 @@ async fn handle_connection(
                 )
                 .await;
                 (resp, Some(ctx))
+            }
+            Request::FingerprintCheck {
+                cache_file,
+                cache_type,
+                root,
+                extensions,
+                include_globs,
+                exclude,
+            } => {
+                let result = state.fingerprint.check(
+                    &cache_file,
+                    &cache_type,
+                    &root,
+                    &extensions,
+                    &include_globs,
+                    &exclude,
+                );
+                // Register watcher on root so future changes are tracked.
+                watch_directory(&state, &root).await;
+                (
+                    Response::FingerprintCheckResult {
+                        decision: result.decision,
+                        reason: result.reason,
+                        changed_files: result.changed_files,
+                    },
+                    None,
+                )
+            }
+            Request::FingerprintMarkSuccess { cache_file } => {
+                state.fingerprint.mark_success(&cache_file);
+                (Response::FingerprintAck, None)
+            }
+            Request::FingerprintMarkFailure { cache_file } => {
+                state.fingerprint.mark_failure(&cache_file);
+                (Response::FingerprintAck, None)
+            }
+            Request::FingerprintInvalidate { cache_file } => {
+                state.fingerprint.invalidate(&cache_file);
+                (Response::FingerprintAck, None)
             }
         };
 

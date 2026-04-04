@@ -99,6 +99,39 @@ pub enum Request {
         /// Session ID to query (UUID string).
         session_id: String,
     },
+    /// Check if files have changed since last successful fingerprint.
+    /// NOTE: Appended at end to preserve bincode variant indices.
+    FingerprintCheck {
+        /// Path to the cache file (e.g., .cache/lint.json).
+        cache_file: PathBuf,
+        /// Cache algorithm: "hash" or "two-layer".
+        cache_type: String,
+        /// Root directory to scan.
+        root: PathBuf,
+        /// File extensions to include (without dot, e.g., "rs", "cpp").
+        /// Empty = all files. Conflicts with `include_globs`.
+        extensions: Vec<String>,
+        /// Glob patterns for files to include (e.g., "**/*.rs").
+        /// Empty = use extensions filter.
+        include_globs: Vec<String>,
+        /// Patterns or directory names to exclude.
+        exclude: Vec<String>,
+    },
+    /// Mark the previous fingerprint check as successful.
+    FingerprintMarkSuccess {
+        /// Path to the cache file.
+        cache_file: PathBuf,
+    },
+    /// Mark the previous fingerprint check as failed.
+    FingerprintMarkFailure {
+        /// Path to the cache file.
+        cache_file: PathBuf,
+    },
+    /// Invalidate a fingerprint cache (delete all state).
+    FingerprintInvalidate {
+        /// Path to the cache file.
+        cache_file: PathBuf,
+    },
 }
 
 /// A response from daemon to client.
@@ -172,6 +205,18 @@ pub enum Response {
         /// Per-session stats, if the session exists and opted in to tracking.
         stats: Option<SessionStats>,
     },
+    /// Result of a fingerprint check.
+    /// NOTE: Appended at end to preserve bincode variant indices.
+    FingerprintCheckResult {
+        /// "skip" or "run".
+        decision: String,
+        /// Reason for run (e.g., "no cache file", "content changed").
+        reason: Option<String>,
+        /// Files that changed (if available).
+        changed_files: Vec<String>,
+    },
+    /// Fingerprint mark/invalidate acknowledged.
+    FingerprintAck,
 }
 
 /// Daemon status information.
@@ -609,6 +654,73 @@ mod tests {
 
     // Compile-time check: PROTOCOL_VERSION must be positive.
     const _: () = assert!(crate::PROTOCOL_VERSION > 0);
+    // Compile-time check: PROTOCOL_VERSION == 4 after fingerprint additions.
+    const _FINGERPRINT_VERSION: () = assert!(crate::PROTOCOL_VERSION == 4);
+
+    #[test]
+    fn fingerprint_check_roundtrip() {
+        roundtrip(&Request::FingerprintCheck {
+            cache_file: PathBuf::from("/tmp/lint.json"),
+            cache_type: "two-layer".into(),
+            root: PathBuf::from("/home/user/project/src"),
+            extensions: vec!["rs".into(), "toml".into()],
+            include_globs: vec![],
+            exclude: vec![".git".into(), "target".into()],
+        });
+        roundtrip(&Request::FingerprintCheck {
+            cache_file: PathBuf::from("cache.json"),
+            cache_type: "hash".into(),
+            root: PathBuf::from("."),
+            extensions: vec![],
+            include_globs: vec!["**/*.cpp".into(), "**/*.h".into()],
+            exclude: vec![],
+        });
+    }
+
+    #[test]
+    fn fingerprint_mark_success_roundtrip() {
+        roundtrip(&Request::FingerprintMarkSuccess {
+            cache_file: PathBuf::from("/tmp/lint.json"),
+        });
+    }
+
+    #[test]
+    fn fingerprint_mark_failure_roundtrip() {
+        roundtrip(&Request::FingerprintMarkFailure {
+            cache_file: PathBuf::from("/tmp/lint.json"),
+        });
+    }
+
+    #[test]
+    fn fingerprint_invalidate_roundtrip() {
+        roundtrip(&Request::FingerprintInvalidate {
+            cache_file: PathBuf::from("/tmp/lint.json"),
+        });
+    }
+
+    #[test]
+    fn fingerprint_check_result_roundtrip() {
+        roundtrip(&Response::FingerprintCheckResult {
+            decision: "skip".into(),
+            reason: None,
+            changed_files: vec![],
+        });
+        roundtrip(&Response::FingerprintCheckResult {
+            decision: "run".into(),
+            reason: Some("content changed".into()),
+            changed_files: vec!["src/main.rs".into(), "src/lib.rs".into()],
+        });
+        roundtrip(&Response::FingerprintCheckResult {
+            decision: "run".into(),
+            reason: Some("no cache file".into()),
+            changed_files: vec![],
+        });
+    }
+
+    #[test]
+    fn fingerprint_ack_roundtrip() {
+        roundtrip(&Response::FingerprintAck);
+    }
 
     #[test]
     fn artifact_clone_shares_payload_via_arc() {

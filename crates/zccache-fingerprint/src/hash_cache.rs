@@ -105,37 +105,13 @@ impl HashCache {
 
     /// Attempt to skip without walking the filesystem.
     ///
-    /// Same logic as `TwoLayerCache::try_skip_fast` — see that method's docs.
-    pub fn try_skip_fast(&self, root: &Path) -> Result<Option<CacheDecision>> {
-        let cached: Option<HashCacheData> = persist::read_json(&self.cache_file)?;
-        let data = match cached {
-            Some(d) if d.status == "success" && d.max_source_mtime_ns > 0 => d,
-            _ => return Ok(None),
-        };
-
-        let cache_mtime = match persist::mtime_ns(&self.cache_file) {
-            Ok(mt) => mt,
-            Err(_) => return Ok(None),
-        };
-        if cache_mtime <= data.max_source_mtime_ns {
-            return Ok(None);
-        }
-
-        let root = match root.canonicalize() {
-            Ok(r) => r,
-            Err(_) => return Ok(None),
-        };
-        let max_dir_mtime = match persist::max_dir_mtime_ns(&root) {
-            Ok(mt) => mt,
-            Err(_) => return Ok(None),
-        };
-
-        if max_dir_mtime > data.max_source_mtime_ns {
-            return Ok(None);
-        }
-
-        tracing::debug!("dir fast-path: no directory changes detected, skipping full scan");
-        Ok(Some(CacheDecision::Skip))
+    /// Always returns `None` — the directory-level mtime optimization was
+    /// removed because directory mtimes on NTFS and ext4 only change on
+    /// file create/delete, not on in-place content edits. This caused
+    /// false cache hits (see BUGS.md). The per-file `try_mtime_fast_path()`
+    /// inside `check()` is the correct fast-path.
+    pub fn try_skip_fast(&self, _root: &Path) -> Result<Option<CacheDecision>> {
+        Ok(None)
     }
 
     /// Delete cache and pending files.
@@ -652,5 +628,49 @@ mod tests {
         let h3 = compute_aggregate_hash(&files).unwrap();
         assert_eq!(h1, h2);
         assert_eq!(h2, h3);
+    }
+
+    // ── Dir fast-path tests ──────────────────────────────────────
+
+    #[test]
+    fn try_skip_fast_always_returns_none() {
+        let (src, cache_dir) = setup();
+        create_file(src.path(), "a.rs", "content");
+
+        let cache_file = cache_dir.path().join("fp.json");
+        let cache = HashCache::new(cache_file.clone());
+        cache.check(&scan_dir(src.path())).unwrap();
+        cache.mark_success().unwrap();
+
+        // try_skip_fast is disabled — always falls through to per-file check.
+        let cache = HashCache::new(cache_file);
+        let decision = cache.try_skip_fast(src.path()).unwrap();
+        assert_eq!(decision, None);
+    }
+
+    #[test]
+    fn in_place_edit_detected_after_mark_success() {
+        // Regression test for BUGS.md: in-place edits must NOT be missed.
+        let (src, cache_dir) = setup();
+        create_file(src.path(), "a.rs", "original");
+
+        let cache_file = cache_dir.path().join("fp.json");
+        let cache = HashCache::new(cache_file.clone());
+        cache.check(&scan_dir(src.path())).unwrap();
+        cache.mark_success().unwrap();
+
+        // In-place edit.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        create_file(src.path(), "a.rs", "modified");
+
+        // try_skip_fast must not skip.
+        let cache = HashCache::new(cache_file.clone());
+        let decision = cache.try_skip_fast(src.path()).unwrap();
+        assert_eq!(decision, None);
+
+        // Full check must detect the change.
+        let cache = HashCache::new(cache_file);
+        let decision = cache.check(&scan_dir(src.path())).unwrap();
+        assert_eq!(decision, CacheDecision::Run(RunReason::ContentChanged));
     }
 }
