@@ -10,6 +10,9 @@ license.workspace = true
 name = "zccache_fingerprint"
 crate-type = ["cdylib", "lib"]
 
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = { workspace = true }
+
 [[bin]]
 name = "zccache-fp"
 path = "src/main.rs"

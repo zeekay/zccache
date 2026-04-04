@@ -17,6 +17,9 @@ zccache-compiler = { path = "../zccache-compiler" }
 zccache-protocol = { path = "../zccache-protocol" }
 zccache-ipc = { path = "../zccache-ipc" }
 
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = { workspace = true }
+
 [[bin]]
 name = "zccache"
 path = "src/main.rs"

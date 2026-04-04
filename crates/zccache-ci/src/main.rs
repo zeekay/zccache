@@ -333,7 +333,7 @@ fn main() -> ExitCode {
     // Catches #[cfg(windows)]-gated code called from cross-platform tests/code,
     // which local-only clippy/check cannot detect.
     if cfg!(windows) {
-        let target = "x86_64-unknown-linux-gnu";
+        let target = "x86_64-unknown-linux-musl";
         if is_target_installed(target) {
             let xcheck_cmd: Vec<String> = vec![
                 "cargo".into(),

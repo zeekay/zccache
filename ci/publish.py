@@ -45,8 +45,8 @@ WORKFLOW_FILE = "build.yml"
 
 # GitHub artifact name -> dist/ subdir
 ARTIFACT_MAP: dict[str, str] = {
-    "binaries-x86_64-unknown-linux-gnu": "linux-x86_64",
-    "binaries-aarch64-unknown-linux-gnu": "linux-aarch64",
+    "binaries-x86_64-unknown-linux-musl": "linux-x86_64",
+    "binaries-aarch64-unknown-linux-musl": "linux-aarch64",
     "binaries-x86_64-apple-darwin": "macos-x86_64",
     "binaries-aarch64-apple-darwin": "macos-aarch64",
     "binaries-x86_64-pc-windows-msvc": "windows-x86_64",
@@ -54,8 +54,8 @@ ARTIFACT_MAP: dict[str, str] = {
 
 # dist/ subdir -> wheel platform tags
 PLATFORMS: dict[str, list[str]] = {
-    "linux-x86_64": ["manylinux_2_17_x86_64", "manylinux2014_x86_64"],
-    "linux-aarch64": ["manylinux_2_17_aarch64", "manylinux2014_aarch64"],
+    "linux-x86_64": ["musllinux_1_2_x86_64"],
+    "linux-aarch64": ["musllinux_1_2_aarch64"],
     "macos-x86_64": ["macosx_10_12_x86_64"],
     "macos-aarch64": ["macosx_11_0_arm64"],
     "windows-x86_64": ["win_amd64"],
@@ -126,7 +126,7 @@ def download_failed_logs(repo: str, run_id: int) -> list[Path]:
     for job in jobs:
         if job.get("conclusion") == "failure":
             name = job.get("name", "")
-            # Extract target triple from job name like "Build (x86_64-unknown-linux-gnu)"
+            # Extract target triple from job name like "Build (x86_64-unknown-linux-musl)"
             m = re.search(r"\(([^)]+)\)", name)
             target = m.group(1) if m else name
             failed_jobs[name] = target

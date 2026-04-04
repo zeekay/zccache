@@ -23,12 +23,12 @@ from pathlib import Path
 
 # Map GitHub Actions artifact names to platform wheel tags
 TARGETS = {
-    "binaries-x86_64-unknown-linux-gnu": {
-        "wheel_plat": "manylinux_2_17_x86_64",
+    "binaries-x86_64-unknown-linux-musl": {
+        "wheel_plat": "musllinux_1_2_x86_64",
         "subdir": "linux-x86_64",
     },
-    "binaries-aarch64-unknown-linux-gnu": {
-        "wheel_plat": "manylinux_2_17_aarch64",
+    "binaries-aarch64-unknown-linux-musl": {
+        "wheel_plat": "musllinux_1_2_aarch64",
         "subdir": "linux-aarch64",
     },
     "binaries-x86_64-apple-darwin": {
@@ -143,7 +143,7 @@ def download_failed_logs(repo: str, run_id: int) -> list[Path]:
     for job in jobs:
         if job.get("conclusion") == "failure":
             name = job.get("name", "")
-            # Extract target triple from job name like "Build (x86_64-unknown-linux-gnu)"
+            # Extract target triple from job name like "Build (x86_64-unknown-linux-musl)"
             m = re.search(r"\(([^)]+)\)", name)
             target = m.group(1) if m else name
             failed_jobs[name] = target

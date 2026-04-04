@@ -20,14 +20,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             binary_ext: ""
 
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             binary_ext: ""
             cross: true
+            linker: aarch64-linux-musl-gcc
+            strip: aarch64-linux-musl-strip
 
           - target: x86_64-apple-darwin
             os: macos-14
@@ -54,16 +56,30 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Linux aarch64 cross-compilation toolchain
-      - name: Install cross-compilation tools
-        if: matrix.cross
+      # Linux musl native (x86_64)
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y musl-tools
+
+      # Linux musl aarch64 cross-compilation toolchain
+      - name: Install musl cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
+          tar xzf aarch64-linux-musl-cross.tgz
+          echo "$PWD/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+
+      # Set cross-compilation linker via target-specific env var
+      - name: Configure cross-compilation linker
+        if: matrix.linker
+        shell: bash
+        run: |
+          TARGET_UPPER=$(echo "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')
+          echo "CARGO_TARGET_${TARGET_UPPER}_LINKER=${{ matrix.linker }}" >> $GITHUB_ENV
 
       - name: Build release binaries
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross && 'aarch64-linux-gnu-gcc' || '' }}
         run: |
           cargo build --release --target ${{ matrix.target }} -p zccache-cli
           cargo build --release --target ${{ matrix.target }} -p zccache-daemon
@@ -77,14 +93,14 @@ jobs:
           cp target/${{ matrix.target }}/release/zccache-daemon${{ matrix.binary_ext }} staging/
           cp target/${{ matrix.target }}/release/zccache-fp${{ matrix.binary_ext }} staging/
           # Strip binaries (reduces size significantly)
-          if command -v strip &> /dev/null && [ -z "${{ matrix.cross }}" ]; then
-            strip staging/zccache${{ matrix.binary_ext }} || true
-            strip staging/zccache-daemon${{ matrix.binary_ext }} || true
-            strip staging/zccache-fp${{ matrix.binary_ext }} || true
-          elif [ "${{ matrix.cross }}" = "true" ]; then
-            aarch64-linux-gnu-strip staging/zccache || true
-            aarch64-linux-gnu-strip staging/zccache-daemon || true
-            aarch64-linux-gnu-strip staging/zccache-fp || true
+          STRIP="${{ matrix.strip }}"
+          if [ -z "$STRIP" ]; then
+            STRIP="strip"
+          fi
+          if command -v "$STRIP" &> /dev/null; then
+            $STRIP staging/zccache${{ matrix.binary_ext }} || true
+            $STRIP staging/zccache-daemon${{ matrix.binary_ext }} || true
+            $STRIP staging/zccache-fp${{ matrix.binary_ext }} || true
           fi
 
       - name: Upload artifacts

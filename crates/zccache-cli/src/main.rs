@@ -14,6 +14,10 @@
 //!    the entire command line as a compiler invocation and forwards
 //!    it to the daemon via the session from ZCCACHE_SESSION_ID.
 
+#[cfg(unix)]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

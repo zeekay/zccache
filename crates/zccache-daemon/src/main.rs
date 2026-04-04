@@ -3,6 +3,10 @@
 //! The daemon maintains in-memory caches, manages the artifact store,
 //! runs the file watcher, and handles IPC requests from CLI/wrappers.
 
+#[cfg(unix)]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::Parser;
 
 /// zccache daemon -- local compiler cache service.
