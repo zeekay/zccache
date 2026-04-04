@@ -460,6 +460,55 @@ impl DepGraph {
         }
     }
 
+    /// Fast-path artifact key check: recompute the key from caller-provided
+    /// hashes and compare against the stored key.  Returns `Some(key)` when
+    /// they match (common cache-hit case), `None` otherwise.
+    ///
+    /// Compared to `check_diagnostic`, this method:
+    /// - Uses a **shared** DashMap read (no write lock)
+    /// - Skips redundant per-file journal freshness checks (caller already
+    ///   stat-verified every file during the hash phase)
+    /// - Avoids `PathBuf` clones by working with references into the entry
+    ///
+    /// Call this *after* hashing and *before* `check_diagnostic`.  On `None`,
+    /// fall back to the full `check_diagnostic` for miss-reason diagnostics.
+    pub fn try_fast_hit<G>(&self, key: &ContextKey, get_hash: G) -> Option<ArtifactKey>
+    where
+        G: Fn(&Path) -> Option<ContentHash>,
+    {
+        let entry = self.contexts.get(key)?;
+
+        if entry.state == ContextState::Cold || entry.has_computed_includes {
+            return None;
+        }
+
+        let stored_key = entry.artifact_key.as_ref()?;
+
+        // Build file_hashes using references — zero PathBuf clones.
+        let cap = 1 + entry.resolved_includes.len() + entry.context.force_includes.len();
+        let mut file_hashes: Vec<(&Path, ContentHash)> = Vec::with_capacity(cap);
+
+        file_hashes.push((
+            &entry.context.source_file,
+            get_hash(&entry.context.source_file)?,
+        ));
+        for header in &entry.resolved_includes {
+            file_hashes.push((header.as_path(), get_hash(header)?));
+        }
+        for fi in &entry.context.force_includes {
+            file_hashes.push((fi.as_path(), get_hash(fi)?));
+        }
+
+        let computed = compute_artifact_key(key, &mut file_hashes);
+
+        if computed == *stored_key {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            Some(computed)
+        } else {
+            None
+        }
+    }
+
     /// After a compile (or on cold path), record the full include list.
     ///
     /// `get_hash` retrieves the content hash for a file from Layer 1.

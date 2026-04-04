@@ -2036,27 +2036,29 @@ fn collect_rustc_outputs(
 }
 
 /// Write cached output to disk. Optimized syscall sequence:
-/// 0. If output exists with matching size, skip (already correct from previous hit)
 /// 1. Try hardlink directly (1 syscall — common case when output doesn't exist)
-/// 2. If that fails, remove existing output and retry hardlink (2 syscalls)
-/// 3. Fall back to fs::write from memory (1 syscall)
+/// 2. If output already exists: check if it's the same file (skip if so)
+/// 3. Remove existing output and retry hardlink (2 syscalls)
+/// 4. Fall back to fs::write from memory (1 syscall)
+///
+/// The hardlink-first order optimizes for the rebuild scenario where outputs
+/// don't exist yet (1 syscall). For incremental builds where outputs exist
+/// as hardlinks, the failed hardlink + same_file check is still fast.
 fn write_cached_output(out_path: &Path, cache_file: &Path, data: &[u8]) -> std::io::Result<()> {
-    // Fast path: if output is already a hardlink to the cache file (same
-    // file identity), skip the write entirely. This is the common case
-    // during incremental builds where the same artifact is hit repeatedly.
-    //
-    // NOTE: We compare file identity (inode/volume+index), NOT file size.
-    // Two different compilations can produce .o files with identical sizes
-    // but different content (alignment, padding). A size-only check would
-    // leave a stale .o on disk, causing linker errors downstream.
-    if same_file(out_path, cache_file) {
-        return Ok(());
-    }
-    // Fast path: hardlink directly (works when out_path doesn't exist yet)
+    // Fast path: hardlink directly (works when out_path doesn't exist yet).
+    // This is the cheapest path — one kernel call when no output exists.
     if std::fs::hard_link(cache_file, out_path).is_ok() {
         return Ok(());
     }
-    // Output exists or cache file missing — remove and retry
+    // Hardlink failed — output probably exists. Check if it's already
+    // the same file (hardlinked from a previous hit). Compare file
+    // identity (inode/volume+index), NOT file size — two different
+    // compilations can produce .o files with identical sizes but
+    // different content (alignment, padding).
+    if same_file(out_path, cache_file) {
+        return Ok(());
+    }
+    // Output exists but is different — remove and retry
     let _ = std::fs::remove_file(out_path);
     if std::fs::hard_link(cache_file, out_path).is_ok() {
         return Ok(());
@@ -2626,17 +2628,30 @@ async fn handle_compile(
         hash_headers_ns = t3.elapsed().as_nanos() as u64;
 
         // ── Phase: depgraph check ────────────────────────────────────
-        let t4 = std::time::Instant::now();
-        let result = {
-            let is_fresh = |p: &Path| !state.cache_system.journal().changed_since(p, snap_clock);
-            let get_hash = |p: &Path| hash_map.get(p).copied();
-            state
-                .dep_graph
-                .check_diagnostic(&context_key, is_fresh, get_hash)
-        };
-        depgraph_check_ns = t4.elapsed().as_nanos() as u64;
-        verdict = result.0;
-        diag_reason = result.1;
+        // Fast path: recompute artifact key from fresh hashes and compare
+        // with the stored key.  Skips redundant journal freshness checks
+        // and PathBuf clones that check_diagnostic performs.
+        if let Some(artifact_key) = state
+            .dep_graph
+            .try_fast_hit(&context_key, |p| hash_map.get(p).copied())
+        {
+            depgraph_check_ns = 0;
+            verdict = zccache_depgraph::CacheVerdict::Hit { artifact_key };
+            diag_reason = "fast_key_match".to_string();
+        } else {
+            let t4 = std::time::Instant::now();
+            let result = {
+                let is_fresh =
+                    |p: &Path| !state.cache_system.journal().changed_since(p, snap_clock);
+                let get_hash = |p: &Path| hash_map.get(p).copied();
+                state
+                    .dep_graph
+                    .check_diagnostic(&context_key, is_fresh, get_hash)
+            };
+            depgraph_check_ns = t4.elapsed().as_nanos() as u64;
+            verdict = result.0;
+            diag_reason = result.1;
+        }
     }
 
     write_session_log(
@@ -2981,48 +2996,50 @@ async fn handle_compile(
             dirs.into_iter().collect()
         };
 
-        // ── Phase: hash all files ────────────────────────────────────
+        // ── Phase: hash all files (parallel) ─────────────────────────
+        // Hash source + resolved headers + force-includes using rayon
+        // parallel iteration, matching the hit path's parallel strategy.
         let t_hash = std::time::Instant::now();
         let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
-        let mut hash_failures: u32 = 0;
-        if let Ok(h) = hash_file(&state.cache_system, &source_path, snap_clock) {
-            hash_map.insert(source_path.clone(), h);
-        } else {
-            hash_failures += 1;
-        }
-        for header in &scan_result.resolved {
-            // For PCH binaries in the resolved include list, hash the source header.
-            let hash_path =
-                resolve_pch_source(header, &state.pch_source_map).unwrap_or_else(|| header.clone());
-            if let Ok(h) = hash_file(&state.cache_system, &hash_path, snap_clock) {
-                hash_map.insert(header.clone(), h);
-            } else {
-                hash_failures += 1;
+        {
+            use rayon::prelude::*;
+            let header_iter = scan_result.resolved.iter().chain(ctx.force_includes.iter());
+            let all_paths: Vec<&PathBuf> =
+                std::iter::once(&source_path).chain(header_iter).collect();
+
+            let results: Vec<_> = all_paths
+                .par_iter()
+                .map(|path| {
+                    let hash_path = resolve_pch_source(path, &state.pch_source_map)
+                        .unwrap_or_else(|| (*path).clone());
+                    let result = hash_file(&state.cache_system, &hash_path, snap_clock);
+                    ((*path).clone(), result)
+                })
+                .collect();
+
+            let mut hash_failures: u32 = 0;
+            for (path, result) in results {
+                match result {
+                    Ok(h) => {
+                        hash_map.insert(path, h);
+                    }
+                    Err(_) => {
+                        hash_failures += 1;
+                    }
+                }
             }
-        }
-        // Hash force-included files (PCH, -include) so their content
-        // is part of the artifact key.
-        // For PCH binaries (.pch/.gch), hash the SOURCE header instead.
-        for fi in &ctx.force_includes {
-            let hash_path =
-                resolve_pch_source(fi, &state.pch_source_map).unwrap_or_else(|| fi.clone());
-            if let Ok(h) = hash_file(&state.cache_system, &hash_path, snap_clock) {
-                hash_map.insert(fi.clone(), h);
-            } else {
-                hash_failures += 1;
+            if hash_failures > 0 {
+                write_session_log(
+                    &state.sessions,
+                    &sid,
+                    &format!(
+                        "[DIAG] hash_failures: {} of {} files failed to hash for {}",
+                        hash_failures,
+                        1 + scan_result.resolved.len() + ctx.force_includes.len(),
+                        source_path.display(),
+                    ),
+                );
             }
-        }
-        if hash_failures > 0 {
-            write_session_log(
-                &state.sessions,
-                &sid,
-                &format!(
-                    "[DIAG] hash_failures: {} of {} files failed to hash for {}",
-                    hash_failures,
-                    1 + scan_result.resolved.len() + ctx.force_includes.len(),
-                    source_path.display(),
-                ),
-            );
         }
         let hash_all_ns = t_hash.elapsed().as_nanos() as u64;
 

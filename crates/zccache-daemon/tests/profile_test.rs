@@ -228,12 +228,20 @@ async fn profile_compile_phases() {
             .to_string()
     });
 
-    // Start daemon — we need to keep the server object to read the profiler
+    // Start daemon — wrap in Arc<Mutex<Option>> so we can read the profiler after shutdown
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
     let endpoint = zccache_ipc::unique_test_endpoint();
-    let mut server = DaemonServer::bind(&endpoint).unwrap();
+    let server = DaemonServer::bind(&endpoint).unwrap();
     let shutdown = server.shutdown_handle();
+    let server = Arc::new(Mutex::new(Some(server)));
+    let server_clone = Arc::clone(&server);
     let server_handle = tokio::spawn(async move {
-        server.run(0).await.unwrap();
+        let mut srv = server_clone.lock().await.take().unwrap();
+        srv.run(0).await.unwrap();
+        // Put it back so we can read the profiler
+        *server_clone.lock().await = Some(srv);
     });
 
     // Give server a moment to start
@@ -328,12 +336,11 @@ async fn profile_compile_phases() {
         );
     }
 
-    // Shutdown
+    // Shutdown and read profiler
     shutdown.notify_one();
     server_handle.await.unwrap();
 
-    // Since we can't access the server's profiler after moving it into the task,
-    // print IPC-level timing analysis
+    // IPC-level timing analysis
     println!("\n  ── IPC-Level Timing ──");
     let avg_warm_us = warm_elapsed.as_micros() as f64 / total_warm as f64;
     let avg_cold_us = cold_elapsed.as_micros() as f64 / FILE_COUNT as f64;
@@ -346,76 +353,9 @@ async fn profile_compile_phases() {
         avg_warm_us / 1000.0
     );
 
-    // The real profiling data needs the server object. Let's run a second
-    // server instance specifically for profiling.
-    println!("\n  ── Phase Profiling (dedicated run) ──");
-
-    let tmp2 = tempfile::tempdir().unwrap();
-    generate_test_files(tmp2.path(), FILE_COUNT, HEADER_COUNT);
-    let cwd2 = tmp2.path().to_string_lossy().into_owned();
-
-    let endpoint2 = zccache_ipc::unique_test_endpoint();
-    let server2 = DaemonServer::bind(&endpoint2).unwrap();
-    let shutdown2 = server2.shutdown_handle();
-
-    // Wrap server in Arc<Mutex> so we can read the profiler while it's running
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-    let server2 = Arc::new(Mutex::new(Some(server2)));
-    let server2_clone = Arc::clone(&server2);
-
-    let server_handle2 = tokio::spawn(async move {
-        let mut srv = server2_clone.lock().await.take().unwrap();
-        srv.run(0).await.unwrap();
-        // Put it back so we can read the profiler
-        *server2_clone.lock().await = Some(srv);
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let mut client2 = zccache_ipc::connect(&endpoint2).await.unwrap();
-    let sid2 = start_session(&mut client2, &clang, &cwd2).await;
-
-    // Cold pass
-    for i in 0..FILE_COUNT {
-        let src = format!("src_{i}.cpp");
-        let obj = format!("src_{i}.o");
-        let (exit_code, _) = compile(
-            &mut client2,
-            &sid2,
-            &compiler,
-            &["-c", &src, "-o", &obj],
-            &cwd2,
-        )
-        .await;
-        assert_eq!(exit_code, 0);
-    }
-
-    // Warm pass
-    for _ in 0..WARM_ITERATIONS {
-        for i in 0..FILE_COUNT {
-            let src = format!("src_{i}.cpp");
-            let obj = format!("src_{i}.o");
-            let _ = std::fs::remove_file(tmp2.path().join(&obj));
-            let (exit_code, cached) = compile(
-                &mut client2,
-                &sid2,
-                &compiler,
-                &["-c", &src, "-o", &obj],
-                &cwd2,
-            )
-            .await;
-            assert_eq!(exit_code, 0);
-            assert!(cached);
-        }
-    }
-
-    // Shutdown and read profiler
-    shutdown2.notify_one();
-    server_handle2.await.unwrap();
-
-    // Now the server is back in the Arc<Mutex>
-    let guard = server2.lock().await;
+    // Phase profiling from the same server instance
+    println!("\n  ── Phase Profiling ──");
+    let guard = server.lock().await;
     if let Some(ref srv) = *guard {
         let profile = srv.profile_snapshot();
         print_profile(&profile);
