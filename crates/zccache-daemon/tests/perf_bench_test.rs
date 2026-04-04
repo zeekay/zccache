@@ -1,8 +1,9 @@
 //! Performance benchmark: warm-cache compilation latency.
 //!
-//! Two benchmarks:
-//!   - `perf_warm_cache_zccache_vs_sccache`: single-file vs multi-file (inline args)
-//!   - `perf_response_file`: same workload but args passed via large nested response files
+//! Three benchmarks:
+//!   - `perf_warm_cache_zccache_vs_sccache`: C++ single-file vs multi-file (inline args)
+//!   - `perf_response_file`: C++ same workload but args passed via large nested response files
+//!   - `perf_rustc_zccache_vs_sccache`: Rust single-file compilation (lib crates)
 //!
 //! Each tool gets its own fresh tempdir to avoid OS page cache cross-contamination.
 //!
@@ -1236,6 +1237,521 @@ async fn perf_response_file() {
         );
     } else {
         eprintln!("  Warm multi-file:   {multi_vs_clang:.0}x faster than clang");
+    }
+    eprintln!();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Rust (rustc) benchmark: zccache vs sccache vs bare rustc
+// ═════════════════════════════════════════════════════════════════════════════
+
+const RUSTC_NUM_FILES: usize = 50;
+const RUSTC_WARM_TRIALS: usize = 5;
+
+fn generate_rust_project(dir: &Path) {
+    // Create output directory (mimics cargo's target/debug/deps)
+    std::fs::create_dir_all(dir.join("deps")).unwrap();
+    for i in 0..RUSTC_NUM_FILES {
+        let content = format!(
+            r#"pub fn compute_{i:03}(n: i32) -> f64 {{
+    let mut acc = n as f64;
+    for j in 0..10 {{
+        acc = (acc * 0.{i:03}1 + j as f64).sin().abs();
+    }}
+    acc
+}}
+
+pub fn transform_{i:03}(data: &[f64]) -> Vec<f64> {{
+    data.iter().map(|&x| compute_{i:03}(x as i32) * x).collect()
+}}
+"#,
+        );
+        std::fs::write(dir.join(format!("unit_{i:03}.rs")), content).unwrap();
+    }
+}
+
+fn rust_source_names() -> Vec<String> {
+    (0..RUSTC_NUM_FILES)
+        .map(|i| format!("unit_{i:03}.rs"))
+        .collect()
+}
+
+fn clean_rlibs(dir: &Path) {
+    let deps = dir.join("deps");
+    if deps.is_dir() {
+        for entry in std::fs::read_dir(&deps).unwrap() {
+            let path = entry.unwrap().path();
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if matches!(ext, "rlib" | "rmeta" | "d") {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+}
+
+fn warmup_rustc(rc: &str, dir: &Path) {
+    let src = dir.join("unit_000.rs");
+    let deps = dir.join("deps");
+    let s = std::process::Command::new(rc)
+        .args([
+            "--edition",
+            "2021",
+            "--crate-type",
+            "lib",
+            "--crate-name",
+            "warmup",
+            "--emit=dep-info,metadata,link",
+            "-C",
+            "metadata=warm",
+            "-C",
+            "extra-filename=-warm",
+        ])
+        .arg(&src)
+        .arg("--out-dir")
+        .arg(&deps)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("rustc warmup failed");
+    assert!(s.success());
+    clean_rlibs(dir);
+}
+
+/// Common rustc args that match what `cargo build` passes.
+/// Uses --out-dir (required by sccache), --emit=dep-info,metadata,link,
+/// and -C metadata/-C extra-filename for output naming.
+fn rustc_args_for(cn: &str, src: &str, deps_dir: &str) -> Vec<String> {
+    vec![
+        "--edition".into(),
+        "2021".into(),
+        "--crate-type".into(),
+        "lib".into(),
+        "--crate-name".into(),
+        cn.into(),
+        "--emit=dep-info,metadata,link".into(),
+        "-C".into(),
+        format!("metadata={cn}"),
+        "-C".into(),
+        format!("extra-filename=-{cn}"),
+        "--out-dir".into(),
+        deps_dir.into(),
+        src.into(),
+    ]
+}
+
+/// Rustc args matching what `cargo check` passes: --emit=dep-info,metadata (no link).
+/// Produces only .rmeta + .d files (no .rlib).
+fn rustc_check_args_for(cn: &str, src: &str, deps_dir: &str) -> Vec<String> {
+    vec![
+        "--edition".into(),
+        "2021".into(),
+        "--crate-type".into(),
+        "lib".into(),
+        "--crate-name".into(),
+        cn.into(),
+        "--emit=dep-info,metadata".into(),
+        "-C".into(),
+        format!("metadata={cn}"),
+        "-C".into(),
+        format!("extra-filename=-{cn}"),
+        "--out-dir".into(),
+        deps_dir.into(),
+        src.into(),
+    ]
+}
+
+/// Run a batch of rustc compilations using the given arg builder.
+fn run_rustc_batch(
+    rc: &str,
+    cwd: &Path,
+    srcs: &[String],
+    args_fn: fn(&str, &str, &str) -> Vec<String>,
+) -> Duration {
+    clean_rlibs(cwd);
+    let deps = cwd.join("deps");
+    let deps_s = deps.to_string_lossy().to_string();
+    let start = Instant::now();
+    for (i, src) in srcs.iter().enumerate() {
+        let cn = format!("unit_{i:03}");
+        let args = args_fn(&cn, src, &deps_s);
+        let s = std::process::Command::new(rc)
+            .args(&args)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(s.success(), "rustc failed for {src}");
+    }
+    start.elapsed()
+}
+
+fn run_sccache_rustc_batch(
+    scc: &Path,
+    rc: &str,
+    cwd: &Path,
+    srcs: &[String],
+    args_fn: fn(&str, &str, &str) -> Vec<String>,
+) -> Duration {
+    clean_rlibs(cwd);
+    let deps = cwd.join("deps");
+    let deps_s = deps.to_string_lossy().to_string();
+    let start = Instant::now();
+    for (i, src) in srcs.iter().enumerate() {
+        let cn = format!("unit_{i:03}");
+        let args = args_fn(&cn, src, &deps_s);
+        let s = std::process::Command::new(scc)
+            .arg(rc)
+            .args(&args)
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(s.success(), "sccache rustc failed for {src}");
+    }
+    start.elapsed()
+}
+
+async fn run_zccache_rustc_batch(
+    client: &mut ClientConn,
+    sid: &str,
+    rc: &str,
+    cwd: &str,
+    srcs: &[String],
+    args_fn: fn(&str, &str, &str) -> Vec<String>,
+) -> Duration {
+    clean_rlibs(Path::new(cwd));
+    let deps = Path::new(cwd).join("deps");
+    let deps_s = deps.to_string_lossy().to_string();
+    let start = Instant::now();
+    for (i, src) in srcs.iter().enumerate() {
+        let cn = format!("unit_{i:03}");
+        let args = args_fn(&cn, src, &deps_s);
+        client
+            .send(&Request::Compile {
+                session_id: sid.to_string(),
+                args,
+                cwd: cwd.into(),
+                compiler: rc.to_string().into(),
+                env: None,
+            })
+            .await
+            .unwrap();
+        match client.recv().await.unwrap() {
+            Some(Response::CompileResult { exit_code, .. }) => {
+                assert_eq!(exit_code, 0, "zccache rustc failed for {src}")
+            }
+            other => panic!("expected CompileResult, got: {other:?}"),
+        }
+    }
+    start.elapsed()
+}
+
+/// Rust compilation: bare rustc vs sccache vs zccache, 50 independent .rs lib files.
+/// Tests both `cargo build` (emit link+metadata+dep-info) and `cargo check` (emit metadata+dep-info) modes.
+#[tokio::test]
+#[ignore]
+async fn perf_rustc_zccache_vs_sccache() {
+    let rustc_path = match zccache_test_support::find_rustc() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: rustc not found");
+            return;
+        }
+    };
+    let rc = rustc_path.to_string_lossy().to_string();
+    let srcs = rust_source_names();
+
+    eprintln!();
+    eprintln!("\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}");
+    eprintln!("  RUST COMPILATION BENCHMARK");
+    eprintln!("  {RUSTC_NUM_FILES} .rs files \u{00b7} {RUSTC_WARM_TRIALS} warm trials \u{00b7} each tool in its own tempdir");
+    eprintln!("  Compiler: {rc}");
+    eprintln!("  Modes: build (--emit=dep-info,metadata,link) + check (--emit=dep-info,metadata)");
+    eprintln!("\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}");
+    eprintln!();
+
+    // Helper: run a mode (build or check) through all 3 tools.
+    // ─── Build mode (--emit=dep-info,metadata,link) ─────────────────────
+    eprintln!("  ─── Build mode (cargo build) ───");
+    eprintln!();
+
+    let bl_dir = tempfile::tempdir().unwrap();
+    generate_rust_project(bl_dir.path());
+    eprintln!("  [1/3] Bare rustc");
+    warmup_rustc(&rc, bl_dir.path());
+    let build_bl_cold = run_rustc_batch(&rc, bl_dir.path(), &srcs, rustc_args_for);
+    eprintln!("        cold:  {}", fmt_dur(build_bl_cold));
+    let build_bl_warm = run_rustc_batch(&rc, bl_dir.path(), &srcs, rustc_args_for);
+    eprintln!("        warm:  {}", fmt_dur(build_bl_warm));
+    eprintln!();
+    drop(bl_dir);
+
+    let build_sc_cold;
+    let build_sc_warm;
+    if let Some(ref scc_bin) = find_sccache() {
+        let sd = tempfile::tempdir().unwrap();
+        generate_rust_project(sd.path());
+        let scd = tempfile::tempdir().unwrap();
+        let scd_s = scd.path().to_string_lossy().into_owned();
+        std::env::set_var("SCCACHE_DIR", &scd_s);
+        eprintln!("  [2/3] sccache");
+        let _ = std::process::Command::new(scc_bin)
+            .arg("--stop-server")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if scd.path().exists() {
+            let _ = std::fs::remove_dir_all(scd.path());
+            let _ = std::fs::create_dir_all(scd.path());
+        }
+        let _ = std::process::Command::new(scc_bin)
+            .arg("--start-server")
+            .env("SCCACHE_DIR", &scd_s)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        warmup_rustc(&rc, sd.path());
+        let c = run_sccache_rustc_batch(scc_bin, &rc, sd.path(), &srcs, rustc_args_for);
+        eprintln!("        cold:  {}", fmt_dur(c));
+        build_sc_cold = Some(c);
+        let mut t = Vec::with_capacity(RUSTC_WARM_TRIALS);
+        for _ in 0..RUSTC_WARM_TRIALS {
+            t.push(run_sccache_rustc_batch(
+                scc_bin,
+                &rc,
+                sd.path(),
+                &srcs,
+                rustc_args_for,
+            ));
+        }
+        print_trials("warm:", &t);
+        build_sc_warm = Some(t);
+        let _ = std::process::Command::new(scc_bin)
+            .arg("--stop-server")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        std::env::remove_var("SCCACHE_DIR");
+        eprintln!();
+    } else {
+        eprintln!("  [2/3] sccache: not found, skipping\n");
+        build_sc_cold = None;
+        build_sc_warm = None;
+    }
+
+    let zd = tempfile::tempdir().unwrap();
+    generate_rust_project(zd.path());
+    let zc = zd.path().to_string_lossy().into_owned();
+    eprintln!("  [3/3] zccache");
+    let (ep, sh, sd) = start_daemon().await;
+    let mut cl = zccache_ipc::connect(&ep).await.unwrap();
+    cl.send(&Request::SessionStart {
+        client_pid: std::process::id(),
+        working_dir: zc.clone().into(),
+        log_file: None,
+        track_stats: true,
+        journal_path: None,
+    })
+    .await
+    .unwrap();
+    let sid = match cl.recv().await.unwrap() {
+        Some(Response::SessionStarted { session_id, .. }) => session_id,
+        other => panic!("expected SessionStarted, got: {other:?}"),
+    };
+    warmup_rustc(&rc, zd.path());
+    let build_zc_cold =
+        run_zccache_rustc_batch(&mut cl, &sid, &rc, &zc, &srcs, rustc_args_for).await;
+    eprintln!("        cold:  {}", fmt_dur(build_zc_cold));
+    let mut build_zc_warm = Vec::with_capacity(RUSTC_WARM_TRIALS);
+    for _ in 0..RUSTC_WARM_TRIALS {
+        build_zc_warm
+            .push(run_zccache_rustc_batch(&mut cl, &sid, &rc, &zc, &srcs, rustc_args_for).await);
+    }
+    print_trials("warm:", &build_zc_warm);
+    eprintln!();
+
+    // ─── Check mode (--emit=dep-info,metadata) ──────────────────────────
+    eprintln!("  ─── Check mode (cargo check) ───");
+    eprintln!();
+
+    let bl_dir2 = tempfile::tempdir().unwrap();
+    generate_rust_project(bl_dir2.path());
+    eprintln!("  [1/3] Bare rustc");
+    warmup_rustc(&rc, bl_dir2.path());
+    let check_bl_cold = run_rustc_batch(&rc, bl_dir2.path(), &srcs, rustc_check_args_for);
+    eprintln!("        cold:  {}", fmt_dur(check_bl_cold));
+    let check_bl_warm = run_rustc_batch(&rc, bl_dir2.path(), &srcs, rustc_check_args_for);
+    eprintln!("        warm:  {}", fmt_dur(check_bl_warm));
+    eprintln!();
+    drop(bl_dir2);
+
+    let check_sc_cold;
+    let check_sc_warm;
+    if let Some(ref scc_bin) = find_sccache() {
+        let sd = tempfile::tempdir().unwrap();
+        generate_rust_project(sd.path());
+        let scd = tempfile::tempdir().unwrap();
+        let scd_s = scd.path().to_string_lossy().into_owned();
+        std::env::set_var("SCCACHE_DIR", &scd_s);
+        eprintln!("  [2/3] sccache");
+        let _ = std::process::Command::new(scc_bin)
+            .arg("--stop-server")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if scd.path().exists() {
+            let _ = std::fs::remove_dir_all(scd.path());
+            let _ = std::fs::create_dir_all(scd.path());
+        }
+        let _ = std::process::Command::new(scc_bin)
+            .arg("--start-server")
+            .env("SCCACHE_DIR", &scd_s)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        warmup_rustc(&rc, sd.path());
+        let c = run_sccache_rustc_batch(scc_bin, &rc, sd.path(), &srcs, rustc_check_args_for);
+        eprintln!("        cold:  {}", fmt_dur(c));
+        check_sc_cold = Some(c);
+        let mut t = Vec::with_capacity(RUSTC_WARM_TRIALS);
+        for _ in 0..RUSTC_WARM_TRIALS {
+            t.push(run_sccache_rustc_batch(
+                scc_bin,
+                &rc,
+                sd.path(),
+                &srcs,
+                rustc_check_args_for,
+            ));
+        }
+        print_trials("warm:", &t);
+        check_sc_warm = Some(t);
+        let _ = std::process::Command::new(scc_bin)
+            .arg("--stop-server")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        std::env::remove_var("SCCACHE_DIR");
+        eprintln!();
+    } else {
+        eprintln!("  [2/3] sccache: not found, skipping\n");
+        check_sc_cold = None;
+        check_sc_warm = None;
+    }
+
+    // Reuse zccache daemon — clear cache for fresh check-mode measurement
+    cl.send(&Request::Clear).await.unwrap();
+    let _ = cl.recv::<Response>().await;
+    generate_rust_project(zd.path());
+    eprintln!("  [3/3] zccache");
+    warmup_rustc(&rc, zd.path());
+    let check_zc_cold =
+        run_zccache_rustc_batch(&mut cl, &sid, &rc, &zc, &srcs, rustc_check_args_for).await;
+    eprintln!("        cold:  {}", fmt_dur(check_zc_cold));
+    let mut check_zc_warm = Vec::with_capacity(RUSTC_WARM_TRIALS);
+    for _ in 0..RUSTC_WARM_TRIALS {
+        check_zc_warm.push(
+            run_zccache_rustc_batch(&mut cl, &sid, &rc, &zc, &srcs, rustc_check_args_for).await,
+        );
+    }
+    print_trials("warm:", &check_zc_warm);
+
+    cl.send(&Request::SessionEnd { session_id: sid })
+        .await
+        .unwrap();
+    let _ = cl.recv::<Response>().await;
+    sd.notify_one();
+    sh.await.unwrap();
+
+    // ── Results table ──────────────────────────────────────────────────
+    let dash = "\u{2014}";
+    let build_zm = median(&build_zc_warm);
+    let check_zm = median(&check_zc_warm);
+
+    eprintln!();
+    eprintln!("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}");
+    eprintln!("  RESULTS");
+    eprintln!("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}");
+    eprintln!();
+    eprintln!("## Rust Benchmark: {RUSTC_NUM_FILES} .rs files, {RUSTC_WARM_TRIALS} warm trials");
+    eprintln!();
+    eprintln!("| Scenario | Bare rustc | sccache | zccache | vs sccache | vs bare rustc |");
+    eprintln!("|:---------|----------:|--------:|--------:|-----------:|--------------:|");
+
+    // Helper closure for table rows
+    let row = |label: &str, bl: Duration, sc: Option<Duration>, zc: Duration, bold: bool| {
+        let sc_s = sc.map(fmt_dur);
+        let sc_str = sc_s.as_deref().unwrap_or(dash);
+        let vs_sc = sc.map(|s| fmt_ratio(s, zc, bold));
+        let vs_bl = fmt_ratio(bl, zc, bold);
+        let zc_fmt = if bold {
+            format!("**{}**", fmt_dur(zc))
+        } else {
+            fmt_dur(zc)
+        };
+        eprintln!(
+            "| {} | {} | {} | {} | {} | {} |",
+            label,
+            fmt_dur(bl),
+            sc_str,
+            zc_fmt,
+            vs_sc.as_deref().unwrap_or(dash),
+            vs_bl
+        );
+    };
+
+    row(
+        "Build, Cold",
+        build_bl_cold,
+        build_sc_cold,
+        build_zc_cold,
+        false,
+    );
+    row(
+        "Build, Warm",
+        build_bl_warm,
+        build_sc_warm.as_ref().map(|t| median(t)),
+        build_zm,
+        true,
+    );
+    row(
+        "Check, Cold",
+        check_bl_cold,
+        check_sc_cold,
+        check_zc_cold,
+        false,
+    );
+    row(
+        "Check, Warm",
+        check_bl_warm,
+        check_sc_warm.as_ref().map(|t| median(t)),
+        check_zm,
+        true,
+    );
+
+    eprintln!();
+    eprintln!("> **Build** = `--emit=dep-info,metadata,link` (cargo build). **Check** = `--emit=dep-info,metadata` (cargo check).");
+    eprintln!("> **Cold** = first compile (empty cache). **Warm** = median of {RUSTC_WARM_TRIALS} subsequent runs.");
+
+    eprintln!();
+    eprintln!("### Bottom Line");
+    eprintln!();
+    let bld_vs_rc = build_bl_warm.as_secs_f64() / build_zm.as_secs_f64();
+    let chk_vs_rc = check_bl_warm.as_secs_f64() / check_zm.as_secs_f64();
+    if let Some(ref t) = build_sc_warm {
+        let bld_vs_sc = median(t).as_secs_f64() / build_zm.as_secs_f64();
+        eprintln!("  Build warm:  {bld_vs_rc:.1}x faster than bare rustc, {bld_vs_sc:.1}x faster than sccache");
+    } else {
+        eprintln!("  Build warm:  {bld_vs_rc:.1}x faster than bare rustc");
+    }
+    if let Some(ref t) = check_sc_warm {
+        let chk_vs_sc = median(t).as_secs_f64() / check_zm.as_secs_f64();
+        eprintln!("  Check warm:  {chk_vs_rc:.1}x faster than bare rustc, {chk_vs_sc:.1}x faster than sccache");
+    } else {
+        eprintln!("  Check warm:  {chk_vs_rc:.1}x faster than bare rustc");
     }
     eprintln!();
 }

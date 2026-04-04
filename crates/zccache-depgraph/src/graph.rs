@@ -123,7 +123,15 @@ impl DepGraph {
     /// If the context already exists, returns the existing key.
     pub fn register(&self, ctx: CompileContext) -> ContextKey {
         let key = ctx.context_key();
+        self.register_with_key(key, ctx)
+    }
 
+    /// Register a compilation context with a precomputed key.
+    ///
+    /// Used for Rustc compilations where the context key is computed from
+    /// `RustcCompileContext` (different domain tag) but the dep_graph stores
+    /// a `CompileContext` with the source file path for freshness checks.
+    pub fn register_with_key(&self, key: ContextKey, ctx: CompileContext) -> ContextKey {
         self.contexts.entry(key).or_insert_with(|| ContextEntry {
             context: ctx,
             resolved_includes: Vec::new(),

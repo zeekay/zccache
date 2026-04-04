@@ -1657,11 +1657,34 @@ fn resolve_pch_source(path: &Path, pch_map: &DashMap<PathBuf, PathBuf>) -> Optio
 }
 
 /// Build a CompileContext and UserDepFlags from a CacheableCompilation and session info.
+/// Result of building a compile context — varies by compiler family.
+enum BuildContextResult {
+    /// C/C++ compilation (GCC, Clang, MSVC).
+    Cc {
+        ctx: CompileContext,
+        dep_flags: UserDepFlags,
+    },
+    /// Rustc compilation.
+    Rustc {
+        /// The Rustc-specific context (for context key computation).
+        rustc_ctx: Box<zccache_depgraph::RustcCompileContext>,
+        /// A "compatible" CompileContext for dep_graph storage (has source_file).
+        compat_ctx: CompileContext,
+        /// Parsed args for extern crate info, output path derivation, etc.
+        rustc_args: Box<zccache_depgraph::RustcParsedArgs>,
+    },
+}
+
 fn build_compile_context(
     compilation: &zccache_compiler::CacheableCompilation,
     cwd: &Path,
     system_includes: &[PathBuf],
-) -> (CompileContext, UserDepFlags) {
+    client_env: &[(String, String)],
+) -> BuildContextResult {
+    if compilation.family == zccache_compiler::CompilerFamily::Rustc {
+        return build_rustc_compile_context(compilation, cwd, client_env);
+    }
+
     // Dispatch to the correct parser based on compiler family.
     let parsed = match compilation.family {
         zccache_compiler::CompilerFamily::Msvc => {
@@ -1689,7 +1712,271 @@ fn build_compile_context(
         }
     }
 
-    (ctx, dep_flags)
+    BuildContextResult::Cc { ctx, dep_flags }
+}
+
+/// Build compile context for a Rustc invocation.
+fn build_rustc_compile_context(
+    compilation: &zccache_compiler::CacheableCompilation,
+    cwd: &Path,
+    client_env: &[(String, String)],
+) -> BuildContextResult {
+    let rustc_args = zccache_depgraph::parse_rustc_args(&compilation.original_args, cwd);
+
+    // Hash the rustc binary for compiler version identity.
+    // Different rustc versions produce different output for the same source.
+    let compiler_hash = zccache_hash::hash_file(&compilation.compiler).ok();
+
+    let rustc_ctx = zccache_depgraph::RustcCompileContext::from_parsed_args(
+        &rustc_args,
+        client_env,
+        compiler_hash,
+    );
+
+    // Create a "compatible" CompileContext for dep_graph storage.
+    // Only source_file is used by the dep_graph for freshness checks.
+    let compat_ctx = CompileContext {
+        source_file: rustc_args.source_file.clone(),
+        include_search: Default::default(),
+        defines: Vec::new(),
+        flags: Vec::new(),
+        force_includes: Vec::new(),
+        unknown_flags: Vec::new(),
+    };
+
+    BuildContextResult::Rustc {
+        rustc_ctx: Box::new(rustc_ctx),
+        compat_ctx,
+        rustc_args: Box::new(rustc_args),
+    }
+}
+
+/// Scan rustc dependencies after compilation.
+///
+/// Parses rustc's dep-info file which has multiple rules (one per output target),
+/// all sharing the same dependencies. Extracts the unique set of source file deps.
+fn scan_rustc_deps(
+    rustc_args: &zccache_depgraph::RustcParsedArgs,
+    source_path: &Path,
+    cwd: &Path,
+) -> zccache_depgraph::ScanResult {
+    let mut result = if rustc_args.emit_types.iter().any(|t| t == "dep-info") {
+        let name = rustc_args.crate_name.as_deref().unwrap_or("unknown");
+        let ext_suffix = rustc_args.extra_filename.as_deref().unwrap_or("");
+        let dir = rustc_args.out_dir.as_deref().unwrap_or(cwd);
+        let depfile_path = dir.join(format!("{name}{ext_suffix}.d"));
+        if depfile_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&depfile_path) {
+                parse_rustc_depinfo(&content, source_path, cwd)
+            } else {
+                zccache_depgraph::ScanResult {
+                    resolved: Vec::new(),
+                    unresolved: Vec::new(),
+                    has_computed: false,
+                }
+            }
+        } else {
+            zccache_depgraph::ScanResult {
+                resolved: Vec::new(),
+                unresolved: Vec::new(),
+                has_computed: false,
+            }
+        }
+    } else {
+        zccache_depgraph::ScanResult {
+            resolved: Vec::new(),
+            unresolved: Vec::new(),
+            has_computed: false,
+        }
+    };
+
+    // Add extern crate files as resolved dependencies.
+    // Their content hashes will be part of the artifact key,
+    // so changing an extern crate causes a cache miss.
+    for ext in &rustc_args.externs {
+        if ext.path.exists() && !result.resolved.contains(&ext.path) {
+            result.resolved.push(ext.path.clone());
+        }
+    }
+
+    result
+}
+
+/// Parse rustc's multi-rule dep-info format.
+///
+/// Rustc dep-info files contain multiple rules, one per output target:
+/// ```text
+/// target1.d: src/lib.rs src/util.rs
+/// libtarget1.rlib: src/lib.rs src/util.rs
+/// libtarget1.rmeta: src/lib.rs src/util.rs
+/// src/lib.rs:
+/// src/util.rs:
+/// ```
+///
+/// We extract deps from ALL rules and deduplicate, excluding the source file.
+fn parse_rustc_depinfo(
+    content: &str,
+    source_path: &Path,
+    cwd: &Path,
+) -> zccache_depgraph::ScanResult {
+    let mut deps = std::collections::HashSet::new();
+
+    for line in content.lines() {
+        // Join continuation lines (backslash-newline)
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Find the colon separator (handling Windows drive letters like C:\)
+        let colon_pos = if line.len() >= 2
+            && line.as_bytes()[1] == b':'
+            && line.as_bytes()[0].is_ascii_alphabetic()
+        {
+            // Skip drive letter colon, find next colon
+            line[2..].find(':').map(|p| p + 2)
+        } else {
+            line.find(':')
+        };
+
+        let Some(colon) = colon_pos else { continue };
+        let rhs = line[colon + 1..].trim();
+        if rhs.is_empty() {
+            continue; // "src/lib.rs:" — phony target, skip
+        }
+
+        // Split RHS on whitespace, respecting backslash-escaped spaces
+        let mut i = 0;
+        let bytes = rhs.as_bytes();
+        while i < bytes.len() {
+            // Skip whitespace
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+
+            // Collect a token (backslash-space is an escaped space in the path)
+            let start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2; // skip escaped char
+                } else {
+                    i += 1;
+                }
+            }
+            let raw = &rhs[start..i];
+            // Unescape backslash-space
+            let token = raw.replace("\\ ", " ");
+            deps.insert(token);
+        }
+    }
+
+    // Resolve paths and filter out the source file
+    let source_canonical = if source_path.is_absolute() {
+        source_path.to_path_buf()
+    } else {
+        cwd.join(source_path)
+    };
+
+    let mut resolved = Vec::new();
+    for dep in &deps {
+        let dep_path = Path::new(dep);
+        let abs = if dep_path.is_absolute() {
+            dep_path.to_path_buf()
+        } else {
+            cwd.join(dep_path)
+        };
+        // Exclude the source file itself
+        if abs == source_canonical {
+            continue;
+        }
+        // Only include files that exist (skip phantom deps)
+        if abs.exists() {
+            resolved.push(abs);
+        }
+    }
+    resolved.sort();
+
+    zccache_depgraph::ScanResult {
+        resolved,
+        unresolved: Vec::new(),
+        has_computed: false,
+    }
+}
+
+/// Collect all output files from a rustc compilation.
+///
+/// Returns `(primary_output_data, all_outputs)` where `all_outputs` includes
+/// the primary output and any additional files (rmeta, dep-info).
+fn collect_rustc_outputs(
+    rustc_args: &zccache_depgraph::RustcParsedArgs,
+    primary_output_path: &Path,
+    cwd: &Path,
+) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+    let primary_data = std::fs::read(primary_output_path).unwrap_or_default();
+    let primary_name = primary_output_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+
+    let mut outputs: Vec<(String, Vec<u8>)> = vec![(primary_name, primary_data.clone())];
+
+    // Find additional outputs based on --emit types
+    let crate_name = rustc_args.crate_name.as_deref().unwrap_or("unknown");
+    let ext_suffix = rustc_args.extra_filename.as_deref().unwrap_or("");
+    let dir = rustc_args.out_dir.as_deref().unwrap_or(cwd);
+
+    for emit_type in &rustc_args.emit_types {
+        let candidate = match emit_type.as_str() {
+            "metadata" => {
+                let path = dir.join(format!("lib{crate_name}{ext_suffix}.rmeta"));
+                if path != primary_output_path && path.exists() {
+                    Some(path)
+                } else {
+                    None
+                }
+            }
+            "link" => {
+                // Could be rlib or staticlib
+                let rlib = dir.join(format!("lib{crate_name}{ext_suffix}.rlib"));
+                let staticlib = dir.join(format!("lib{crate_name}{ext_suffix}.a"));
+                if rlib != primary_output_path && rlib.exists() {
+                    Some(rlib)
+                } else if staticlib != primary_output_path && staticlib.exists() {
+                    Some(staticlib)
+                } else {
+                    None
+                }
+            }
+            "dep-info" => {
+                let path = dir.join(format!("{crate_name}{ext_suffix}.d"));
+                if path.exists() {
+                    Some(path)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(path) = candidate {
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            // Avoid duplicates
+            if !outputs.iter().any(|(n, _)| n == &name) {
+                if let Ok(data) = std::fs::read(&path) {
+                    outputs.push((name, data));
+                }
+            }
+        }
+    }
+
+    (primary_data, outputs)
 }
 
 /// Write cached output to disk. Optimized syscall sequence:
@@ -2055,8 +2342,24 @@ async fn handle_compile(
 
     // ── Phase: build context + register ──────────────────────────────
     let t1 = std::time::Instant::now();
-    let (ctx, dep_flags) = build_compile_context(&compilation, &cwd_path, &system_includes);
-    let context_key = state.dep_graph.register(ctx.clone());
+    let env_slice = client_env.as_deref().unwrap_or(&[]);
+    let build_result = build_compile_context(&compilation, &cwd_path, &system_includes, env_slice);
+    let (ctx, dep_flags, rustc_args_opt, context_key) = match build_result {
+        BuildContextResult::Cc { ctx, dep_flags } => {
+            let key = state.dep_graph.register(ctx.clone());
+            (ctx, dep_flags, None, key)
+        }
+        BuildContextResult::Rustc {
+            rustc_ctx,
+            compat_ctx,
+            rustc_args,
+        } => {
+            let key = rustc_ctx.context_key();
+            state.dep_graph.register_with_key(key, compat_ctx.clone());
+            (compat_ctx, UserDepFlags::default(), Some(rustc_args), key)
+        }
+    };
+    let is_rustc = rustc_args_opt.is_some();
     let build_context_ns = t1.elapsed().as_nanos() as u64;
 
     // ── Ultra-fast path: per-file freshness skip ────────────────────
@@ -2094,11 +2397,16 @@ async fn handle_compile(
                         drop(cached_ref);
 
                         let mut write_ok = true;
+                        let secondary_dir = if is_rustc {
+                            output_path.parent().unwrap_or(&cwd_path).to_path_buf()
+                        } else {
+                            cwd_path.clone()
+                        };
                         for (i, payload) in payloads.iter().enumerate() {
                             let out_path = if i == 0 {
                                 output_path.clone()
                             } else {
-                                cwd_path.join(&names[i])
+                                secondary_dir.join(&names[i])
                             };
                             let cache_file =
                                 state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
@@ -2325,11 +2633,16 @@ async fn handle_compile(
                     drop(cached_ref);
 
                     let mut write_ok = true;
+                    let secondary_dir = if is_rustc {
+                        output_path.parent().unwrap_or(&cwd_path).to_path_buf()
+                    } else {
+                        cwd_path.clone()
+                    };
                     for (i, payload) in payloads.iter().enumerate() {
                         let out_path = if i == 0 {
                             output_path.clone()
                         } else {
-                            cwd_path.join(&names[i])
+                            secondary_dir.join(&names[i])
                         };
                         let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
                         if write_cached_output(&out_path, &cache_file, payload).is_err() {
@@ -2510,11 +2823,12 @@ async fn handle_compile(
         // to wait for a watcher event.
         state.cache_system.apply_changes(vec![output_path.clone()]);
 
-        // Read the output file
-        let output_data = match std::fs::read(&output_path) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::warn!("failed to read output file {}: {e}", output_path.display());
+        // Read the output file(s)
+        let (output_data, rustc_all_outputs) = if is_rustc {
+            let (primary, all) =
+                collect_rustc_outputs(rustc_args_opt.as_ref().unwrap(), &output_path, &cwd_path);
+            if primary.is_empty() {
+                tracing::warn!("failed to read output file {}", output_path.display());
                 return Response::CompileResult {
                     exit_code,
                     stdout: Arc::clone(&stdout),
@@ -2522,41 +2836,68 @@ async fn handle_compile(
                     cached: false,
                 };
             }
+            (primary, Some(all))
+        } else {
+            match std::fs::read(&output_path) {
+                Ok(data) => (data, None),
+                Err(e) => {
+                    tracing::warn!("failed to read output file {}: {e}", output_path.display());
+                    return Response::CompileResult {
+                        exit_code,
+                        stdout: Arc::clone(&stdout),
+                        stderr: Arc::clone(&stderr),
+                        cached: false,
+                    };
+                }
+            }
         };
 
         // ── Phase: include scan (depfile or fallback) ────────────────
         let t_scan = std::time::Instant::now();
-        let scan_result = match &depfile_strategy {
-            DepfileStrategy::Injected { path }
-            | DepfileStrategy::UserSpecified { path }
-            | DepfileStrategy::UserDefault { path } => {
-                let cwd_path = PathBuf::from(cwd);
-                match zccache_depgraph::depfile::parse_depfile_path(path, &source_path, &cwd_path) {
-                    Ok(result) => {
-                        if matches!(depfile_strategy, DepfileStrategy::Injected { .. }) {
-                            let _ = std::fs::remove_file(path);
+        let scan_result = if is_rustc {
+            // Rustc: try to parse the dep-info file if --emit included dep-info.
+            // The dep-info file is in --out-dir with crate name and extra-filename.
+            scan_rustc_deps(rustc_args_opt.as_ref().unwrap(), &source_path, &cwd_path)
+        } else {
+            match &depfile_strategy {
+                DepfileStrategy::Injected { path }
+                | DepfileStrategy::UserSpecified { path }
+                | DepfileStrategy::UserDefault { path } => {
+                    let cwd_path = PathBuf::from(cwd);
+                    match zccache_depgraph::depfile::parse_depfile_path(
+                        path,
+                        &source_path,
+                        &cwd_path,
+                    ) {
+                        Ok(result) => {
+                            if matches!(depfile_strategy, DepfileStrategy::Injected { .. }) {
+                                let _ = std::fs::remove_file(path);
+                            }
+                            result
                         }
-                        result
-                    }
-                    Err(e) => {
-                        tracing::warn!("depfile parse failed, falling back to scanner: {e}");
-                        write_session_log(
-                            &state.sessions,
-                            &sid,
-                            &format!(
-                                "[DIAG] depfile_parse_fail: path={} error={e}",
-                                path.display()
-                            ),
-                        );
-                        if matches!(depfile_strategy, DepfileStrategy::Injected { .. }) {
-                            let _ = std::fs::remove_file(path);
+                        Err(e) => {
+                            tracing::warn!("depfile parse failed, falling back to scanner: {e}");
+                            write_session_log(
+                                &state.sessions,
+                                &sid,
+                                &format!(
+                                    "[DIAG] depfile_parse_fail: path={} error={e}",
+                                    path.display()
+                                ),
+                            );
+                            if matches!(depfile_strategy, DepfileStrategy::Injected { .. }) {
+                                let _ = std::fs::remove_file(path);
+                            }
+                            zccache_depgraph::scanner::scan_recursive(
+                                &source_path,
+                                &ctx.include_search,
+                            )
                         }
-                        zccache_depgraph::scanner::scan_recursive(&source_path, &ctx.include_search)
                     }
                 }
-            }
-            DepfileStrategy::Unsupported => {
-                zccache_depgraph::scanner::scan_recursive(&source_path, &ctx.include_search)
+                DepfileStrategy::Unsupported => {
+                    zccache_depgraph::scanner::scan_recursive(&source_path, &ctx.include_search)
+                }
             }
         };
         let include_scan_ns = t_scan.elapsed().as_nanos() as u64;
@@ -2662,18 +3003,34 @@ async fn handle_compile(
                 }
             }
 
-            let artifact = ArtifactData {
-                outputs: vec![ArtifactOutput {
-                    name: output_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                    data: Arc::new(output_data),
-                }],
-                stdout: Arc::clone(&stdout),
-                stderr: Arc::clone(&stderr),
-                exit_code,
+            // Build artifact — multi-output for Rustc, single output for C/C++.
+            let artifact = if let Some(ref all_outputs) = rustc_all_outputs {
+                ArtifactData {
+                    outputs: all_outputs
+                        .iter()
+                        .map(|(name, data)| ArtifactOutput {
+                            name: name.clone(),
+                            data: Arc::new(data.clone()),
+                        })
+                        .collect(),
+                    stdout: Arc::clone(&stdout),
+                    stderr: Arc::clone(&stderr),
+                    exit_code,
+                }
+            } else {
+                ArtifactData {
+                    outputs: vec![ArtifactOutput {
+                        name: output_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                        data: Arc::new(output_data),
+                    }],
+                    stdout: Arc::clone(&stdout),
+                    stderr: Arc::clone(&stderr),
+                    exit_code,
+                }
             };
 
             let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
@@ -2850,7 +3207,10 @@ fn check_unit_cache(
             },
         )
     } else {
-        build_compile_context(compilation, cwd_path, system_includes)
+        match build_compile_context(compilation, cwd_path, system_includes, &[]) {
+            BuildContextResult::Cc { ctx, dep_flags } => (ctx, dep_flags),
+            BuildContextResult::Rustc { compat_ctx, .. } => (compat_ctx, UserDepFlags::default()),
+        }
     };
     let t_ctx = t0.elapsed();
     let context_key = state.dep_graph.register(ctx.clone());

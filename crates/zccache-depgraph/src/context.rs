@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use zccache_hash::ContentHash;
 
 use crate::args::ParsedArgs;
+use crate::rustc_args::RustcParsedArgs;
 use crate::search_paths::IncludeSearchPaths;
 
 /// blake3 hash identifying a (source + include_dirs + defines + flags) combination.
@@ -196,10 +197,265 @@ pub fn compute_artifact_key(
     ArtifactKey(ContentHash::from_bytes(*hasher.finalize().as_bytes()))
 }
 
+/// All inputs defining a rustc compilation context.
+///
+/// Separate from `CompileContext` because Rust's compilation model differs
+/// fundamentally from C/C++: no include paths, `--cfg` instead of `-D`,
+/// `--extern` crates instead of headers, etc.
+#[derive(Debug, Clone)]
+pub struct RustcCompileContext {
+    /// Absolute path to the source file.
+    pub source_file: PathBuf,
+    /// `--crate-name` value.
+    pub crate_name: Option<String>,
+    /// Sorted `--crate-type` values.
+    pub crate_types: Vec<String>,
+    /// `--edition` value.
+    pub edition: Option<String>,
+    /// Sorted `--emit` types.
+    pub emit_types: Vec<String>,
+    /// Sorted `--cfg` values.
+    pub cfgs: Vec<String>,
+    /// Sorted `--check-cfg` values.
+    pub check_cfgs: Vec<String>,
+    /// Sorted cache-relevant `-C` codegen options.
+    pub codegen_flags: Vec<String>,
+    /// `--target` triple.
+    pub target: Option<String>,
+    /// `--cap-lints` value.
+    pub cap_lints: Option<String>,
+    /// Extern crate names (sorted, just the names — paths are for content hashing).
+    pub extern_names: Vec<String>,
+    /// Sorted lint flags (`-A`, `-W`, `-D`, `-F`).
+    pub lint_flags: Vec<String>,
+    /// Sorted unknown flags.
+    pub unknown_flags: Vec<String>,
+    /// Sorted `--remap-path-prefix` values (affect embedded paths in output).
+    pub remap_path_prefixes: Vec<String>,
+    /// Sorted CARGO_* environment variables that affect compilation via `env!()`.
+    pub env_vars: Vec<(String, String)>,
+    /// Hash of the compiler binary (different rustc versions produce different output).
+    pub compiler_hash: Option<ContentHash>,
+}
+
+impl RustcCompileContext {
+    /// Build from parsed rustc args and client environment.
+    ///
+    /// `client_env` should be the CARGO_* env vars from the client process.
+    /// These affect compilation via `env!()` macros and must be in the cache key.
+    #[must_use]
+    pub fn from_parsed_args(
+        args: &RustcParsedArgs,
+        client_env: &[(String, String)],
+        compiler_hash: Option<ContentHash>,
+    ) -> Self {
+        let mut crate_types = args.crate_types.clone();
+        crate_types.sort();
+        let mut emit_types = args.emit_types.clone();
+        emit_types.sort();
+        let mut extern_names: Vec<String> = args.externs.iter().map(|e| e.name.clone()).collect();
+        extern_names.sort();
+        let mut remap_path_prefixes = args.remap_path_prefixes.clone();
+        remap_path_prefixes.sort();
+
+        // Filter CARGO_* env vars — these affect compilation output via env!() macro.
+        // Exclude CARGO_MAKEFLAGS (job server, not output-affecting) and
+        // CARGO_INCREMENTAL (handled by stripping -C incremental).
+        let mut env_vars: Vec<(String, String)> = client_env
+            .iter()
+            .filter(|(k, _)| {
+                k.starts_with("CARGO_") && k != "CARGO_MAKEFLAGS" && k != "CARGO_INCREMENTAL"
+            })
+            .cloned()
+            .collect();
+        env_vars.sort();
+
+        Self {
+            source_file: args.source_file.clone(),
+            crate_name: args.crate_name.clone(),
+            crate_types,
+            edition: args.edition.clone(),
+            emit_types,
+            cfgs: args.cfgs.clone(),
+            check_cfgs: args.check_cfgs.clone(),
+            codegen_flags: args.codegen_flags.clone(),
+            target: args.target.clone(),
+            cap_lints: args.cap_lints.clone(),
+            extern_names,
+            lint_flags: args.lint_flags.clone(),
+            unknown_flags: args.unknown_flags.clone(),
+            remap_path_prefixes,
+            env_vars,
+            compiler_hash,
+        }
+    }
+
+    /// Compute the context key.
+    ///
+    /// Uses a different domain tag from C/C++ to avoid collisions.
+    #[must_use]
+    pub fn context_key(&self) -> ContextKey {
+        let mut hasher = blake3::Hasher::new();
+
+        hasher.update(b"zccache-rustc-context-key-v2\0");
+
+        // Compiler binary hash (different rustc versions → different output).
+        if let Some(ref ch) = self.compiler_hash {
+            hasher.update(b"compiler\0");
+            hasher.update(ch.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Source file (absolute path).
+        hasher.update(self.source_file.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+
+        // Crate name.
+        if let Some(ref name) = self.crate_name {
+            hasher.update(b"crate-name\0");
+            hasher.update(name.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Crate types (sorted).
+        hasher.update(b"crate-types\0");
+        for ct in &self.crate_types {
+            hasher.update(ct.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Edition.
+        if let Some(ref edition) = self.edition {
+            hasher.update(b"edition\0");
+            hasher.update(edition.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Emit types (sorted).
+        hasher.update(b"emit\0");
+        for et in &self.emit_types {
+            hasher.update(et.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Cfg values (sorted).
+        hasher.update(b"cfg\0");
+        for cfg in &self.cfgs {
+            hasher.update(cfg.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Check-cfg values (sorted).
+        hasher.update(b"check-cfg\0");
+        for cfg in &self.check_cfgs {
+            hasher.update(cfg.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Codegen flags (sorted).
+        hasher.update(b"codegen\0");
+        for flag in &self.codegen_flags {
+            hasher.update(flag.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Target.
+        if let Some(ref target) = self.target {
+            hasher.update(b"target\0");
+            hasher.update(target.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Cap lints.
+        if let Some(ref cap) = self.cap_lints {
+            hasher.update(b"cap-lints\0");
+            hasher.update(cap.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Extern crate names (sorted — paths excluded, content-hashed separately).
+        hasher.update(b"externs\0");
+        for name in &self.extern_names {
+            hasher.update(name.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Lint flags (sorted).
+        hasher.update(b"lints\0");
+        for flag in &self.lint_flags {
+            hasher.update(flag.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Unknown flags (sorted).
+        hasher.update(b"unknown\0");
+        for flag in &self.unknown_flags {
+            hasher.update(flag.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // --remap-path-prefix values (sorted, affect embedded paths in output).
+        hasher.update(b"remap\0");
+        for remap in &self.remap_path_prefixes {
+            hasher.update(remap.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // CARGO_* environment variables (sorted, affect env!() macro output).
+        hasher.update(b"env\0");
+        for (key, val) in &self.env_vars {
+            hasher.update(key.as_bytes());
+            hasher.update(b"=");
+            hasher.update(val.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        ContextKey(ContentHash::from_bytes(*hasher.finalize().as_bytes()))
+    }
+}
+
+/// Compute the artifact key for a rustc compilation.
+///
+/// Like `compute_artifact_key` for C/C++, but also incorporates
+/// extern crate content hashes (analogous to header content hashes).
+pub fn compute_rustc_artifact_key(
+    context_key: &ContextKey,
+    file_hashes: &mut [(PathBuf, ContentHash)],
+    extern_hashes: &mut [(String, ContentHash)],
+) -> ArtifactKey {
+    file_hashes.sort_by(|a, b| a.0.cmp(&b.0));
+    extern_hashes.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"zccache-rustc-artifact-key-v1\0");
+    hasher.update(context_key.0.as_bytes());
+    hasher.update(b"\0");
+
+    // Source + dependency file hashes.
+    for (path, hash) in file_hashes.iter() {
+        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(hash.as_bytes());
+        hasher.update(b"\0");
+    }
+
+    // Extern crate content hashes.
+    hasher.update(b"externs\0");
+    for (name, hash) in extern_hashes.iter() {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(hash.as_bytes());
+        hasher.update(b"\0");
+    }
+
+    ArtifactKey(ContentHash::from_bytes(*hasher.finalize().as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::args::UserDepFlags;
+    use crate::rustc_args::ExternCrate;
 
     fn make_context(source: &str, user_dirs: &[&str], defines: &[&str]) -> CompileContext {
         CompileContext {
@@ -373,5 +629,196 @@ mod tests {
             ctx2.context_key(),
             "unknown flag order should not affect context key"
         );
+    }
+
+    // ─── RustcCompileContext tests ───────────────────────────────────
+
+    fn make_rustc_context(source: &str, edition: &str) -> RustcCompileContext {
+        RustcCompileContext {
+            source_file: PathBuf::from(source),
+            crate_name: Some("mylib".to_string()),
+            crate_types: vec!["lib".to_string()],
+            edition: Some(edition.to_string()),
+            emit_types: vec!["link".to_string()],
+            cfgs: Vec::new(),
+            check_cfgs: Vec::new(),
+            codegen_flags: Vec::new(),
+            target: None,
+            cap_lints: None,
+            extern_names: Vec::new(),
+            lint_flags: Vec::new(),
+            unknown_flags: Vec::new(),
+            remap_path_prefixes: Vec::new(),
+            env_vars: Vec::new(),
+            compiler_hash: None,
+        }
+    }
+
+    #[test]
+    fn rustc_context_key_deterministic() {
+        let ctx = make_rustc_context("/src/lib.rs", "2021");
+        let k1 = ctx.context_key();
+        let k2 = ctx.context_key();
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn rustc_different_edition_different_key() {
+        let k1 = make_rustc_context("/src/lib.rs", "2021").context_key();
+        let k2 = make_rustc_context("/src/lib.rs", "2024").context_key();
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn rustc_different_cfg_different_key() {
+        let mut ctx1 = make_rustc_context("/src/lib.rs", "2021");
+        ctx1.cfgs = vec!["feature=\"std\"".to_string()];
+        let mut ctx2 = make_rustc_context("/src/lib.rs", "2021");
+        ctx2.cfgs = vec!["feature=\"alloc\"".to_string()];
+        assert_ne!(ctx1.context_key(), ctx2.context_key());
+    }
+
+    #[test]
+    fn rustc_different_codegen_different_key() {
+        let mut ctx1 = make_rustc_context("/src/lib.rs", "2021");
+        ctx1.codegen_flags = vec!["opt-level=2".to_string()];
+        let mut ctx2 = make_rustc_context("/src/lib.rs", "2021");
+        ctx2.codegen_flags = vec!["opt-level=3".to_string()];
+        assert_ne!(ctx1.context_key(), ctx2.context_key());
+    }
+
+    #[test]
+    fn rustc_context_key_differs_from_cc() {
+        // The domain separation tags differ, so even identical-looking contexts
+        // produce different keys.
+        let cc_ctx = make_context("/src/lib.rs", &[], &[]);
+        let rustc_ctx = make_rustc_context("/src/lib.rs", "2021");
+        assert_ne!(
+            cc_ctx.context_key(),
+            rustc_ctx.context_key(),
+            "C and Rust context keys must differ (domain separation)"
+        );
+    }
+
+    #[test]
+    fn rustc_compiler_hash_affects_key() {
+        let ctx1 = make_rustc_context("/src/lib.rs", "2021");
+        let mut ctx2 = make_rustc_context("/src/lib.rs", "2021");
+        ctx2.compiler_hash = Some(zccache_hash::hash_bytes(b"rustc-1.75.0"));
+        assert_ne!(
+            ctx1.context_key(),
+            ctx2.context_key(),
+            "different compiler hash must produce different context key"
+        );
+    }
+
+    #[test]
+    fn rustc_different_compiler_versions_different_key() {
+        let mut ctx1 = make_rustc_context("/src/lib.rs", "2021");
+        ctx1.compiler_hash = Some(zccache_hash::hash_bytes(b"rustc-1.75.0"));
+        let mut ctx2 = make_rustc_context("/src/lib.rs", "2021");
+        ctx2.compiler_hash = Some(zccache_hash::hash_bytes(b"rustc-1.76.0"));
+        assert_ne!(ctx1.context_key(), ctx2.context_key());
+    }
+
+    #[test]
+    fn rustc_extern_names_affect_key() {
+        let ctx1 = make_rustc_context("/src/lib.rs", "2021");
+        let mut ctx2 = make_rustc_context("/src/lib.rs", "2021");
+        ctx2.extern_names = vec!["serde".to_string()];
+        assert_ne!(ctx1.context_key(), ctx2.context_key());
+    }
+
+    #[test]
+    fn rustc_from_parsed_args() {
+        let args = RustcParsedArgs {
+            source_file: PathBuf::from("/src/lib.rs"),
+            crate_name: Some("mylib".to_string()),
+            crate_types: vec!["rlib".to_string(), "lib".to_string()],
+            edition: Some("2021".to_string()),
+            emit_types: vec!["link".to_string(), "dep-info".to_string()],
+            cfgs: vec!["unix".to_string(), "feature=\"std\"".to_string()],
+            check_cfgs: Vec::new(),
+            codegen_flags: vec!["opt-level=2".to_string()],
+            target: None,
+            cap_lints: Some("allow".to_string()),
+            externs: vec![
+                ExternCrate {
+                    name: "serde".to_string(),
+                    path: PathBuf::from("/deps/libserde.rlib"),
+                },
+                ExternCrate {
+                    name: "log".to_string(),
+                    path: PathBuf::from("/deps/liblog.rlib"),
+                },
+            ],
+            lint_flags: Vec::new(),
+            unknown_flags: Vec::new(),
+            out_dir: None,
+            extra_filename: None,
+            cargo_metadata: None,
+            incremental_dir: None,
+            error_format: None,
+            json_format: None,
+            color: None,
+            diagnostic_width: None,
+            search_paths: Vec::new(),
+            remap_path_prefixes: Vec::new(),
+            sysroot: None,
+            output_file: None,
+        };
+        let ctx = RustcCompileContext::from_parsed_args(&args, &[], None);
+        // Crate types sorted
+        assert_eq!(ctx.crate_types, vec!["lib", "rlib"]);
+        // Emit types sorted
+        assert_eq!(ctx.emit_types, vec!["dep-info", "link"]);
+        // Extern names extracted and sorted
+        assert_eq!(ctx.extern_names, vec!["log", "serde"]);
+    }
+
+    #[test]
+    fn rustc_artifact_key_changes_with_extern_content() {
+        let ctx = make_rustc_context("/src/lib.rs", "2021");
+        let ck = ctx.context_key();
+
+        let src_hash = zccache_hash::hash_bytes(b"source");
+        let ext_hash_a = zccache_hash::hash_bytes(b"extern A");
+        let ext_hash_b = zccache_hash::hash_bytes(b"extern B");
+
+        let ak1 = compute_rustc_artifact_key(
+            &ck,
+            &mut [(PathBuf::from("/src/lib.rs"), src_hash)],
+            &mut [("serde".to_string(), ext_hash_a)],
+        );
+        let ak2 = compute_rustc_artifact_key(
+            &ck,
+            &mut [(PathBuf::from("/src/lib.rs"), src_hash)],
+            &mut [("serde".to_string(), ext_hash_b)],
+        );
+        assert_ne!(
+            ak1, ak2,
+            "different extern content should produce different artifact key"
+        );
+    }
+
+    #[test]
+    fn rustc_artifact_key_stable() {
+        let ctx = make_rustc_context("/src/lib.rs", "2021");
+        let ck = ctx.context_key();
+
+        let src_hash = zccache_hash::hash_bytes(b"source");
+        let ext_hash = zccache_hash::hash_bytes(b"extern");
+
+        let ak1 = compute_rustc_artifact_key(
+            &ck,
+            &mut [(PathBuf::from("/src/lib.rs"), src_hash)],
+            &mut [("serde".to_string(), ext_hash)],
+        );
+        let ak2 = compute_rustc_artifact_key(
+            &ck,
+            &mut [(PathBuf::from("/src/lib.rs"), src_hash)],
+            &mut [("serde".to_string(), ext_hash)],
+        );
+        assert_eq!(ak1, ak2);
     }
 }

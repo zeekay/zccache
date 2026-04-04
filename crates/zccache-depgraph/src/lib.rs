@@ -10,6 +10,7 @@ pub mod context;
 pub mod depfile;
 pub mod graph;
 pub mod msvc_args;
+pub mod rustc_args;
 pub mod scanner;
 pub mod search_paths;
 pub mod session;
@@ -19,9 +20,13 @@ pub mod watcher_support;
 
 pub use args::{ParsedArgs, UserDepFlags};
 pub use compile_commands::{parse_compile_commands_json, CompileCommand};
-pub use context::{compute_artifact_key, ArtifactKey, CompileContext, ContextKey};
+pub use context::{
+    compute_artifact_key, compute_rustc_artifact_key, ArtifactKey, CompileContext, ContextKey,
+    RustcCompileContext,
+};
 pub use depfile::{prepare_depfile, DepfileError, DepfileStrategy};
 pub use graph::{CacheVerdict, ContextState, DepGraph, DepGraphStats};
+pub use rustc_args::{parse_rustc_args, ExternCrate, RustcParsedArgs};
 pub use scanner::{IncludeDirective, IncludeKind, ScanResult};
 pub use search_paths::IncludeSearchPaths;
 pub use session::{

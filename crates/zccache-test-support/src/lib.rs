@@ -110,6 +110,11 @@ pub fn find_clang() -> Option<PathBuf> {
     find_on_path("clang++")
 }
 
+/// Find `rustc` on PATH.
+pub fn find_rustc() -> Option<PathBuf> {
+    find_on_path("rustc")
+}
+
 // ─── Integration test timeout ───────────────────────────────────────────────
 
 /// Default timeout for integration tests that start a daemon / use IPC.

@@ -4,7 +4,7 @@
 [![macOS](https://github.com/zackees/zccache/actions/workflows/ci-macos.yml/badge.svg)](https://github.com/zackees/zccache/actions/workflows/ci-macos.yml)
 [![Windows](https://github.com/zackees/zccache/actions/workflows/ci-windows.yml/badge.svg)](https://github.com/zackees/zccache/actions/workflows/ci-windows.yml)
 
-### A blazing fast cpp compiler cache
+### A blazing fast compiler cache for C/C++ and Rust
 
 
 ![New Project](https://github.com/user-attachments/assets/f4d85974-0772-4710-b9f8-47bbd9439cef)
@@ -14,7 +14,39 @@ with aggressive file metadata caching and filesystem watching.
 
 ## Performance
 
-### Benchmark: 50 C++ files, 5 warm trials
+### Rust Benchmark: 50 .rs files, 5 warm trials
+
+| Scenario | Bare rustc | sccache | zccache | vs sccache | vs bare rustc |
+|:---------|----------:|--------:|--------:|-----------:|--------------:|
+| Build, Cold | 7.119s | 10.023s | 8.507s | 1.2x faster | 1.2x slower |
+| Build, Warm | 6.592s | 8.604s | **0.045s** | **193x faster** | **148x faster** |
+| Check, Cold | 4.289s | 7.056s | 5.060s | 1.4x faster | 1.2x slower |
+| Check, Warm | 3.716s | 5.922s | **0.049s** | **121x faster** | **76x faster** |
+
+> **Build** = `--emit=dep-info,metadata,link` (cargo build). **Check** = `--emit=dep-info,metadata` (cargo check).
+> **Cold** = first compile (empty cache). **Warm** = median of 5 subsequent runs.
+> Each file is an independent `rustc --crate-type lib` invocation with `--out-dir`
+> (same flags cargo passes).
+>
+> sccache gets cache hits but each hit still costs ~170ms subprocess overhead.
+> zccache serves hits in ~1ms via in-process IPC — no subprocess, no re-hashing.
+
+#### Why is zccache 120-193x faster than sccache on warm hits?
+
+The difference comes from **architecture**, not better caching:
+
+| | sccache | zccache |
+|---|---------|---------|
+| **IPC model** | Subprocess per invocation (fork + exec + connect) | Persistent daemon, single IPC message per compile |
+| **Cache lookup** | Client hashes inputs, sends to server, server checks disk | Daemon has inputs in memory (file watcher + metadata cache) |
+| **On hit** | Server reads artifact from disk, sends back via IPC | Daemon hardlinks cached file to output path (1 syscall) |
+| **Per-hit cost** | ~170ms (process spawn + hash + disk I/O + IPC) | ~1ms (in-memory lookup + hardlink) |
+
+sccache was designed for **distributed** caching (S3, GCS, Redis) where network
+latency dwarfs local overhead. zccache is designed for **local-first** use where
+every millisecond of wrapper overhead matters.
+
+### C++ Benchmark: 50 C++ files, 5 warm trials
 
 | Scenario | Bare Clang | sccache | zccache | vs sccache | vs bare clang |
 |:---------|----------:|--------:|--------:|-----------:|--------------:|
@@ -64,7 +96,29 @@ zccache --version
 
 Use it as a drop-in replacement for sccache — just substitute `zccache`:
 
-### Build system integration (ninja, meson, cmake, make)
+### Rust / Cargo integration
+
+```bash
+# cargo build (cached)
+RUSTC_WRAPPER=zccache cargo build
+
+# cargo check (cached)
+RUSTC_WRAPPER=zccache cargo check
+```
+
+Add to `.cargo/config.toml` for automatic use:
+
+```toml
+[build]
+rustc-wrapper = "zccache"
+```
+
+Supports `--emit=metadata` (cargo check), `--emit=dep-info,metadata,link` (cargo build),
+extern crate content hashing (dependency changes cause cache misses), and all
+cacheable crate types (`lib`, `rlib`, `staticlib`). Proc-macro and binary crates
+are passed through without caching (same as sccache).
+
+### C/C++ build system integration (ninja, meson, cmake, make)
 
 zccache is a **drop-in compiler wrapper**. Point your build system's compiler
 at `zccache <real-compiler>` and it handles the rest:
