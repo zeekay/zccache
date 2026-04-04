@@ -87,9 +87,11 @@ fn canon(path: &Path) -> PathBuf {
     }
 }
 
-/// Canonicalize a cache file path. The file may not exist yet, so
-/// canonicalize the parent directory and join the filename.
-fn canon_cache_file(path: &Path) -> PathBuf {
+/// Canonicalize a path that may not exist yet.
+/// Tries full canonicalization first, then falls back to canonicalizing
+/// the parent directory and joining the filename. Used for cache file
+/// paths and for watcher event paths (removed files no longer exist).
+fn canon_maybe_missing(path: &Path) -> PathBuf {
     if let Ok(c) = path.canonicalize() {
         return strip_win_prefix(c);
     }
@@ -123,7 +125,7 @@ impl FingerprintManager {
         exclude: &[String],
     ) -> FpCheckResult {
         let canon_root = canon(root);
-        let canon_cf = canon_cache_file(cache_file);
+        let canon_cf = canon_maybe_missing(cache_file);
         let key = WatchKey {
             root: canon_root.clone(),
             cache_file: canon_cf,
@@ -265,7 +267,7 @@ impl FingerprintManager {
     /// check (generation == checked_generation). If on_batch bumped the
     /// generation between check and mark_success, dirty stays set.
     pub fn mark_success(&self, cache_file: &Path) {
-        let canon_cf = canon_cache_file(cache_file);
+        let canon_cf = canon_maybe_missing(cache_file);
         for mut entry in self.watches.iter_mut() {
             if entry.key().cache_file == canon_cf {
                 let w = entry.value_mut();
@@ -286,7 +288,7 @@ impl FingerprintManager {
 
     /// Mark the watch as failed.
     pub fn mark_failure(&self, cache_file: &Path) {
-        let canon_cf = canon_cache_file(cache_file);
+        let canon_cf = canon_maybe_missing(cache_file);
         for mut entry in self.watches.iter_mut() {
             if entry.key().cache_file == canon_cf {
                 entry.value_mut().status = "failure".into();
@@ -298,7 +300,7 @@ impl FingerprintManager {
 
     /// Invalidate (remove) a watch entirely.
     pub fn invalidate(&self, cache_file: &Path) {
-        let canon_cf = canon_cache_file(cache_file);
+        let canon_cf = canon_maybe_missing(cache_file);
         self.watches.retain(|key, _| key.cache_file != canon_cf);
         tracing::debug!("fingerprint invalidate: {}", cache_file.display());
     }
@@ -317,12 +319,13 @@ impl FingerprintManager {
             let root = &watch.root;
 
             for path in changed {
+                let path = canon(path);
                 if let Ok(rel) = path.strip_prefix(root) {
                     let rel_str = rel.to_string_lossy().replace('\\', "/");
                     // Re-hash the changed file.
-                    let mtime = zccache_fingerprint::persist::mtime_ns(path).unwrap_or(0);
-                    let size = zccache_fingerprint::persist::file_size(path).unwrap_or(0);
-                    let hash_hex = match zccache_hash::hash_file(path) {
+                    let mtime = zccache_fingerprint::persist::mtime_ns(&path).unwrap_or(0);
+                    let size = zccache_fingerprint::persist::file_size(&path).unwrap_or(0);
+                    let hash_hex = match zccache_hash::hash_file(&path) {
                         Ok(h) => h.to_hex(),
                         Err(_) => String::new(),
                     };
@@ -357,6 +360,7 @@ impl FingerprintManager {
             }
 
             for path in removed {
+                let path = canon_maybe_missing(path);
                 if let Ok(rel) = path.strip_prefix(root) {
                     let rel_str = rel.to_string_lossy().replace('\\', "/");
                     if watch.files.remove(&rel_str).is_some() {
