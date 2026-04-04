@@ -13,6 +13,9 @@ crate-type = ["cdylib", "lib"]
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+mimalloc = { workspace = true }
+
 [[bin]]
 name = "zccache-fp"
 path = "src/main.rs"

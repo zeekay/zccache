@@ -18,6 +18,10 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
