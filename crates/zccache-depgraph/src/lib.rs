@@ -14,6 +14,7 @@ pub mod rustc_args;
 pub mod scanner;
 pub mod search_paths;
 pub mod session;
+pub mod show_includes;
 pub mod snapshot;
 pub mod system_includes;
 pub mod watcher_support;

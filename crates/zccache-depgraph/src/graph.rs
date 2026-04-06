@@ -851,6 +851,44 @@ mod tests {
     }
 
     #[test]
+    fn show_includes_enables_cache_hit_after_computed() {
+        // Simulates the MSVC /showIncludes optimization:
+        // 1. First update from scanner: has_computed=true → NeedsPreprocessor
+        // 2. Second update from /showIncludes: has_computed=false → Hit
+        let graph = DepGraph::new();
+        let key = graph.register(make_ctx("/src/a.c"));
+
+        // Scanner found #include MACRO → has_computed=true
+        let scanner_scan = ScanResult {
+            resolved: vec![PathBuf::from("/inc/known.h")],
+            unresolved: Vec::new(),
+            has_computed: true,
+        };
+        graph.update(&key, scanner_scan, dummy_hash);
+
+        let verdict = graph.check(&key, always_fresh, dummy_hash);
+        assert!(matches!(verdict, CacheVerdict::NeedsPreprocessor));
+
+        // /showIncludes resolved all includes → has_computed=false
+        let depfile_scan = ScanResult {
+            resolved: vec![
+                PathBuf::from("/inc/known.h"),
+                PathBuf::from("/inc/macro_resolved.h"),
+            ],
+            unresolved: Vec::new(),
+            has_computed: false,
+        };
+        graph.update(&key, depfile_scan, dummy_hash);
+
+        // Now should be a hit.
+        let verdict = graph.check(&key, always_fresh, dummy_hash);
+        assert!(
+            matches!(verdict, CacheVerdict::Hit { .. }),
+            "expected Hit after /showIncludes update, got {verdict:?}"
+        );
+    }
+
+    #[test]
     fn update_sets_warm_state() {
         let graph = DepGraph::new();
         let key = graph.register(make_ctx("/src/a.c"));

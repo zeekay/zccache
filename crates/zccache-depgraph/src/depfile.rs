@@ -130,6 +130,8 @@ pub enum DepfileStrategy {
     UserSpecified { path: PathBuf },
     /// User had `-MD` but no `-MF` — derive path from output stem.
     UserDefault { path: PathBuf },
+    /// MSVC `/showIncludes` — parse stderr after compilation.
+    ShowIncludes,
     /// Compiler doesn't support depfiles — use fallback scanner.
     Unsupported,
 }
@@ -302,7 +304,7 @@ fn split_and_unescape(deps: &str) -> Vec<String> {
 /// On Windows, `std::fs::canonicalize` produces `\\?\` extended-length paths.
 /// These must be stripped so paths match the format used by the file watcher
 /// (which also strips `\\?\`), ensuring journal/metadata lookups work correctly.
-fn canonicalize_path(path: &Path, cwd: &Path) -> PathBuf {
+pub(crate) fn canonicalize_path(path: &Path, cwd: &Path) -> PathBuf {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| {
         if path.is_absolute() {
             path.to_path_buf()
@@ -315,7 +317,7 @@ fn canonicalize_path(path: &Path, cwd: &Path) -> PathBuf {
 
 /// Strip the `\\?\` extended-length prefix on Windows.
 /// No-op on other platforms.
-fn strip_win_prefix(path: PathBuf) -> PathBuf {
+pub(crate) fn strip_win_prefix(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
         let s = path.to_string_lossy();

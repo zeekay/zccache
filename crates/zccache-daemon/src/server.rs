@@ -2831,12 +2831,24 @@ async fn handle_compile(
     // ── Phase: compiler exec (with depfile injection) ────────────────
     let t_exec = std::time::Instant::now();
     let supports_depfile = compilation.family.supports_depfile();
-    let (extra_args, depfile_strategy) = zccache_depgraph::depfile::prepare_depfile(
+    let (mut extra_args, mut depfile_strategy) = zccache_depgraph::depfile::prepare_depfile(
         supports_depfile,
         &dep_flags,
         &output_path,
         &state.depfile_tmpdir,
     );
+
+    // For MSVC, use /showIncludes to get complete dependency info
+    // (equivalent to depfiles for gcc/clang). This enables cache hits
+    // for files with computed includes like `#include MACRO`.
+    if compilation.family == zccache_compiler::CompilerFamily::Msvc
+        && depfile_strategy == DepfileStrategy::Unsupported
+    {
+        if !dep_flags.has_md {
+            extra_args.push("/showIncludes".to_string());
+        }
+        depfile_strategy = DepfileStrategy::ShowIncludes;
+    }
 
     // Combine expanded_args + extra_args for response-file length check.
     // Only allocates when extra_args is non-empty.
@@ -2884,7 +2896,20 @@ async fn handle_compile(
 
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = Arc::new(output.stdout);
-    let stderr = Arc::new(output.stderr);
+
+    // For MSVC /showIncludes: parse dependency info from stderr and
+    // filter out the /showIncludes lines before returning to the client.
+    let (show_includes_scan, stderr_bytes) = if depfile_strategy == DepfileStrategy::ShowIncludes {
+        let (scan, filtered) = zccache_depgraph::show_includes::parse_show_includes(
+            &output.stderr,
+            &source_path,
+            &cwd_path,
+        );
+        (Some(scan), filtered)
+    } else {
+        (None, output.stderr)
+    };
+    let stderr = Arc::new(stderr_bytes);
 
     if exit_code != 0 {
         state.stats.record_error();
@@ -2970,6 +2995,12 @@ async fn handle_compile(
                             )
                         }
                     }
+                }
+                DepfileStrategy::ShowIncludes => {
+                    // Already parsed from stderr above.
+                    show_includes_scan.unwrap_or_else(|| {
+                        zccache_depgraph::scanner::scan_recursive(&source_path, &ctx.include_search)
+                    })
                 }
                 DepfileStrategy::Unsupported => {
                     zccache_depgraph::scanner::scan_recursive(&source_path, &ctx.include_search)
