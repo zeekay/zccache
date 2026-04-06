@@ -97,14 +97,20 @@ pub fn is_link_invocation(tool: &str, args: &[String]) -> bool {
 
     if effective_args
         .iter()
-        .any(|a| a == "-c" || a == "-E" || a == "-S")
+        .any(|a| a == "-c" || a == "-E" || a == "-S" || a == "--precompile")
     {
         return false;
     }
-    // Check for `-x c++-header` or `-x c-header` (PCH generation mode)
+    // Check for `-x` language modes that imply compilation (not linking):
+    // header (PCH) and header-unit (C++20) imply compilation without `-c`.
+    // Module mode does NOT imply compilation — it needs `-c` or `--precompile`.
     for pair in effective_args.windows(2) {
-        if pair[0] == "-x" && super::is_header_language(&pair[1]) {
-            return false;
+        if pair[0] == "-x" {
+            if let Some(mode) = super::source_mode_from_language(&pair[1]) {
+                if mode.implies_compilation() {
+                    return false;
+                }
+            }
         }
     }
     true
@@ -1689,18 +1695,9 @@ mod tests {
     }
 
     #[test]
-    fn is_link_pch_exact_match() {
-        // `-x c-header-unit` is NOT a PCH header language — exact match only.
-        // Without -c, this should be treated as a link invocation.
-        assert!(is_link_invocation(
-            "clang++",
-            &args(&["-x", "c-header-unit", "foo.h", "-o", "foo.pcm"])
-        ));
-        assert!(is_link_invocation(
-            "clang++",
-            &args(&["-x", "c++-header-unit", "foo.h", "-o", "foo.pcm"])
-        ));
-        // But exact `c-header` and `c++-header` should still NOT be link
+    fn is_link_header_and_module_modes_not_link() {
+        // All `-x` language modes that imply compilation should NOT be link invocations.
+        // Header (PCH):
         assert!(!is_link_invocation(
             "clang++",
             &args(&["-x", "c-header", "foo.h", "-o", "foo.gch"])
@@ -1708,6 +1705,25 @@ mod tests {
         assert!(!is_link_invocation(
             "clang++",
             &args(&["-x", "c++-header", "foo.h", "-o", "foo.pch"])
+        ));
+        // Header unit (C++20):
+        assert!(!is_link_invocation(
+            "clang++",
+            &args(&["-x", "c-header-unit", "foo.h", "-o", "foo.pcm"])
+        ));
+        assert!(!is_link_invocation(
+            "clang++",
+            &args(&["-x", "c++-header-unit", "foo.h", "-o", "foo.pcm"])
+        ));
+        // Module mode does NOT imply compilation — without -c/--precompile, it's still a link.
+        assert!(is_link_invocation(
+            "clang++",
+            &args(&["-x", "c++-module", "interface.cpp", "-o", "interface"])
+        ));
+        // --precompile is also not a link invocation:
+        assert!(!is_link_invocation(
+            "clang++",
+            &args(&["--precompile", "module.cppm", "-o", "module.pcm"])
         ));
     }
 

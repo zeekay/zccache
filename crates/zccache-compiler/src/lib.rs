@@ -95,14 +95,59 @@ pub struct CacheableCompilation {
     pub unknown_flags: Vec<String>,
 }
 
-/// Check if a `-x` language value is a header language (PCH generation).
-/// Uses exact match — does not match hypothetical values like `c-header-unit`.
-fn is_header_language(lang: &str) -> bool {
-    matches!(lang, "c-header" | "c++-header")
+/// The language mode for a source file, as determined by `-x <lang>` or file extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceMode {
+    /// Normal C/C++ source (`.c`, `.cpp`, etc.) — compiles to `.o`.
+    Normal,
+    /// PCH header (`-x c-header` / `-x c++-header`) — compiles to `.pch`/`.gch`.
+    Header,
+    /// Header unit (`-x c-header-unit` / `-x c++-header-unit`) — compiles to `.pcm`.
+    HeaderUnit,
+    /// Module interface (`-x c++-module` or `.cppm`/`.ixx`) — `.pcm` with `--precompile`, `.o` with `-c`.
+    Module,
+}
+
+impl SourceMode {
+    /// Whether this mode implies compilation without an explicit `-c` or `--precompile` flag.
+    /// Header and header-unit modes imply compilation (like PCH generation).
+    /// Module mode does NOT — it requires `-c` or `--precompile`.
+    pub(crate) fn implies_compilation(self) -> bool {
+        matches!(self, SourceMode::Header | SourceMode::HeaderUnit)
+    }
+}
+
+/// Map a `-x <lang>` value to the corresponding source mode.
+/// Returns `None` for unrecognized language values (no special mode).
+fn source_mode_from_language(lang: &str) -> Option<SourceMode> {
+    match lang {
+        "c-header" | "c++-header" => Some(SourceMode::Header),
+        "c-header-unit" | "c++-header-unit" => Some(SourceMode::HeaderUnit),
+        "c++-module" => Some(SourceMode::Module),
+        _ => None,
+    }
 }
 
 /// Source file extensions we recognize as C/C++.
-const SOURCE_EXTENSIONS: &[&str] = &["c", "cc", "cpp", "cxx", "c++", "C", "m", "mm", "i", "ii"];
+const SOURCE_EXTENSIONS: &[&str] = &[
+    "c", "cc", "cpp", "cxx", "c++", "C", "m", "mm", "i", "ii", "cppm", "ixx",
+];
+
+/// File extensions that imply module-interface mode even without `-x c++-module`.
+const MODULE_EXTENSIONS: &[&str] = &["cppm", "ixx"];
+
+/// Determine the source mode implied by a file extension.
+fn source_mode_from_extension(path: &str) -> SourceMode {
+    if let Some(ext) = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        if MODULE_EXTENSIONS.contains(&ext) {
+            return SourceMode::Module;
+        }
+    }
+    SourceMode::Normal
+}
 
 /// Detect the compiler family from the compiler path.
 #[must_use]
@@ -157,16 +202,43 @@ fn is_source_file(path: &str) -> bool {
 /// the filename. This prevents spurious `.pch` files from being written
 /// into the source tree when a compilation falls back to `default_output`
 /// (e.g., during cache restoration without an explicit `-o` flag).
-fn default_output(source: &str, family: CompilerFamily, is_header: bool) -> String {
-    if is_header {
-        if let Some(ext) = family.pch_extension() {
+fn default_output(
+    source: &str,
+    family: CompilerFamily,
+    mode: SourceMode,
+    has_precompile: bool,
+) -> String {
+    match mode {
+        SourceMode::Header => {
+            // PCH: filename.pch (Clang) or filename.gch (GCC)
+            if let Some(ext) = family.pch_extension() {
+                let filename = std::path::Path::new(source)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(source);
+                return format!("{filename}.{ext}");
+            }
+        }
+        SourceMode::HeaderUnit => {
+            // Header unit: filename.pcm
             let filename = std::path::Path::new(source)
                 .file_name()
                 .and_then(|f| f.to_str())
                 .unwrap_or(source);
-            return format!("{filename}.{ext}");
+            return format!("{filename}.pcm");
+        }
+        SourceMode::Module | SourceMode::Normal => {
+            if has_precompile {
+                // --precompile: stem.pcm
+                let stem = std::path::Path::new(source)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("a");
+                return format!("{stem}.pcm");
+            }
         }
     }
+    // Default: stem.o
     let stem = std::path::Path::new(source)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -221,9 +293,10 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     }
 
     let mut has_c_flag = false;
-    let mut source_files: Vec<(String, usize, bool)> = Vec::new();
+    let mut has_precompile_flag = false;
+    let mut source_files: Vec<(String, usize, SourceMode)> = Vec::new();
     let mut output_file: Option<String> = None;
-    let mut header_mode = false;
+    let mut current_mode = SourceMode::Normal;
     let mut unknown_flags: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -249,6 +322,14 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             continue;
         }
 
+        // --precompile (Clang): compile module interface to BMI (.pcm).
+        // Acts like -c but for module output.
+        if arg == "--precompile" {
+            has_precompile_flag = true;
+            i += 1;
+            continue;
+        }
+
         // -o takes the next arg as output file, or -o<path> (concatenated)
         if arg == "-o" {
             if let Some(next) = args.get(i + 1) {
@@ -267,7 +348,8 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
         // Flags that take a value in the next arg — skip both flag and value
         if let Some(&flag) = FLAGS_WITH_VALUE.iter().find(|&&f| f == arg.as_str()) {
             if flag == "-x" && i + 1 < args.len() {
-                header_mode = is_header_language(&args[i + 1]);
+                current_mode =
+                    source_mode_from_language(&args[i + 1]).unwrap_or(SourceMode::Normal);
             }
             i += 2;
             continue;
@@ -280,18 +362,26 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             continue;
         }
 
-        // Positional arg — source file candidate
-        if is_source_file(arg) || header_mode {
-            source_files.push((arg.clone(), i, header_mode));
+        // Positional arg — source file candidate.
+        // In a special mode (Header/HeaderUnit/Module), any positional arg is a source.
+        // Otherwise, check by file extension. Module extensions (.cppm/.ixx) also set
+        // the effective mode to Module for correct default output.
+        let effective_mode = if current_mode != SourceMode::Normal {
+            current_mode
+        } else {
+            source_mode_from_extension(arg)
+        };
+        if is_source_file(arg) || current_mode != SourceMode::Normal {
+            source_files.push((arg.clone(), i, effective_mode));
         }
 
         i += 1;
     }
 
-    // `-x c++-header` / `-x c-header` implies compilation (PCH generation)
-    // even without an explicit `-c` flag. Clang treats header mode as
-    // "compile to PCH, don't link", so `-c` is redundant.
-    if !has_c_flag && !header_mode {
+    // Header and header-unit modes imply compilation (no -c needed).
+    // Module mode does NOT imply compilation alone — requires -c or --precompile.
+    // --precompile also implies compilation (like -c but for BMI output).
+    if !has_c_flag && !has_precompile_flag && !current_mode.implies_compilation() {
         return ParsedInvocation::NonCacheable {
             reason: "no -c flag (likely a link invocation)".to_string(),
         };
@@ -312,11 +402,11 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
         let shared_args: Arc<[String]> = Arc::from(args.to_vec());
         let compilations = source_files
             .iter()
-            .map(|(src, _, is_header)| CacheableCompilation {
+            .map(|(src, _, mode)| CacheableCompilation {
                 compiler: PathBuf::from(compiler),
                 family,
                 source_file: PathBuf::from(src),
-                output_file: PathBuf::from(default_output(src, family, *is_header)),
+                output_file: PathBuf::from(default_output(src, family, *mode, has_precompile_flag)),
                 original_args: Arc::clone(&shared_args),
                 unknown_flags: unknown_flags.clone(),
             })
@@ -329,8 +419,9 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     }
 
     // Single source file
-    let (source, _, is_header) = source_files.into_iter().next().unwrap();
-    let output = output_file.unwrap_or_else(|| default_output(&source, family, is_header));
+    let (source, _, mode) = source_files.into_iter().next().unwrap();
+    let output =
+        output_file.unwrap_or_else(|| default_output(&source, family, mode, has_precompile_flag));
 
     ParsedInvocation::Cacheable(CacheableCompilation {
         compiler: PathBuf::from(compiler),
@@ -973,30 +1064,36 @@ mod tests {
     }
 
     #[test]
-    fn header_language_exact_match_no_prefix() {
-        // `-x c-header-unit` should NOT activate header_mode (exact match only).
-        // With old starts_with("c-header"), this would have set header_mode=true.
+    fn header_unit_c_is_cacheable() {
+        // `-x c-header-unit` activates header-unit mode (C++20 module support).
+        // Header-unit mode implies compilation, producing .pcm output.
         let result = parse_invocation(
             "clang++",
             &args(&["-x", "c-header-unit", "foo.h", "-o", "foo.pcm"]),
         );
-        assert!(
-            matches!(result, ParsedInvocation::NonCacheable { .. }),
-            "c-header-unit should not activate header mode, got: {result:?}"
-        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("foo.h"));
+                assert_eq!(c.output_file, PathBuf::from("foo.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
     }
 
     #[test]
-    fn header_language_exact_match_cpp_no_prefix() {
-        // `-x c++-header-unit` should NOT activate header_mode.
+    fn header_unit_cpp_is_cacheable() {
+        // `-x c++-header-unit` activates header-unit mode (C++20 module support).
         let result = parse_invocation(
             "clang++",
             &args(&["-x", "c++-header-unit", "foo.h", "-o", "foo.pcm"]),
         );
-        assert!(
-            matches!(result, ParsedInvocation::NonCacheable { .. }),
-            "c++-header-unit should not activate header mode, got: {result:?}"
-        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("foo.h"));
+                assert_eq!(c.output_file, PathBuf::from("foo.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -1681,5 +1778,378 @@ mod tests {
             ]),
         );
         assert!(matches!(result, ParsedInvocation::Cacheable(_)));
+    }
+
+    // ─── C++20 Module support tests ─────────────────────────────────
+
+    // Group A: Source extension recognition (.cppm, .ixx)
+
+    #[test]
+    fn cppm_extension_is_cacheable() {
+        let result = parse_invocation("clang++", &args(&["-c", "module.cppm", "-o", "module.pcm"]));
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("module.cppm"));
+                assert_eq!(c.output_file, PathBuf::from("module.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ixx_extension_is_cacheable() {
+        let result = parse_invocation("g++", &args(&["-c", "module.ixx", "-o", "module.o"]));
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("module.ixx"));
+                assert_eq!(c.output_file, PathBuf::from("module.o"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cppm_default_output_with_precompile_is_pcm() {
+        // --precompile without -o should produce stem.pcm
+        let result = parse_invocation("clang++", &args(&["--precompile", "module.cppm"]));
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("module.cppm"));
+                assert_eq!(c.output_file, PathBuf::from("module.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cppm_default_output_with_c_flag_is_object() {
+        // -c on a .cppm without -o should produce stem.o (normal object)
+        let result = parse_invocation("clang++", &args(&["-c", "module.cppm"]));
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("module.cppm"));
+                assert_eq!(c.output_file, PathBuf::from("module.o"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cppm_multi_file() {
+        let result = parse_invocation("clang++", &args(&["-c", "a.cppm", "b.cppm"]));
+        match result {
+            ParsedInvocation::MultiFile { compilations, .. } => {
+                assert_eq!(compilations.len(), 2);
+                assert_eq!(compilations[0].source_file, PathBuf::from("a.cppm"));
+                assert_eq!(compilations[1].source_file, PathBuf::from("b.cppm"));
+            }
+            other => panic!("expected MultiFile, got: {other:?}"),
+        }
+    }
+
+    // Group B: -x c++-module language mode
+
+    #[test]
+    fn x_cpp_module_with_precompile_is_cacheable() {
+        let result = parse_invocation(
+            "clang++",
+            &args(&[
+                "-x",
+                "c++-module",
+                "--precompile",
+                "interface.cpp",
+                "-o",
+                "interface.pcm",
+            ]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("interface.cpp"));
+                assert_eq!(c.output_file, PathBuf::from("interface.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x_cpp_module_with_c_flag_is_cacheable() {
+        let result = parse_invocation(
+            "clang++",
+            &args(&[
+                "-x",
+                "c++-module",
+                "-c",
+                "interface.cpp",
+                "-o",
+                "interface.o",
+            ]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("interface.cpp"));
+                assert_eq!(c.output_file, PathBuf::from("interface.o"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x_cpp_module_without_c_or_precompile_is_non_cacheable() {
+        // Module mode alone does NOT imply compilation (unlike header mode).
+        // Without -c or --precompile, this is a link invocation.
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-module", "interface.cpp", "-o", "interface"]),
+        );
+        assert!(
+            matches!(result, ParsedInvocation::NonCacheable { .. }),
+            "-x c++-module without -c or --precompile should be non-cacheable, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn x_cpp_module_accepts_non_source_extension() {
+        // -x c++-module should allow any positional arg as a source file
+        // (same behavior as -x c++-header with non-standard extensions).
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-module", "--precompile", "interface.mpp"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("interface.mpp"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x_cpp_module_default_output_precompile() {
+        // --precompile without -o → stem.pcm
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-module", "--precompile", "interface.cpp"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.output_file, PathBuf::from("interface.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x_cpp_module_default_output_c_flag() {
+        // -c without -o → stem.o (even in module mode)
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-module", "-c", "interface.cpp"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.output_file, PathBuf::from("interface.o"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x_cpp_module_reset_by_x_cpp() {
+        // -x c++ resets module mode, just like it resets header mode.
+        let result = parse_invocation(
+            "clang++",
+            &args(&[
+                "-x",
+                "c++-module",
+                "--precompile",
+                "interface.mpp",
+                "-x",
+                "c++",
+                "-c",
+                "main.cpp",
+            ]),
+        );
+        match result {
+            ParsedInvocation::MultiFile { compilations, .. } => {
+                assert_eq!(compilations.len(), 2);
+                assert_eq!(compilations[0].source_file, PathBuf::from("interface.mpp"));
+                assert_eq!(compilations[1].source_file, PathBuf::from("main.cpp"));
+            }
+            other => panic!("expected MultiFile, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x_cpp_module_implies_compilation_with_precompile() {
+        // --precompile without -c is still a cacheable compilation.
+        let result = parse_invocation(
+            "clang++",
+            &args(&[
+                "-x",
+                "c++-module",
+                "--precompile",
+                "interface.cpp",
+                "-o",
+                "interface.pcm",
+            ]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("interface.cpp"));
+                assert_eq!(c.output_file, PathBuf::from("interface.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    // Group C: Header units (-x c++-header-unit / -x c-header-unit)
+
+    #[test]
+    fn x_cpp_header_unit_with_precompile_is_cacheable() {
+        let result = parse_invocation(
+            "clang++",
+            &args(&[
+                "-x",
+                "c++-header-unit",
+                "--precompile",
+                "foo.h",
+                "-o",
+                "foo.pcm",
+            ]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("foo.h"));
+                assert_eq!(c.output_file, PathBuf::from("foo.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x_c_header_unit_with_c_flag_is_cacheable() {
+        let result = parse_invocation(
+            "gcc",
+            &args(&["-x", "c-header-unit", "-c", "foo.h", "-o", "foo.pcm"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("foo.h"));
+                assert_eq!(c.output_file, PathBuf::from("foo.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x_cpp_header_unit_default_output_is_pcm() {
+        // Header unit without -o → filename.pcm
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-header-unit", "--precompile", "foo.h"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.output_file, PathBuf::from("foo.h.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x_cpp_header_unit_implies_compilation() {
+        // Header-unit mode implies compilation (no -c needed), like header mode.
+        let result = parse_invocation(
+            "clang++",
+            &args(&["-x", "c++-header-unit", "foo.h", "-o", "foo.pcm"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("foo.h"));
+                assert_eq!(c.output_file, PathBuf::from("foo.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    // Group D: --precompile flag handling
+
+    #[test]
+    fn precompile_on_normal_cpp_is_cacheable() {
+        // --precompile on a .cpp (with export module inside) is valid.
+        let result = parse_invocation("clang++", &args(&["--precompile", "foo.cpp"]));
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
+                assert_eq!(c.output_file, PathBuf::from("foo.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn precompile_without_source_is_non_cacheable() {
+        let result = parse_invocation("clang++", &args(&["--precompile", "-O2"]));
+        assert!(
+            matches!(result, ParsedInvocation::NonCacheable { .. }),
+            "--precompile without source should be non-cacheable, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn precompile_and_c_flag_together() {
+        // Both --precompile and -c can coexist. --precompile takes precedence
+        // for default output (produces .pcm, not .o).
+        let result = parse_invocation(
+            "clang++",
+            &args(&["--precompile", "-c", "module.cppm", "-o", "module.pcm"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("module.cppm"));
+                assert_eq!(c.output_file, PathBuf::from("module.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    // Group E: GCC -fmodules-ts interaction
+
+    #[test]
+    fn gcc_fmodules_ts_with_cppm_is_cacheable() {
+        // -fmodules-ts falls through to unknown_flags, which is fine.
+        let result = parse_invocation(
+            "g++",
+            &args(&["-fmodules-ts", "-c", "module.cppm", "-o", "module.o"]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("module.cppm"));
+                assert_eq!(c.output_file, PathBuf::from("module.o"));
+                assert!(c.unknown_flags.contains(&"-fmodules-ts".to_string()));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gcc_fmodules_ts_with_x_module_precompile() {
+        let result = parse_invocation(
+            "g++",
+            &args(&[
+                "-fmodules-ts",
+                "-x",
+                "c++-module",
+                "--precompile",
+                "interface.cpp",
+            ]),
+        );
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, PathBuf::from("interface.cpp"));
+                assert_eq!(c.output_file, PathBuf::from("interface.pcm"));
+            }
+            other => panic!("expected cacheable, got: {other:?}"),
+        }
     }
 }
