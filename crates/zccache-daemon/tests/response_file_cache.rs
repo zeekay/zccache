@@ -700,6 +700,82 @@ async fn daemon_spill_rsp_preserves_fbuild_style_args() {
     h.shutdown().await;
 }
 
+#[cfg(windows)]
+#[tokio::test]
+#[ignore] // integration: spawns clang and exercises Windows multi-file partial-hit spill path
+async fn daemon_spill_rsp_preserves_multi_file_partial_hits() {
+    let mut h = match TestHarness::new().await {
+        Some(h) => h,
+        None => return,
+    };
+
+    h.write_file("inc/shared.h", "#define SHARED 7\n");
+    h.write_file(
+        "a.c",
+        "#include \"shared.h\"\nint fa(void) { return SHARED + 1; }\n",
+    );
+    h.write_file(
+        "b.c",
+        "#include \"shared.h\"\nint fb(void) { return SHARED + 2; }\n",
+    );
+    h.write_file("includes.rsp", "'-Iinc'\n");
+
+    let mut outer_args = vec![
+        "-c".to_string(),
+        "a.c".to_string(),
+        "b.c".to_string(),
+        "@includes.rsp".to_string(),
+    ];
+    outer_args = padded_rsp_args(outer_args);
+    h.write_file("outer.rsp", &outer_args.join("\n"));
+
+    let (exit, cached) = h.compile_with_args(&["@outer.rsp"]).await;
+    assert_eq!(exit, 0);
+    assert!(!cached, "first multi-file compile must miss");
+    assert!(
+        h.path("a.o").exists(),
+        "a.o should exist after first compile"
+    );
+    assert!(
+        h.path("b.o").exists(),
+        "b.o should exist after first compile"
+    );
+
+    std::fs::remove_file(h.path("a.o")).unwrap();
+    std::fs::remove_file(h.path("b.o")).unwrap();
+    let (exit, cached) = h.compile_with_args(&["@outer.rsp"]).await;
+    assert_eq!(exit, 0);
+    assert!(cached, "second multi-file compile should be all cache hits");
+    assert!(h.path("a.o").exists(), "a.o should be restored from cache");
+    assert!(h.path("b.o").exists(), "b.o should be restored from cache");
+
+    h.write_file(
+        "a.c",
+        "#include \"shared.h\"\nint fa(void) { return SHARED + 11; }\n",
+    );
+    // The watcher pipeline is asynchronous; wait for the source edit to be
+    // journaled so this compile exercises the intended mixed hit/miss path.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    std::fs::remove_file(h.path("a.o")).unwrap();
+    std::fs::remove_file(h.path("b.o")).unwrap();
+    let (exit, cached) = h.compile_with_args(&["@outer.rsp"]).await;
+    assert_eq!(exit, 0);
+    assert!(
+        !cached,
+        "changing one source should force a partial miss, not a full bypass"
+    );
+    assert!(
+        h.path("a.o").exists(),
+        "a.o should be rebuilt when its source changes"
+    );
+    assert!(
+        h.path("b.o").exists(),
+        "b.o should still be restored on the mixed hit/miss path"
+    );
+
+    h.shutdown().await;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // ERROR HANDLING
 // ═══════════════════════════════════════════════════════════════════════════════
