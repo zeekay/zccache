@@ -28,7 +28,7 @@ zccache-protocol = { workspace = true }
 zccache-ipc = { workspace = true }
 rayon = { workspace = true }
 tempfile = { workspace = true }
-pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+pyo3 = { version = "0.23", features = ["extension-module", "generate-import-lib"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true }

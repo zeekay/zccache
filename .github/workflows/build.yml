@@ -25,6 +25,7 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             binary_ext: ""
+            include_python: false
 
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
@@ -32,10 +33,12 @@ jobs:
             cross: true
             linker: aarch64-unknown-linux-musl-gcc
             strip: aarch64-unknown-linux-musl-strip
+            include_python: false
 
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             binary_ext: ""
+            include_python: true
 
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
@@ -43,22 +46,27 @@ jobs:
             cross: true
             linker: aarch64-linux-gnu-gcc
             strip: aarch64-linux-gnu-strip
+            include_python: true
 
           - target: x86_64-apple-darwin
             os: macos-14
             binary_ext: ""
+            include_python: true
 
           - target: aarch64-apple-darwin
             os: macos-latest
             binary_ext: ""
+            include_python: true
 
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             binary_ext: ".exe"
+            include_python: true
 
           - target: aarch64-pc-windows-msvc
             os: windows-latest
             binary_ext: ".exe"
+            include_python: true
 
     steps:
       - uses: actions/checkout@v4
@@ -71,7 +79,7 @@ jobs:
           target: ${{ matrix.target }}
           binary_ext: ${{ matrix.binary_ext }}
           cache_key: ${{ matrix.target }}
-          include_python: "true"
+          include_python: ${{ matrix.include_python && 'true' || 'false' }}
           python_version: "3.13"
           linker: ${{ matrix.linker || '' }}
           strip: ${{ matrix.strip || '' }}

@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: dtolnay/rust-toolchain@nightly-2025-09-18
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview, rust-src, rustc-dev
       - uses: Swatinem/rust-cache@v2
@@ -39,7 +39,7 @@ jobs:
       - name: Check Dylint Library Formatting
         run: cargo fmt --manifest-path dylints/ban_std_pathbuf/Cargo.toml --all -- --check
       - name: Test Dylint Library
-        run: cargo +nightly-2025-09-18 test --manifest-path dylints/ban_std_pathbuf/Cargo.toml
+        run: cargo +nightly test --manifest-path dylints/ban_std_pathbuf/Cargo.toml
       - name: Run Dylint
         run: cargo dylint --all --workspace
 

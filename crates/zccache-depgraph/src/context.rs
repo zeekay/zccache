@@ -477,7 +477,6 @@ mod tests {
     use super::*;
     use crate::args::UserDepFlags;
     use crate::rustc_args::ExternCrate;
-    use zccache_hash::hash_bytes;
 
     fn make_context(source: &str, user_dirs: &[&str], defines: &[&str]) -> CompileContext {
         CompileContext {
@@ -581,21 +580,21 @@ mod tests {
         let mut file_hashes_a = vec![
             (
                 NormalizedPath::from(r"C:\work\include\foo.h"),
-                hash_bytes(b"header"),
+                zccache_hash::hash_bytes(b"header"),
             ),
             (
                 NormalizedPath::from(r"C:\work\src\main.cpp"),
-                hash_bytes(b"source"),
+                zccache_hash::hash_bytes(b"source"),
             ),
         ];
         let mut file_hashes_b = vec![
             (
                 NormalizedPath::from("c:/work/include/foo.h"),
-                hash_bytes(b"header"),
+                zccache_hash::hash_bytes(b"header"),
             ),
             (
                 NormalizedPath::from("c:/work/src/main.cpp"),
-                hash_bytes(b"source"),
+                zccache_hash::hash_bytes(b"source"),
             ),
         ];
 

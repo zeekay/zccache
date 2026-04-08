@@ -114,11 +114,23 @@ runs:
         cargo build --release --target ${{ inputs.target }} -p zccache-cli
         cargo build --release --target ${{ inputs.target }} -p zccache-daemon
         cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint
-        if [ "${{ inputs.include_python }}" = "true" ]; then
-          cargo build --release --target ${{ inputs.target }} -p zccache-cli --features python
-          cargo build --release --target ${{ inputs.target }} -p zccache-watcher --features python
-          cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint --features python
+
+    - name: Build Python extension artifacts
+      if: inputs.include_python == 'true'
+      shell: bash
+      env:
+        PYO3_PYTHON: python
+      run: |
+        HOST_TARGET=$(rustc -vV | awk '/^host: / { print $2 }')
+        if [ "$HOST_TARGET" != "${{ inputs.target }}" ]; then
+          export PYO3_CROSS=1
+          export PYO3_CROSS_PYTHON_VERSION="${{ inputs.python_version }}"
+          export PYO3_CROSS_PYTHON_IMPLEMENTATION=CPython
         fi
+
+        cargo build --release --target ${{ inputs.target }} -p zccache-cli --features python --lib
+        cargo build --release --target ${{ inputs.target }} -p zccache-watcher --features python --lib
+        cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint --features python --lib
 
     - name: Stage artifacts
       shell: bash
