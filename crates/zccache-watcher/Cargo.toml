@@ -28,3 +28,6 @@ globset = "0.4"
 [dev-dependencies]
 tempfile = { workspace = true }
 zccache-hash = { workspace = true }
+
+[build-dependencies]
+pyo3-build-config = "0.23"

@@ -1,6 +1,6 @@
 # CI & Development Tools
 
-Python scripts for development tooling. Project-root trampolines (`_cargo`, `_rustc`, `_rustfmt`) prepend `.cargo/bin` to PATH so the rustup toolchain is always used.
+Python scripts for development tooling. Project-root trampolines (`_cargo`, `_rustc`, `_rustfmt`) prepend the shared rustup proxy location to PATH so the pinned toolchain is always used.
 
 ## Top-level scripts
 

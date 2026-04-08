@@ -1,13 +1,17 @@
 #!/bin/bash
-# Trampoline: ensures the repo-local rustup toolchain is used for rustc.
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_CARGO_HOME="$SCRIPT_DIR/.cargo"
-PROJECT_RUSTUP_HOME="$SCRIPT_DIR/.rustup"
+# Trampoline: prefers the shared rustup proxy in ~/.cargo/bin when present.
+if [ -n "${CARGO_HOME:-}" ]; then
+  CARGO_BIN="$CARGO_HOME/bin"
+elif [ -n "${HOME:-}" ]; then
+  CARGO_BIN="$HOME/.cargo/bin"
+elif [ -n "${USERPROFILE:-}" ]; then
+  CARGO_BIN="$USERPROFILE/.cargo/bin"
+else
+  CARGO_BIN=""
+fi
 
-if [[ -x "$PROJECT_CARGO_HOME/bin/cargo" ]]; then
-  export CARGO_HOME="${CARGO_HOME:-$PROJECT_CARGO_HOME}"
-  export RUSTUP_HOME="${RUSTUP_HOME:-$PROJECT_RUSTUP_HOME}"
-  export PATH="$CARGO_HOME/bin:$PATH"
+if [ -n "$CARGO_BIN" ] && [ -d "$CARGO_BIN" ]; then
+  export PATH="$CARGO_BIN:$PATH"
 fi
 
 exec rustc "$@"

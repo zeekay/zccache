@@ -1,16 +1,10 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.9"
+# requires-python = ">=3.11"
 # ///
-"""Install uv and the pinned Rust toolchain for zccache development.
+"""Install uv and the pinned shared Rust toolchain for zccache development."""
 
-Usage:
-    python3 install          # bootstrap (before uv is installed)
-    uv run --script install  # after uv is available
-
-Downloads use Python's urllib for maximum OS compatibility (avoids
-MSYS2 curl issues with .exe files on Windows).
-"""
+from __future__ import annotations
 
 import os
 import platform
@@ -18,275 +12,285 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
+from contextlib import contextmanager
+from pathlib import Path
 
-RUST_TOOLCHAIN = "1.94.1"
-RUSTUP_WIN_URL = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe"
-RUSTUP_UNIX_URL = "https://sh.rustup.rs"
+import tomllib
 
 GREEN = "\033[1;32m"
 YELLOW = "\033[1;33m"
 RED = "\033[1;31m"
 RESET = "\033[0m"
-ROOT = os.path.dirname(os.path.abspath(__file__))
-PROJECT_CARGO_HOME = os.path.join(ROOT, ".cargo")
-PROJECT_RUSTUP_HOME = os.path.join(ROOT, ".rustup")
+ROOT = Path(__file__).resolve().parent
+TOOLCHAIN_FILE = ROOT / "rust-toolchain.toml"
+LOCK_TIMEOUT_SECONDS = 15 * 60
+LOCK_POLL_SECONDS = 0.2
 
 
-def cargo_exe_name():
-    return "cargo.exe" if detect_platform() == "windows" else "cargo"
-
-
-def rustup_exe_name():
-    return "rustup.exe" if detect_platform() == "windows" else "rustup"
-
-
-def project_cargo_bin():
-    return os.path.join(PROJECT_CARGO_HOME, "bin")
-
-
-def project_toolchain_bootstrapped():
-    return os.path.isfile(os.path.join(project_cargo_bin(), cargo_exe_name()))
-
-
-def log(msg):
+def log(msg: str) -> None:
     print(f"{GREEN}[install]{RESET} {msg}")
 
 
-def warn(msg):
+def warn(msg: str) -> None:
     print(f"{YELLOW}[install]{RESET} {msg}")
 
 
-def err(msg):
+def err(msg: str) -> None:
     print(f"{RED}[install]{RESET} {msg}", file=sys.stderr)
 
 
-def die(msg):
+def die(msg: str) -> None:
     err(msg)
-    sys.exit(1)
+    raise SystemExit(1)
 
 
-def detect_platform():
+def cargo_home() -> Path:
+    if os.environ.get("CARGO_HOME"):
+        return Path(os.environ["CARGO_HOME"]).expanduser()
+    return Path.home() / ".cargo"
+
+
+def rustup_home() -> Path:
+    if os.environ.get("RUSTUP_HOME"):
+        return Path(os.environ["RUSTUP_HOME"]).expanduser()
+    return Path.home() / ".rustup"
+
+
+def cargo_bin_dir() -> Path:
+    return cargo_home() / "bin"
+
+
+def prepend_cargo_bin_to_path() -> None:
+    bin_dir = cargo_bin_dir()
+    current_path = os.environ.get("PATH", "")
+    path_parts = current_path.split(os.pathsep) if current_path else []
+    normalized_bin = os.path.normcase(os.path.normpath(str(bin_dir)))
+    normalized_parts = {
+        os.path.normcase(os.path.normpath(part))
+        for part in path_parts
+        if part
+    }
+    if normalized_bin not in normalized_parts:
+        os.environ["PATH"] = str(bin_dir) + (os.pathsep + current_path if current_path else "")
+
+
+def rustup_exe_name() -> str:
+    return "rustup.exe" if os.name == "nt" else "rustup"
+
+
+def homes_are_overridden() -> bool:
+    return "CARGO_HOME" in os.environ or "RUSTUP_HOME" in os.environ
+
+
+def rustup_executable() -> str | None:
+    candidate = cargo_bin_dir() / rustup_exe_name()
+    if candidate.exists():
+        return str(candidate)
+    if homes_are_overridden():
+        return None
+    return shutil.which("rustup")
+
+
+def rustup_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["RUSTUP_INIT_SKIP_PATH_CHECK"] = "yes"
+    env["CARGO_HOME"] = str(cargo_home())
+    env["RUSTUP_HOME"] = str(rustup_home())
+    return env
+
+
+def host_target_triple() -> str:
     system = platform.system()
-    if system == "Linux":
-        return "linux"
-    if system == "Darwin":
-        return "macos"
+    machine = platform.machine().lower()
+    arch = {
+        "amd64": "x86_64",
+        "x86_64": "x86_64",
+        "arm64": "aarch64",
+        "aarch64": "aarch64",
+    }.get(machine)
+    if arch is None:
+        die(f"unsupported architecture: {machine}")
     if system == "Windows":
-        return "windows"
-    # Check uname for MSYS/MINGW
+        return f"{arch}-pc-windows-msvc"
+    if system == "Linux":
+        return f"{arch}-unknown-linux-gnu"
+    if system == "Darwin":
+        return f"{arch}-apple-darwin"
+    die(f"unsupported platform: {system}")
+
+
+def rustup_init_url() -> str:
+    suffix = ".exe" if os.name == "nt" else ""
+    return f"https://static.rust-lang.org/rustup/dist/{host_target_triple()}/rustup-init{suffix}"
+
+
+def load_toolchain_spec() -> dict[str, object]:
+    with TOOLCHAIN_FILE.open("rb") as handle:
+        data = tomllib.load(handle)
+    toolchain = data.get("toolchain")
+    if not isinstance(toolchain, dict):
+        die(f"missing [toolchain] in {TOOLCHAIN_FILE}")
+
+    channel = toolchain.get("channel")
+    profile = toolchain.get("profile", "minimal")
+    components = toolchain.get("components", [])
+    targets = toolchain.get("targets", [])
+
+    if not isinstance(channel, str) or not channel:
+        die(f"missing toolchain.channel in {TOOLCHAIN_FILE}")
+    if not isinstance(profile, str):
+        die(f"toolchain.profile must be a string in {TOOLCHAIN_FILE}")
+    if not isinstance(components, list) or not all(isinstance(item, str) for item in components):
+        die(f"toolchain.components must be a list of strings in {TOOLCHAIN_FILE}")
+    if not isinstance(targets, list) or not all(isinstance(item, str) for item in targets):
+        die(f"toolchain.targets must be a list of strings in {TOOLCHAIN_FILE}")
+
+    return {
+        "channel": channel,
+        "profile": profile,
+        "components": components,
+        "targets": targets,
+    }
+
+
+@contextmanager
+def file_lock(name: str):
+    lock_root = rustup_home() / "tmp" / "zccache-locks"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_root / f"{name}.lock"
+    deadline = time.time() + LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, f"pid={os.getpid()}\ntime={time.time()}\n".encode("utf-8"))
+            finally:
+                os.close(fd)
+            break
+        except FileExistsError:
+            if time.time() >= deadline:
+                raise TimeoutError(f"timed out waiting for lock {lock_path}")
+            time.sleep(LOCK_POLL_SECONDS)
     try:
-        uname = subprocess.check_output(["uname", "-s"], text=True).strip()
-        if any(x in uname for x in ("MINGW", "MSYS", "CYGWIN", "_NT")):
-            return "windows"
-    except Exception:
-        pass
-    die(f"Unsupported platform: {system}")
+        yield
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
-def download(url, dest):
-    """Download a file using Python's urllib (most portable)."""
+def download(url: str, destination: Path) -> None:
     log(f"Downloading {url} ...")
-    try:
-        urllib.request.urlretrieve(url, dest)
-        return True
-    except Exception as e:
-        err(f"Download failed: {e}")
-        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(url) as response, destination.open("wb") as handle:
+        shutil.copyfileobj(response, handle)
 
 
-def native_path(path, plat):
-    """Convert to native Windows path if on Windows/MSYS."""
-    if plat == "windows":
-        try:
-            return subprocess.check_output(
-                ["cygpath", "-w", path], text=True
-            ).strip()
-        except Exception:
-            pass
-    return path
-
-
-def make_tempfile(filename, plat):
-    """Create a temp file path that works on MSYS2."""
-    if plat == "windows":
-        try:
-            wintemp = subprocess.check_output(
-                ["cygpath", "-u", os.environ.get("TEMP", os.environ.get("USERPROFILE", "/tmp"))],
-                text=True,
-            ).strip()
-            return os.path.join(wintemp, filename)
-        except Exception:
-            pass
-    return os.path.join(tempfile.gettempdir(), filename)
-
-
-def install_uv(plat):
-    """Install uv if not already present."""
+def install_uv() -> None:
     if shutil.which("uv"):
         log(f"uv already installed: {shutil.which('uv')}")
         return
 
     log("Installing uv ...")
-    if plat == "windows":
-        if shutil.which("powershell"):
-            subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "irm https://astral.sh/uv/install.ps1 | iex"],
-                check=True,
-            )
-        else:
+    if os.name == "nt":
+        if not shutil.which("powershell"):
             die("Cannot install uv: powershell not found.")
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "irm https://astral.sh/uv/install.ps1 | iex"],
+            check=True,
+        )
     else:
-        tmp = make_tempfile("uv-install.sh", plat)
-        if download("https://astral.sh/uv/install.sh", tmp):
-            os.chmod(tmp, 0o755)
-            subprocess.run(["sh", tmp], check=True)
-            os.unlink(tmp)
-        elif shutil.which("curl"):
-            subprocess.run(
-                ["sh", "-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"],
-                check=True,
-            )
-        else:
-            die("No download method for uv. Install curl or fix python urllib.")
+        tmp = Path(tempfile.mkdtemp(prefix="zccache-uv-install-")) / "install.sh"
+        try:
+            download("https://astral.sh/uv/install.sh", tmp)
+            tmp.chmod(0o755)
+            subprocess.run(["sh", str(tmp)], check=True)
+        finally:
+            shutil.rmtree(tmp.parent, ignore_errors=True)
 
-    # Add common install locations to PATH
-    for d in [
-        os.path.expanduser("~/.cargo/bin"),
-        os.path.expanduser("~/.local/bin"),
-    ]:
-        if os.path.isdir(d) and d not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = d + os.pathsep + os.environ["PATH"]
+    for directory in [Path.home() / ".cargo" / "bin", Path.home() / ".local" / "bin"]:
+        if directory.is_dir():
+            os.environ["PATH"] = str(directory) + os.pathsep + os.environ.get("PATH", "")
 
     if not shutil.which("uv"):
         warn("uv installed but not on PATH. Restart your terminal.")
 
 
-def uv_sync():
-    """Initialize the uv project environment."""
+def uv_sync() -> None:
     if shutil.which("uv"):
         log("Running uv sync ...")
         subprocess.run(["uv", "sync"], check=False)
 
 
-def source_cargo_env():
-    """Add the repo-local .cargo/bin to PATH, then fall back to legacy locations."""
-    os.environ.setdefault("CARGO_HOME", PROJECT_CARGO_HOME)
-    os.environ.setdefault("RUSTUP_HOME", PROJECT_RUSTUP_HOME)
-    for candidate in [
-        os.environ.get("CARGO_HOME", ""),
-        PROJECT_CARGO_HOME,
-        os.path.expanduser("~/.cargo"),
-    ]:
-        if candidate:
-            bin_dir = os.path.join(candidate, "bin")
-            if os.path.isdir(bin_dir) and bin_dir not in os.environ.get("PATH", ""):
-                os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
+def bootstrap_rustup() -> None:
+    if rustup_executable():
+        prepend_cargo_bin_to_path()
+        return
 
-    userprofile = os.environ.get("USERPROFILE")
-    if userprofile:
-        bin_dir = os.path.join(userprofile, ".cargo", "bin")
-        if os.path.isdir(bin_dir) and bin_dir not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
+    with file_lock("rustup-bootstrap"):
+        if rustup_executable():
+            prepend_cargo_bin_to_path()
+            return
 
-
-def source_project_cargo_env():
-    """Force the repo-local rustup installation onto PATH."""
-    os.environ["CARGO_HOME"] = PROJECT_CARGO_HOME
-    os.environ["RUSTUP_HOME"] = PROJECT_RUSTUP_HOME
-    bin_dir = project_cargo_bin()
-    if os.path.isdir(bin_dir) and bin_dir not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
-
-
-def current_rust_version():
-    """Get the current rustc version, or None."""
-    source_cargo_env()
-    try:
-        out = subprocess.check_output(["rustc", "--version"], text=True).strip()
-        parts = out.split()
-        if len(parts) >= 2:
-            return parts[1].split("-")[0]
-    except Exception:
-        pass
-    return None
-
-
-def install_rustup(plat):
-    """Install rustup and the pinned toolchain using Python urllib for downloads."""
-    rustup_args = [
-        "-y",
-        "--default-toolchain", RUST_TOOLCHAIN,
-        "--profile", "default",
-        "-c", "clippy",
-        "-c", "rustfmt",
-    ]
-    env = os.environ.copy()
-    env["RUSTUP_INIT_SKIP_PATH_CHECK"] = "yes"
-    env["CARGO_HOME"] = env.get("CARGO_HOME", PROJECT_CARGO_HOME)
-    env["RUSTUP_HOME"] = env.get("RUSTUP_HOME", PROJECT_RUSTUP_HOME)
-
-    if plat in ("linux", "macos"):
-        log("Installing rustup via sh.rustup.rs ...")
-        tmp = make_tempfile("rustup-init.sh", plat)
-        if not download(RUSTUP_UNIX_URL, tmp):
-            die("Failed to download rustup installer.")
-        os.chmod(tmp, 0o755)
-        subprocess.run([tmp] + rustup_args, env=env, check=True)
-        os.unlink(tmp)
-    else:
-        log("Installing rustup via rustup-init.exe ...")
-        tmp = make_tempfile("rustup-init.exe", plat)
-        native = native_path(tmp, plat)
-        if not download(RUSTUP_WIN_URL, native):
-            die("Failed to download rustup-init.exe.")
-        log("Running rustup-init.exe ...")
-        subprocess.run([tmp] + rustup_args, env=env, check=True)
+        suffix = ".exe" if os.name == "nt" else ""
+        temp_dir = Path(tempfile.mkdtemp(prefix="zccache-rustup-init-"))
+        temp_path = temp_dir / f"rustup-init{suffix}"
+        download(rustup_init_url(), temp_path)
         try:
-            os.unlink(tmp)
-        except Exception:
-            pass
+            if os.name != "nt":
+                temp_path.chmod(0o755)
+            subprocess.run(
+                [
+                    str(temp_path),
+                    "-y",
+                    "--profile",
+                    "minimal",
+                    "--default-toolchain",
+                    "none",
+                    "--default-host",
+                    host_target_triple(),
+                    "--no-modify-path",
+                ],
+                check=True,
+                env=rustup_env(),
+            )
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    prepend_cargo_bin_to_path()
 
 
-def ensure_repo_local_rust(plat):
-    """Ensure the repo-local rustup installation exists and has the pinned toolchain."""
-    if not project_toolchain_bootstrapped():
-        log(f"Bootstrapping repo-local Rust {RUST_TOOLCHAIN} ...")
-        install_rustup(plat)
-        source_project_cargo_env()
-        return
+def ensure_shared_rust() -> None:
+    spec = load_toolchain_spec()
+    bootstrap_rustup()
+    rustup = rustup_executable()
+    if not rustup:
+        die("rustup bootstrap completed but rustup is still unavailable")
 
-    source_project_cargo_env()
-    current = current_rust_version()
-    if current == RUST_TOOLCHAIN:
-        log(f"Repo-local Rust {RUST_TOOLCHAIN} already installed.")
-        return
+    cmd = [
+        rustup,
+        "toolchain",
+        "install",
+        str(spec["channel"]),
+        "--profile",
+        str(spec["profile"]),
+        "--no-self-update",
+    ]
+    for component in spec["components"]:
+        cmd.extend(["-c", str(component)])
+    for target in spec["targets"]:
+        cmd.extend(["-t", str(target)])
 
-    if current:
-        warn(f"Repo-local rustc: {current} (need {RUST_TOOLCHAIN})")
-    else:
-        warn("Repo-local rustc not found on PATH; reinstalling rustup locally.")
-
-    rustup = os.path.join(project_cargo_bin(), rustup_exe_name())
-    if not os.path.isfile(rustup):
-        warn("Repo-local rustup shim missing; reinstalling rustup locally.")
-        install_rustup(plat)
-        source_project_cargo_env()
-        return
-
-    log(f"Updating repo-local toolchain to {RUST_TOOLCHAIN} ...")
-    subprocess.run(
-        [rustup, "toolchain", "install", RUST_TOOLCHAIN, "--profile", "default", "-c", "clippy", "-c", "rustfmt"],
-        check=True,
-    )
-    subprocess.run([rustup, "default", RUST_TOOLCHAIN], check=True)
+    lock_name = f"toolchain-{str(spec['channel']).replace('/', '-').replace(':', '-')}"
+    with file_lock(lock_name):
+        subprocess.run(cmd, check=True, env=rustup_env())
 
 
-def verify(plat):
-    """Verify the installation."""
-    source_cargo_env()
-
+def verify() -> bool:
+    prepend_cargo_bin_to_path()
     if not shutil.which("rustc"):
         err("rustc not found on PATH after installation.")
         err("Restart your terminal, then run: rustc --version")
@@ -311,14 +315,13 @@ def verify(plat):
     else:
         warn("uv: not found on PATH")
 
-    # Check for PATH shadowing
     rustc_path = shutil.which("rustc") or ""
     if ".cargo" not in rustc_path and "cargo" not in rustc_path:
         warn("")
         warn(f"WARNING: rustc at '{rustc_path}' is NOT from rustup.")
         warn("An old system Rust may shadow the rustup toolchain.")
-        warn(f'  export CARGO_HOME="{PROJECT_CARGO_HOME}"')
-        warn(f'  export RUSTUP_HOME="{PROJECT_RUSTUP_HOME}"')
+        warn(f'  export CARGO_HOME="{cargo_home()}"')
+        warn(f'  export RUSTUP_HOME="{rustup_home()}"')
         warn('  export PATH="$CARGO_HOME/bin:$PATH"')
 
     log("")
@@ -326,27 +329,20 @@ def verify(plat):
     return True
 
 
-def main():
-    log("zccache — toolchain installer (uv + Rust)")
-    log(f"Pinned: Rust {RUST_TOOLCHAIN}")
-    log(f"Toolchain home: {PROJECT_CARGO_HOME}")
-    log(f"Rustup home:    {PROJECT_RUSTUP_HOME}")
+def main() -> None:
+    spec = load_toolchain_spec()
+    log("zccache - toolchain installer (uv + Rust)")
+    log(f"Pinned: Rust {spec['channel']}")
+    log(f"Cargo home:  {cargo_home()}")
+    log(f"Rustup home: {rustup_home()}")
+    log(f"Platform:    {host_target_triple()}")
     log("")
 
-    plat = detect_platform()
-    log(f"Platform: {plat}")
-
-    # Step 1: Install uv
-    install_uv(plat)
-
-    # Step 2: Initialize uv project
+    install_uv()
     uv_sync()
+    ensure_shared_rust()
 
-    # Step 3: Install the repo-local Rust toolchain
-    ensure_repo_local_rust(plat)
-
-    source_project_cargo_env()
-    if not verify(plat):
+    if not verify():
         warn("")
         warn("Restart your terminal, then run:")
         warn("  rustc --version")

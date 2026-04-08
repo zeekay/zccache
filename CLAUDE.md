@@ -4,7 +4,7 @@ zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md 
 
 ## Essential Rules
 
-- **Always use the project-root trampolines** (`_cargo`, `_rustc`, `_rustfmt`) to execute Rust commands. Bare cargo/rustc and `uv run cargo` are blocked by hook. Trampolines prepend `.cargo/bin` to PATH so the rustup toolchain is always used. Usage: `./_cargo check --workspace`.
+- **Always use the project-root trampolines** (`_cargo`, `_rustc`, `_rustfmt`) to execute Rust commands. Bare cargo/rustc and `uv run cargo` are blocked by hook. Trampolines prepend the shared rustup proxy location so the pinned toolchain is always used. Usage: `./_cargo check --workspace`.
 - **Always use `uv` for Python.** Bare `python`/`pip` are blocked by hook. Use `uv run ...` or `uv pip ...`.
 - MSRV: 1.75 | Edition: 2021 | Toolchain: stable (clippy + rustfmt)
 - CI: Linux, macOS, Windows. All warnings denied (`RUSTFLAGS="-D warnings"`)
@@ -69,7 +69,7 @@ Hooks are in `ci/hooks/` (Python) and `crates/zccache-ci` (Rust):
 ## Language Policy
 
 - **Python is only for CI scripts, packaging, and hooks.** All tests, benchmarks, and application logic must be written in Rust.
-- Trampolines (`_cargo`, `_rustc`, `_rustfmt`) are required for Rust commands because hooks enforce it — they prepend `.cargo/bin` to PATH ensuring the rustup toolchain. This is not an endorsement of Python for project code.
+- Trampolines (`_cargo`, `_rustc`, `_rustfmt`) are required for Rust commands because hooks enforce it — they prepend the shared rustup proxy location to PATH ensuring the pinned toolchain. This is not an endorsement of Python for project code.
 - When in doubt, write it in Rust.
 
 ## Development Philosophy: TDD
