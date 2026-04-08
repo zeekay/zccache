@@ -25,6 +25,7 @@ static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use clap::{Parser, Subcommand};
 use std::path::Path;
 use std::process::ExitCode;
+use zccache_cli::{run_ino_convert_cached, InoConvertOptions};
 use zccache_core::NormalizedPath;
 
 /// zccache -- fast local compiler cache.
@@ -128,6 +129,22 @@ enum Commands {
         #[command(subcommand)]
         fp_command: FpCommands,
     },
+    /// Convert an Arduino `.ino` sketch into a generated `.ino.cpp`.
+    #[command(name = "ino")]
+    Ino {
+        /// Input `.ino` file.
+        #[arg(long)]
+        input: String,
+        /// Output `.ino.cpp` file.
+        #[arg(long)]
+        output: String,
+        /// Extra clang arguments used when parsing the `.ino`.
+        #[arg(long = "clang-arg")]
+        clang_args: Vec<String>,
+        /// Do not inject `#include <Arduino.h>`.
+        #[arg(long)]
+        no_arduino_include: bool,
+    },
 }
 
 /// Fingerprint subcommands.
@@ -179,6 +196,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "session-stats",
     "crashes",
     "fp",
+    "ino",
     "help",
     "--help",
     "-h",
@@ -263,6 +281,25 @@ fn main() -> ExitCode {
             let endpoint = resolve_endpoint(None);
             run_async(cmd_clear(&endpoint))
         }
+        Commands::Ino {
+            input,
+            output,
+            clang_args,
+            no_arduino_include,
+        } => match run_ino_convert_cached(
+            Path::new(&input),
+            Path::new(&output),
+            &InoConvertOptions {
+                clang_args,
+                inject_arduino_include: !no_arduino_include,
+            },
+        ) {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("zccache: {err}");
+                ExitCode::FAILURE
+            }
+        },
         Commands::SessionStart {
             cwd,
             log,

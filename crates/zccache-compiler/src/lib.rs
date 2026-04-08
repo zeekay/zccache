@@ -5,6 +5,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod arduino;
 pub mod parse_archiver;
 pub mod parse_linker;
 pub mod parse_rustfmt;

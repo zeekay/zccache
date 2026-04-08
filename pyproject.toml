@@ -10,10 +10,22 @@ dependencies = []
 run_zccache = "ci.trampoline:run_zccache"
 run_zccache_daemon = "ci.trampoline:run_zccache_daemon"
 run_zccache_fingerprint = "ci.trampoline:run_zccache_fingerprint"
+zccache-python = "zccache.cli:main"
 
 [build-system]
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["ci"]
+packages = ["ci", "zccache", "zccache.fingerprint", "zccache.watcher"]
+
+[tool.setuptools.package-dir]
+ci = "ci"
+zccache = "python/zccache"
+"zccache.fingerprint" = "python/zccache/fingerprint"
+"zccache.watcher" = "python/zccache/watcher"
+
+[tool.setuptools.package-data]
+zccache = ["py.typed"]
+"zccache.fingerprint" = ["py.typed"]
+"zccache.watcher" = ["py.typed"]

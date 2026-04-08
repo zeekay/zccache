@@ -462,7 +462,8 @@ def build_wheel(
     if not bin_dir.exists():
         return None
 
-    binaries = sorted(bin_dir.iterdir())
+    binaries = sorted(path for path in bin_dir.iterdir() if path.is_file())
+    native_root = bin_dir / "python"
     if not binaries:
         return None
 
@@ -495,6 +496,24 @@ def build_wheel(
             info.compress_type = zipfile.ZIP_DEFLATED
             whl.writestr(info, data)
             record_rows.append((arcname, record_hash(data), len(data)))
+
+        source_root = ROOT / "python"
+        for source in sorted(source_root.rglob("*")):
+            if not source.is_file():
+                continue
+            rel = source.relative_to(source_root).as_posix()
+            data = source.read_bytes()
+            whl.writestr(rel, data)
+            record_rows.append((rel, record_hash(data), len(data)))
+
+        if native_root.exists():
+            for native in sorted(native_root.rglob("*")):
+                if not native.is_file():
+                    continue
+                rel = native.relative_to(native_root).as_posix()
+                data = native.read_bytes()
+                whl.writestr(rel, data)
+                record_rows.append((rel, record_hash(data), len(data)))
 
         meta_bytes = metadata.encode()
         whl.writestr(f"{dist_info}/METADATA", meta_bytes)

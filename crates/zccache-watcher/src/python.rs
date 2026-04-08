@@ -70,7 +70,7 @@ impl NativeWatcher {
         debounce_ms: u64,
     ) -> PyResult<Self> {
         let mut config = PollingWatcherConfig::new(PathBuf::from(root));
-        config.include_folders = include_folders.into_iter().map(PathBuf::from).collect();
+        config.include_folders = include_folders.into_iter().map(Into::into).collect();
         config.include_globs = include_globs;
         config.excluded_patterns = excluded_patterns;
         config.poll_interval = Duration::from_millis(poll_interval_ms.max(1));

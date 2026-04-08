@@ -108,14 +108,32 @@ jobs:
           cargo build --release --target ${{ matrix.target }} -p zccache-cli
           cargo build --release --target ${{ matrix.target }} -p zccache-daemon
           cargo build --release --target ${{ matrix.target }} -p zccache-fingerprint
+          cargo build --release --target ${{ matrix.target }} -p zccache-cli --features python
+          cargo build --release --target ${{ matrix.target }} -p zccache-watcher --features python
+          cargo build --release --target ${{ matrix.target }} -p zccache-fingerprint --features python
 
       - name: Stage artifacts
         shell: bash
         run: |
           mkdir -p staging
+          mkdir -p staging/python/zccache/fingerprint
+          mkdir -p staging/python/zccache/watcher
           cp target/${{ matrix.target }}/release/zccache${{ matrix.binary_ext }} staging/
           cp target/${{ matrix.target }}/release/zccache-daemon${{ matrix.binary_ext }} staging/
           cp target/${{ matrix.target }}/release/zccache-fp${{ matrix.binary_ext }} staging/
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/${{ matrix.target }}/release/zccache_cli.dll staging/python/zccache/_native.pyd
+            cp target/${{ matrix.target }}/release/zccache_fingerprint.dll staging/python/zccache/fingerprint/_native.pyd
+            cp target/${{ matrix.target }}/release/zccache_watcher.dll staging/python/zccache/watcher/_native.pyd
+          elif [[ "${{ matrix.target }}" == *apple-darwin ]]; then
+            cp target/${{ matrix.target }}/release/libzccache_cli.dylib staging/python/zccache/_native.so
+            cp target/${{ matrix.target }}/release/libzccache_fingerprint.dylib staging/python/zccache/fingerprint/_native.so
+            cp target/${{ matrix.target }}/release/libzccache_watcher.dylib staging/python/zccache/watcher/_native.so
+          else
+            cp target/${{ matrix.target }}/release/libzccache_cli.so staging/python/zccache/_native.so
+            cp target/${{ matrix.target }}/release/libzccache_fingerprint.so staging/python/zccache/fingerprint/_native.so
+            cp target/${{ matrix.target }}/release/libzccache_watcher.so staging/python/zccache/watcher/_native.so
+          fi
           # Strip binaries (reduces size significantly)
           STRIP="${{ matrix.strip }}"
           if [ -z "$STRIP" ]; then
@@ -125,6 +143,9 @@ jobs:
             $STRIP staging/zccache${{ matrix.binary_ext }} || true
             $STRIP staging/zccache-daemon${{ matrix.binary_ext }} || true
             $STRIP staging/zccache-fp${{ matrix.binary_ext }} || true
+            $STRIP staging/python/zccache/_native.* || true
+            $STRIP staging/python/zccache/fingerprint/_native.* || true
+            $STRIP staging/python/zccache/watcher/_native.* || true
           fi
 
       - name: Package standalone release archive

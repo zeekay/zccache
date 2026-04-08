@@ -8,6 +8,12 @@ repository.workspace = true
 homepage.workspace = true
 description = "Command-line interface for the zccache compiler cache"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+python = ["dep:pyo3"]
 
 [dependencies]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "macros"] }
@@ -21,6 +27,8 @@ zccache-hash = { workspace = true }
 zccache-protocol = { workspace = true }
 zccache-ipc = { workspace = true }
 rayon = { workspace = true }
+tempfile = { workspace = true }
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true }
@@ -33,5 +41,4 @@ name = "zccache"
 path = "src/main.rs"
 
 [dev-dependencies]
-tempfile = { workspace = true }
 zip = "2"

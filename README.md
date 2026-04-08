@@ -521,10 +521,34 @@ steps that only need a yes/no change answer rather than a stream of file events.
 
 ### Python API
 
-The repository also exposes `zccache.watcher` for robust cross-platform file
-watching from Python. The public API is polling- and callback-friendly, while
-the backend runs the filesystem scan loop in Rust and only crosses into Python
-when delivering events.
+`pip install zccache` now exposes an importable `zccache` module in addition to
+the native binaries. The Python surface is aimed at the same hot-path features
+the CLI already exposes: watcher events, fingerprint decisions, daemon/session
+control, and Arduino `.ino` conversion.
+
+```python
+from zccache.client import ZcCacheClient
+from zccache.fingerprint import FingerprintCache
+from zccache.ino import convert_ino
+from zccache.watcher import watch_files
+
+client = ZcCacheClient()
+client.start()
+
+fp = FingerprintCache(".cache/watch.json")
+decision = fp.check(
+    root=".",
+    include=["**/*.cpp", "**/*.hpp", "**/*.ino"],
+    exclude=["**/.build/**", "**/fastled_js/**"],
+)
+if decision.should_run:
+    convert_ino("Blink.ino", "build/Blink.ino.cpp")
+    fp.mark_success()
+```
+
+The watcher API remains polling- and callback-friendly, while the backend runs
+the filesystem scan loop in Rust and only crosses into Python when delivering
+events.
 
 ```python
 from zccache.watcher import watch_files
@@ -533,7 +557,7 @@ watcher = watch_files(
     ".",
     include_folders=["src", "include"],
     include_globs=["src/**/*.cpp", "include/**/*.h"],
-    excluded_patterns=["build", "dist/**", ".git"],
+    exclude_globs=["build", "dist/**", ".git"],
     debounce_seconds=0.2,
     poll_interval=0.1,
 )
@@ -562,11 +586,34 @@ Python watcher features:
 
 - `include_folders` to narrow the scan roots
 - `include_globs` to include only matching files
-- `excluded_patterns` to skip directories or files
+- `exclude_globs` / `excluded_patterns` to skip directories or files
 - `debounce_seconds` to coalesce bursts of edits
 - optional `notification_predicate` applied at Python delivery time
 - callback API plus polling API
 - explicit `start()`, `stop()`, `resume()`, and context-manager support
+
+Daemon/session control is also available without shelling out per call:
+
+```python
+from zccache.client import ZcCacheClient
+
+client = ZcCacheClient()
+client.start()
+session = client.session_start(cwd=".", track_stats=True)
+stats = client.session_stats(session.session_id)
+client.session_end(session.session_id)
+```
+
+And fingerprint state can be managed directly from Python:
+
+```python
+from zccache.fingerprint import FingerprintCache
+
+fp = FingerprintCache(".cache/lint.json", cache_type="two-layer")
+decision = fp.check(root=".", include=["**/*.cpp"], exclude=["**/.build/**"])
+if decision.should_run:
+    fp.mark_success()
+```
 
 Compatibility wrappers used by `fastled-wasm` are also available:
 
