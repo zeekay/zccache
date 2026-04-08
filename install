@@ -20,7 +20,7 @@ import sys
 import tempfile
 import urllib.request
 
-RUST_TOOLCHAIN = "1.85.1"
+RUST_TOOLCHAIN = "1.94.1"
 RUSTUP_WIN_URL = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe"
 RUSTUP_UNIX_URL = "https://sh.rustup.rs"
 
@@ -28,6 +28,25 @@ GREEN = "\033[1;32m"
 YELLOW = "\033[1;33m"
 RED = "\033[1;31m"
 RESET = "\033[0m"
+ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_CARGO_HOME = os.path.join(ROOT, ".cargo")
+PROJECT_RUSTUP_HOME = os.path.join(ROOT, ".rustup")
+
+
+def cargo_exe_name():
+    return "cargo.exe" if detect_platform() == "windows" else "cargo"
+
+
+def rustup_exe_name():
+    return "rustup.exe" if detect_platform() == "windows" else "rustup"
+
+
+def project_cargo_bin():
+    return os.path.join(PROJECT_CARGO_HOME, "bin")
+
+
+def project_toolchain_bootstrapped():
+    return os.path.isfile(os.path.join(project_cargo_bin(), cargo_exe_name()))
 
 
 def log(msg):
@@ -152,9 +171,12 @@ def uv_sync():
 
 
 def source_cargo_env():
-    """Add .cargo/bin to PATH."""
+    """Add the repo-local .cargo/bin to PATH, then fall back to legacy locations."""
+    os.environ.setdefault("CARGO_HOME", PROJECT_CARGO_HOME)
+    os.environ.setdefault("RUSTUP_HOME", PROJECT_RUSTUP_HOME)
     for candidate in [
         os.environ.get("CARGO_HOME", ""),
+        PROJECT_CARGO_HOME,
         os.path.expanduser("~/.cargo"),
     ]:
         if candidate:
@@ -167,6 +189,15 @@ def source_cargo_env():
         bin_dir = os.path.join(userprofile, ".cargo", "bin")
         if os.path.isdir(bin_dir) and bin_dir not in os.environ.get("PATH", ""):
             os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
+
+
+def source_project_cargo_env():
+    """Force the repo-local rustup installation onto PATH."""
+    os.environ["CARGO_HOME"] = PROJECT_CARGO_HOME
+    os.environ["RUSTUP_HOME"] = PROJECT_RUSTUP_HOME
+    bin_dir = project_cargo_bin()
+    if os.path.isdir(bin_dir) and bin_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
 
 
 def current_rust_version():
@@ -193,6 +224,8 @@ def install_rustup(plat):
     ]
     env = os.environ.copy()
     env["RUSTUP_INIT_SKIP_PATH_CHECK"] = "yes"
+    env["CARGO_HOME"] = env.get("CARGO_HOME", PROJECT_CARGO_HOME)
+    env["RUSTUP_HOME"] = env.get("RUSTUP_HOME", PROJECT_RUSTUP_HOME)
 
     if plat in ("linux", "macos"):
         log("Installing rustup via sh.rustup.rs ...")
@@ -214,6 +247,40 @@ def install_rustup(plat):
             os.unlink(tmp)
         except Exception:
             pass
+
+
+def ensure_repo_local_rust(plat):
+    """Ensure the repo-local rustup installation exists and has the pinned toolchain."""
+    if not project_toolchain_bootstrapped():
+        log(f"Bootstrapping repo-local Rust {RUST_TOOLCHAIN} ...")
+        install_rustup(plat)
+        source_project_cargo_env()
+        return
+
+    source_project_cargo_env()
+    current = current_rust_version()
+    if current == RUST_TOOLCHAIN:
+        log(f"Repo-local Rust {RUST_TOOLCHAIN} already installed.")
+        return
+
+    if current:
+        warn(f"Repo-local rustc: {current} (need {RUST_TOOLCHAIN})")
+    else:
+        warn("Repo-local rustc not found on PATH; reinstalling rustup locally.")
+
+    rustup = os.path.join(project_cargo_bin(), rustup_exe_name())
+    if not os.path.isfile(rustup):
+        warn("Repo-local rustup shim missing; reinstalling rustup locally.")
+        install_rustup(plat)
+        source_project_cargo_env()
+        return
+
+    log(f"Updating repo-local toolchain to {RUST_TOOLCHAIN} ...")
+    subprocess.run(
+        [rustup, "toolchain", "install", RUST_TOOLCHAIN, "--profile", "default", "-c", "clippy", "-c", "rustfmt"],
+        check=True,
+    )
+    subprocess.run([rustup, "default", RUST_TOOLCHAIN], check=True)
 
 
 def verify(plat):
@@ -250,20 +317,20 @@ def verify(plat):
         warn("")
         warn(f"WARNING: rustc at '{rustc_path}' is NOT from rustup.")
         warn("An old system Rust may shadow the rustup toolchain.")
-        if plat == "windows":
-            username = os.environ.get("USERNAME", os.environ.get("USER", "user"))
-            warn(f'  export PATH="/c/Users/{username}/.cargo/bin:$PATH"')
-        else:
-            warn('  export PATH="$HOME/.cargo/bin:$PATH"')
+        warn(f'  export CARGO_HOME="{PROJECT_CARGO_HOME}"')
+        warn(f'  export RUSTUP_HOME="{PROJECT_RUSTUP_HOME}"')
+        warn('  export PATH="$CARGO_HOME/bin:$PATH"')
 
     log("")
-    log("Done. Run: uv run cargo check --workspace")
+    log("Done. Run: ./_cargo check --workspace")
     return True
 
 
 def main():
     log("zccache — toolchain installer (uv + Rust)")
     log(f"Pinned: Rust {RUST_TOOLCHAIN}")
+    log(f"Toolchain home: {PROJECT_CARGO_HOME}")
+    log(f"Rustup home:    {PROJECT_RUSTUP_HOME}")
     log("")
 
     plat = detect_platform()
@@ -275,33 +342,15 @@ def main():
     # Step 2: Initialize uv project
     uv_sync()
 
-    # Step 3: Install Rust
-    current = current_rust_version()
-    if current == RUST_TOOLCHAIN:
-        log(f"Rust {RUST_TOOLCHAIN} already installed.")
-    else:
-        if current:
-            warn(f"Current rustc: {current} (need {RUST_TOOLCHAIN})")
+    # Step 3: Install the repo-local Rust toolchain
+    ensure_repo_local_rust(plat)
 
-        source_cargo_env()
-        if shutil.which("rustup"):
-            log(f"rustup found. Installing toolchain {RUST_TOOLCHAIN} ...")
-            subprocess.run(
-                ["rustup", "toolchain", "install", RUST_TOOLCHAIN,
-                 "--profile", "default", "-c", "clippy", "-c", "rustfmt"],
-                check=True,
-            )
-            subprocess.run(["rustup", "default", RUST_TOOLCHAIN], check=True)
-        else:
-            log("rustup not found. Installing from scratch ...")
-            install_rustup(plat)
-
-    source_cargo_env()
+    source_project_cargo_env()
     if not verify(plat):
         warn("")
         warn("Restart your terminal, then run:")
         warn("  rustc --version")
-        warn("  uv run cargo check --workspace")
+        warn("  ./_cargo check --workspace")
 
 
 if __name__ == "__main__":

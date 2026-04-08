@@ -20,6 +20,7 @@ Thumbs.db
 # sccache (project-local, versioned by toolchain)
 .sccache/
 .cargo/
+.rustup/
 
 # zccache cache directory
 .zccache/

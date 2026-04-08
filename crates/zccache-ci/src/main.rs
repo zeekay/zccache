@@ -238,19 +238,32 @@ fn run_streaming(root: &Path, cmd: &[String], label: &str) -> (i32, bool) {
 // Main
 // ---------------------------------------------------------------------------
 
-/// Prepend ~/.cargo/bin to PATH so all spawned cargo/rustc calls use rustup.
-fn activate_rustup_toolchain() {
-    let home = if cfg!(windows) {
+/// Prefer the repo-local rustup installation so spawned cargo/rustc calls use
+/// the pinned workspace toolchain. Fall back to the user home for compatibility.
+fn activate_rustup_toolchain(root: &Path) {
+    let project_cargo_home = root.join(".cargo");
+    let project_rustup_home = root.join(".rustup");
+    env::set_var("CARGO_HOME", &project_cargo_home);
+    env::set_var("RUSTUP_HOME", &project_rustup_home);
+
+    let mut candidates: Vec<NormalizedPath> =
+        vec![NormalizedPath::new(project_cargo_home.join("bin"))];
+    if let Some(home) = if cfg!(windows) {
         env::var("USERPROFILE").ok()
     } else {
         env::var("HOME").ok()
-    };
-    if let Some(home) = home {
-        let cargo_bin = NormalizedPath::new(home).join(".cargo").join("bin");
+    } {
+        candidates.push(NormalizedPath::new(
+            Path::new(&home).join(".cargo").join("bin"),
+        ));
+    }
+
+    for cargo_bin in candidates {
         if cargo_bin.is_dir() {
             let sep = if cfg!(windows) { ";" } else { ":" };
             let current = env::var("PATH").unwrap_or_default();
             env::set_var("PATH", format!("{}{sep}{current}", cargo_bin.display()));
+            break;
         }
     }
 }
@@ -280,7 +293,7 @@ fn main() -> ExitCode {
     }
 
     // Ensure all spawned cargo/rustc processes find the rustup toolchain
-    activate_rustup_toolchain();
+    activate_rustup_toolchain(&root);
 
     // Kill any running daemon so cargo can replace the exe on Windows
     kill_daemon();

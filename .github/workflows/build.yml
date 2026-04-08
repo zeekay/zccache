@@ -11,6 +11,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  CARGO_HOME: ${{ github.workspace }}/.cargo
+  RUSTUP_HOME: ${{ github.workspace }}/.rustup
+  PYO3_PYTHON: python
 
 jobs:
   build:
@@ -63,9 +66,19 @@ jobs:
         with:
           ref: ${{ github.event.inputs.ref || github.sha }}
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.85.1
+          components: rustfmt,clippy
           targets: ${{ matrix.target }}
+
+      - name: Activate repo-local Rust toolchain
+        shell: bash
+        run: echo "${{ github.workspace }}/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: Swatinem/rust-cache@v2
         with:

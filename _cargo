@@ -1,4 +1,13 @@
 #!/bin/bash
-# Trampoline: ensures rustup toolchain is used for cargo.
-export PATH="$HOME/.cargo/bin:$PATH"
+# Trampoline: ensures the repo-local rustup toolchain is used for cargo.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_CARGO_HOME="$SCRIPT_DIR/.cargo"
+PROJECT_RUSTUP_HOME="$SCRIPT_DIR/.rustup"
+
+if [[ -x "$PROJECT_CARGO_HOME/bin/cargo" ]]; then
+  export CARGO_HOME="${CARGO_HOME:-$PROJECT_CARGO_HOME}"
+  export RUSTUP_HOME="${RUSTUP_HOME:-$PROJECT_RUSTUP_HOME}"
+  export PATH="$CARGO_HOME/bin:$PATH"
+fi
+
 exec cargo "$@"

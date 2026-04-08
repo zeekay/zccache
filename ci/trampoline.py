@@ -1,7 +1,7 @@
 """Rust toolchain trampolines.
 
-Helper functions that prepend .cargo/bin to PATH before executing Rust tools.
-The primary PATH setup is now handled by `.env` (auto-loaded by `uv run`).
+Helper functions that activate the repo-local rustup toolchain before
+executing Rust tools. The primary PATH setup is also shared via `ci.env`.
 These trampolines are used by the remaining project scripts (`run_zccache`,
 `run_zccache_daemon`) which wrap `cargo run` invocations.
 """
@@ -12,23 +12,17 @@ import subprocess
 import sys
 from pathlib import Path
 
+from ci.env import activate, find_cargo_bin
+
 
 def _find_cargo_bin():
-    """Find the rustup .cargo/bin directory."""
-    for candidate in [
-        os.environ.get("CARGO_HOME", ""),
-        os.path.join(os.path.expanduser("~"), ".cargo"),
-        os.path.join(os.environ.get("USERPROFILE", ""), ".cargo"),
-    ]:
-        if candidate:
-            bin_dir = os.path.join(candidate, "bin")
-            if os.path.isdir(bin_dir):
-                return bin_dir
-    return None
+    """Find the preferred rustup .cargo/bin directory."""
+    return find_cargo_bin()
 
 
 def _run_tool(tool_name):
     """Prepend .cargo/bin to PATH and exec the given tool."""
+    activate()
     cargo_bin = _find_cargo_bin()
     if not cargo_bin:
         print("error: Cannot find .cargo/bin. Run ./install first.", file=sys.stderr)
@@ -62,6 +56,7 @@ def clippy_driver():
 
 def _run_cargo_bin(package):
     """Run a cargo binary with the correct toolchain on PATH."""
+    activate()
     cargo_bin = _find_cargo_bin()
     if not cargo_bin:
         print("error: Cannot find .cargo/bin. Run ./install first.", file=sys.stderr)
