@@ -168,13 +168,7 @@ runs:
       run: |
         VERSION="${{ inputs.version }}"
         if [ -z "$VERSION" ]; then
-          VERSION=$(python - <<'PY'
-          import tomllib
-          from pathlib import Path
-          with open(Path("Cargo.toml"), "rb") as f:
-              print(tomllib.load(f)["workspace"]["package"]["version"])
-          PY
-          )
+          VERSION=$(python -c "import tomllib; from pathlib import Path; print(tomllib.loads(Path('Cargo.toml').read_text(encoding='utf-8'))['workspace']['package']['version'])")
         fi
         python ci/package_release.py \
           --version "$VERSION" \

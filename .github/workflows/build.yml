@@ -71,8 +71,6 @@ jobs:
           target: ${{ matrix.target }}
           binary_ext: ${{ matrix.binary_ext }}
           cache_key: ${{ matrix.target }}
-          include_python: "true"
-          python_version: "3.13"
           linker: ${{ matrix.linker || '' }}
           strip: ${{ matrix.strip || '' }}
 
