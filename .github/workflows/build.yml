@@ -127,9 +127,33 @@ jobs:
             $STRIP staging/zccache-fp${{ matrix.binary_ext }} || true
           fi
 
+      - name: Package standalone release archive
+        shell: bash
+        run: |
+          VERSION=$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          with open(Path("Cargo.toml"), "rb") as f:
+              print(tomllib.load(f)["workspace"]["package"]["version"])
+          PY
+          )
+          python ci/package_release.py \
+            --version "$VERSION" \
+            --target "${{ matrix.target }}" \
+            --binary-ext "${{ matrix.binary_ext }}" \
+            --input-dir staging \
+            --output-dir standalone
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.target }}
           path: staging/
+          if-no-files-found: error
+
+      - name: Upload standalone archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: standalone/
           if-no-files-found: error

@@ -8,9 +8,9 @@
 //! emit immediately, since everything is invalidated.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use zccache_core::NormalizedPath;
 
 use crate::WatchEvent;
 
@@ -19,8 +19,8 @@ use crate::WatchEvent;
 pub enum SettledEvent {
     /// A coalesced batch of file changes after the settle window.
     Batch {
-        changed: Vec<PathBuf>,
-        removed: Vec<PathBuf>,
+        changed: Vec<NormalizedPath>,
+        removed: Vec<NormalizedPath>,
     },
     /// Watcher overflow — all cached state should be considered stale.
     Overflow,
@@ -75,7 +75,7 @@ impl SettleBuffer {
         mut rx: mpsc::UnboundedReceiver<WatchEvent>,
         tx: mpsc::UnboundedSender<SettledEvent>,
     ) {
-        let mut pending: HashMap<PathBuf, ChangeKind> = HashMap::new();
+        let mut pending: HashMap<NormalizedPath, ChangeKind> = HashMap::new();
 
         loop {
             // Wait for the first event (or channel close).
@@ -146,7 +146,7 @@ impl SettleBuffer {
         }
     }
 
-    fn apply_event(pending: &mut HashMap<PathBuf, ChangeKind>, event: WatchEvent) {
+    fn apply_event(pending: &mut HashMap<NormalizedPath, ChangeKind>, event: WatchEvent) {
         match event {
             WatchEvent::Modified(p) | WatchEvent::Created(p) => {
                 pending.insert(p, ChangeKind::Modified);
@@ -164,7 +164,7 @@ impl SettleBuffer {
         }
     }
 
-    fn drain(pending: &mut HashMap<PathBuf, ChangeKind>) -> SettledEvent {
+    fn drain(pending: &mut HashMap<NormalizedPath, ChangeKind>) -> SettledEvent {
         let mut changed = Vec::new();
         let mut removed = Vec::new();
         for (path, kind) in pending.drain() {
@@ -191,9 +191,7 @@ mod tests {
             buffer.run(raw_rx, settled_tx).await;
         });
 
-        raw_tx
-            .send(WatchEvent::Modified(PathBuf::from("a.c")))
-            .unwrap();
+        raw_tx.send(WatchEvent::Modified("a.c".into())).unwrap();
         drop(raw_tx);
 
         let event = settled_rx.recv().await.unwrap();
@@ -220,7 +218,7 @@ mod tests {
 
         for i in 0..5 {
             raw_tx
-                .send(WatchEvent::Modified(PathBuf::from(format!("file_{i}.c"))))
+                .send(WatchEvent::Modified(format!("file_{i}.c").into()))
                 .unwrap();
         }
         drop(raw_tx);
@@ -247,7 +245,7 @@ mod tests {
             buffer.run(raw_rx, settled_tx).await;
         });
 
-        let path = PathBuf::from("hot.c");
+        let path = NormalizedPath::new("hot.c");
         raw_tx.send(WatchEvent::Modified(path.clone())).unwrap();
         raw_tx.send(WatchEvent::Modified(path.clone())).unwrap();
         raw_tx.send(WatchEvent::Modified(path)).unwrap();
@@ -275,7 +273,7 @@ mod tests {
             buffer.run(raw_rx, settled_tx).await;
         });
 
-        let path = PathBuf::from("temp.c");
+        let path = NormalizedPath::new("temp.c");
         raw_tx.send(WatchEvent::Modified(path.clone())).unwrap();
         raw_tx.send(WatchEvent::Removed(path)).unwrap();
         drop(raw_tx);
@@ -302,7 +300,7 @@ mod tests {
             buffer.run(raw_rx, settled_tx).await;
         });
 
-        let path = PathBuf::from("replaced.c");
+        let path = NormalizedPath::new("replaced.c");
         raw_tx.send(WatchEvent::Removed(path.clone())).unwrap();
         raw_tx.send(WatchEvent::Created(path)).unwrap();
         drop(raw_tx);
@@ -311,7 +309,7 @@ mod tests {
         match event {
             SettledEvent::Batch { changed, removed } => {
                 assert_eq!(changed.len(), 1);
-                assert!(changed.contains(&PathBuf::from("replaced.c")));
+                assert!(changed.contains(&NormalizedPath::new("replaced.c")));
                 assert!(removed.is_empty());
             }
             SettledEvent::Overflow => panic!("expected batch"),
@@ -332,8 +330,8 @@ mod tests {
 
         raw_tx
             .send(WatchEvent::Renamed {
-                from: PathBuf::from("old.c"),
-                to: PathBuf::from("new.c"),
+                from: "old.c".into(),
+                to: "new.c".into(),
             })
             .unwrap();
         drop(raw_tx);
@@ -342,9 +340,9 @@ mod tests {
         match event {
             SettledEvent::Batch { changed, removed } => {
                 assert_eq!(changed.len(), 1);
-                assert!(changed.contains(&PathBuf::from("new.c")));
+                assert!(changed.contains(&NormalizedPath::new("new.c")));
                 assert_eq!(removed.len(), 1);
-                assert!(removed.contains(&PathBuf::from("old.c")));
+                assert!(removed.contains(&NormalizedPath::new("old.c")));
             }
             SettledEvent::Overflow => panic!("expected batch"),
         }
@@ -363,9 +361,7 @@ mod tests {
         });
 
         // Send some events, then overflow.
-        raw_tx
-            .send(WatchEvent::Modified(PathBuf::from("a.c")))
-            .unwrap();
+        raw_tx.send(WatchEvent::Modified("a.c".into())).unwrap();
         raw_tx.send(WatchEvent::Overflow).unwrap();
         drop(raw_tx);
 
@@ -388,9 +384,7 @@ mod tests {
             buffer.run(raw_rx, settled_tx).await;
         });
 
-        raw_tx
-            .send(WatchEvent::Modified(PathBuf::from("a.c")))
-            .unwrap();
+        raw_tx.send(WatchEvent::Modified("a.c".into())).unwrap();
         raw_tx
             .send(WatchEvent::Error("some error".to_string()))
             .unwrap();
@@ -414,9 +408,7 @@ mod tests {
             buffer.run(raw_rx, settled_tx).await;
         });
 
-        raw_tx
-            .send(WatchEvent::Modified(PathBuf::from("x.c")))
-            .unwrap();
+        raw_tx.send(WatchEvent::Modified("x.c".into())).unwrap();
         drop(raw_tx);
 
         let event = settled_rx.recv().await.unwrap();
@@ -461,9 +453,7 @@ mod tests {
         });
 
         raw_tx.send(WatchEvent::Overflow).unwrap();
-        raw_tx
-            .send(WatchEvent::Modified(PathBuf::from("after.c")))
-            .unwrap();
+        raw_tx.send(WatchEvent::Modified("after.c".into())).unwrap();
         drop(raw_tx);
 
         let mut saw_overflow = false;
@@ -472,7 +462,7 @@ mod tests {
             match event {
                 SettledEvent::Overflow => saw_overflow = true,
                 SettledEvent::Batch { changed, .. } => {
-                    assert!(changed.contains(&PathBuf::from("after.c")));
+                    assert!(changed.contains(&NormalizedPath::new("after.c")));
                     saw_batch = true;
                 }
             }
@@ -494,9 +484,7 @@ mod tests {
 
         for i in 0..200 {
             raw_tx
-                .send(WatchEvent::Modified(PathBuf::from(format!(
-                    "src/file_{i}.c"
-                ))))
+                .send(WatchEvent::Modified(format!("src/file_{i}.c").into()))
                 .unwrap();
         }
         drop(raw_tx);
@@ -522,19 +510,13 @@ mod tests {
             buffer.run(raw_rx, settled_tx).await;
         });
 
-        raw_tx
-            .send(WatchEvent::Created(PathBuf::from("new.c")))
-            .unwrap();
-        raw_tx
-            .send(WatchEvent::Modified(PathBuf::from("edit.c")))
-            .unwrap();
-        raw_tx
-            .send(WatchEvent::Removed(PathBuf::from("gone.c")))
-            .unwrap();
+        raw_tx.send(WatchEvent::Created("new.c".into())).unwrap();
+        raw_tx.send(WatchEvent::Modified("edit.c".into())).unwrap();
+        raw_tx.send(WatchEvent::Removed("gone.c".into())).unwrap();
         raw_tx
             .send(WatchEvent::Renamed {
-                from: PathBuf::from("old.c"),
-                to: PathBuf::from("renamed.c"),
+                from: "old.c".into(),
+                to: "renamed.c".into(),
             })
             .unwrap();
         drop(raw_tx);
@@ -563,12 +545,8 @@ mod tests {
         });
 
         // Send events then close channel before settle window elapses.
-        raw_tx
-            .send(WatchEvent::Modified(PathBuf::from("a.c")))
-            .unwrap();
-        raw_tx
-            .send(WatchEvent::Modified(PathBuf::from("b.c")))
-            .unwrap();
+        raw_tx.send(WatchEvent::Modified("a.c".into())).unwrap();
+        raw_tx.send(WatchEvent::Modified("b.c".into())).unwrap();
         drop(raw_tx); // Close before 500ms window
 
         let event = settled_rx.recv().await.unwrap();

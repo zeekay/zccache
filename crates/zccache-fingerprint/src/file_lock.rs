@@ -1,7 +1,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
+use zccache_core::NormalizedPath;
 
 // fs2::FileExt trait methods are called via UFCS below to avoid
 // ambiguity with std::fs::File inherent methods added in Rust 1.89.
@@ -11,10 +12,10 @@ use crate::error::Result;
 const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
-fn lock_path(cache_path: &Path) -> PathBuf {
+fn lock_path(cache_path: &Path) -> NormalizedPath {
     let mut s = cache_path.as_os_str().to_os_string();
     s.push(".lock");
-    PathBuf::from(s)
+    NormalizedPath::new(Path::new(&s))
 }
 
 fn open_lock_file(cache_path: &Path) -> io::Result<File> {

@@ -10,11 +10,12 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
 use serde::Serialize;
 use tokio::sync::mpsc;
+use zccache_core::NormalizedPath;
 use zccache_protocol::Response;
 
 use crate::event_log::{format_timestamp, open_append};
@@ -79,10 +80,10 @@ enum JournalMessage {
     /// Write a line to the global journal and optionally to a session journal.
     Entry {
         line: String,
-        session_path: Option<PathBuf>,
+        session_path: Option<NormalizedPath>,
     },
     /// Close a session journal file handle.
-    CloseSession { path: PathBuf },
+    CloseSession { path: NormalizedPath },
 }
 
 /// JSONL compile journal backed by a lock-free channel and background writer thread.
@@ -94,7 +95,7 @@ impl CompileJournal {
     /// Create a new compile journal writing to `log_dir/compile_journal.jsonl`.
     ///
     /// Spawns a background thread for all I/O. Returns `noop()` on failure.
-    pub fn new(log_dir: PathBuf) -> Self {
+    pub fn new(log_dir: NormalizedPath) -> Self {
         match Self::try_new(log_dir) {
             Ok(journal) => journal,
             Err(e) => {
@@ -104,7 +105,7 @@ impl CompileJournal {
         }
     }
 
-    fn try_new(log_dir: PathBuf) -> std::io::Result<Self> {
+    fn try_new(log_dir: NormalizedPath) -> std::io::Result<Self> {
         fs::create_dir_all(&log_dir)?;
         let path = log_dir.join("compile_journal.jsonl");
         let file = open_append(&path)?;
@@ -137,7 +138,7 @@ impl CompileJournal {
                 Ok(line) => {
                     let _ = tx.send(JournalMessage::Entry {
                         line,
-                        session_path: session_path.map(Path::to_path_buf),
+                        session_path: session_path.map(Into::into),
                     });
                 }
                 Err(e) => {
@@ -151,9 +152,7 @@ impl CompileJournal {
     /// so the background thread can release the file.
     pub fn close_session(&self, path: &Path) {
         if let Some(tx) = &self.sender {
-            let _ = tx.send(JournalMessage::CloseSession {
-                path: path.to_path_buf(),
-            });
+            let _ = tx.send(JournalMessage::CloseSession { path: path.into() });
         }
     }
 }
@@ -166,10 +165,10 @@ const JOURNAL_MAX_FILES: usize = 3;
 /// Background thread: receives journal messages and writes to files.
 fn journal_thread(
     mut rx: mpsc::UnboundedReceiver<JournalMessage>,
-    global_path: PathBuf,
+    global_path: NormalizedPath,
     mut global_file: std::fs::File,
 ) {
-    let mut session_files: HashMap<PathBuf, std::fs::File> = HashMap::new();
+    let mut session_files: HashMap<NormalizedPath, std::fs::File> = HashMap::new();
     let mut current_size: u64 = global_path.metadata().map(|m| m.len()).unwrap_or(0);
 
     while let Some(msg) = rx.blocking_recv() {
@@ -245,14 +244,14 @@ fn gc_journal_files(path: &Path) {
         Some(d) => d,
         None => return,
     };
-    let mut rotated: Vec<std::path::PathBuf> = fs::read_dir(dir)
+    let mut rotated: Vec<NormalizedPath> = fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
             if name.starts_with("compile_journal.jsonl.") {
-                Some(e.path())
+                Some(e.path().into())
             } else {
                 None
             }
@@ -360,7 +359,7 @@ mod tests {
     #[test]
     fn test_journal_file_write() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = CompileJournal::new(dir.path().to_path_buf());
+        let journal = CompileJournal::new(dir.path().to_path_buf().into());
 
         let ctx = JournalContext {
             compiler: "/usr/bin/clang++".to_string(),
@@ -407,7 +406,7 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let session_path = session_dir.join("test-session.jsonl");
 
-        let journal = CompileJournal::new(dir.path().to_path_buf());
+        let journal = CompileJournal::new(dir.path().to_path_buf().into());
 
         let ctx = JournalContext {
             compiler: "/usr/bin/clang++".to_string(),
@@ -441,7 +440,7 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let session_path = session_dir.join("close-test.jsonl");
 
-        let journal = CompileJournal::new(dir.path().to_path_buf());
+        let journal = CompileJournal::new(dir.path().to_path_buf().into());
 
         let ctx = JournalContext {
             compiler: "clang".to_string(),
@@ -573,7 +572,7 @@ mod tests {
 
     #[test]
     fn test_extract_outcome_all_non_journalable() {
-        use std::path::PathBuf;
+        use zccache_core::NormalizedPath;
         use zccache_protocol::{DaemonStatus, LookupResult as LR, SessionStats, StoreResult as SR};
 
         let non_journalable: Vec<Response> = vec![
@@ -599,7 +598,7 @@ mod tests {
                 dep_graph_files: 0,
                 sessions_total: 0,
                 sessions_active: 0,
-                cache_dir: PathBuf::new(),
+                cache_dir: NormalizedPath::from(""),
                 dep_graph_version: 0,
                 dep_graph_disk_size: 0,
             }),
@@ -767,7 +766,7 @@ mod tests {
     #[test]
     fn test_multiple_entries_valid_jsonl() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = CompileJournal::new(dir.path().to_path_buf());
+        let journal = CompileJournal::new(dir.path().to_path_buf().into());
 
         for i in 0..50 {
             let ctx = JournalContext {
@@ -796,7 +795,7 @@ mod tests {
     #[test]
     fn test_concurrent_logging() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Arc::new(CompileJournal::new(dir.path().to_path_buf()));
+        let journal = Arc::new(CompileJournal::new(dir.path().to_path_buf().into()));
 
         let mut handles = vec![];
         for t in 0..10 {
@@ -844,7 +843,7 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let session_path = session_dir.join("multi-entry.jsonl");
 
-        let journal = CompileJournal::new(dir.path().to_path_buf());
+        let journal = CompileJournal::new(dir.path().to_path_buf().into());
 
         for i in 0..5 {
             let ctx = JournalContext {
@@ -872,7 +871,7 @@ mod tests {
         let path_a = session_dir.join("session-a.jsonl");
         let path_b = session_dir.join("session-b.jsonl");
 
-        let journal = CompileJournal::new(dir.path().to_path_buf());
+        let journal = CompileJournal::new(dir.path().to_path_buf().into());
 
         // Interleave entries between two sessions
         for i in 0..6 {
@@ -926,7 +925,7 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let session_path = session_dir.join("reopen.jsonl");
 
-        let journal = CompileJournal::new(dir.path().to_path_buf());
+        let journal = CompileJournal::new(dir.path().to_path_buf().into());
 
         // Write first entry
         let ctx1 = JournalContext {
@@ -1035,7 +1034,7 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         let session_path = session_dir.join("double-close.jsonl");
 
-        let journal = CompileJournal::new(dir.path().to_path_buf());
+        let journal = CompileJournal::new(dir.path().to_path_buf().into());
 
         let ctx = JournalContext {
             compiler: "clang".to_string(),

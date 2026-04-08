@@ -3,9 +3,10 @@
 //! Extracts include paths, defines, and cache-relevant flags from
 //! compiler command-line arguments.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::search_paths::IncludeSearchPaths;
+use zccache_core::NormalizedPath;
 
 /// Dependency-generation flags already present in the user's compiler args.
 #[derive(Debug, Clone, Default)]
@@ -13,16 +14,16 @@ pub struct UserDepFlags {
     /// User has -MD or -MMD (emit depfile as side-effect of compilation).
     pub has_md: bool,
     /// User has -MF `<path>` (explicit depfile output path).
-    pub mf_path: Option<PathBuf>,
+    pub mf_path: Option<NormalizedPath>,
 }
 
 /// Result of parsing compiler arguments.
 #[derive(Debug, Clone)]
 pub struct ParsedArgs {
     /// The source file being compiled.
-    pub source_file: PathBuf,
+    pub source_file: NormalizedPath,
     /// The output file (`-o`).
-    pub output_file: Option<PathBuf>,
+    pub output_file: Option<NormalizedPath>,
     /// Structured include search paths.
     pub include_search: IncludeSearchPaths,
     /// Defines (`-DFOO`, `-DFOO=1`). Sorted for deterministic hashing.
@@ -33,9 +34,9 @@ pub struct ParsedArgs {
     /// Sorted for deterministic hashing.
     pub flags: Vec<String>,
     /// Force-included files (`-include <file>`).
-    pub force_includes: Vec<PathBuf>,
+    pub force_includes: Vec<NormalizedPath>,
     /// The compiler executable (first arg or from context).
-    pub compiler: Option<PathBuf>,
+    pub compiler: Option<NormalizedPath>,
     /// Dependency generation flags detected in the user's args.
     pub dep_flags: UserDepFlags,
     /// Flags not recognized by the parser. Sorted for deterministic hashing.
@@ -50,7 +51,7 @@ pub struct ParsedArgs {
 /// Relative paths are resolved against `cwd`.
 pub fn parse_gnu_args(args: &[String], cwd: &Path) -> ParsedArgs {
     let mut result = ParsedArgs {
-        source_file: PathBuf::new(),
+        source_file: NormalizedPath::new(""),
         output_file: None,
         include_search: IncludeSearchPaths::default(),
         defines: Vec::new(),
@@ -63,7 +64,7 @@ pub fn parse_gnu_args(args: &[String], cwd: &Path) -> ParsedArgs {
     };
 
     let mut i = 0;
-    let mut source_candidates: Vec<PathBuf> = Vec::new();
+    let mut source_candidates: Vec<NormalizedPath> = Vec::new();
 
     while i < args.len() {
         let arg = &args[i];
@@ -147,7 +148,7 @@ pub fn parse_gnu_args(args: &[String], cwd: &Path) -> ParsedArgs {
             continue;
         }
 
-        // -include-pch <file> (precompiled header — must come BEFORE -include)
+        // -include-pch <file> (precompiled header â€” must come BEFORE -include)
         if arg == "-include-pch" {
             if let Some(next) = args.get(i + 1) {
                 result.force_includes.push(resolve_path(next, cwd));
@@ -213,7 +214,7 @@ pub fn parse_gnu_args(args: &[String], cwd: &Path) -> ParsedArgs {
             continue;
         }
 
-        // -MF takes a following argument — capture path.
+        // -MF takes a following argument â€” capture path.
         if arg == "-MF" {
             if let Some(next) = args.get(i + 1) {
                 result.dep_flags.mf_path = Some(resolve_path(next, cwd));
@@ -246,7 +247,7 @@ pub fn parse_gnu_args(args: &[String], cwd: &Path) -> ParsedArgs {
         if !arg.starts_with('-') {
             source_candidates.push(resolve_path(arg, cwd));
         } else {
-            // Unrecognized flag — track for cache invalidation.
+            // Unrecognized flag â€” track for cache invalidation.
             result.unknown_flags.push(arg.clone());
         }
 
@@ -331,12 +332,12 @@ pub fn split_command(command: &str) -> Vec<String> {
     args
 }
 
-fn resolve_path(path: &str, cwd: &Path) -> PathBuf {
+fn resolve_path(path: &str, cwd: &Path) -> NormalizedPath {
     let p = Path::new(path);
     if p.is_absolute() {
-        p.to_path_buf()
+        NormalizedPath::new(p)
     } else {
-        cwd.join(p)
+        NormalizedPath::new(cwd.join(p))
     }
 }
 
@@ -516,7 +517,7 @@ mod tests {
         assert!(parsed.flags.contains(&"-x c++".to_string()));
     }
 
-    // ── unknown_flags tests ─────────────────────────────────────────
+    // â”€â”€ unknown_flags tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn unknown_flags_collected() {
@@ -555,7 +556,7 @@ mod tests {
         assert!(parsed.unknown_flags.is_empty());
     }
 
-    // ── split_command tests ──────────────────────────────────────────
+    // â”€â”€ split_command tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn split_simple_command() {

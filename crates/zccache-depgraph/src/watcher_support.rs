@@ -1,19 +1,20 @@
 //! Watcher integration support for the dependency graph.
 //!
 //! Provides:
-//! - `WatchSet` — tracks which directories should be watched and which
+//! - `WatchSet` â€” tracks which directories should be watched and which
 //!   filenames within them are relevant.
-//! - Shadow detection — identifies when a newly created file in a
+//! - Shadow detection â€” identifies when a newly created file in a
 //!   higher-priority include directory would shadow an existing resolved
 //!   include.
-//! - Unresolved include resolution — identifies when a newly created file
+//! - Unresolved include resolution â€” identifies when a newly created file
 //!   matches a previously unresolved `#include`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::context::ContextKey;
 use crate::graph::DepGraph;
+use zccache_core::NormalizedPath;
 
 /// Set of directories that should be watched, with tracked filenames per directory.
 ///
@@ -21,8 +22,20 @@ use crate::graph::DepGraph;
 /// the OS file-watcher (non-recursive) and which events to filter for.
 #[derive(Debug, Clone, Default)]
 pub struct WatchSet {
-    /// Maps directory path → set of tracked file names within it.
-    dirs: HashMap<PathBuf, HashSet<String>>,
+    /// Maps directory path â†’ set of tracked file names within it.
+    dirs: HashMap<NormalizedPath, HashSet<String>>,
+}
+
+fn normalize_watch_filename(name: &std::ffi::OsStr) -> String {
+    #[cfg(windows)]
+    {
+        name.to_string_lossy().to_ascii_lowercase()
+    }
+
+    #[cfg(not(windows))]
+    {
+        name.to_string_lossy().into_owned()
+    }
 }
 
 impl WatchSet {
@@ -36,13 +49,13 @@ impl WatchSet {
     /// Each file's parent directory is added, with the filename tracked.
     #[must_use]
     pub fn from_paths(paths: impl IntoIterator<Item = impl AsRef<Path>>) -> Self {
-        let mut dirs: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+        let mut dirs: HashMap<NormalizedPath, HashSet<String>> = HashMap::new();
         for path in paths {
             let path = path.as_ref();
             if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
-                dirs.entry(parent.to_path_buf())
+                dirs.entry(parent.to_path_buf().into())
                     .or_default()
-                    .insert(name.to_string_lossy().into_owned());
+                    .insert(normalize_watch_filename(name));
             }
         }
         Self { dirs }
@@ -50,7 +63,7 @@ impl WatchSet {
 
     /// Add a directory to watch (even if it has no tracked files yet).
     /// Used for include search directories where new files might appear.
-    pub fn add_dir(&mut self, dir: PathBuf) {
+    pub fn add_dir(&mut self, dir: NormalizedPath) {
         self.dirs.entry(dir).or_default();
     }
 
@@ -58,14 +71,14 @@ impl WatchSet {
     pub fn add_path(&mut self, path: &Path) {
         if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
             self.dirs
-                .entry(parent.to_path_buf())
+                .entry(parent.to_path_buf().into())
                 .or_default()
-                .insert(name.to_string_lossy().into_owned());
+                .insert(normalize_watch_filename(name));
         }
     }
 
     /// Get all directories that need to be watched.
-    pub fn dirs(&self) -> impl Iterator<Item = &PathBuf> {
+    pub fn dirs(&self) -> impl Iterator<Item = &NormalizedPath> {
         self.dirs.keys()
     }
 
@@ -73,9 +86,10 @@ impl WatchSet {
     #[must_use]
     pub fn is_tracked(&self, path: &Path) -> bool {
         if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+            let parent = NormalizedPath::new(parent);
             self.dirs
-                .get(parent)
-                .is_some_and(|names| names.contains(&*name.to_string_lossy()))
+                .get(&parent)
+                .is_some_and(|names| names.contains(&normalize_watch_filename(name)))
         } else {
             false
         }
@@ -84,7 +98,7 @@ impl WatchSet {
     /// Check if a directory is in the watch set.
     #[must_use]
     pub fn is_watched(&self, dir: &Path) -> bool {
-        self.dirs.contains_key(dir)
+        self.dirs.contains_key(&NormalizedPath::new(dir))
     }
 
     /// Number of watched directories.
@@ -102,7 +116,7 @@ impl WatchSet {
     /// Directories in `self` that are not in `previous`.
     /// These are newly added directories that need watch registration.
     #[must_use]
-    pub fn new_dirs_vs(&self, previous: &WatchSet) -> Vec<PathBuf> {
+    pub fn new_dirs_vs(&self, previous: &WatchSet) -> Vec<NormalizedPath> {
         self.dirs
             .keys()
             .filter(|d| !previous.dirs.contains_key(*d))
@@ -113,7 +127,7 @@ impl WatchSet {
     /// Directories in `previous` that are not in `self`.
     /// These are removed directories whose watches can be dropped.
     #[must_use]
-    pub fn removed_dirs_vs(&self, previous: &WatchSet) -> Vec<PathBuf> {
+    pub fn removed_dirs_vs(&self, previous: &WatchSet) -> Vec<NormalizedPath> {
         previous
             .dirs
             .keys()
@@ -167,7 +181,7 @@ impl DepGraph {
 
             // All include search dirs (for new-file detection).
             for dir in ctx_entry.context.include_search.all_search_dirs() {
-                ws.add_dir(dir.to_path_buf());
+                ws.add_dir(dir.into());
             }
         }
 
@@ -212,7 +226,7 @@ impl DepGraph {
                     None => continue,
                 };
 
-                // Same directory — not a shadow, just a replacement (handled
+                // Same directory â€” not a shadow, just a replacement (handled
                 // by the watcher's Modified event).
                 if resolved_dir == new_dir {
                     continue;
@@ -264,7 +278,7 @@ impl DepGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use zccache_core::NormalizedPath;
 
     use crate::context::CompileContext;
     use crate::scanner::ScanResult;
@@ -277,7 +291,7 @@ mod tests {
 
     fn make_ctx_with_search(source: &str, search: IncludeSearchPaths) -> CompileContext {
         CompileContext {
-            source_file: PathBuf::from(source),
+            source_file: NormalizedPath::from(source),
             include_search: search,
             defines: Vec::new(),
             flags: Vec::new(),
@@ -291,9 +305,9 @@ mod tests {
     #[test]
     fn watch_set_from_paths_groups_by_dir() {
         let ws = WatchSet::from_paths([
-            PathBuf::from("/inc/a.h"),
-            PathBuf::from("/inc/b.h"),
-            PathBuf::from("/src/main.c"),
+            NormalizedPath::from("/inc/a.h"),
+            NormalizedPath::from("/inc/b.h"),
+            NormalizedPath::from("/src/main.c"),
         ]);
         assert_eq!(ws.dir_count(), 2);
         assert_eq!(ws.file_count(), 3);
@@ -304,8 +318,8 @@ mod tests {
     #[test]
     fn watch_set_deduplication() {
         let ws = WatchSet::from_paths([
-            PathBuf::from("/inc/a.h"),
-            PathBuf::from("/inc/a.h"), // duplicate
+            NormalizedPath::from("/inc/a.h"),
+            NormalizedPath::from("/inc/a.h"), // duplicate
         ]);
         assert_eq!(ws.dir_count(), 1);
         assert_eq!(ws.file_count(), 1);
@@ -313,16 +327,24 @@ mod tests {
 
     #[test]
     fn watch_set_is_tracked() {
-        let ws = WatchSet::from_paths([PathBuf::from("/inc/a.h")]);
+        let ws = WatchSet::from_paths([NormalizedPath::from("/inc/a.h")]);
         assert!(ws.is_tracked(Path::new("/inc/a.h")));
         assert!(!ws.is_tracked(Path::new("/inc/b.h")));
         assert!(!ws.is_tracked(Path::new("/other/a.h")));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn watch_set_is_tracked_ignores_filename_case_on_windows() {
+        let ws = WatchSet::from_paths([NormalizedPath::from(r"C:\inc\Config.h")]);
+        assert!(ws.is_tracked(Path::new(r"C:\inc\config.h")));
+        assert!(ws.is_tracked(Path::new(r"C:\inc\CONFIG.H")));
+    }
+
     #[test]
     fn watch_set_add_dir_empty() {
         let mut ws = WatchSet::new();
-        ws.add_dir(PathBuf::from("/usr/include"));
+        ws.add_dir(NormalizedPath::from("/usr/include"));
         assert!(ws.is_watched(Path::new("/usr/include")));
         assert_eq!(ws.file_count(), 0);
         assert_eq!(ws.dir_count(), 1);
@@ -338,18 +360,24 @@ mod tests {
 
     #[test]
     fn watch_set_new_dirs_vs() {
-        let old = WatchSet::from_paths([PathBuf::from("/inc/a.h")]);
-        let new = WatchSet::from_paths([PathBuf::from("/inc/a.h"), PathBuf::from("/new/b.h")]);
+        let old = WatchSet::from_paths([NormalizedPath::from("/inc/a.h")]);
+        let new = WatchSet::from_paths([
+            NormalizedPath::from("/inc/a.h"),
+            NormalizedPath::from("/new/b.h"),
+        ]);
         let added = new.new_dirs_vs(&old);
-        assert_eq!(added, vec![PathBuf::from("/new")]);
+        assert_eq!(added, vec![NormalizedPath::from("/new")]);
     }
 
     #[test]
     fn watch_set_removed_dirs_vs() {
-        let old = WatchSet::from_paths([PathBuf::from("/inc/a.h"), PathBuf::from("/old/b.h")]);
-        let new = WatchSet::from_paths([PathBuf::from("/inc/a.h")]);
+        let old = WatchSet::from_paths([
+            NormalizedPath::from("/inc/a.h"),
+            NormalizedPath::from("/old/b.h"),
+        ]);
+        let new = WatchSet::from_paths([NormalizedPath::from("/inc/a.h")]);
         let removed = new.removed_dirs_vs(&old);
-        assert_eq!(removed, vec![PathBuf::from("/old")]);
+        assert_eq!(removed, vec![NormalizedPath::from("/old")]);
     }
 
     // --- DepGraph::watch_set() tests ---
@@ -361,7 +389,10 @@ mod tests {
         let key = graph.register(ctx);
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/inc/a.h"), PathBuf::from("/inc/b.h")],
+            resolved: vec![
+                NormalizedPath::from("/inc/a.h"),
+                NormalizedPath::from("/inc/b.h"),
+            ],
             unresolved: Vec::new(),
             has_computed: false,
         };
@@ -377,8 +408,8 @@ mod tests {
     fn watch_set_includes_search_dirs() {
         let graph = DepGraph::new();
         let search = IncludeSearchPaths {
-            user: vec![PathBuf::from("/project/include")],
-            system: vec![PathBuf::from("/usr/include")],
+            user: vec![NormalizedPath::from("/project/include")],
+            system: vec![NormalizedPath::from("/usr/include")],
             ..Default::default()
         };
         let ctx = make_ctx_with_search("/src/main.c", search);
@@ -394,7 +425,7 @@ mod tests {
     fn watch_set_dedupes_across_contexts() {
         let graph = DepGraph::new();
         let search = IncludeSearchPaths {
-            user: vec![PathBuf::from("/inc")],
+            user: vec![NormalizedPath::from("/inc")],
             ..Default::default()
         };
 
@@ -404,7 +435,7 @@ mod tests {
         let key2 = graph.register(ctx2);
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/inc/common.h")],
+            resolved: vec![NormalizedPath::from("/inc/common.h")],
             unresolved: Vec::new(),
             has_computed: false,
         };
@@ -426,7 +457,7 @@ mod tests {
     fn check_shadow_detects_higher_priority() {
         let graph = DepGraph::new();
         let search = IncludeSearchPaths {
-            user: vec![PathBuf::from("/high"), PathBuf::from("/low")],
+            user: vec![NormalizedPath::from("/high"), NormalizedPath::from("/low")],
             ..Default::default()
         };
         let ctx = make_ctx_with_search("/src/main.c", search);
@@ -434,7 +465,7 @@ mod tests {
 
         // foo.h currently resolves from /low.
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/low/foo.h")],
+            resolved: vec![NormalizedPath::from("/low/foo.h")],
             unresolved: Vec::new(),
             has_computed: false,
         };
@@ -449,7 +480,7 @@ mod tests {
     fn check_shadow_no_false_positive_lower_priority() {
         let graph = DepGraph::new();
         let search = IncludeSearchPaths {
-            user: vec![PathBuf::from("/high"), PathBuf::from("/low")],
+            user: vec![NormalizedPath::from("/high"), NormalizedPath::from("/low")],
             ..Default::default()
         };
         let ctx = make_ctx_with_search("/src/main.c", search);
@@ -457,13 +488,13 @@ mod tests {
 
         // foo.h already resolves from /high.
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/high/foo.h")],
+            resolved: vec![NormalizedPath::from("/high/foo.h")],
             unresolved: Vec::new(),
             has_computed: false,
         };
         graph.update(&key, scan, dummy_hash);
 
-        // New foo.h appears in /low (lower priority) — NOT a shadow.
+        // New foo.h appears in /low (lower priority) â€” NOT a shadow.
         let affected = graph.check_shadow(Path::new("/low/foo.h"));
         assert!(affected.is_empty());
     }
@@ -472,20 +503,20 @@ mod tests {
     fn check_shadow_different_filename_no_match() {
         let graph = DepGraph::new();
         let search = IncludeSearchPaths {
-            user: vec![PathBuf::from("/high"), PathBuf::from("/low")],
+            user: vec![NormalizedPath::from("/high"), NormalizedPath::from("/low")],
             ..Default::default()
         };
         let ctx = make_ctx_with_search("/src/main.c", search);
         let key = graph.register(ctx);
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/low/foo.h")],
+            resolved: vec![NormalizedPath::from("/low/foo.h")],
             unresolved: Vec::new(),
             has_computed: false,
         };
         graph.update(&key, scan, dummy_hash);
 
-        // bar.h in /high — different name, not a shadow.
+        // bar.h in /high â€” different name, not a shadow.
         let affected = graph.check_shadow(Path::new("/high/bar.h"));
         assert!(affected.is_empty());
     }
@@ -494,20 +525,20 @@ mod tests {
     fn check_shadow_same_dir_not_shadow() {
         let graph = DepGraph::new();
         let search = IncludeSearchPaths {
-            user: vec![PathBuf::from("/inc")],
+            user: vec![NormalizedPath::from("/inc")],
             ..Default::default()
         };
         let ctx = make_ctx_with_search("/src/main.c", search);
         let key = graph.register(ctx);
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/inc/foo.h")],
+            resolved: vec![NormalizedPath::from("/inc/foo.h")],
             unresolved: Vec::new(),
             has_computed: false,
         };
         graph.update(&key, scan, dummy_hash);
 
-        // Same dir — this is a modify/replace, not a shadow.
+        // Same dir â€” this is a modify/replace, not a shadow.
         let affected = graph.check_shadow(Path::new("/inc/foo.h"));
         assert!(affected.is_empty());
     }
@@ -516,8 +547,8 @@ mod tests {
     fn check_shadow_iquote_over_user() {
         let graph = DepGraph::new();
         let search = IncludeSearchPaths {
-            iquote: vec![PathBuf::from("/iquote")],
-            user: vec![PathBuf::from("/user")],
+            iquote: vec![NormalizedPath::from("/iquote")],
+            user: vec![NormalizedPath::from("/user")],
             ..Default::default()
         };
         let ctx = make_ctx_with_search("/src/main.c", search);
@@ -525,7 +556,7 @@ mod tests {
 
         // foo.h resolves from -I dir.
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/user/foo.h")],
+            resolved: vec![NormalizedPath::from("/user/foo.h")],
             unresolved: Vec::new(),
             has_computed: false,
         };
@@ -540,13 +571,13 @@ mod tests {
     fn check_shadow_cold_context_not_affected() {
         let graph = DepGraph::new();
         let search = IncludeSearchPaths {
-            user: vec![PathBuf::from("/high"), PathBuf::from("/low")],
+            user: vec![NormalizedPath::from("/high"), NormalizedPath::from("/low")],
             ..Default::default()
         };
         let ctx = make_ctx_with_search("/src/main.c", search);
         graph.register(ctx);
 
-        // Cold context has no resolved includes — nothing to shadow.
+        // Cold context has no resolved includes â€” nothing to shadow.
         let affected = graph.check_shadow(Path::new("/high/foo.h"));
         assert!(affected.is_empty());
     }
@@ -645,8 +676,8 @@ mod tests {
     #[test]
     fn priority_iquote_before_user() {
         let search = IncludeSearchPaths {
-            iquote: vec![PathBuf::from("/q")],
-            user: vec![PathBuf::from("/u")],
+            iquote: vec![NormalizedPath::from("/q")],
+            user: vec![NormalizedPath::from("/u")],
             ..Default::default()
         };
         assert!(is_higher_priority(
@@ -664,8 +695,8 @@ mod tests {
     #[test]
     fn priority_user_before_system() {
         let search = IncludeSearchPaths {
-            user: vec![PathBuf::from("/u")],
-            system: vec![PathBuf::from("/s")],
+            user: vec![NormalizedPath::from("/u")],
+            system: vec![NormalizedPath::from("/s")],
             ..Default::default()
         };
         assert!(is_higher_priority(
@@ -678,7 +709,7 @@ mod tests {
     #[test]
     fn priority_unknown_dir_returns_false() {
         let search = IncludeSearchPaths {
-            user: vec![PathBuf::from("/u")],
+            user: vec![NormalizedPath::from("/u")],
             ..Default::default()
         };
         assert!(!is_higher_priority(
@@ -691,7 +722,7 @@ mod tests {
     #[test]
     fn priority_same_dir_returns_false() {
         let search = IncludeSearchPaths {
-            user: vec![PathBuf::from("/u")],
+            user: vec![NormalizedPath::from("/u")],
             ..Default::default()
         };
         assert!(!is_higher_priority(

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
+use zccache_core::NormalizedPath;
 
 use serde::{Deserialize, Serialize};
 
@@ -214,18 +215,18 @@ fn remove_cache_inner(cache_path: &Path) {
 
 // ── Path helpers ─────────────────────────────────────────────────
 
-fn pending_path(cache_path: &Path) -> PathBuf {
-    cache_path.with_extension("pending")
+fn pending_path(cache_path: &Path) -> NormalizedPath {
+    cache_path.with_extension("pending").into()
 }
 
-fn tmp_path(path: &Path) -> PathBuf {
+fn tmp_path(path: &Path) -> NormalizedPath {
     cache_path_with_suffix(path, ".tmp")
 }
 
-fn cache_path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+fn cache_path_with_suffix(path: &Path, suffix: &str) -> NormalizedPath {
     let mut s = path.as_os_str().to_os_string();
     s.push(suffix);
-    PathBuf::from(s)
+    NormalizedPath::new(Path::new(&s))
 }
 
 // ── Utilities ────────────────────────────────────────────────────
@@ -450,9 +451,9 @@ mod tests {
     #[test]
     fn pending_path_replaces_extension() {
         // Verify the pending path convention.
-        let cache = PathBuf::from("/tmp/fp.json");
+        let cache = NormalizedPath::from("/tmp/fp.json");
         let pending = pending_path(&cache);
-        assert_eq!(pending, PathBuf::from("/tmp/fp.pending"));
+        assert_eq!(pending, NormalizedPath::from("/tmp/fp.pending"));
     }
 
     #[test]

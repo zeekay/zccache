@@ -3,8 +3,8 @@
 //! Three-way benchmark measuring compile latency across cache-miss and cache-hit scenarios.
 //! Run with: uv run cargo test -p zccache-daemon --test perf_test -- --nocapture --ignored
 
-use std::path::PathBuf;
 use std::time::Instant;
+use zccache_core::NormalizedPath;
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
@@ -22,7 +22,7 @@ const BARE_ITERATIONS: usize = 20; // bare clang is slow, fewer iterations neede
 
 // ─── Tool discovery ──────────────────────────────────────────────────────────
 
-fn find_sccache() -> Option<PathBuf> {
+fn find_sccache() -> Option<NormalizedPath> {
     for path in &[
         "sccache",
         "sccache.exe",
@@ -30,7 +30,7 @@ fn find_sccache() -> Option<PathBuf> {
     ] {
         if let Ok(output) = std::process::Command::new(path).arg("--version").output() {
             if output.status.success() {
-                return Some(PathBuf::from(path));
+                return Some(NormalizedPath::new(path));
             }
         }
     }

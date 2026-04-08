@@ -5,7 +5,9 @@
 //! expanding those files into the argument list.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use zccache_core::NormalizedPath;
 
 /// Maximum nesting depth for response files to prevent stack overflow.
 const MAX_DEPTH: usize = 10;
@@ -16,15 +18,15 @@ pub enum ResponseFileError {
     /// The response file could not be read.
     #[error("failed to read response file '{path}': {source}")]
     ReadError {
-        path: PathBuf,
+        path: NormalizedPath,
         source: std::io::Error,
     },
     /// Circular reference detected among response files.
     #[error("circular response file reference: '{path}'")]
-    CircularReference { path: PathBuf },
+    CircularReference { path: NormalizedPath },
     /// Response file nesting exceeded the maximum depth.
     #[error("response file nesting too deep (max {MAX_DEPTH}): '{path}'")]
-    TooDeep { path: PathBuf },
+    TooDeep { path: NormalizedPath },
 }
 
 /// Parse the content of a response file into individual arguments.
@@ -109,7 +111,7 @@ pub fn parse_response_file_content(content: &str) -> Vec<String> {
 /// directory. Use [`expand_response_files_in`] to specify a custom base directory.
 pub fn expand_response_files(args: &[String]) -> Result<Vec<String>, ResponseFileError> {
     let cwd = std::env::current_dir().map_err(|e| ResponseFileError::ReadError {
-        path: PathBuf::from("."),
+        path: NormalizedPath::new("."),
         source: e,
     })?;
     expand_response_files_in(args, &cwd)
@@ -132,7 +134,7 @@ pub fn expand_response_files_in(
 fn expand_recursive(
     args: &[String],
     base_dir: &Path,
-    seen: &mut HashSet<PathBuf>,
+    seen: &mut HashSet<NormalizedPath>,
     depth: usize,
 ) -> Result<Vec<String>, ResponseFileError> {
     let mut result = Vec::new();
@@ -147,16 +149,16 @@ fn expand_recursive(
 
             let raw_path = Path::new(filename);
             let resolved = if raw_path.is_absolute() {
-                raw_path.to_path_buf()
+                NormalizedPath::new(raw_path)
             } else {
-                base_dir.join(raw_path)
+                base_dir.join(raw_path).into()
             };
-            let canonical = resolved
-                .canonicalize()
-                .map_err(|e| ResponseFileError::ReadError {
+            let canonical = NormalizedPath::new(resolved.canonicalize().map_err(|e| {
+                ResponseFileError::ReadError {
                     path: resolved.clone(),
                     source: e,
-                })?;
+                }
+            })?);
 
             if !seen.insert(canonical.clone()) {
                 return Err(ResponseFileError::CircularReference { path: resolved });
@@ -173,10 +175,10 @@ fn expand_recursive(
                 })?;
 
             // Nested @file references resolve against the parent file's directory
-            let parent_dir = canonical.parent().unwrap_or(base_dir).to_path_buf();
+            let parent_dir = canonical.parent().unwrap_or(base_dir);
 
             let expanded_args = parse_response_file_content(&content);
-            let nested = expand_recursive(&expanded_args, &parent_dir, seen, depth + 1)?;
+            let nested = expand_recursive(&expanded_args, parent_dir, seen, depth + 1)?;
             result.extend(nested);
 
             // Remove from seen so the same file can appear in sibling branches
@@ -279,7 +281,8 @@ pub fn write_response_file_if_needed(
     }
 
     let id = RSP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let rsp_path = tmp_dir.join(format!("zccache_{}_{}.rsp", std::process::id(), id));
+    let rsp_path =
+        NormalizedPath::new(tmp_dir.join(format!("zccache_{}_{}.rsp", std::process::id(), id)));
     let Some(content) = format_rsp_content_if_safe(args) else {
         return Ok(None);
     };
@@ -299,7 +302,7 @@ pub fn write_response_file_if_needed(
 
 /// RAII guard for a temporary response file. Deletes the file on drop.
 pub struct TempResponseFile {
-    pub path: PathBuf,
+    pub path: NormalizedPath,
 }
 
 impl TempResponseFile {
@@ -325,7 +328,7 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
-    // ── parse_response_file_content tests ──
+    // â”€â”€ parse_response_file_content tests â”€â”€
 
     #[test]
     fn parse_simple_whitespace_separated() {
@@ -377,7 +380,7 @@ mod tests {
 
     #[test]
     fn parse_single_quotes_no_escapes() {
-        // Single quotes are literal — backslash is not special
+        // Single quotes are literal â€” backslash is not special
         let result = parse_response_file_content(r"'-DMSG=a\nb'");
         assert_eq!(result, s(&[r"-DMSG=a\nb"]));
     }
@@ -414,7 +417,7 @@ mod tests {
         assert_eq!(result, s(&["-Ipath with spaces"]));
     }
 
-    // ── expand_response_files tests ──
+    // â”€â”€ expand_response_files tests â”€â”€
 
     #[test]
     fn expand_no_at_files() {
@@ -569,8 +572,8 @@ mod tests {
         let result = crate::parse_invocation("gcc", &expanded);
         match result {
             crate::ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
-                assert_eq!(c.output_file, PathBuf::from("foo.o"));
+                assert_eq!(c.source_file, NormalizedPath::new("foo.cpp"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.o"));
                 assert!(c.original_args.contains(&"-O2".to_string()));
                 assert!(c.original_args.contains(&"-Wall".to_string()));
                 assert!(c.original_args.contains(&"-DNDEBUG".to_string()));
@@ -579,7 +582,7 @@ mod tests {
         }
     }
 
-    // ── expand_response_files_in tests ──
+    // â”€â”€ expand_response_files_in tests â”€â”€
 
     #[test]
     fn expand_in_resolves_relative_against_base_dir() {
@@ -661,7 +664,7 @@ mod tests {
 
     #[test]
     fn expand_in_nested_absolute_inside_relative() {
-        // @relative.rsp contains @/absolute/path.rsp — absolute ref ignores parent dir
+        // @relative.rsp contains @/absolute/path.rsp â€” absolute ref ignores parent dir
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("sub");
         std::fs::create_dir_all(&sub).unwrap();
@@ -683,7 +686,7 @@ mod tests {
 
     #[test]
     fn expand_in_three_level_relative_chain() {
-        // a/1.rsp -> @b/2.rsp -> @c/3.rsp — each relative to its parent
+        // a/1.rsp -> @b/2.rsp -> @c/3.rsp â€” each relative to its parent
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");
         let ab = a.join("b");
@@ -701,7 +704,7 @@ mod tests {
 
     #[test]
     fn expand_in_error_shows_resolved_path() {
-        // @relative.rsp that doesn't exist — error should show resolved path, not raw
+        // @relative.rsp that doesn't exist â€” error should show resolved path, not raw
         let dir = tempfile::tempdir().unwrap();
         let args = s(&["@missing.rsp"]);
         let err = expand_response_files_in(&args, dir.path()).unwrap_err();
@@ -756,7 +759,7 @@ mod tests {
         );
     }
 
-    // ── format_rsp_content / write_response_file tests ──
+    // â”€â”€ format_rsp_content / write_response_file tests â”€â”€
 
     #[test]
     fn format_rsp_simple_args() {
@@ -834,9 +837,9 @@ mod tests {
 
     #[test]
     fn temp_response_file_at_arg() {
-        let path = PathBuf::from("/tmp/test.rsp");
+        let path = NormalizedPath::new("/tmp/test.rsp");
         let rsp = TempResponseFile { path };
-        assert_eq!(rsp.at_arg(), "@/tmp/test.rsp");
+        assert_eq!(rsp.at_arg(), format!("@{}", rsp.path.display()));
         std::mem::forget(rsp);
     }
 
@@ -848,7 +851,7 @@ mod tests {
         assert!(rsp_path.exists());
 
         let rsp = TempResponseFile {
-            path: rsp_path.clone(),
+            path: rsp_path.clone().into(),
         };
         drop(rsp);
         assert!(!rsp_path.exists());

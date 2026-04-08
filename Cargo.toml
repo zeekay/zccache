@@ -16,6 +16,7 @@ members = [
     "crates/zccache-ci",
     "crates/zccache-fingerprint",
 ]
+exclude = ["dylints/ban_std_pathbuf"]
 
 [workspace.package]
 version = "1.1.18"
@@ -64,6 +65,9 @@ zccache-fingerprint = { version = "=1.1.18", path = "crates/zccache-fingerprint"
 # 2. Report start_read failure (watcher silently dying) as error
 [patch.crates-io]
 notify = { path = "vendor/notify" }
+
+[workspace.metadata.dylint]
+libraries = [{ path = "dylints/*" }]
 
 # Note: workspace.lints requires Rust 1.74+. If your toolchain is older,
 # these are ignored. Lint configuration is also enforced via CI clippy flags.

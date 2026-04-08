@@ -210,7 +210,7 @@ async fn session_stats_not_tracked_returns_none() {
         client
             .send(&Request::SessionStart {
                 client_pid: std::process::id(),
-                working_dir: std::env::current_dir().unwrap(),
+                working_dir: std::env::current_dir().unwrap().into(),
                 log_file: None,
                 track_stats: false,
                 journal_path: None,

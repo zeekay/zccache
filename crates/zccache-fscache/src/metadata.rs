@@ -2,8 +2,8 @@
 
 use dashmap::DashMap;
 use rayon::prelude::*;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
+use zccache_core::NormalizedPath;
 
 /// Confidence level for a cached metadata entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -41,7 +41,7 @@ pub struct FileMetadata {
 /// by normalized path.
 #[derive(Debug)]
 pub struct MetadataCache {
-    entries: DashMap<PathBuf, FileMetadata>,
+    entries: DashMap<NormalizedPath, FileMetadata>,
     /// Duration after which a High-confidence entry decays to Medium.
     high_decay: Duration,
     /// Duration after which a Medium-confidence entry decays to Low.
@@ -63,7 +63,7 @@ impl MetadataCache {
     ///
     /// Returns `None` if the path is not in the cache.
     #[must_use]
-    pub fn get(&self, path: &Path) -> Option<FileMetadata> {
+    pub fn get(&self, path: &NormalizedPath) -> Option<FileMetadata> {
         self.entries.get(path).map(|entry| {
             let mut meta = entry.clone();
             meta.confidence = self.decayed_confidence(&meta);
@@ -72,12 +72,12 @@ impl MetadataCache {
     }
 
     /// Insert or update metadata for a path.
-    pub fn insert(&self, path: PathBuf, metadata: FileMetadata) {
+    pub fn insert(&self, path: NormalizedPath, metadata: FileMetadata) {
         self.entries.insert(path, metadata);
     }
 
     /// Mark a path's entry as Low confidence (e.g., after watcher overflow).
-    pub fn downgrade(&self, path: &Path) {
+    pub fn downgrade(&self, path: &NormalizedPath) {
         if let Some(mut entry) = self.entries.get_mut(path) {
             entry.confidence = Confidence::Low;
         }
@@ -102,7 +102,7 @@ impl MetadataCache {
     pub fn rescan_all(&self) -> usize {
         // Collect Low-confidence keys so we can stat them in parallel
         // without holding DashMap shard locks during I/O.
-        let low_keys: Vec<PathBuf> = self
+        let low_keys: Vec<NormalizedPath> = self
             .entries
             .iter()
             .filter(|e| e.confidence == Confidence::Low)
@@ -114,7 +114,7 @@ impl MetadataCache {
         }
 
         // Parallel stat: each file is independent.
-        let results: Vec<(PathBuf, SystemTime, u64)> = low_keys
+        let results: Vec<(NormalizedPath, SystemTime, u64)> = low_keys
             .par_iter()
             .filter_map(|path| {
                 Self::stat_file(path)
@@ -139,7 +139,7 @@ impl MetadataCache {
     }
 
     /// Remove a path from the cache.
-    pub fn remove(&self, path: &Path) {
+    pub fn remove(&self, path: &NormalizedPath) {
         self.entries.remove(path);
     }
 
@@ -167,7 +167,7 @@ impl MetadataCache {
     /// not applied. Returns `None` if the entry is missing, Low confidence,
     /// or has no cached hash.
     #[must_use]
-    pub fn get_cached_hash(&self, path: &Path) -> Option<zccache_hash::ContentHash> {
+    pub fn get_cached_hash(&self, path: &NormalizedPath) -> Option<zccache_hash::ContentHash> {
         self.entries
             .get(path)
             .and_then(|entry| match entry.confidence {
@@ -188,7 +188,10 @@ impl MetadataCache {
     /// Returns `None` if the entry is missing, Low confidence, has no cached
     /// hash, or the stat check fails / shows a mismatch.
     #[must_use]
-    pub fn get_cached_hash_if_stat_valid(&self, path: &Path) -> Option<zccache_hash::ContentHash> {
+    pub fn get_cached_hash_if_stat_valid(
+        &self,
+        path: &NormalizedPath,
+    ) -> Option<zccache_hash::ContentHash> {
         let entry = self.entries.get(path)?;
         match entry.confidence {
             Confidence::High | Confidence::Medium => {}
@@ -234,7 +237,7 @@ impl MetadataCache {
             return 0;
         }
         // Collect (path, last_verified) then sort oldest first.
-        let mut entries: Vec<(PathBuf, Instant)> = self
+        let mut entries: Vec<(NormalizedPath, Instant)> = self
             .entries
             .iter()
             .map(|e| (e.key().clone(), e.value().last_verified))
@@ -248,7 +251,7 @@ impl MetadataCache {
     }
 
     /// Iterate all cached paths.
-    pub fn paths(&self) -> Vec<PathBuf> {
+    pub fn paths(&self) -> Vec<NormalizedPath> {
         self.entries.iter().map(|e| e.key().clone()).collect()
     }
 
@@ -278,7 +281,7 @@ mod tests {
     #[test]
     fn insert_and_get() {
         let cache = MetadataCache::new();
-        let path = PathBuf::from("/tmp/test.c");
+        let path = NormalizedPath::from("/tmp/test.c");
         let meta = FileMetadata {
             mtime: SystemTime::now(),
             size: 100,
@@ -293,13 +296,13 @@ mod tests {
     #[test]
     fn get_returns_none_for_missing_path() {
         let cache = MetadataCache::new();
-        assert!(cache.get(Path::new("/no/such/path")).is_none());
+        assert!(cache.get(&NormalizedPath::from("/no/such/path")).is_none());
     }
 
     #[test]
     fn insert_overwrites_existing() {
         let cache = MetadataCache::new();
-        let path = PathBuf::from("/tmp/overwrite.c");
+        let path = NormalizedPath::from("/tmp/overwrite.c");
 
         let meta1 = FileMetadata {
             mtime: SystemTime::now(),
@@ -325,8 +328,8 @@ mod tests {
     #[test]
     fn downgrade_single_path() {
         let cache = MetadataCache::new();
-        let path_a = PathBuf::from("/tmp/a.c");
-        let path_b = PathBuf::from("/tmp/b.c");
+        let path_a = NormalizedPath::from("/tmp/a.c");
+        let path_b = NormalizedPath::from("/tmp/b.c");
 
         for path in [&path_a, &path_b] {
             cache.insert(
@@ -349,13 +352,13 @@ mod tests {
     #[test]
     fn downgrade_nonexistent_is_noop() {
         let cache = MetadataCache::new();
-        cache.downgrade(Path::new("/no/such/path")); // should not panic
+        cache.downgrade(&NormalizedPath::from("/no/such/path")); // should not panic
     }
 
     #[test]
     fn remove_entry() {
         let cache = MetadataCache::new();
-        let path = PathBuf::from("/tmp/removable.c");
+        let path = NormalizedPath::from("/tmp/removable.c");
         cache.insert(
             path.clone(),
             FileMetadata {
@@ -376,7 +379,7 @@ mod tests {
     #[test]
     fn remove_nonexistent_is_noop() {
         let cache = MetadataCache::new();
-        cache.remove(Path::new("/no/such/path")); // should not panic
+        cache.remove(&NormalizedPath::from("/no/such/path")); // should not panic
     }
 
     #[test]
@@ -386,7 +389,7 @@ mod tests {
         assert_eq!(cache.len(), 0);
 
         cache.insert(
-            PathBuf::from("/tmp/x.c"),
+            NormalizedPath::from("/tmp/x.c"),
             FileMetadata {
                 mtime: SystemTime::now(),
                 size: 1,
@@ -402,7 +405,7 @@ mod tests {
     #[test]
     fn get_cached_hash_high_confidence() {
         let cache = MetadataCache::new();
-        let path = PathBuf::from("/tmp/hashed.c");
+        let path = NormalizedPath::from("/tmp/hashed.c");
         let hash_bytes = [42u8; 32];
         cache.insert(
             path.clone(),
@@ -423,7 +426,7 @@ mod tests {
     #[test]
     fn get_cached_hash_medium_confidence() {
         let cache = MetadataCache::new();
-        let path = PathBuf::from("/tmp/med.c");
+        let path = NormalizedPath::from("/tmp/med.c");
         let hash_bytes = [7u8; 32];
         cache.insert(
             path.clone(),
@@ -443,7 +446,7 @@ mod tests {
     #[test]
     fn get_cached_hash_low_confidence_returns_none() {
         let cache = MetadataCache::new();
-        let path = PathBuf::from("/tmp/low.c");
+        let path = NormalizedPath::from("/tmp/low.c");
         cache.insert(
             path.clone(),
             FileMetadata {
@@ -461,7 +464,7 @@ mod tests {
     #[test]
     fn get_cached_hash_no_hash_returns_none() {
         let cache = MetadataCache::new();
-        let path = PathBuf::from("/tmp/nohash.c");
+        let path = NormalizedPath::from("/tmp/nohash.c");
         cache.insert(
             path.clone(),
             FileMetadata {
@@ -479,7 +482,9 @@ mod tests {
     #[test]
     fn get_cached_hash_missing_path_returns_none() {
         let cache = MetadataCache::new();
-        assert!(cache.get_cached_hash(Path::new("/no/such")).is_none());
+        assert!(cache
+            .get_cached_hash(&NormalizedPath::from("/no/such"))
+            .is_none());
     }
 
     #[test]
@@ -487,7 +492,7 @@ mod tests {
         let cache = MetadataCache::new();
         for i in 0..5 {
             cache.insert(
-                PathBuf::from(format!("/tmp/clear{i}.c")),
+                NormalizedPath::from(format!("/tmp/clear{i}.c")),
                 FileMetadata {
                     mtime: SystemTime::now(),
                     size: i as u64,
@@ -507,7 +512,7 @@ mod tests {
         let cache = MetadataCache::new();
         let old = Instant::now() - Duration::from_secs(120);
         cache.insert(
-            PathBuf::from("/tmp/old.c"),
+            NormalizedPath::from("/tmp/old.c"),
             FileMetadata {
                 mtime: SystemTime::now(),
                 size: 10,
@@ -517,7 +522,7 @@ mod tests {
             },
         );
         cache.insert(
-            PathBuf::from("/tmp/new.c"),
+            NormalizedPath::from("/tmp/new.c"),
             FileMetadata {
                 mtime: SystemTime::now(),
                 size: 10,
@@ -529,8 +534,8 @@ mod tests {
         let removed = cache.trim(Duration::from_secs(60));
         assert_eq!(removed, 1);
         assert_eq!(cache.len(), 1);
-        assert!(cache.get(Path::new("/tmp/old.c")).is_none());
-        assert!(cache.get(Path::new("/tmp/new.c")).is_some());
+        assert!(cache.get(&NormalizedPath::from("/tmp/old.c")).is_none());
+        assert!(cache.get(&NormalizedPath::from("/tmp/new.c")).is_some());
     }
 
     #[test]
@@ -538,7 +543,7 @@ mod tests {
         let cache = MetadataCache::new();
         for i in 0..5 {
             cache.insert(
-                PathBuf::from(format!("/tmp/recent{i}.c")),
+                NormalizedPath::from(format!("/tmp/recent{i}.c")),
                 FileMetadata {
                     mtime: SystemTime::now(),
                     size: 10,
@@ -559,7 +564,7 @@ mod tests {
         let base = Instant::now() - Duration::from_secs(100);
         for i in 0..5 {
             cache.insert(
-                PathBuf::from(format!("/tmp/e{i}.c")),
+                NormalizedPath::from(format!("/tmp/e{i}.c")),
                 FileMetadata {
                     mtime: SystemTime::now(),
                     size: 10,
@@ -578,7 +583,7 @@ mod tests {
     fn evict_oldest_zero_noop() {
         let cache = MetadataCache::new();
         cache.insert(
-            PathBuf::from("/tmp/z.c"),
+            NormalizedPath::from("/tmp/z.c"),
             FileMetadata {
                 mtime: SystemTime::now(),
                 size: 10,
@@ -596,7 +601,7 @@ mod tests {
     fn evict_oldest_exceeds_count() {
         let cache = MetadataCache::new();
         cache.insert(
-            PathBuf::from("/tmp/only.c"),
+            NormalizedPath::from("/tmp/only.c"),
             FileMetadata {
                 mtime: SystemTime::now(),
                 size: 10,
@@ -613,8 +618,8 @@ mod tests {
     #[test]
     fn paths_returns_all() {
         let cache = MetadataCache::new();
-        let expected: HashSet<PathBuf> = (0..3)
-            .map(|i| PathBuf::from(format!("/tmp/p{i}.c")))
+        let expected: HashSet<NormalizedPath> = (0..3)
+            .map(|i| NormalizedPath::from(format!("/tmp/p{i}.c")))
             .collect();
         for p in &expected {
             cache.insert(
@@ -628,7 +633,7 @@ mod tests {
                 },
             );
         }
-        let actual: HashSet<PathBuf> = cache.paths().into_iter().collect();
+        let actual: HashSet<NormalizedPath> = cache.paths().into_iter().collect();
         assert_eq!(actual, expected);
     }
 
@@ -649,7 +654,7 @@ mod tests {
     fn downgrade_all_works() {
         let cache = MetadataCache::new();
         for i in 0..10 {
-            let path = PathBuf::from(format!("/tmp/test{i}.c"));
+            let path = NormalizedPath::from(format!("/tmp/test{i}.c"));
             let meta = FileMetadata {
                 mtime: SystemTime::now(),
                 size: 100,

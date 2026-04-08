@@ -13,10 +13,11 @@
 //! Run all:    uv run cargo test -p zccache-compiler --test response_file_adversarial -- --nocapture
 //! Run single: uv run cargo test -p zccache-compiler --test response_file_adversarial -- <test_name> --nocapture
 
-use std::path::PathBuf;
+use std::path::Path;
 use zccache_compiler::response_file::{
     expand_response_files, parse_response_file_content, ResponseFileError,
 };
+use zccache_core::NormalizedPath;
 
 #[cfg(windows)]
 use zccache_compiler::response_file::write_response_file_if_needed;
@@ -611,17 +612,17 @@ fn parse_escaped_quote_then_unquoted() {
 /// Helper: create a chain of N response files, each referencing the next.
 /// The deepest file contains `-DLEAF`.
 /// Returns the path to the outermost file.
-fn create_nested_chain(dir: &std::path::Path, depth: usize) -> PathBuf {
+fn create_nested_chain(dir: &Path, depth: usize) -> NormalizedPath {
     // Create files from deepest to shallowest
     let deepest = dir.join(format!("level_{depth}.rsp"));
     std::fs::write(&deepest, "-DLEAF").unwrap();
 
-    let mut prev_path = deepest;
+    let mut prev_path = NormalizedPath::new(deepest);
     for i in (0..depth).rev() {
         let this_path = dir.join(format!("level_{i}.rsp"));
         let content = format!("-DLEVEL_{i} @{}", prev_path.display());
         std::fs::write(&this_path, content).unwrap();
-        prev_path = this_path;
+        prev_path = NormalizedPath::new(this_path);
     }
     prev_path
 }
@@ -1060,8 +1061,8 @@ fn integration_all_args_from_response_file() {
     let expanded = expand_response_files(&args).unwrap();
     match zccache_compiler::parse_invocation("gcc", &expanded) {
         zccache_compiler::ParsedInvocation::Cacheable(c) => {
-            assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
-            assert_eq!(c.output_file, PathBuf::from("foo.o"));
+            assert_eq!(c.source_file, Path::new("foo.cpp"));
+            assert_eq!(c.output_file, Path::new("foo.o"));
             assert!(c.original_args.contains(&"-O2".to_string()));
             assert!(c.original_args.contains(&"-Wall".to_string()));
         }
@@ -1080,8 +1081,8 @@ fn integration_c_flag_from_response_file() {
     let expanded = expand_response_files(&args).unwrap();
     match zccache_compiler::parse_invocation("clang", &expanded) {
         zccache_compiler::ParsedInvocation::Cacheable(c) => {
-            assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
-            assert_eq!(c.output_file, PathBuf::from("foo.o"));
+            assert_eq!(c.source_file, Path::new("foo.cpp"));
+            assert_eq!(c.output_file, Path::new("foo.o"));
         }
         other => panic!("expected cacheable, got: {other:?}"),
     }
@@ -1113,8 +1114,8 @@ fn integration_quoted_source_path_from_response_file() {
     let expanded = expand_response_files(&args).unwrap();
     match zccache_compiler::parse_invocation("gcc", &expanded) {
         zccache_compiler::ParsedInvocation::Cacheable(c) => {
-            assert_eq!(c.source_file, PathBuf::from("path with spaces/main.cpp"));
-            assert_eq!(c.output_file, PathBuf::from("main.o"));
+            assert_eq!(c.source_file, Path::new("path with spaces/main.cpp"));
+            assert_eq!(c.output_file, Path::new("main.o"));
         }
         other => panic!("expected cacheable, got: {other:?}"),
     }
@@ -1139,8 +1140,8 @@ fn integration_nested_response_files_cacheable() {
     let expanded = expand_response_files(&args).unwrap();
     match zccache_compiler::parse_invocation("g++", &expanded) {
         zccache_compiler::ParsedInvocation::Cacheable(c) => {
-            assert_eq!(c.source_file, PathBuf::from("main.cpp"));
-            assert_eq!(c.output_file, PathBuf::from("main.o"));
+            assert_eq!(c.source_file, Path::new("main.cpp"));
+            assert_eq!(c.output_file, Path::new("main.o"));
             assert!(c.original_args.contains(&"-O2".to_string()));
             assert!(c.original_args.contains(&"-Wall".to_string()));
             assert!(c.original_args.contains(&"-DNDEBUG".to_string()));

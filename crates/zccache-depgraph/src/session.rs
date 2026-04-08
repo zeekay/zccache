@@ -4,14 +4,14 @@
 //! tracks which compilation contexts it has registered, the client's PID
 //! (for dead-man's switch), and idle time for timeout-based cleanup.
 //!
-//! The graph itself survives across sessions — sessions are ephemeral
+//! The graph itself survives across sessions â€” sessions are ephemeral
 //! metadata about who is using the graph.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use zccache_core::NormalizedPath;
 
 use crate::context::ContextKey;
 
@@ -31,7 +31,7 @@ pub struct SessionStatsTracker {
     /// Estimated time saved in nanoseconds.
     pub time_saved_ns: u64,
     /// Distinct source files compiled.
-    pub sources: HashSet<PathBuf>,
+    pub sources: HashSet<NormalizedPath>,
     /// Artifact bytes served from cache.
     pub bytes_read: u64,
     /// Artifact bytes stored into cache.
@@ -71,7 +71,7 @@ impl SessionStatsTracker {
     }
 
     /// Record a cache hit.
-    pub fn record_hit(&mut self, source: PathBuf, saved_ns: u64, bytes: u64) {
+    pub fn record_hit(&mut self, source: NormalizedPath, saved_ns: u64, bytes: u64) {
         self.compilations += 1;
         self.hits += 1;
         self.time_saved_ns += saved_ns;
@@ -80,7 +80,7 @@ impl SessionStatsTracker {
     }
 
     /// Record a cache miss.
-    pub fn record_miss(&mut self, source: PathBuf, bytes: u64) {
+    pub fn record_miss(&mut self, source: NormalizedPath, bytes: u64) {
         self.compilations += 1;
         self.misses += 1;
         self.sources.insert(source);
@@ -160,13 +160,13 @@ pub struct SessionConfig {
     /// PID of the client process (for dead-man's switch).
     pub client_pid: u32,
     /// Working directory of the client.
-    pub working_dir: PathBuf,
+    pub working_dir: NormalizedPath,
     /// Optional log file path for session-scoped logging.
-    pub log_file: Option<PathBuf>,
+    pub log_file: Option<NormalizedPath>,
     /// Whether to track per-session statistics.
     pub track_stats: bool,
     /// Path for per-session JSONL compile journal (must end in .jsonl).
-    pub journal_path: Option<PathBuf>,
+    pub journal_path: Option<NormalizedPath>,
 }
 
 /// An active session.
@@ -177,9 +177,9 @@ pub struct Session {
     /// PID of the client process.
     pub client_pid: u32,
     /// Client's working directory.
-    pub working_dir: PathBuf,
+    pub working_dir: NormalizedPath,
     /// Optional log file path for session-scoped logging.
-    pub log_file: Option<PathBuf>,
+    pub log_file: Option<NormalizedPath>,
     /// Context keys registered by this session.
     pub context_keys: HashSet<ContextKey>,
     /// When the session was created.
@@ -189,7 +189,7 @@ pub struct Session {
     /// Per-session stats tracker (only present when opted in).
     pub stats_tracker: Option<SessionStatsTracker>,
     /// Path to the per-session JSONL journal file (if journal was requested).
-    pub journal_path: Option<PathBuf>,
+    pub journal_path: Option<NormalizedPath>,
 }
 
 /// Manages active sessions.
@@ -276,7 +276,7 @@ impl SessionManager {
 
     /// Get a session's working directory.
     #[must_use]
-    pub fn working_dir(&self, id: &SessionId) -> Option<PathBuf> {
+    pub fn working_dir(&self, id: &SessionId) -> Option<NormalizedPath> {
         self.sessions.get(id).map(|s| s.working_dir.clone())
     }
 
@@ -366,7 +366,7 @@ mod tests {
     fn test_config() -> SessionConfig {
         SessionConfig {
             client_pid: 1234,
-            working_dir: PathBuf::from("/home/user/project"),
+            working_dir: "/home/user/project".into(),
             log_file: None,
             track_stats: false,
             journal_path: None,
@@ -431,7 +431,7 @@ mod tests {
         let id = mgr.create(test_config());
 
         let ctx = crate::context::CompileContext {
-            source_file: PathBuf::from("/src/main.c"),
+            source_file: "/src/main.c".into(),
             include_search: crate::search_paths::IncludeSearchPaths::default(),
             defines: Vec::new(),
             flags: Vec::new(),
@@ -452,7 +452,7 @@ mod tests {
     fn add_context_nonexistent_session_returns_false() {
         let mgr = SessionManager::new(Duration::from_secs(900));
         let ctx = crate::context::CompileContext {
-            source_file: PathBuf::from("/src/main.c"),
+            source_file: "/src/main.c".into(),
             include_search: crate::search_paths::IncludeSearchPaths::default(),
             defines: Vec::new(),
             flags: Vec::new(),
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!(mgr.active_count(), 100);
     }
 
-    // ─── SessionStatsTracker tests ──────────────────────────────────────
+    // â”€â”€â”€ SessionStatsTracker tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn tracker_new_is_zero() {
@@ -568,8 +568,8 @@ mod tests {
     #[test]
     fn tracker_record_hit() {
         let mut t = SessionStatsTracker::new();
-        t.record_hit(PathBuf::from("/src/a.c"), 5_000_000, 1024);
-        t.record_hit(PathBuf::from("/src/a.c"), 3_000_000, 2048); // same source
+        t.record_hit("/src/a.c".into(), 5_000_000, 1024);
+        t.record_hit("/src/a.c".into(), 3_000_000, 2048); // same source
         assert_eq!(t.compilations, 2);
         assert_eq!(t.hits, 2);
         assert_eq!(t.time_saved_ns, 8_000_000);
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn tracker_record_miss() {
         let mut t = SessionStatsTracker::new();
-        t.record_miss(PathBuf::from("/src/b.c"), 4096);
+        t.record_miss("/src/b.c".into(), 4096);
         assert_eq!(t.compilations, 1);
         assert_eq!(t.misses, 1);
         assert_eq!(t.bytes_written, 4096);
@@ -600,8 +600,8 @@ mod tests {
     #[test]
     fn tracker_finalize() {
         let mut t = SessionStatsTracker::new();
-        t.record_hit(PathBuf::from("/src/a.c"), 5_000_000, 1024);
-        t.record_miss(PathBuf::from("/src/b.c"), 2048);
+        t.record_hit("/src/a.c".into(), 5_000_000, 1024);
+        t.record_miss("/src/b.c".into(), 2048);
         t.record_non_cacheable();
 
         let created_at = Instant::now() - Duration::from_millis(500);

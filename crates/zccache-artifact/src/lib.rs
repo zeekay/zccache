@@ -9,13 +9,14 @@ mod store;
 
 pub use store::{ArtifactIndex, ArtifactStore};
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use zccache_core::NormalizedPath;
 
 /// Configuration for the artifact store.
 #[derive(Debug, Clone)]
 pub struct ArtifactStoreConfig {
     /// Root directory for artifact storage.
-    pub cache_dir: PathBuf,
+    pub cache_dir: NormalizedPath,
     /// Maximum total cache size in bytes.
     pub max_size: u64,
 }
@@ -42,7 +43,7 @@ impl ArtifactStoreLegacy {
 
     /// Returns the path where an artifact with the given key would be stored.
     #[must_use]
-    pub fn artifact_path(&self, key: &zccache_hash::ContentHash) -> PathBuf {
+    pub fn artifact_path(&self, key: &zccache_hash::ContentHash) -> NormalizedPath {
         let shards = key.shard_prefix(2, 1);
         self.config
             .cache_dir

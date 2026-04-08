@@ -3,7 +3,8 @@
 //! On panic, writes a timestamped crash dump to the crash directory.
 //! On startup, warns about unreported crashes from previous sessions.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use zccache_core::NormalizedPath;
 
 /// Install a panic hook that writes crash dumps before aborting.
 pub fn install_panic_hook() {
@@ -39,7 +40,7 @@ pub fn install_panic_hook() {
 /// Write a crash dump file to the crash directory.
 ///
 /// Returns the path to the written file, or `None` if writing failed.
-pub fn write_crash_dump(panic_info: &str, backtrace: &str) -> Option<PathBuf> {
+pub fn write_crash_dump(panic_info: &str, backtrace: &str) -> Option<NormalizedPath> {
     let crash_dir = zccache_core::config::crash_dump_dir();
     std::fs::create_dir_all(&crash_dir).ok()?;
 
@@ -109,13 +110,13 @@ pub fn check_previous_crashes() {
 
 /// List all crash dump files, sorted by name.
 #[must_use]
-pub fn list_crash_dumps() -> Vec<PathBuf> {
+pub fn list_crash_dumps() -> Vec<NormalizedPath> {
     let crash_dir = zccache_core::config::crash_dump_dir();
-    let mut dumps: Vec<PathBuf> = match std::fs::read_dir(&crash_dir) {
+    let mut dumps: Vec<NormalizedPath> = match std::fs::read_dir(&crash_dir) {
         Ok(entries) => entries
             .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "txt"))
+            .map(|e| e.path().into())
+            .filter(|p: &NormalizedPath| p.extension().is_some_and(|e| e == "txt"))
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -275,11 +276,11 @@ mod tests {
         std::fs::write(crash_dir.join("crash-2.txt"), "b").unwrap();
         std::fs::write(crash_dir.join("crash-2.reported"), "").unwrap();
 
-        let mut dumps: Vec<PathBuf> = std::fs::read_dir(crash_dir)
+        let mut dumps: Vec<NormalizedPath> = std::fs::read_dir(crash_dir)
             .unwrap()
             .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "txt"))
+            .map(|e| e.path().into())
+            .filter(|p: &NormalizedPath| p.extension().is_some_and(|e| e == "txt"))
             .collect();
         dumps.sort();
 

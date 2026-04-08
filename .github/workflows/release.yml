@@ -1,0 +1,147 @@
+name: Release Standalone Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            binary_ext: ""
+
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            binary_ext: ""
+            cross: true
+            linker: aarch64-unknown-linux-musl-gcc
+            strip: aarch64-unknown-linux-musl-strip
+
+          - target: x86_64-apple-darwin
+            os: macos-14
+            binary_ext: ""
+
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            binary_ext: ""
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            binary_ext: ".exe"
+
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            binary_ext: ".exe"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install musl cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          curl -fsSL -o aarch64-unknown-linux-musl.tar.xz \
+            https://github.com/cross-tools/musl-cross/releases/download/20250929/aarch64-unknown-linux-musl.tar.xz
+          tar xJf aarch64-unknown-linux-musl.tar.xz
+          echo "$PWD/aarch64-unknown-linux-musl/bin" >> $GITHUB_PATH
+
+      - name: Configure cross-compilation linker
+        if: matrix.linker
+        shell: bash
+        run: |
+          TARGET_UPPER=$(echo "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')
+          echo "CARGO_TARGET_${TARGET_UPPER}_LINKER=${{ matrix.linker }}" >> $GITHUB_ENV
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p zccache-cli
+          cargo build --release --target ${{ matrix.target }} -p zccache-daemon
+          cargo build --release --target ${{ matrix.target }} -p zccache-fingerprint
+
+      - name: Stage binaries
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/zccache${{ matrix.binary_ext }} staging/
+          cp target/${{ matrix.target }}/release/zccache-daemon${{ matrix.binary_ext }} staging/
+          cp target/${{ matrix.target }}/release/zccache-fp${{ matrix.binary_ext }} staging/
+          STRIP="${{ matrix.strip }}"
+          if [ -z "$STRIP" ]; then
+            STRIP="strip"
+          fi
+          if command -v "$STRIP" &> /dev/null; then
+            $STRIP staging/zccache${{ matrix.binary_ext }} || true
+            $STRIP staging/zccache-daemon${{ matrix.binary_ext }} || true
+            $STRIP staging/zccache-fp${{ matrix.binary_ext }} || true
+          fi
+
+      - name: Package standalone archive
+        shell: bash
+        run: |
+          python ci/package_release.py \
+            --version "${GITHUB_REF_NAME}" \
+            --target "${{ matrix.target }}" \
+            --binary-ext "${{ matrix.binary_ext }}" \
+            --input-dir staging \
+            --output-dir standalone
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: standalone/
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Add installer scripts
+        run: |
+          cp install.sh release-assets/install.sh
+          cp install.ps1 release-assets/install.ps1
+          chmod 755 release-assets/install.sh
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*

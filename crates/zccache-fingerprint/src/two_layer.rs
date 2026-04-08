@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use zccache_core::NormalizedPath;
 
 use rayon::prelude::*;
 
@@ -14,13 +15,15 @@ use crate::scan::ScannedFile;
 /// Layer 2: If mtime differs, compute blake3. If hash matches, the file was
 /// merely touched (e.g., `git checkout`) — update cached mtime silently.
 pub struct TwoLayerCache {
-    cache_file: PathBuf,
+    cache_file: NormalizedPath,
 }
 
 impl TwoLayerCache {
     /// Create a new cache backed by the given file path.
-    pub fn new(cache_file: PathBuf) -> Self {
-        Self { cache_file }
+    pub fn new(cache_file: impl Into<NormalizedPath>) -> Self {
+        Self {
+            cache_file: cache_file.into(),
+        }
     }
 
     /// Check whether the operation needs to run.
@@ -184,7 +187,7 @@ impl TwoLayerCache {
         data.status = status.to_string();
         data.timestamp_ns = persist::now_ns();
         persist::write_atomic(&self.cache_file, &data)?;
-        let pending = self.cache_file.with_extension("pending");
+        let pending = NormalizedPath::from(self.cache_file.with_extension("pending"));
         let _ = std::fs::remove_file(pending);
         Ok(())
     }

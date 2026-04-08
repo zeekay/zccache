@@ -10,28 +10,29 @@
 
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
 use wait_timeout::ChildExt;
+use zccache_core::NormalizedPath;
 
 const TIMEOUT_SECS: u64 = 120;
 
-fn project_root() -> PathBuf {
+fn project_root() -> NormalizedPath {
     let current = env::current_dir().expect("cannot determine working directory");
     let mut dir = current.as_path();
     loop {
         if dir.join("Cargo.toml").exists() {
             if let Ok(content) = fs::read_to_string(dir.join("Cargo.toml")) {
                 if content.contains("[workspace]") {
-                    return dir.to_path_buf();
+                    return dir.into();
                 }
             }
         }
         dir = match dir.parent() {
             Some(p) => p,
-            None => return current,
+            None => return current.into(),
         };
     }
 }
@@ -245,7 +246,7 @@ fn activate_rustup_toolchain() {
         env::var("HOME").ok()
     };
     if let Some(home) = home {
-        let cargo_bin = PathBuf::from(home).join(".cargo").join("bin");
+        let cargo_bin = NormalizedPath::new(home).join(".cargo").join("bin");
         if cargo_bin.is_dir() {
             let sep = if cfg!(windows) { ";" } else { ":" };
             let current = env::var("PATH").unwrap_or_default();

@@ -2072,6 +2072,7 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "wait-timeout",
+ "zccache-core",
 ]
 
 [[package]]
@@ -2081,6 +2082,7 @@ dependencies = [
  "clap",
  "mimalloc",
  "rayon",
+ "tempfile",
  "thiserror",
  "tikv-jemallocator",
  "tokio",
@@ -2183,6 +2185,7 @@ dependencies = [
  "thiserror",
  "tikv-jemallocator",
  "tracing",
+ "zccache-core",
  "zccache-hash",
 ]
 
@@ -2243,6 +2246,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zccache-core",
 ]
 
 [[package]]

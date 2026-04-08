@@ -5,7 +5,8 @@
 //! answers from the in-memory state.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use zccache_core::NormalizedPath;
 
 use dashmap::DashMap;
 
@@ -13,9 +14,9 @@ use dashmap::DashMap;
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub(crate) struct WatchKey {
     /// Canonicalized root directory being watched.
-    pub root: PathBuf,
+    pub root: NormalizedPath,
     /// Canonical path to the cache file.
-    pub cache_file: PathBuf,
+    pub cache_file: NormalizedPath,
 }
 
 /// Per-file tracked entry within a watch.
@@ -44,7 +45,7 @@ struct WatchState {
     /// Cache algorithm: "hash" or "two-layer".
     cache_type: String,
     /// Root directory (canonical).
-    root: PathBuf,
+    root: NormalizedPath,
 }
 
 /// Result of a fingerprint check.
@@ -68,22 +69,22 @@ pub(crate) struct FingerprintManager {
 
 /// Strip the `\\?\` extended-length prefix on Windows.
 /// No-op on other platforms.
-fn strip_win_prefix(path: PathBuf) -> PathBuf {
+fn strip_win_prefix(path: NormalizedPath) -> NormalizedPath {
     #[cfg(windows)]
     {
         let s = path.to_string_lossy();
         if let Some(stripped) = s.strip_prefix(r"\\?\") {
-            return PathBuf::from(stripped);
+            return NormalizedPath::from(stripped);
         }
     }
     path
 }
 
 /// Canonicalize a path, stripping the `\\?\` prefix on Windows.
-fn canon(path: &Path) -> PathBuf {
+fn canon(path: &Path) -> NormalizedPath {
     match path.canonicalize() {
-        Ok(c) => strip_win_prefix(c),
-        Err(_) => path.to_path_buf(),
+        Ok(c) => strip_win_prefix(c.into()),
+        Err(_) => path.into(),
     }
 }
 
@@ -91,16 +92,16 @@ fn canon(path: &Path) -> PathBuf {
 /// Tries full canonicalization first, then falls back to canonicalizing
 /// the parent directory and joining the filename. Used for cache file
 /// paths and for watcher event paths (removed files no longer exist).
-fn canon_maybe_missing(path: &Path) -> PathBuf {
+fn canon_maybe_missing(path: &Path) -> NormalizedPath {
     if let Ok(c) = path.canonicalize() {
-        return strip_win_prefix(c);
+        return strip_win_prefix(c.into());
     }
     if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
         if let Ok(cp) = parent.canonicalize() {
-            return strip_win_prefix(cp).join(name);
+            return strip_win_prefix(cp.into()).join(name);
         }
     }
-    path.to_path_buf()
+    path.into()
 }
 
 impl FingerprintManager {
@@ -309,7 +310,7 @@ impl FingerprintManager {
     ///
     /// For each changed/removed path, checks all watches whose root contains
     /// the path, marks them dirty, and re-hashes only the affected file.
-    pub fn on_batch(&self, changed: &[PathBuf], removed: &[PathBuf]) {
+    pub fn on_batch(&self, changed: &[NormalizedPath], removed: &[NormalizedPath]) {
         if changed.is_empty() && removed.is_empty() {
             return;
         }
@@ -507,7 +508,7 @@ mod tests {
         create_file(src.path(), "a.rs", "modified");
 
         // Simulate watcher event.
-        mgr.on_batch(&[src.path().join("a.rs")], &[]);
+        mgr.on_batch(&[src.path().join("a.rs").into()], &[]);
 
         // Check should return run (dirty).
         let result = mgr.check(&cache_file, "two-layer", src.path(), &[], &[], &[]);
@@ -529,7 +530,7 @@ mod tests {
         mgr.mark_success(&cache_file);
 
         // Simulate watcher event for removed file.
-        mgr.on_batch(&[], &[src.path().join("b.rs")]);
+        mgr.on_batch(&[], &[src.path().join("b.rs").into()]);
 
         let result = mgr.check(&cache_file, "two-layer", src.path(), &[], &[], &[]);
         assert_eq!(result.decision, "run");
@@ -552,7 +553,7 @@ mod tests {
         create_file(src.path(), "a.rs", "stable");
 
         // Simulate watcher event — content is the same, so dirty should NOT be set.
-        mgr.on_batch(&[src.path().join("a.rs")], &[]);
+        mgr.on_batch(&[src.path().join("a.rs").into()], &[]);
 
         let result = mgr.check(&cache_file, "two-layer", src.path(), &[], &[], &[]);
         assert_eq!(result.decision, "skip");
@@ -610,7 +611,7 @@ mod tests {
         mgr.mark_success(&cache_file);
 
         // Event for a file outside the watched root.
-        mgr.on_batch(&[PathBuf::from("/some/other/path.rs")], &[]);
+        mgr.on_batch(&[NormalizedPath::from("/some/other/path.rs")], &[]);
 
         let result = mgr.check(&cache_file, "two-layer", src.path(), &[], &[], &[]);
         assert_eq!(result.decision, "skip");
@@ -635,7 +636,7 @@ mod tests {
         // Modify only a.rs.
         std::thread::sleep(std::time::Duration::from_millis(50));
         create_file(src.path(), "a.rs", "modified");
-        mgr.on_batch(&[src.path().join("a.rs")], &[]);
+        mgr.on_batch(&[src.path().join("a.rs").into()], &[]);
 
         let result = mgr.check(&cache_file, "two-layer", src.path(), &[], &[], &[]);
         assert_eq!(result.decision, "run");
@@ -667,7 +668,7 @@ mod tests {
         // File changes → dirty.
         std::thread::sleep(std::time::Duration::from_millis(50));
         create_file(src.path(), "a.rs", "v2");
-        mgr.on_batch(&[src.path().join("a.rs")], &[]);
+        mgr.on_batch(&[src.path().join("a.rs").into()], &[]);
 
         // check returns "run" (dirty).
         let result = mgr.check(&cache_file, "two-layer", src.path(), &[], &[], &[]);
@@ -676,7 +677,7 @@ mod tests {
         // ANOTHER file changes between check and mark_success.
         std::thread::sleep(std::time::Duration::from_millis(50));
         create_file(src.path(), "a.rs", "v3");
-        mgr.on_batch(&[src.path().join("a.rs")], &[]);
+        mgr.on_batch(&[src.path().join("a.rs").into()], &[]);
 
         // User marks the operation as successful (based on v2 state).
         mgr.mark_success(&cache_file);

@@ -4,11 +4,12 @@
 //! - `files`: shared file nodes (one per unique path, across all contexts)
 //! - `contexts`: per-compilation-context entries with resolved include lists
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use zccache_core::NormalizedPath;
 use zccache_hash::ContentHash;
 
 use crate::context::{compute_artifact_key, ArtifactKey, CompileContext, ContextKey};
@@ -26,11 +27,11 @@ pub struct FileEntry {
 /// State of a compilation context in the graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextState {
-    /// No include list yet — needs full recursive scan.
+    /// No include list yet â€” needs full recursive scan.
     Cold,
     /// Include list populated and believed current.
     Warm,
-    /// Something changed — needs partial or full rescan.
+    /// Something changed â€” needs partial or full rescan.
     Stale,
 }
 
@@ -40,15 +41,15 @@ pub struct ContextEntry {
     /// The compilation context (source + flags).
     pub context: CompileContext,
     /// Flat list of all transitive resolved headers (absolute paths).
-    pub resolved_includes: Vec<PathBuf>,
+    pub resolved_includes: Vec<NormalizedPath>,
     /// Include names that could not be resolved to any file.
     pub unresolved_includes: Vec<String>,
     /// True if any `#include MACRO` was found during scanning.
     pub has_computed_includes: bool,
     /// Last computed artifact key.
     pub artifact_key: Option<ArtifactKey>,
-    /// File hashes from the last update() — used for drift diagnostics.
-    pub last_file_hashes: Vec<(PathBuf, ContentHash)>,
+    /// File hashes from the last update() â€” used for drift diagnostics.
+    pub last_file_hashes: Vec<(NormalizedPath, ContentHash)>,
     /// When this entry was last accessed (for trimming).
     pub last_accessed: Instant,
     /// Current state.
@@ -63,7 +64,7 @@ pub enum CacheVerdict {
     /// Source changed but headers are fresh. New artifact key computed.
     SourceChanged { artifact_key: ArtifactKey },
     /// One or more headers changed. Rescan needed.
-    HeadersChanged { changed: Vec<PathBuf> },
+    HeadersChanged { changed: Vec<NormalizedPath> },
     /// No include list yet. Full scan required.
     Cold,
     /// Contains `#include MACRO`. Needs preprocessor fallback.
@@ -96,9 +97,9 @@ impl std::fmt::Debug for DepGraph {
 }
 
 pub struct DepGraph {
-    /// Shared file nodes: path → scanned includes.
-    files: DashMap<PathBuf, FileEntry>,
-    /// Per-context entries: context key → include list + state.
+    /// Shared file nodes: path â†’ scanned includes.
+    files: DashMap<NormalizedPath, FileEntry>,
+    /// Per-context entries: context key â†’ include list + state.
     contexts: DashMap<ContextKey, ContextEntry>,
     /// Stats counters.
     checks: AtomicU64,
@@ -216,7 +217,7 @@ impl DepGraph {
             };
         }
 
-        // All headers fresh. Compute artifact key (using &Path to avoid PathBuf clones).
+        // All headers fresh. Compute artifact key (using &Path to avoid NormalizedPath clones).
         let mut file_hashes: Vec<(&Path, ContentHash)> = Vec::new();
 
         if let Some(h) = get_hash(&entry.context.source_file) {
@@ -468,7 +469,7 @@ impl DepGraph {
     /// - Uses a **shared** DashMap read (no write lock)
     /// - Skips redundant per-file journal freshness checks (caller already
     ///   stat-verified every file during the hash phase)
-    /// - Avoids `PathBuf` clones by working with references into the entry
+    /// - Avoids `NormalizedPath` clones by working with references into the entry
     ///
     /// Call this *after* hashing and *before* `check_diagnostic`.  On `None`,
     /// fall back to the full `check_diagnostic` for miss-reason diagnostics.
@@ -484,7 +485,7 @@ impl DepGraph {
 
         let stored_key = entry.artifact_key.as_ref()?;
 
-        // Build file_hashes using references — zero PathBuf clones.
+        // Build file_hashes using references â€” zero NormalizedPath clones.
         let cap = 1 + entry.resolved_includes.len() + entry.context.force_includes.len();
         let mut file_hashes: Vec<(&Path, ContentHash)> = Vec::with_capacity(cap);
 
@@ -528,9 +529,9 @@ impl DepGraph {
         entry.unresolved_includes = scan_result.unresolved;
         entry.has_computed_includes = scan_result.has_computed;
         entry.last_accessed = Instant::now();
-        // DO NOT set state=Warm here — wait until all hashes succeed.
+        // DO NOT set state=Warm here â€” wait until all hashes succeed.
 
-        // Compute artifact key — if any file is missing a hash, leave state
+        // Compute artifact key â€” if any file is missing a hash, leave state
         // unchanged (Cold stays Cold) so check() doesn't see a Warm context
         // with no artifact key.
         let mut file_hashes = Vec::new();
@@ -540,7 +541,7 @@ impl DepGraph {
         for header in &entry.resolved_includes {
             match get_hash(header) {
                 Some(h) => file_hashes.push((header.clone(), h)),
-                None => return None, // Incomplete hashes → state stays unchanged
+                None => return None, // Incomplete hashes â†’ state stays unchanged
             }
         }
         // Hash force-included files (PCH content must affect artifact key).
@@ -553,7 +554,7 @@ impl DepGraph {
 
         let artifact_key = compute_artifact_key(key, &mut file_hashes);
 
-        // SUCCESS: all hashes computed — transition to Warm atomically with artifact key.
+        // SUCCESS: all hashes computed â€” transition to Warm atomically with artifact key.
         entry.state = ContextState::Warm;
         entry.artifact_key = Some(artifact_key);
         entry.last_file_hashes = file_hashes;
@@ -579,7 +580,7 @@ impl DepGraph {
         });
 
         // Also trim file entries not referenced by any context.
-        let referenced: std::collections::HashSet<PathBuf> = self
+        let referenced: std::collections::HashSet<NormalizedPath> = self
             .contexts
             .iter()
             .flat_map(
@@ -628,12 +629,12 @@ impl DepGraph {
 
     /// Get the resolved includes for a context.
     #[must_use]
-    pub fn get_includes(&self, key: &ContextKey) -> Option<Vec<PathBuf>> {
+    pub fn get_includes(&self, key: &ContextKey) -> Option<Vec<NormalizedPath>> {
         self.contexts.get(key).map(|e| e.resolved_includes.clone())
     }
 
     /// Store scanned includes for a file (shared file node).
-    pub fn store_file_includes(&self, path: PathBuf, includes: Vec<IncludeDirective>) {
+    pub fn store_file_includes(&self, path: NormalizedPath, includes: Vec<IncludeDirective>) {
         self.files.insert(
             path,
             FileEntry {
@@ -645,7 +646,7 @@ impl DepGraph {
 
     /// Get scanned includes for a file.
     #[must_use]
-    pub fn get_file_includes(&self, path: &PathBuf) -> Option<Vec<IncludeDirective>> {
+    pub fn get_file_includes(&self, path: &NormalizedPath) -> Option<Vec<IncludeDirective>> {
         self.files.get(path).map(|e| e.includes.clone())
     }
 
@@ -655,13 +656,13 @@ impl DepGraph {
     }
 
     /// Iterate over all file entries.
-    pub(crate) fn files_iter(&self) -> dashmap::iter::Iter<'_, PathBuf, FileEntry> {
+    pub(crate) fn files_iter(&self) -> dashmap::iter::Iter<'_, NormalizedPath, FileEntry> {
         self.files.iter()
     }
 
     /// Construct a `DepGraph` from pre-built maps (for deserialization).
     pub(crate) fn from_maps(
-        files: DashMap<PathBuf, FileEntry>,
+        files: DashMap<NormalizedPath, FileEntry>,
         contexts: DashMap<ContextKey, ContextEntry>,
     ) -> Self {
         Self {
@@ -692,7 +693,7 @@ impl DepGraph {
     pub fn ingest_compile_commands(
         &self,
         commands: &[crate::compile_commands::CompileCommand],
-        system_includes: &[std::path::PathBuf],
+        system_includes: &[NormalizedPath],
     ) -> Vec<ContextKey> {
         commands
             .iter()
@@ -725,12 +726,13 @@ impl Default for DepGraph {
 mod tests {
     use super::*;
     use std::path::Path;
+    use zccache_core::NormalizedPath;
 
     use crate::search_paths::IncludeSearchPaths;
 
     fn make_ctx(source: &str) -> CompileContext {
         CompileContext {
-            source_file: PathBuf::from(source),
+            source_file: NormalizedPath::from(source),
             include_search: IncludeSearchPaths::default(),
             defines: Vec::new(),
             flags: Vec::new(),
@@ -783,7 +785,7 @@ mod tests {
         let key = graph.register(make_ctx("/src/a.c"));
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/inc/b.h")],
+            resolved: vec![NormalizedPath::from("/inc/b.h")],
             unresolved: Vec::new(),
             has_computed: false,
         };
@@ -799,7 +801,7 @@ mod tests {
         let key = graph.register(make_ctx("/src/a.c"));
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/inc/b.h")],
+            resolved: vec![NormalizedPath::from("/inc/b.h")],
             unresolved: Vec::new(),
             has_computed: false,
         };
@@ -817,7 +819,10 @@ mod tests {
         let key = graph.register(make_ctx("/src/a.c"));
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/inc/b.h"), PathBuf::from("/inc/c.h")],
+            resolved: vec![
+                NormalizedPath::from("/inc/b.h"),
+                NormalizedPath::from("/inc/c.h"),
+            ],
             unresolved: Vec::new(),
             has_computed: false,
         };
@@ -828,7 +833,7 @@ mod tests {
         let verdict = graph.check(&key, is_fresh, dummy_hash);
         match verdict {
             CacheVerdict::HeadersChanged { changed } => {
-                assert_eq!(changed, vec![PathBuf::from("/inc/b.h")]);
+                assert_eq!(changed, vec![NormalizedPath::from("/inc/b.h")]);
             }
             other => panic!("expected HeadersChanged, got {other:?}"),
         }
@@ -840,7 +845,7 @@ mod tests {
         let key = graph.register(make_ctx("/src/a.c"));
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/inc/b.h")],
+            resolved: vec![NormalizedPath::from("/inc/b.h")],
             unresolved: Vec::new(),
             has_computed: true,
         };
@@ -853,14 +858,14 @@ mod tests {
     #[test]
     fn show_includes_enables_cache_hit_after_computed() {
         // Simulates the MSVC /showIncludes optimization:
-        // 1. First update from scanner: has_computed=true → NeedsPreprocessor
-        // 2. Second update from /showIncludes: has_computed=false → Hit
+        // 1. First update from scanner: has_computed=true â†’ NeedsPreprocessor
+        // 2. Second update from /showIncludes: has_computed=false â†’ Hit
         let graph = DepGraph::new();
         let key = graph.register(make_ctx("/src/a.c"));
 
-        // Scanner found #include MACRO → has_computed=true
+        // Scanner found #include MACRO â†’ has_computed=true
         let scanner_scan = ScanResult {
-            resolved: vec![PathBuf::from("/inc/known.h")],
+            resolved: vec![NormalizedPath::from("/inc/known.h")],
             unresolved: Vec::new(),
             has_computed: true,
         };
@@ -869,11 +874,11 @@ mod tests {
         let verdict = graph.check(&key, always_fresh, dummy_hash);
         assert!(matches!(verdict, CacheVerdict::NeedsPreprocessor));
 
-        // /showIncludes resolved all includes → has_computed=false
+        // /showIncludes resolved all includes â†’ has_computed=false
         let depfile_scan = ScanResult {
             resolved: vec![
-                PathBuf::from("/inc/known.h"),
-                PathBuf::from("/inc/macro_resolved.h"),
+                NormalizedPath::from("/inc/known.h"),
+                NormalizedPath::from("/inc/macro_resolved.h"),
             ],
             unresolved: Vec::new(),
             has_computed: false,
@@ -909,7 +914,7 @@ mod tests {
         let key = graph.register(make_ctx("/src/a.c"));
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/h.h")],
+            resolved: vec![NormalizedPath::from("/h.h")],
             unresolved: Vec::new(),
             has_computed: false,
         };
@@ -995,7 +1000,7 @@ mod tests {
     #[test]
     fn store_and_get_file_includes() {
         let graph = DepGraph::new();
-        let path = PathBuf::from("/src/foo.h");
+        let path = NormalizedPath::from("/src/foo.h");
         let includes = vec![crate::IncludeDirective {
             kind: crate::IncludeKind::Quoted,
             path: "bar.h".to_string(),
@@ -1025,7 +1030,7 @@ mod tests {
                     let key = graph.register(ctx);
 
                     let scan = ScanResult {
-                        resolved: vec![PathBuf::from(format!("/inc/t{t}_h{i}.h"))],
+                        resolved: vec![NormalizedPath::from(format!("/inc/t{t}_h{i}.h"))],
                         unresolved: Vec::new(),
                         has_computed: false,
                     };
@@ -1061,7 +1066,7 @@ mod tests {
 
         let commands = crate::compile_commands::parse_compile_commands_json(json).unwrap();
         let graph = DepGraph::new();
-        let system_includes = vec![PathBuf::from("/usr/include")];
+        let system_includes = vec![NormalizedPath::from("/usr/include")];
         let keys = graph.ingest_compile_commands(&commands, &system_includes);
 
         assert_eq!(keys.len(), 2);
@@ -1085,7 +1090,7 @@ mod tests {
 
         let commands = crate::compile_commands::parse_compile_commands_json(json).unwrap();
         let graph = DepGraph::new();
-        let system_includes = vec![PathBuf::from("/usr/include")];
+        let system_includes = vec![NormalizedPath::from("/usr/include")];
         let keys = graph.ingest_compile_commands(&commands, &system_includes);
 
         assert_eq!(keys.len(), 1);
@@ -1117,7 +1122,7 @@ mod tests {
         let commands = crate::compile_commands::parse_compile_commands_json(json).unwrap();
         let graph = DepGraph::new();
         // /usr/include is already in -isystem, should not be added twice.
-        let system_includes = vec![PathBuf::from("/usr/include")];
+        let system_includes = vec![NormalizedPath::from("/usr/include")];
         let keys = graph.ingest_compile_commands(&commands, &system_includes);
         assert_eq!(keys.len(), 1);
     }
@@ -1128,7 +1133,7 @@ mod tests {
         let key = graph.register(make_ctx("/src/a.c"));
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/inc/b.h")],
+            resolved: vec![NormalizedPath::from("/inc/b.h")],
             unresolved: Vec::new(),
             has_computed: false,
         };
@@ -1167,7 +1172,7 @@ mod tests {
         assert_eq!(graph.get_state(&key), Some(ContextState::Stale));
     }
 
-    // ── update() atomicity tests ──────────────────────────────────────
+    // â”€â”€ update() atomicity tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn update_with_hash_failure_stays_cold() {
@@ -1176,11 +1181,11 @@ mod tests {
         assert_eq!(graph.get_state(&key), Some(ContextState::Cold));
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/inc/b.h")],
+            resolved: vec![NormalizedPath::from("/inc/b.h")],
             unresolved: Vec::new(),
             has_computed: false,
         };
-        // Source hash fails → update returns None, state must stay Cold.
+        // Source hash fails â†’ update returns None, state must stay Cold.
         let no_hash = |_: &Path| -> Option<ContentHash> { None };
         let result = graph.update(&key, scan, no_hash);
         assert!(result.is_none());
@@ -1194,14 +1199,14 @@ mod tests {
 
         let scan = ScanResult {
             resolved: vec![
-                PathBuf::from("/inc/a.h"),
-                PathBuf::from("/inc/b.h"),
-                PathBuf::from("/inc/c.h"),
+                NormalizedPath::from("/inc/a.h"),
+                NormalizedPath::from("/inc/b.h"),
+                NormalizedPath::from("/inc/c.h"),
             ],
             unresolved: Vec::new(),
             has_computed: false,
         };
-        // 2nd header hash fails → state must stay Cold.
+        // 2nd header hash fails â†’ state must stay Cold.
         let partial_hash = |p: &Path| -> Option<ContentHash> {
             if p == Path::new("/inc/b.h") {
                 None
@@ -1221,7 +1226,7 @@ mod tests {
         assert_eq!(graph.get_state(&key), Some(ContextState::Cold));
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/inc/b.h")],
+            resolved: vec![NormalizedPath::from("/inc/b.h")],
             unresolved: Vec::new(),
             has_computed: false,
         };
@@ -1232,12 +1237,15 @@ mod tests {
 
     #[test]
     fn pch_gen_context_hit_after_update() {
-        // Register a PCH-generation context (no force_includes — it IS the PCH).
+        // Register a PCH-generation context (no force_includes â€” it IS the PCH).
         let graph = DepGraph::new();
         let key = graph.register(make_ctx("/src/pch.h"));
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/inc/a.h"), PathBuf::from("/inc/b.h")],
+            resolved: vec![
+                NormalizedPath::from("/inc/a.h"),
+                NormalizedPath::from("/inc/b.h"),
+            ],
             unresolved: Vec::new(),
             has_computed: false,
         };
@@ -1254,7 +1262,7 @@ mod tests {
     #[test]
     fn warm_context_with_no_artifact_returns_cold_on_check() {
         // Simulate the bug scenario: state=Warm but artifact_key=None.
-        // With the fix, this can't happen via update() — but if someone
+        // With the fix, this can't happen via update() â€” but if someone
         // manually sets state=Warm, check_diagnostic should handle it.
         let graph = DepGraph::new();
         let ctx = make_ctx("/src/a.c");
@@ -1265,7 +1273,7 @@ mod tests {
             key,
             ContextEntry {
                 context: ctx,
-                resolved_includes: vec![PathBuf::from("/inc/b.h")],
+                resolved_includes: vec![NormalizedPath::from("/inc/b.h")],
                 unresolved_includes: Vec::new(),
                 has_computed_includes: false,
                 artifact_key: None,
@@ -1293,11 +1301,11 @@ mod tests {
 
         // Create a context with a force-include (PCH file).
         let mut ctx = make_ctx("/src/a.c");
-        ctx.force_includes = vec![PathBuf::from("/pch/precompiled.h")];
+        ctx.force_includes = vec![NormalizedPath::from("/pch/precompiled.h")];
         let key = graph.register(ctx);
 
         let scan = ScanResult {
-            resolved: vec![PathBuf::from("/inc/b.h")],
+            resolved: vec![NormalizedPath::from("/inc/b.h")],
             unresolved: Vec::new(),
             has_computed: false,
         };
@@ -1309,12 +1317,15 @@ mod tests {
             path: "stdafx.h".to_string(),
             line: 1,
         }];
-        graph.store_file_includes(PathBuf::from("/pch/precompiled.h"), empty_includes.clone());
-        graph.store_file_includes(PathBuf::from("/inc/b.h"), empty_includes);
+        graph.store_file_includes(
+            NormalizedPath::from("/pch/precompiled.h"),
+            empty_includes.clone(),
+        );
+        graph.store_file_includes(NormalizedPath::from("/inc/b.h"), empty_includes);
 
         // Also add an unreferenced file that should be evicted.
         graph.store_file_includes(
-            PathBuf::from("/stale/old.h"),
+            NormalizedPath::from("/stale/old.h"),
             vec![crate::IncludeDirective {
                 kind: crate::IncludeKind::Quoted,
                 path: "gone.h".to_string(),
@@ -1324,28 +1335,28 @@ mod tests {
 
         assert_eq!(graph.stats().file_count, 3);
 
-        // Trim with a long max_age — no contexts should be removed.
+        // Trim with a long max_age â€” no contexts should be removed.
         let removed = graph.trim(Duration::from_secs(3600));
         assert_eq!(removed, 0);
 
         // The force-included PCH file must still be in the files map.
         assert!(
             graph
-                .get_file_includes(&PathBuf::from("/pch/precompiled.h"))
+                .get_file_includes(&NormalizedPath::from("/pch/precompiled.h"))
                 .is_some(),
             "force-included PCH file should not be evicted by trim"
         );
         // Regular includes should also be preserved.
         assert!(
             graph
-                .get_file_includes(&PathBuf::from("/inc/b.h"))
+                .get_file_includes(&NormalizedPath::from("/inc/b.h"))
                 .is_some(),
             "resolved include should not be evicted by trim"
         );
         // Unreferenced file should be evicted.
         assert!(
             graph
-                .get_file_includes(&PathBuf::from("/stale/old.h"))
+                .get_file_includes(&NormalizedPath::from("/stale/old.h"))
                 .is_none(),
             "unreferenced file should be evicted by trim"
         );

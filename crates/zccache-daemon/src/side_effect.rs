@@ -8,8 +8,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
+use zccache_core::NormalizedPath;
 
 /// Maximum size (bytes) for a single side-effect file. Larger files are skipped.
 const MAX_SIDE_EFFECT_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
@@ -30,7 +31,7 @@ struct FileEntry {
 
 /// A detected side-effect file ready to be cached.
 pub struct SideEffectFile {
-    pub path: PathBuf,
+    pub path: NormalizedPath,
     pub file_name: std::ffi::OsString,
 }
 
@@ -130,7 +131,7 @@ pub fn detect_side_effects(
         }
 
         results.push(SideEffectFile {
-            path: entry.path(),
+            path: entry.path().into(),
             file_name: name,
         });
 

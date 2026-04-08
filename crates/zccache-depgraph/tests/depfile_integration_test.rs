@@ -5,6 +5,7 @@
 
 use std::process::Command;
 use tempfile::TempDir;
+use zccache_core::NormalizedPath;
 
 /// Check if a compiler is available on PATH.
 fn has_compiler(name: &str) -> bool {
@@ -80,7 +81,7 @@ fn depfile_basic() {
     // Should contain util.h (and possibly system headers)
     let util_h = std::fs::canonicalize(cwd.join("util.h")).unwrap();
     assert!(
-        result.resolved.contains(&util_h),
+        result.resolved.contains(&NormalizedPath::new(&util_h)),
         "expected util.h in resolved deps: {:?}",
         result.resolved
     );
@@ -145,17 +146,17 @@ int main() { return 0; }
     let c_h = std::fs::canonicalize(cwd.join("c.h")).unwrap();
 
     assert!(
-        result.resolved.contains(&a_h),
+        result.resolved.contains(&NormalizedPath::new(&a_h)),
         "missing a.h: {:?}",
         result.resolved
     );
     assert!(
-        result.resolved.contains(&b_h),
+        result.resolved.contains(&NormalizedPath::new(&b_h)),
         "missing b.h: {:?}",
         result.resolved
     );
     assert!(
-        result.resolved.contains(&c_h),
+        result.resolved.contains(&NormalizedPath::new(&c_h)),
         "missing c.h: {:?}",
         result.resolved
     );
@@ -210,7 +211,7 @@ fn depfile_computed_include() {
     // The compiler resolves computed includes — depfile should contain computed.h
     let computed_h = std::fs::canonicalize(cwd.join("computed.h")).unwrap();
     assert!(
-        result.resolved.contains(&computed_h),
+        result.resolved.contains(&NormalizedPath::new(&computed_h)),
         "depfile should resolve computed includes: {:?}",
         result.resolved
     );
@@ -321,7 +322,7 @@ fn depfile_parity_with_scanner() {
     // Scan with scanner
     let search_paths = zccache_depgraph::IncludeSearchPaths {
         iquote: vec![],
-        user: vec![cwd.to_path_buf()],
+        user: vec![cwd.to_path_buf().into()],
         system: vec![],
         after: vec![],
     };
@@ -329,9 +330,11 @@ fn depfile_parity_with_scanner() {
 
     // All scanner-resolved paths should appear in depfile results
     for path in &scan_result.resolved {
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         assert!(
-            depfile_result.resolved.contains(&canonical),
+            depfile_result
+                .resolved
+                .contains(&NormalizedPath::new(&canonical)),
             "depfile missing scanner-found header: {}",
             path.display()
         );
@@ -406,7 +409,7 @@ fn depfile_strategy_injected_works_end_to_end() {
 
     let test_h = std::fs::canonicalize(cwd.join("test.h")).unwrap();
     assert!(
-        result.resolved.contains(&test_h),
+        result.resolved.contains(&NormalizedPath::new(&test_h)),
         "expected test.h in deps: {:?}",
         result.resolved
     );

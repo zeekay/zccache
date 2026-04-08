@@ -31,3 +31,6 @@ mimalloc = { workspace = true }
 [[bin]]
 name = "zccache"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = { workspace = true }

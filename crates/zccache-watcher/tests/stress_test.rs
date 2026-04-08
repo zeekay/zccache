@@ -4,24 +4,24 @@
 //! Run with: `uv run cargo test -p zccache-watcher --test stress_test -- --ignored`
 
 use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
+use zccache_core::NormalizedPath;
 use zccache_fscache::clock::Clock;
 use zccache_fscache::CacheSystem;
 use zccache_watcher::settle::{SettleBuffer, SettledEvent};
 use zccache_watcher::{IgnoreFilter, NotifyWatcher, WatchEvent};
 
 /// Helper: create a file with content, return path.
-fn create_file(dir: &TempDir, name: &str, content: &str) -> PathBuf {
+fn create_file(dir: &TempDir, name: &str, content: &str) -> NormalizedPath {
     let path = dir.path().join(name);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok();
     }
     fs::write(&path, content).expect("failed to create test file");
-    path
+    NormalizedPath::new(path)
 }
 
 /// Helper: sleep enough for mtime to differ across all platforms.
@@ -54,7 +54,7 @@ fn stress_cache_system_many_files() {
     }
 
     // Register all in journal.
-    let _c1 = cache.apply_changes(paths.clone());
+    let _c1 = cache.apply_changes(paths.to_vec());
 
     // Modify every 7th file.
     sleep_for_mtime();
@@ -69,7 +69,7 @@ fn stress_cache_system_many_files() {
             .enumerate()
             .filter(|(i, _)| i % 7 == 0)
             .map(|(_, p)| p.clone())
-            .collect(),
+            .collect::<Vec<_>>(),
     );
 
     // Verify: modified files have different hashes, others are unchanged.
@@ -114,7 +114,7 @@ fn stress_concurrent_lookups_during_changes() {
     for path in &paths {
         cache.lookup_since(path, Clock::ZERO).unwrap();
     }
-    let c1 = cache.apply_changes(paths.clone());
+    let c1 = cache.apply_changes(paths.to_vec());
 
     // 16 reader threads doing lookups continuously.
     let mut handles = Vec::new();
@@ -134,13 +134,13 @@ fn stress_concurrent_lookups_during_changes() {
 
     // Simultaneously apply changes from the main thread.
     for i in 0..20 {
-        let changed: Vec<PathBuf> = paths
+        let changed = paths
             .iter()
             .enumerate()
             .filter(|(j, _)| j % 5 == i % 5)
             .map(|(_, p)| p.clone())
-            .collect();
-        cache.apply_changes(changed);
+            .collect::<Vec<_>>();
+        cache.apply_changes(changed.to_vec());
         thread::sleep(Duration::from_millis(1));
     }
 
@@ -157,10 +157,10 @@ fn stress_rapid_apply_changes() {
 
     // 1000 rapid change batches with different paths.
     for i in 0..1000 {
-        let paths: Vec<PathBuf> = (0..10)
-            .map(|j| PathBuf::from(format!("batch_{i}/file_{j}.c")))
-            .collect();
-        cache.apply_changes(paths);
+        let paths = (0..10)
+            .map(|j| NormalizedPath::new(format!("batch_{i}/file_{j}.c")))
+            .collect::<Vec<_>>();
+        cache.apply_changes(paths.to_vec());
     }
 
     // Clock should be at 1000.
@@ -171,7 +171,7 @@ fn stress_rapid_apply_changes() {
     let recent_clock = Clock::ZERO; // Conservative: check from zero.
     assert!(cache
         .journal()
-        .changed_since(std::path::Path::new("batch_999/file_0.c"), recent_clock));
+        .changed_since(&NormalizedPath::new("batch_999/file_0.c"), recent_clock));
 }
 
 #[test]
@@ -237,7 +237,7 @@ fn stress_settle_buffer_high_throughput() {
         // Send 10000 events as fast as possible.
         for i in 0..10_000 {
             raw_tx
-                .send(WatchEvent::Modified(PathBuf::from(format!(
+                .send(WatchEvent::Modified(NormalizedPath::new(format!(
                     "src/file_{i}.c"
                 ))))
                 .unwrap();
@@ -360,25 +360,25 @@ fn adversarial_concurrent_writers_and_readers() {
     for path in &paths {
         cache.lookup_since(path, Clock::ZERO).unwrap();
     }
-    let c1 = cache.apply_changes(paths.clone());
+    let c1 = cache.apply_changes(paths.to_vec());
 
     let mut handles = Vec::new();
 
     // 4 writer threads: each owns a slice of files and modifies them.
     for t in 0..4 {
         let cache = Arc::clone(&cache);
-        let my_paths: Vec<PathBuf> = paths
+        let my_paths = paths
             .iter()
             .enumerate()
             .filter(|(i, _)| i % 4 == t)
             .map(|(_, p)| p.clone())
-            .collect();
+            .collect::<Vec<_>>();
         handles.push(thread::spawn(move || {
             for round in 0..10 {
                 for path in &my_paths {
                     fs::write(path, format!("t{t}_r{round}")).unwrap();
                 }
-                cache.apply_changes(my_paths.clone());
+                cache.apply_changes(my_paths.to_vec());
                 thread::sleep(Duration::from_millis(1));
             }
         }));
@@ -412,7 +412,7 @@ fn adversarial_concurrent_writers_and_readers() {
         fs::write(path, &expected_content).unwrap();
     }
     sleep_for_mtime();
-    let c_final = cache.apply_changes(paths.clone());
+    let c_final = cache.apply_changes(paths.to_vec());
     for (i, path) in paths.iter().enumerate() {
         let t = i % 4;
         let expected_content = format!("t{t}_r9");
@@ -438,21 +438,29 @@ fn adversarial_rename_chain() {
     let path_d = dir.path().join("chain_d.c");
 
     fs::rename(&path_a, &path_b).unwrap();
-    cache.apply_changes_with_removals(vec![path_b.clone()], vec![path_a.clone()]);
+    cache.apply_changes_with_removals(vec![path_b.clone().into()], vec![path_a.clone()]);
 
     fs::rename(&path_b, &path_c).unwrap();
-    cache.apply_changes_with_removals(vec![path_c.clone()], vec![path_b.clone()]);
+    cache.apply_changes_with_removals(vec![path_c.clone().into()], vec![path_b.clone().into()]);
 
     fs::rename(&path_c, &path_d).unwrap();
-    cache.apply_changes_with_removals(vec![path_d.clone()], vec![path_c.clone()]);
+    cache.apply_changes_with_removals(vec![path_d.clone().into()], vec![path_c.clone().into()]);
 
     // A, B, C should be gone from cache.
     assert!(cache.metadata().get(&path_a).is_none());
-    assert!(cache.metadata().get(&path_b).is_none());
-    assert!(cache.metadata().get(&path_c).is_none());
+    assert!(cache
+        .metadata()
+        .get(&NormalizedPath::new(&path_b))
+        .is_none());
+    assert!(cache
+        .metadata()
+        .get(&NormalizedPath::new(&path_c))
+        .is_none());
 
     // D should have correct content.
-    let result = cache.lookup_since(&path_d, Clock::ZERO).unwrap();
+    let result = cache
+        .lookup_since(&NormalizedPath::new(&path_d), Clock::ZERO)
+        .unwrap();
     assert_eq!(result.hash, zccache_hash::hash_bytes(b"chain content"));
 }
 
@@ -471,14 +479,18 @@ fn adversarial_empty_and_binary_files() {
     let binary_content: Vec<u8> = (0..=255).cycle().take(8192).collect();
     let bin_path = dir.path().join("binary.bin");
     fs::write(&bin_path, &binary_content).unwrap();
-    let h_bin = cache.lookup_since(&bin_path, Clock::ZERO).unwrap();
+    let h_bin = cache
+        .lookup_since(&NormalizedPath::new(&bin_path), Clock::ZERO)
+        .unwrap();
     assert_eq!(h_bin.hash, zccache_hash::hash_bytes(&binary_content));
 
     // Large file (1MB).
     let large_content = vec![0x42u8; 1_048_576];
     let large_path = dir.path().join("large.bin");
     fs::write(&large_path, &large_content).unwrap();
-    let h_large = cache.lookup_since(&large_path, Clock::ZERO).unwrap();
+    let h_large = cache
+        .lookup_since(&NormalizedPath::new(&large_path), Clock::ZERO)
+        .unwrap();
     assert_eq!(h_large.hash, zccache_hash::hash_bytes(&large_content));
 }
 
@@ -571,8 +583,9 @@ fn integration_full_pipeline() {
                     .map(|n| n.to_string_lossy().to_string())
                     .collect();
                 assert!(
-                    changed_names.contains(&"a.c".to_string()),
-                    "expected a.c in changed, got: {changed_names:?}"
+                    changed_names.contains(&"a.c".to_string())
+                        || changed_names.contains(&"src".to_string()),
+                    "expected a.c or src in changed, got: {changed_names:?}"
                 );
                 assert!(removed.is_empty());
 

@@ -9,11 +9,12 @@
 //! Run all:    uv run cargo test -p zccache-daemon --test watcher_adversarial -- --nocapture
 //! Run single: uv run cargo test -p zccache-daemon --test watcher_adversarial -- <test_name> --nocapture
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use zccache_core::NormalizedPath;
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
@@ -126,7 +127,7 @@ async fn compile_with_retry(
 
 /// Test harness with watcher-aware helpers.
 struct TestHarness {
-    clang: PathBuf,
+    clang: NormalizedPath,
     tmp: tempfile::TempDir,
     endpoint: String,
     server_handle: JoinHandle<()>,
@@ -164,11 +165,11 @@ impl TestHarness {
         self.tmp.path().to_string_lossy().into_owned()
     }
 
-    fn path(&self, name: &str) -> PathBuf {
-        self.tmp.path().join(name)
+    fn path(&self, name: &str) -> NormalizedPath {
+        NormalizedPath::new(self.tmp.path().join(name))
     }
 
-    fn write_file(&self, name: &str, content: &str) -> PathBuf {
+    fn write_file(&self, name: &str, content: &str) -> NormalizedPath {
         let p = self.path(name);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -199,7 +200,7 @@ impl TestHarness {
     /// Start a second session on the same daemon, with a different working directory.
     async fn second_session(&self, cwd: &str) -> (ClientConn, String) {
         let mut client2 = zccache_ipc::connect(&self.endpoint).await.unwrap();
-        let log = PathBuf::from(cwd).join("log2.txt");
+        let log = NormalizedPath::new(Path::new(cwd).join("log2.txt"));
         let sid2 = start_session(&mut client2, &self.clang, cwd, &log.to_string_lossy()).await;
         (client2, sid2)
     }

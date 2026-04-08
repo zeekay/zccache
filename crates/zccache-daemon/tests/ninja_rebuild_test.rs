@@ -14,10 +14,11 @@
 //! Run stress: uv run cargo test -p zccache-daemon --test ninja_rebuild_test -- --ignored --nocapture
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Once};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use zccache_core::NormalizedPath;
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 use zccache_test_support::{MesonProject, TestProject};
@@ -27,7 +28,7 @@ use zccache_test_support::{MesonProject, TestProject};
 /// Build the debug CLI binary once across all tests (avoids Cargo lock contention).
 static BUILD_DEBUG_CLI: Once = Once::new();
 
-fn find_cli_binary() -> PathBuf {
+fn find_cli_binary() -> NormalizedPath {
     BUILD_DEBUG_CLI.call_once(|| {
         let status = std::process::Command::new("cargo")
             .args(["build", "-p", "zccache-cli"])
@@ -40,9 +41,9 @@ fn find_cli_binary() -> PathBuf {
         .parent()
         .unwrap();
     if cfg!(windows) {
-        bin_dir.join("zccache.exe")
+        bin_dir.join("zccache.exe").into()
     } else {
-        bin_dir.join("zccache")
+        bin_dir.join("zccache").into()
     }
 }
 
@@ -52,7 +53,7 @@ fn find_cli_binary() -> PathBuf {
 /// debug overhead (~1.5s/call) dominates.
 static BUILD_RELEASE_CLI: Once = Once::new();
 
-fn build_and_find_release_cli() -> PathBuf {
+fn build_and_find_release_cli() -> NormalizedPath {
     BUILD_RELEASE_CLI.call_once(|| {
         let status = std::process::Command::new("cargo")
             .args(["build", "--release", "-p", "zccache-cli"])
@@ -68,10 +69,22 @@ fn build_and_find_release_cli() -> PathBuf {
     // debug_dir is target/debug/ — go up to target/ then into release/
     let release_dir = debug_dir.parent().unwrap().join("release");
     if cfg!(windows) {
-        release_dir.join("zccache.exe")
+        release_dir.join("zccache.exe").into()
     } else {
-        release_dir.join("zccache")
+        release_dir.join("zccache").into()
     }
+}
+
+fn normalize_units<I, P, Q>(units: I) -> Vec<(NormalizedPath, NormalizedPath)>
+where
+    I: IntoIterator<Item = (P, Q)>,
+    P: Into<NormalizedPath>,
+    Q: Into<NormalizedPath>,
+{
+    units
+        .into_iter()
+        .map(|(src, obj)| (src.into(), obj.into()))
+        .collect()
 }
 
 async fn start_daemon(endpoint: &str) -> (JoinHandle<()>, Arc<Notify>) {
@@ -109,7 +122,7 @@ fn build_all_cli(
     cli: &Path,
     clang: &Path,
     endpoint: &str,
-    units: &[(PathBuf, PathBuf)],
+    units: &[(NormalizedPath, NormalizedPath)],
     root: &Path,
 ) -> HashMap<String, Vec<u8>> {
     let clang_str = clang.to_string_lossy().into_owned();
@@ -156,7 +169,7 @@ fn build_all_cli(
 async fn build_all_ipc(
     endpoint: &str,
     clang: &Path,
-    units: &[(PathBuf, PathBuf)],
+    units: &[(NormalizedPath, NormalizedPath)],
     root: &Path,
 ) -> Vec<(String, i32, bool)> {
     let mut client = zccache_ipc::connect(endpoint).await.unwrap();
@@ -250,7 +263,7 @@ async fn ninja_cold_then_warm_rebuild_cli() {
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let units = project.generate(root);
+    let units = normalize_units(project.generate(root));
 
     let endpoint = zccache_ipc::unique_test_endpoint();
     let (server_handle, shutdown) = start_daemon(&endpoint).await;
@@ -334,7 +347,7 @@ async fn ninja_cold_then_warm_rebuild_ipc() {
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let units = project.generate(root);
+    let units = normalize_units(project.generate(root));
 
     let endpoint = zccache_ipc::unique_test_endpoint();
     let (server_handle, shutdown) = start_daemon(&endpoint).await;
@@ -400,7 +413,7 @@ async fn ninja_persistent_artifacts_survive_restart() {
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let units = project.generate(root);
+    let units = normalize_units(project.generate(root));
 
     let endpoint = zccache_ipc::unique_test_endpoint();
     let (server_handle, shutdown) = start_daemon(&endpoint).await;
@@ -482,7 +495,7 @@ async fn ninja_header_change_invalidates_dependents() {
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let units = project.generate(root);
+    let units = normalize_units(project.generate(root));
 
     let endpoint = zccache_ipc::unique_test_endpoint();
     let (server_handle, shutdown) = start_daemon(&endpoint).await;
@@ -535,7 +548,7 @@ async fn ninja_concurrent_cold_build() {
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let units = project.generate(root);
+    let units = normalize_units(project.generate(root));
 
     let endpoint = zccache_ipc::unique_test_endpoint();
     let (server_handle, shutdown) = start_daemon(&endpoint).await;
@@ -646,7 +659,7 @@ async fn ninja_clear_forces_cold_rebuild() {
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let units = project.generate(root);
+    let units = normalize_units(project.generate(root));
 
     let endpoint = zccache_ipc::unique_test_endpoint();
     let (server_handle, shutdown) = start_daemon(&endpoint).await;
@@ -715,7 +728,7 @@ async fn stress_large_project_cold_warm() {
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let units = project.generate(root);
+    let units = normalize_units(project.generate(root));
     eprintln!("Generated {} compilation units", units.len());
 
     let endpoint = zccache_ipc::unique_test_endpoint();
@@ -803,7 +816,7 @@ async fn bench_medium_project_warm_iterations() {
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let units = project.generate(root);
+    let units = normalize_units(project.generate(root));
 
     let endpoint = zccache_ipc::unique_test_endpoint();
     let (server_handle, shutdown) = start_daemon(&endpoint).await;
@@ -849,18 +862,18 @@ async fn bench_medium_project_warm_iterations() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Simple PATH lookup (mirrors the CLI's which_on_path).
-fn which_on_path(name: &str) -> Option<PathBuf> {
+fn which_on_path(name: &str) -> Option<NormalizedPath> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(name);
         if candidate.is_file() {
-            return Some(candidate);
+            return Some(candidate.into());
         }
         #[cfg(windows)]
         if std::path::Path::new(name).extension().is_none() {
             let with_exe = dir.join(format!("{name}.exe"));
             if with_exe.is_file() {
-                return Some(with_exe);
+                return Some(with_exe.into());
             }
         }
     }
@@ -868,9 +881,9 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Find meson: `MESON` env var, then PATH.
-fn find_meson() -> Option<PathBuf> {
+fn find_meson() -> Option<NormalizedPath> {
     if let Ok(p) = std::env::var("MESON") {
-        let path = PathBuf::from(p);
+        let path = NormalizedPath::new(p);
         if path.is_file() {
             return Some(path);
         }
@@ -879,9 +892,9 @@ fn find_meson() -> Option<PathBuf> {
 }
 
 /// Find ninja: `NINJA` env var, then PATH.
-fn find_ninja() -> Option<PathBuf> {
+fn find_ninja() -> Option<NormalizedPath> {
     if let Ok(p) = std::env::var("NINJA") {
-        let path = PathBuf::from(p);
+        let path = NormalizedPath::new(p);
         if path.is_file() {
             return Some(path);
         }

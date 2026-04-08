@@ -15,9 +15,10 @@
 
 use std::process::Command;
 use std::time::{Duration, Instant};
+use zccache_core::NormalizedPath;
 
 /// Find the zccache binary in the target directory.
-fn zccache_bin() -> std::path::PathBuf {
+fn zccache_bin() -> NormalizedPath {
     let mut path = std::env::current_exe()
         .expect("current_exe")
         .parent()
@@ -36,7 +37,7 @@ fn zccache_bin() -> std::path::PathBuf {
         path.exists(),
         "zccache binary not found at {path:?}. Run `cargo build` first."
     );
-    path
+    NormalizedPath::new(path)
 }
 
 /// Stop the daemon and wait until the endpoint is fully released.

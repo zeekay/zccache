@@ -4,7 +4,9 @@
 //! args that affect compilation output (included in cache key) from
 //! args that are cosmetic or path-dependent (excluded).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use zccache_core::NormalizedPath;
 
 /// A parsed `--extern name=path` declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,16 +14,16 @@ pub struct ExternCrate {
     /// The crate name (e.g., "serde").
     pub name: String,
     /// Path to the rlib/rmeta file.
-    pub path: PathBuf,
+    pub path: NormalizedPath,
 }
 
 /// Result of parsing rustc arguments for cache key computation.
 #[derive(Debug, Clone)]
 pub struct RustcParsedArgs {
     /// The source file (positional .rs arg).
-    pub source_file: PathBuf,
+    pub source_file: NormalizedPath,
 
-    // ── Cache-key fields (affect compilation output) ──
+    // â”€â”€ Cache-key fields (affect compilation output) â”€â”€
     /// `--crate-name` value.
     pub crate_name: Option<String>,
     /// `--crate-type` values (lib, rlib, staticlib).
@@ -50,15 +52,15 @@ pub struct RustcParsedArgs {
     /// Flags not recognized by the parser (sorted, hashed into key).
     pub unknown_flags: Vec<String>,
 
-    // ── Non-cache-key fields (needed for output path / depfile) ──
+    // â”€â”€ Non-cache-key fields (needed for output path / depfile) â”€â”€
     /// `--out-dir` path.
-    pub out_dir: Option<PathBuf>,
+    pub out_dir: Option<NormalizedPath>,
     /// `-C extra-filename=` value.
     pub extra_filename: Option<String>,
     /// `-C metadata=` value (cargo's disambiguation hash).
     pub cargo_metadata: Option<String>,
     /// `-C incremental=` path.
-    pub incremental_dir: Option<PathBuf>,
+    pub incremental_dir: Option<NormalizedPath>,
     /// `--error-format` value.
     pub error_format: Option<String>,
     /// `--json` value.
@@ -68,13 +70,13 @@ pub struct RustcParsedArgs {
     /// `--diagnostic-width` value.
     pub diagnostic_width: Option<String>,
     /// `-L` search paths.
-    pub search_paths: Vec<PathBuf>,
+    pub search_paths: Vec<NormalizedPath>,
     /// `--remap-path-prefix` values.
     pub remap_path_prefixes: Vec<String>,
     /// `--sysroot` path.
-    pub sysroot: Option<PathBuf>,
+    pub sysroot: Option<NormalizedPath>,
     /// `-o` output file (explicit).
-    pub output_file: Option<PathBuf>,
+    pub output_file: Option<NormalizedPath>,
 }
 
 /// Codegen options excluded from cache key (cosmetic or path-dependent).
@@ -97,7 +99,7 @@ const EXCLUDED_CODEGEN: &[&str] = &[
 /// Relative paths are resolved against `cwd`.
 pub fn parse_rustc_args(args: &[String], cwd: &Path) -> RustcParsedArgs {
     let mut result = RustcParsedArgs {
-        source_file: PathBuf::new(),
+        source_file: NormalizedPath::new(""),
         crate_name: None,
         crate_types: Vec::new(),
         edition: None,
@@ -195,7 +197,7 @@ pub fn parse_rustc_args(args: &[String], cwd: &Path) -> RustcParsedArgs {
                     path: resolve_path(path, cwd),
                 });
             }
-            // --extern name (without =path) — no file to hash
+            // --extern name (without =path) â€” no file to hash
             continue;
         }
 
@@ -241,7 +243,7 @@ pub fn parse_rustc_args(args: &[String], cwd: &Path) -> RustcParsedArgs {
             continue;
         }
 
-        // --env-set <val> — skip (nightly feature, not cache-relevant)
+        // --env-set <val> â€” skip (nightly feature, not cache-relevant)
         if let Some(_val) = take_option(arg, "--env-set", args.get(i + 1), &mut i) {
             continue;
         }
@@ -258,7 +260,7 @@ pub fn parse_rustc_args(args: &[String], cwd: &Path) -> RustcParsedArgs {
         // -L <path>
         if arg == "-L" {
             if let Some(next) = args.get(i + 1) {
-                // -L [KIND=]PATH — strip the kind= prefix
+                // -L [KIND=]PATH â€” strip the kind= prefix
                 let path_str = next.split_once('=').map(|(_, p)| p).unwrap_or(next);
                 result.search_paths.push(resolve_path(path_str, cwd));
                 i += 2;
@@ -297,7 +299,7 @@ pub fn parse_rustc_args(args: &[String], cwd: &Path) -> RustcParsedArgs {
             }
         }
 
-        // -Z <option> — nightly flags. Consume both flag and value.
+        // -Z <option> â€” nightly flags. Consume both flag and value.
         if arg == "-Z" {
             if let Some(next) = args.get(i + 1) {
                 result.unknown_flags.push(format!("-Z {next}"));
@@ -313,7 +315,7 @@ pub fn parse_rustc_args(args: &[String], cwd: &Path) -> RustcParsedArgs {
             continue;
         }
 
-        // Positional arg — source file
+        // Positional arg â€” source file
         if arg.ends_with(".rs") {
             result.source_file = resolve_path(arg, cwd);
         }
@@ -372,31 +374,36 @@ fn handle_codegen_option(opt: &str, cwd: &Path, result: &mut RustcParsedArgs) {
 }
 
 /// Resolve a path against cwd if relative.
-fn resolve_path(path: &str, cwd: &Path) -> PathBuf {
+fn resolve_path(path: &str, cwd: &Path) -> NormalizedPath {
     let p = Path::new(path);
     if p.is_absolute() {
-        p.to_path_buf()
+        NormalizedPath::new(p)
     } else {
-        cwd.join(p)
+        NormalizedPath::new(cwd.join(p))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use zccache_core::NormalizedPath;
+
     use super::*;
 
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
     }
 
-    fn cwd() -> PathBuf {
-        PathBuf::from("/project")
+    fn cwd() -> NormalizedPath {
+        NormalizedPath::from("/project")
     }
 
     #[test]
     fn basic_parse_source_file() {
         let parsed = parse_rustc_args(&args(&["src/lib.rs"]), &cwd());
-        assert_eq!(parsed.source_file, PathBuf::from("/project/src/lib.rs"));
+        assert_eq!(
+            parsed.source_file,
+            NormalizedPath::from("/project/src/lib.rs")
+        );
     }
 
     #[test]
@@ -493,7 +500,10 @@ mod tests {
         // But they should be in their dedicated fields
         assert_eq!(parsed.cargo_metadata.as_deref(), Some("abc123"));
         assert_eq!(parsed.extra_filename.as_deref(), Some("-abc123"));
-        assert_eq!(parsed.incremental_dir, Some(PathBuf::from("/tmp/incr")));
+        assert_eq!(
+            parsed.incremental_dir,
+            Some(NormalizedPath::from("/tmp/incr"))
+        );
     }
 
     #[test]
@@ -512,7 +522,7 @@ mod tests {
         assert_eq!(parsed.externs[0].name, "serde");
         assert_eq!(
             parsed.externs[0].path,
-            PathBuf::from("/target/deps/libserde.rlib")
+            NormalizedPath::from("/target/deps/libserde.rlib")
         );
         assert_eq!(parsed.externs[1].name, "log");
     }
@@ -554,7 +564,10 @@ mod tests {
             &args(&["--out-dir", "/target/debug/deps", "src/lib.rs"]),
             &cwd(),
         );
-        assert_eq!(parsed.out_dir, Some(PathBuf::from("/target/debug/deps")));
+        assert_eq!(
+            parsed.out_dir,
+            Some(NormalizedPath::from("/target/debug/deps"))
+        );
         assert!(parsed.unknown_flags.is_empty());
     }
 
@@ -621,7 +634,7 @@ mod tests {
         let parsed = parse_rustc_args(&args(&["-o", "libfoo.rlib", "src/lib.rs"]), &cwd());
         assert_eq!(
             parsed.output_file,
-            Some(PathBuf::from("/project/libfoo.rlib"))
+            Some(NormalizedPath::from("/project/libfoo.rlib"))
         );
     }
 
@@ -716,13 +729,19 @@ mod tests {
     #[test]
     fn relative_paths_resolved_against_cwd() {
         let parsed = parse_rustc_args(&args(&["src/lib.rs"]), &cwd());
-        assert_eq!(parsed.source_file, PathBuf::from("/project/src/lib.rs"));
+        assert_eq!(
+            parsed.source_file,
+            NormalizedPath::from("/project/src/lib.rs")
+        );
     }
 
     #[test]
     fn absolute_paths_unchanged() {
         let parsed = parse_rustc_args(&args(&["/absolute/src/lib.rs"]), &cwd());
-        assert_eq!(parsed.source_file, PathBuf::from("/absolute/src/lib.rs"));
+        assert_eq!(
+            parsed.source_file,
+            NormalizedPath::from("/absolute/src/lib.rs")
+        );
     }
 
     #[test]
@@ -746,7 +765,7 @@ mod tests {
         );
         assert_eq!(
             parsed.sysroot,
-            Some(PathBuf::from("/home/user/.rustup/toolchains/stable"))
+            Some(NormalizedPath::from("/home/user/.rustup/toolchains/stable"))
         );
     }
 

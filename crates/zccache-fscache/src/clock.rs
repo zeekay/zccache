@@ -7,9 +7,9 @@
 
 use dashmap::DashMap;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use zccache_core::NormalizedPath;
 
 /// Monotonically increasing clock tick.
 ///
@@ -39,14 +39,14 @@ impl std::fmt::Display for Clock {
 /// Tracks which files changed at which clock tick.
 ///
 /// Two complementary structures:
-/// - `journal`: `BTreeMap<Clock, Vec<PathBuf>>` — ordered by clock, for
+/// - `journal`: `BTreeMap<Clock, Vec<NormalizedPath>>` — ordered by clock, for
 ///   "give me everything changed since clock N" queries. Bounded.
-/// - `last_change`: `DashMap<PathBuf, Clock>` — per-file last-change clock,
+/// - `last_change`: `DashMap<NormalizedPath, Clock>` — per-file last-change clock,
 ///   for O(1) "has this specific file changed since clock N?" checks.
 pub struct ChangeJournal {
     current: AtomicU64,
-    journal: RwLock<BTreeMap<Clock, Vec<PathBuf>>>,
-    last_change: DashMap<PathBuf, Clock>,
+    journal: RwLock<BTreeMap<Clock, Vec<NormalizedPath>>>,
+    last_change: DashMap<NormalizedPath, Clock>,
     /// Clock at which the last overflow occurred. Any query with
     /// `since < last_overflow` returns "changed" for all files.
     last_overflow: AtomicU64,
@@ -90,7 +90,7 @@ impl ChangeJournal {
     /// Record a batch of changed paths, advancing the clock by one.
     ///
     /// Returns the new clock value.
-    pub fn advance(&self, changed_paths: Vec<PathBuf>) -> Clock {
+    pub fn advance(&self, changed_paths: Vec<NormalizedPath>) -> Clock {
         let new_tick = self.current.fetch_add(1, Ordering::AcqRel) + 1;
         let clock = Clock(new_tick);
 
@@ -121,7 +121,7 @@ impl ChangeJournal {
     /// Returns `false` only when we have positive evidence that the file
     /// has NOT changed since the given clock.
     #[must_use]
-    pub fn changed_since(&self, path: &Path, since: Clock) -> bool {
+    pub fn changed_since(&self, path: &NormalizedPath, since: Clock) -> bool {
         // Overflow invalidates everything before it.
         let overflow = self.last_overflow.load(Ordering::Acquire);
         if overflow > 0 && since.0 < overflow {
@@ -141,7 +141,7 @@ impl ChangeJournal {
     /// Uses the BTreeMap range query. May return incomplete results
     /// for very old clocks if journal entries have been trimmed.
     #[must_use]
-    pub fn changes_since(&self, since: Clock) -> Vec<PathBuf> {
+    pub fn changes_since(&self, since: Clock) -> Vec<NormalizedPath> {
         let journal = self.journal.read().expect("journal lock poisoned");
         let mut result = Vec::new();
         for (_clock, paths) in
@@ -175,7 +175,7 @@ impl ChangeJournal {
 
     /// Remove `last_change` entries whose path is not in the `live` set.
     /// Returns the number of entries removed.
-    pub fn retain_paths(&self, live: &std::collections::HashSet<PathBuf>) -> usize {
+    pub fn retain_paths(&self, live: &std::collections::HashSet<NormalizedPath>) -> usize {
         let before = self.last_change.len();
         self.last_change.retain(|path, _| live.contains(path));
         before - self.last_change.len()
@@ -193,7 +193,7 @@ impl ChangeJournal {
     /// Enables `changed_since` to return `false` for files that haven't been
     /// seen by the watcher yet. If the file is already tracked with a more
     /// recent clock, the entry is NOT overwritten.
-    pub fn register(&self, path: PathBuf) {
+    pub fn register(&self, path: NormalizedPath) {
         let current = Clock(self.current.load(Ordering::Acquire));
         self.last_change.entry(path).or_insert(current);
     }
@@ -256,25 +256,25 @@ mod tests {
     #[test]
     fn changed_since_at_exact_clock_returns_false() {
         let journal = ChangeJournal::new();
-        let c1 = journal.advance(vec![PathBuf::from("a.c")]);
+        let c1 = journal.advance(vec![NormalizedPath::from("a.c")]);
         // File changed AT c1, asking since c1 → false (not AFTER c1).
-        assert!(!journal.changed_since(Path::new("a.c"), c1));
+        assert!(!journal.changed_since(&NormalizedPath::from("a.c"), c1));
     }
 
     #[test]
     fn overflow_then_new_changes() {
         let journal = ChangeJournal::new();
-        let c1 = journal.advance(vec![PathBuf::from("a.c")]);
+        let c1 = journal.advance(vec![NormalizedPath::from("a.c")]);
         let overflow_clock = journal.mark_overflow();
 
         // New change after overflow.
-        let c3 = journal.advance(vec![PathBuf::from("b.c")]);
+        let c3 = journal.advance(vec![NormalizedPath::from("b.c")]);
 
         // Before overflow → always changed.
-        assert!(journal.changed_since(Path::new("a.c"), c1));
+        assert!(journal.changed_since(&NormalizedPath::from("a.c"), c1));
         // After overflow → normal behavior.
-        assert!(!journal.changed_since(Path::new("b.c"), c3));
-        assert!(journal.changed_since(Path::new("b.c"), overflow_clock));
+        assert!(!journal.changed_since(&NormalizedPath::from("b.c"), c3));
+        assert!(journal.changed_since(&NormalizedPath::from("b.c"), overflow_clock));
     }
 
     #[test]
@@ -282,10 +282,10 @@ mod tests {
         let journal = ChangeJournal::new();
         assert_eq!(journal.current_clock(), Clock::ZERO);
 
-        let c1 = journal.advance(vec![PathBuf::from("a.c")]);
+        let c1 = journal.advance(vec![NormalizedPath::from("a.c")]);
         assert_eq!(c1, Clock(1));
 
-        let c2 = journal.advance(vec![PathBuf::from("b.c")]);
+        let c2 = journal.advance(vec![NormalizedPath::from("b.c")]);
         assert_eq!(c2, Clock(2));
 
         assert_eq!(journal.current_clock(), Clock(2));
@@ -295,52 +295,55 @@ mod tests {
     fn changed_since_returns_true_for_changed_file() {
         let journal = ChangeJournal::new();
 
-        let c1 = journal.advance(vec![PathBuf::from("foo.h")]);
-        let c2 = journal.advance(vec![PathBuf::from("bar.h")]);
+        let c1 = journal.advance(vec![NormalizedPath::from("foo.h")]);
+        let c2 = journal.advance(vec![NormalizedPath::from("bar.h")]);
 
         // foo.h changed at c1 — asking since ZERO should be true.
-        assert!(journal.changed_since(Path::new("foo.h"), Clock::ZERO));
+        assert!(journal.changed_since(&NormalizedPath::from("foo.h"), Clock::ZERO));
         // bar.h changed at c2 — asking since c1 should be true.
-        assert!(journal.changed_since(Path::new("bar.h"), c1));
+        assert!(journal.changed_since(&NormalizedPath::from("bar.h"), c1));
         // bar.h changed at c2 — asking since c2 should be false (not AFTER c2).
-        assert!(!journal.changed_since(Path::new("bar.h"), c2));
+        assert!(!journal.changed_since(&NormalizedPath::from("bar.h"), c2));
     }
 
     #[test]
     fn changed_since_returns_false_for_unchanged_file() {
         let journal = ChangeJournal::new();
 
-        let c1 = journal.advance(vec![PathBuf::from("foo.h")]);
+        let c1 = journal.advance(vec![NormalizedPath::from("foo.h")]);
         // bar.h was never changed. But since it's untracked, conservative = true.
         // To get false, bar.h must have been in a batch.
-        let _c2 = journal.advance(vec![PathBuf::from("bar.h")]);
+        let _c2 = journal.advance(vec![NormalizedPath::from("bar.h")]);
 
         // foo.h last changed at c1. Asking since c1 → false (not after c1).
-        assert!(!journal.changed_since(Path::new("foo.h"), c1));
+        assert!(!journal.changed_since(&NormalizedPath::from("foo.h"), c1));
     }
 
     #[test]
     fn untracked_file_reports_changed() {
         let journal = ChangeJournal::new();
-        journal.advance(vec![PathBuf::from("known.h")]);
+        journal.advance(vec![NormalizedPath::from("known.h")]);
 
         // A file the journal has never seen → conservative true.
-        assert!(journal.changed_since(Path::new("unknown.h"), Clock::ZERO));
+        assert!(journal.changed_since(&NormalizedPath::from("unknown.h"), Clock::ZERO));
     }
 
     #[test]
     fn changes_since_returns_batch_union() {
         let journal = ChangeJournal::new();
 
-        let c1 = journal.advance(vec![PathBuf::from("a.c")]);
-        let _c2 = journal.advance(vec![PathBuf::from("b.c"), PathBuf::from("c.c")]);
-        let _c3 = journal.advance(vec![PathBuf::from("d.c")]);
+        let c1 = journal.advance(vec![NormalizedPath::from("a.c")]);
+        let _c2 = journal.advance(vec![
+            NormalizedPath::from("b.c"),
+            NormalizedPath::from("c.c"),
+        ]);
+        let _c3 = journal.advance(vec![NormalizedPath::from("d.c")]);
 
         let changed = journal.changes_since(c1);
         assert_eq!(changed.len(), 3);
-        assert!(changed.contains(&PathBuf::from("b.c")));
-        assert!(changed.contains(&PathBuf::from("c.c")));
-        assert!(changed.contains(&PathBuf::from("d.c")));
+        assert!(changed.contains(&NormalizedPath::from("b.c")));
+        assert!(changed.contains(&NormalizedPath::from("c.c")));
+        assert!(changed.contains(&NormalizedPath::from("d.c")));
     }
 
     #[test]
@@ -348,7 +351,7 @@ mod tests {
         let journal = ChangeJournal::with_capacity(5);
 
         for i in 0..10 {
-            journal.advance(vec![PathBuf::from(format!("file_{i}.c"))]);
+            journal.advance(vec![NormalizedPath::from(format!("file_{i}.c"))]);
         }
 
         let journal_entries = journal.journal.read().unwrap();
@@ -363,21 +366,21 @@ mod tests {
     fn mark_overflow_invalidates_everything() {
         let journal = ChangeJournal::new();
 
-        let c1 = journal.advance(vec![PathBuf::from("a.c")]);
-        let _c2 = journal.advance(vec![PathBuf::from("b.c")]);
+        let c1 = journal.advance(vec![NormalizedPath::from("a.c")]);
+        let _c2 = journal.advance(vec![NormalizedPath::from("b.c")]);
         let overflow_clock = journal.mark_overflow();
 
         // Queries with clock before overflow → always true.
-        assert!(journal.changed_since(Path::new("a.c"), c1));
-        assert!(journal.changed_since(Path::new("b.c"), c1));
+        assert!(journal.changed_since(&NormalizedPath::from("a.c"), c1));
+        assert!(journal.changed_since(&NormalizedPath::from("b.c"), c1));
         // Even untracked files.
-        assert!(journal.changed_since(Path::new("never_seen.c"), c1));
+        assert!(journal.changed_since(&NormalizedPath::from("never_seen.c"), c1));
 
         // Queries at or after overflow clock → normal behavior.
         // a.c last changed at c1, which is before overflow_clock,
         // but the query is since=overflow_clock which is >= overflow,
         // so overflow check doesn't trigger.
-        assert!(!journal.changed_since(Path::new("a.c"), overflow_clock));
+        assert!(!journal.changed_since(&NormalizedPath::from("a.c"), overflow_clock));
     }
 
     #[test]
@@ -385,31 +388,31 @@ mod tests {
         let journal = ChangeJournal::new();
 
         // Before register: untracked → conservative true
-        assert!(journal.changed_since(Path::new("registered.h"), Clock::ZERO));
+        assert!(journal.changed_since(&NormalizedPath::from("registered.h"), Clock::ZERO));
 
-        journal.register(PathBuf::from("registered.h"));
+        journal.register(NormalizedPath::from("registered.h"));
 
         // After register at Clock(0): changed_since(Clock(0)) → false
-        assert!(!journal.changed_since(Path::new("registered.h"), Clock::ZERO));
+        assert!(!journal.changed_since(&NormalizedPath::from("registered.h"), Clock::ZERO));
     }
 
     #[test]
     fn register_does_not_overwrite_newer_change() {
         let journal = ChangeJournal::new();
-        let path = PathBuf::from("modified.h");
+        let path = NormalizedPath::from("modified.h");
 
         let _c1 = journal.advance(vec![path.clone()]); // Changed at c1
-        journal.register(PathBuf::from("modified.h")); // Try to register at current (c1)
+        journal.register(NormalizedPath::from("modified.h")); // Try to register at current (c1)
 
         // Should still show as changed since Clock::ZERO (changed at c1 > 0)
-        assert!(journal.changed_since(Path::new("modified.h"), Clock::ZERO));
+        assert!(journal.changed_since(&NormalizedPath::from("modified.h"), Clock::ZERO));
     }
 
     #[test]
     fn clear_empties_journal_and_marks_overflow() {
         let journal = ChangeJournal::new();
-        let c1 = journal.advance(vec![PathBuf::from("a.c")]);
-        let _c2 = journal.advance(vec![PathBuf::from("b.c")]);
+        let c1 = journal.advance(vec![NormalizedPath::from("a.c")]);
+        let _c2 = journal.advance(vec![NormalizedPath::from("b.c")]);
 
         let overflow_clock = journal.clear();
 
@@ -418,35 +421,40 @@ mod tests {
         assert!(changes.is_empty());
 
         // Queries before the overflow clock return "changed" (overflow).
-        assert!(journal.changed_since(Path::new("a.c"), c1));
+        assert!(journal.changed_since(&NormalizedPath::from("a.c"), c1));
 
         // After the overflow clock, a newly tracked file should be "not changed".
-        journal.register(PathBuf::from("new.c"));
-        assert!(!journal.changed_since(Path::new("new.c"), overflow_clock));
+        journal.register(NormalizedPath::from("new.c"));
+        assert!(!journal.changed_since(&NormalizedPath::from("new.c"), overflow_clock));
     }
 
     #[test]
     fn retain_removes_orphans() {
         let journal = ChangeJournal::new();
         journal.advance(vec![
-            PathBuf::from("a.c"),
-            PathBuf::from("b.c"),
-            PathBuf::from("c.c"),
+            NormalizedPath::from("a.c"),
+            NormalizedPath::from("b.c"),
+            NormalizedPath::from("c.c"),
         ]);
-        let live: std::collections::HashSet<PathBuf> = [PathBuf::from("a.c")].into_iter().collect();
+        let live: std::collections::HashSet<NormalizedPath> =
+            [NormalizedPath::from("a.c")].into_iter().collect();
         let removed = journal.retain_paths(&live);
         assert_eq!(removed, 2);
         assert_eq!(journal.last_change_len(), 1);
-        assert!(!journal.changed_since(Path::new("a.c"), Clock(1)));
+        assert!(!journal.changed_since(&NormalizedPath::from("a.c"), Clock(1)));
     }
 
     #[test]
     fn retain_keeps_all() {
         let journal = ChangeJournal::new();
-        journal.advance(vec![PathBuf::from("a.c"), PathBuf::from("b.c")]);
-        let live: std::collections::HashSet<PathBuf> = [PathBuf::from("a.c"), PathBuf::from("b.c")]
-            .into_iter()
-            .collect();
+        journal.advance(vec![
+            NormalizedPath::from("a.c"),
+            NormalizedPath::from("b.c"),
+        ]);
+        let live: std::collections::HashSet<NormalizedPath> =
+            [NormalizedPath::from("a.c"), NormalizedPath::from("b.c")]
+                .into_iter()
+                .collect();
         let removed = journal.retain_paths(&live);
         assert_eq!(removed, 0);
         assert_eq!(journal.last_change_len(), 2);
@@ -456,9 +464,12 @@ mod tests {
     fn last_change_len_tracks() {
         let journal = ChangeJournal::new();
         assert_eq!(journal.last_change_len(), 0);
-        journal.advance(vec![PathBuf::from("x.c")]);
+        journal.advance(vec![NormalizedPath::from("x.c")]);
         assert_eq!(journal.last_change_len(), 1);
-        journal.advance(vec![PathBuf::from("y.c"), PathBuf::from("z.c")]);
+        journal.advance(vec![
+            NormalizedPath::from("y.c"),
+            NormalizedPath::from("z.c"),
+        ]);
         assert_eq!(journal.last_change_len(), 3);
     }
 
@@ -474,7 +485,7 @@ mod tests {
             let j = Arc::clone(&journal);
             handles.push(std::thread::spawn(move || {
                 for i in 0..100 {
-                    j.advance(vec![PathBuf::from(format!("t{t}_f{i}.c"))]);
+                    j.advance(vec![NormalizedPath::from(format!("t{t}_f{i}.c"))]);
                 }
             }));
         }
@@ -485,7 +496,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for _ in 0..100 {
                     let clock = j.current_clock();
-                    let _ = j.changed_since(Path::new("t0_f0.c"), clock);
+                    let _ = j.changed_since(&NormalizedPath::from("t0_f0.c"), clock);
                     let _ = j.changes_since(Clock::ZERO);
                 }
             }));

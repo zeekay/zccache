@@ -14,7 +14,7 @@ pub use error::IpcError;
 pub use transport::IpcClientConnection;
 pub use transport::{connect, unique_test_endpoint, IpcConnection, IpcListener};
 
-use std::path::PathBuf;
+use zccache_core::NormalizedPath;
 
 /// Returns the platform-specific default IPC endpoint path.
 ///
@@ -40,14 +40,14 @@ pub fn default_endpoint() -> String {
 
 /// Returns the path for the daemon lock file.
 #[must_use]
-pub fn lock_file_path() -> PathBuf {
+pub fn lock_file_path() -> NormalizedPath {
     #[cfg(unix)]
     {
         let endpoint = default_endpoint();
         let dir = std::path::Path::new(&endpoint)
             .parent()
             .expect("endpoint should have parent directory");
-        dir.join("daemon.lock")
+        dir.join("daemon.lock").into()
     }
     #[cfg(windows)]
     {

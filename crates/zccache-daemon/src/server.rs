@@ -2,11 +2,12 @@
 
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use zccache_artifact::{ArtifactIndex, ArtifactStore};
+use zccache_core::NormalizedPath;
 use zccache_depgraph::{
     CompileContext, ContextKey, DepGraph, DepfileStrategy, SessionId, SessionManager,
     SystemIncludeCache, UserDepFlags,
@@ -55,7 +56,7 @@ const FAST_HIT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60)
 
 #[derive(Clone)]
 struct RspDependency {
-    path: PathBuf,
+    path: NormalizedPath,
     hash: ContentHash,
 }
 
@@ -159,11 +160,11 @@ fn migrate_meta_files(
     use rayon::prelude::*;
 
     // Collect .meta file paths first.
-    let meta_paths: Vec<std::path::PathBuf> = match std::fs::read_dir(artifact_dir) {
+    let meta_paths: Vec<NormalizedPath> = match std::fs::read_dir(artifact_dir) {
         Ok(entries) => entries
             .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("meta"))
+            .map(|e| e.path().into())
+            .filter(|p: &NormalizedPath| p.extension().and_then(|e| e.to_str()) == Some("meta"))
             .collect(),
         Err(_) => return 0,
     };
@@ -174,12 +175,12 @@ fn migrate_meta_files(
 
     // Parallel phase: read, deserialize, and write data files.
     // Each .meta file is fully independent for I/O.
-    let migrated: Vec<(String, CachedArtifact, std::path::PathBuf)> = meta_paths
+    let migrated: Vec<(String, CachedArtifact, NormalizedPath)> = meta_paths
         .par_iter()
         .filter_map(|path| {
             let data = std::fs::read(path).ok()?;
             let artifact = bincode::deserialize::<ArtifactData>(&data).ok()?;
-            let stem = path
+            let stem: String = path
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -229,7 +230,7 @@ struct SharedState {
     /// File watcher for proactive metadata invalidation.
     watcher: Mutex<Option<NotifyWatcher>>,
     /// Directories currently being watched (avoid duplicate watches).
-    watched_dirs: Mutex<HashSet<PathBuf>>,
+    watched_dirs: Mutex<HashSet<NormalizedPath>>,
     /// Shutdown signal — shared so request handlers can trigger shutdown.
     shutdown: Arc<Notify>,
     /// Epoch seconds of last client activity (for idle timeout).
@@ -241,9 +242,9 @@ struct SharedState {
     /// Phase-level profiler for hot-path breakdown.
     profiler: PhaseProfiler,
     /// On-disk artifact cache for hardlink optimization on cache hits.
-    artifact_dir: PathBuf,
+    artifact_dir: NormalizedPath,
     /// Temporary directory for injected depfiles.
-    depfile_tmpdir: PathBuf,
+    depfile_tmpdir: NormalizedPath,
     /// Ultra-fast hit cache: context_key → (clock, artifact_key_hex, timestamp).
     /// When the journal clock hasn't advanced since the last verified hit,
     /// we skip all stat/hash/depgraph work and jump straight to artifact lookup.
@@ -254,7 +255,7 @@ struct SharedState {
     /// Response file expansion cache keyed by canonical root path.
     /// Each entry carries the transitive response-file hashes required to
     /// validate freshness before reusing the cached expansion.
-    rsp_cache: DashMap<PathBuf, RspCacheEntry>,
+    rsp_cache: DashMap<NormalizedPath, RspCacheEntry>,
     /// Request-level fast path cache: hash(compiler, args, cwd) → pre-computed context.
     /// When the same compile request is seen again and the fast-hit cache still
     /// holds a valid entry, this allows skipping ALL heavy work: system include
@@ -264,12 +265,12 @@ struct SharedState {
     /// Pre-filter for watch_directories: raw (non-canonicalized) paths we've
     /// already processed. Avoids expensive canonicalize() syscalls (~1-5ms each
     /// on Windows) for directories that are already being watched.
-    watched_raw_dirs: DashMap<PathBuf, ()>,
+    watched_raw_dirs: DashMap<NormalizedPath, ()>,
     /// PCH source registry: pch_output_path → source_header_path.
     /// When a PCH generation succeeds, we record the mapping so that
     /// consuming compilations can hash the source header instead of the
     /// non-deterministic PCH binary.
-    pch_source_map: DashMap<PathBuf, PathBuf>,
+    pch_source_map: DashMap<NormalizedPath, NormalizedPath>,
     /// JSONL compile journal for build replay.
     journal: CompileJournal,
     /// Bytes currently in spawn_blocking persistence tasks, invisible to eviction.
@@ -288,8 +289,8 @@ struct SharedState {
 /// Pre-computed compile request data for the request-level fast path.
 struct RequestCacheEntry {
     context_key: ContextKey,
-    source_path: PathBuf,
-    output_path: PathBuf,
+    source_path: NormalizedPath,
+    output_path: NormalizedPath,
 }
 
 /// The daemon server that listens for IPC connections.
@@ -669,13 +670,13 @@ impl DaemonServer {
                             // so journal/metadata lookups match.
                             #[cfg(windows)]
                             let (changed, removed) = {
-                                let strip = |paths: Vec<PathBuf>| -> Vec<PathBuf> {
+                                let strip = |paths: Vec<NormalizedPath>| -> Vec<NormalizedPath> {
                                     paths
                                         .into_iter()
                                         .map(|p| {
                                             let s = p.to_string_lossy();
                                             if let Some(stripped) = s.strip_prefix(r"\\?\") {
-                                                PathBuf::from(stripped)
+                                                stripped.into()
                                             } else {
                                                 p
                                             }
@@ -713,14 +714,14 @@ impl DaemonServer {
 
 /// Watch a directory for file changes, if not already watched.
 async fn watch_directory(state: &SharedState, dir: &Path) {
-    watch_directories(state, &[dir.to_path_buf()]).await;
+    watch_directories(state, &[dir.into()]).await;
 }
 
 /// Watch multiple directories in a single batch, acquiring locks once.
 ///
 /// Canonicalizes all paths up front, deduplicates against already-watched set,
 /// then registers all new watches in one lock acquisition.
-async fn watch_directories(state: &SharedState, dirs: &[PathBuf]) {
+async fn watch_directories(state: &SharedState, dirs: &[NormalizedPath]) {
     if dirs.is_empty() {
         return;
     }
@@ -728,7 +729,7 @@ async fn watch_directories(state: &SharedState, dirs: &[PathBuf]) {
     // Pre-filter: skip dirs we've already processed (by raw path).
     // This avoids expensive canonicalize() syscalls (~1-5ms each on Windows)
     // for directories that are already being watched.
-    let new_raw: Vec<&PathBuf> = dirs
+    let new_raw: Vec<&NormalizedPath> = dirs
         .iter()
         .filter(|d| !state.watched_raw_dirs.contains_key(*d))
         .collect();
@@ -740,7 +741,7 @@ async fn watch_directories(state: &SharedState, dirs: &[PathBuf]) {
     // On Windows, canonicalize() produces \\?\ extended-length paths which
     // don't match the paths reported by notify's ReadDirectoryChangesW.
     // Strip the prefix so watched paths match event paths.
-    let canonical: Vec<PathBuf> = new_raw
+    let canonical: Vec<NormalizedPath> = new_raw
         .iter()
         .filter_map(|dir| match dir.canonicalize() {
             Ok(p) => {
@@ -748,14 +749,14 @@ async fn watch_directories(state: &SharedState, dirs: &[PathBuf]) {
                 {
                     let s = p.to_string_lossy();
                     if let Some(stripped) = s.strip_prefix(r"\\?\") {
-                        Some(PathBuf::from(stripped))
+                        Some(stripped.into())
                     } else {
-                        Some(p)
+                        Some(p.into())
                     }
                 }
                 #[cfg(not(windows))]
                 {
-                    Some(p)
+                    Some(p.into())
                 }
             }
             Err(e) => {
@@ -779,7 +780,7 @@ async fn watch_directories(state: &SharedState, dirs: &[PathBuf]) {
     // Each directory here is the exact parent of a source/header file from
     // depfile scanning — no need to walk children or parents.
     let mut watched = state.watched_dirs.lock().await;
-    let new_dirs: Vec<PathBuf> = canonical
+    let new_dirs: Vec<NormalizedPath> = canonical
         .into_iter()
         .filter(|p| !watched.contains(p))
         .collect();
@@ -1221,9 +1222,9 @@ async fn handle_link_ephemeral(
 
     // 1. Parse the tool invocation — try archiver first, then linker
     struct ParsedTool {
-        input_files: Vec<std::path::PathBuf>,
-        output_file: std::path::PathBuf,
-        secondary_outputs: Vec<std::path::PathBuf>,
+        input_files: Vec<NormalizedPath>,
+        output_file: NormalizedPath,
+        secondary_outputs: Vec<NormalizedPath>,
         cache_relevant_flags: Vec<String>,
         non_deterministic: bool,
         non_determinism_hint: String,
@@ -1306,7 +1307,7 @@ async fn handle_link_ephemeral(
         let input_path = if input.is_absolute() {
             input.clone()
         } else {
-            cwd_path.join(input)
+            cwd_path.join(input).into()
         };
         let input_hash = match hash_file_via_cache(state, &input_path) {
             Some(h) => h,
@@ -1344,14 +1345,18 @@ async fn handle_link_ephemeral(
             let output_path = if parsed_tool.output_file.is_absolute() {
                 parsed_tool.output_file.clone()
             } else {
-                cwd_path.join(&parsed_tool.output_file)
+                cwd_path.join(&parsed_tool.output_file).into()
             };
             let mut write_ok = true;
             for (i, payload) in payloads.iter().enumerate() {
                 let target = if payloads.len() == 1 {
                     output_path.clone()
                 } else {
-                    output_path.parent().unwrap_or(cwd_path).join(&names[i])
+                    output_path
+                        .parent()
+                        .unwrap_or(cwd_path)
+                        .join(&names[i])
+                        .into()
                 };
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent).ok();
@@ -1385,7 +1390,7 @@ async fn handle_link_ephemeral(
     let output_path = if parsed_tool.output_file.is_absolute() {
         parsed_tool.output_file.clone()
     } else {
-        cwd_path.join(&parsed_tool.output_file)
+        cwd_path.join(&parsed_tool.output_file).into()
     };
     let output_dir = output_path.parent().unwrap_or(cwd_path);
 
@@ -1419,7 +1424,7 @@ async fn handle_link_ephemeral(
                 let sec_path = if secondary.is_absolute() {
                     secondary.clone()
                 } else {
-                    cwd_path.join(secondary)
+                    cwd_path.join(secondary).into()
                 };
                 if let Ok(sec_data) = std::fs::read(&sec_path) {
                     outputs.push(ArtifactOutput {
@@ -1600,13 +1605,13 @@ async fn handle_session_start(
     state: &SharedState,
     client_pid: u32,
     working_dir: &Path,
-    log_file: Option<PathBuf>,
+    log_file: Option<NormalizedPath>,
     track_stats: bool,
-    journal_path: Option<PathBuf>,
+    journal_path: Option<NormalizedPath>,
 ) -> Response {
     let session_config = zccache_depgraph::SessionConfig {
         client_pid,
-        working_dir: working_dir.to_path_buf(),
+        working_dir: working_dir.into(),
         log_file,
         track_stats,
         journal_path,
@@ -1672,7 +1677,7 @@ fn hash_file(cache_system: &CacheSystem, path: &Path, clock: Clock) -> Result<Co
         path.display()
     );
     cache_system
-        .lookup_since(path, clock)
+        .lookup_since(&NormalizedPath::new(path), clock)
         .map(|r| r.hash)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -1686,7 +1691,7 @@ fn hash_file(cache_system: &CacheSystem, path: &Path, clock: Clock) -> Result<Co
 /// `test_pch.h.pch` → `test_pch.h`
 /// `.build/meson-quick/tests/test_pch.h.pch` → tries sibling `test_pch.h`,
 /// then walks parent directories looking for `tests/test_pch.h`.
-fn pch_source_header(path: &Path) -> Option<PathBuf> {
+fn pch_source_header(path: &Path) -> Option<NormalizedPath> {
     let ext = path.extension()?.to_str()?;
     if ext != "pch" && ext != "gch" {
         return None;
@@ -1696,7 +1701,7 @@ fn pch_source_header(path: &Path) -> Option<PathBuf> {
     // Try sibling: same directory
     let sibling = path.with_file_name(header_name);
     if sibling.exists() {
-        return Some(sibling);
+        return Some(sibling.into());
     }
     // The PCH is typically in a build directory. Walk up looking for the
     // source header by matching the last path component(s).
@@ -1704,16 +1709,16 @@ fn pch_source_header(path: &Path) -> Option<PathBuf> {
     if let Some(parent) = path.parent() {
         // Get the directory name (e.g., "tests")
         if let Some(dir_name) = parent.file_name() {
-            let relative = PathBuf::from(dir_name).join(header_name);
+            let relative = NormalizedPath::new(dir_name).join(header_name);
             // Walk up from the build dir looking for a matching path
-            let mut search = parent.to_path_buf();
+            let mut search: NormalizedPath = parent.into();
             for _ in 0..10 {
                 if let Some(up) = search.parent() {
                     let candidate = up.join(&relative);
                     if candidate.exists() {
-                        return Some(candidate);
+                        return Some(candidate.into());
                     }
-                    search = up.to_path_buf();
+                    search = up.into();
                 } else {
                     break;
                 }
@@ -1726,9 +1731,12 @@ fn pch_source_header(path: &Path) -> Option<PathBuf> {
 /// Resolve the source header for a PCH binary. First checks the in-memory
 /// registry (populated when PCH generation succeeds), then falls back to the
 /// filesystem heuristic. Returns `None` for non-PCH files.
-fn resolve_pch_source(path: &Path, pch_map: &DashMap<PathBuf, PathBuf>) -> Option<PathBuf> {
+fn resolve_pch_source(
+    path: &Path,
+    pch_map: &DashMap<NormalizedPath, NormalizedPath>,
+) -> Option<NormalizedPath> {
     // Fast path: check registry (covers build-dir separation).
-    if let Some(src) = pch_map.get(path) {
+    if let Some(src) = pch_map.get(&NormalizedPath::new(path)) {
         return Some(src.clone());
     }
     // Fallback: filesystem heuristic.
@@ -1757,7 +1765,7 @@ enum BuildContextResult {
 fn build_compile_context(
     compilation: &zccache_compiler::CacheableCompilation,
     cwd: &Path,
-    system_includes: &[PathBuf],
+    system_includes: &[NormalizedPath],
     client_env: &[(String, String)],
 ) -> BuildContextResult {
     if compilation.family == zccache_compiler::CompilerFamily::Rustc {
@@ -1780,7 +1788,7 @@ fn build_compile_context(
     let source_path = if compilation.source_file.is_absolute() {
         compilation.source_file.clone()
     } else {
-        cwd.join(&compilation.source_file)
+        cwd.join(&compilation.source_file).into()
     };
     ctx.source_file = source_path;
 
@@ -1873,8 +1881,9 @@ fn scan_rustc_deps(
     // Their content hashes will be part of the artifact key,
     // so changing an extern crate causes a cache miss.
     for ext in &rustc_args.externs {
-        if ext.path.exists() && !result.resolved.contains(&ext.path) {
-            result.resolved.push(ext.path.clone());
+        let dep_path: NormalizedPath = ext.path.clone().into_path_buf().into();
+        if ext.path.exists() && !result.resolved.contains(&dep_path) {
+            result.resolved.push(dep_path);
         }
     }
 
@@ -1953,10 +1962,10 @@ fn parse_rustc_depinfo(
     }
 
     // Resolve paths and filter out the source file
-    let source_canonical = if source_path.is_absolute() {
-        source_path.to_path_buf()
+    let source_canonical: NormalizedPath = if source_path.is_absolute() {
+        source_path.into()
     } else {
-        cwd.join(source_path)
+        cwd.join(source_path).into()
     };
 
     let mut resolved = Vec::new();
@@ -1973,7 +1982,7 @@ fn parse_rustc_depinfo(
         }
         // Only include files that exist (skip phantom deps)
         if abs.exists() {
-            resolved.push(abs);
+            resolved.push(abs.into());
         }
     }
     resolved.sort();
@@ -2168,10 +2177,10 @@ fn expand_args_cached(state: &SharedState, args: &[String], cwd: &Path) -> Vec<S
     for arg in args {
         if arg.len() > 1 && arg.starts_with('@') {
             let filename = &arg[1..];
-            let resolved = if Path::new(filename).is_absolute() {
-                PathBuf::from(filename)
+            let resolved: NormalizedPath = if Path::new(filename).is_absolute() {
+                filename.into()
             } else {
-                cwd.join(filename)
+                cwd.join(filename).into()
             };
 
             match expand_rsp_arg_cached(state, &resolved) {
@@ -2189,9 +2198,10 @@ fn expand_args_cached(state: &SharedState, args: &[String], cwd: &Path) -> Vec<S
 }
 
 fn expand_rsp_arg_cached(state: &SharedState, resolved: &Path) -> Result<Vec<String>, String> {
-    let canonical = resolved
+    let canonical: NormalizedPath = resolved
         .canonicalize()
-        .map_err(|e| format!("failed to read response file '{}': {e}", resolved.display()))?;
+        .map_err(|e| format!("failed to read response file '{}': {e}", resolved.display()))?
+        .into();
 
     if let Some(cached) = state.rsp_cache.get(&canonical) {
         let fresh = cached
@@ -2220,7 +2230,7 @@ fn expand_rsp_arg_cached(state: &SharedState, resolved: &Path) -> Result<Vec<Str
 fn expand_rsp_recursive(
     state: &SharedState,
     path: &Path,
-    seen: &mut HashSet<PathBuf>,
+    seen: &mut HashSet<NormalizedPath>,
     dependencies: &mut Vec<RspDependency>,
     depth: usize,
 ) -> Result<Vec<String>, zccache_compiler::response_file::ResponseFileError> {
@@ -2229,17 +2239,16 @@ fn expand_rsp_recursive(
     const MAX_RSP_DEPTH: usize = 10;
 
     if depth >= MAX_RSP_DEPTH {
-        return Err(ResponseFileError::TooDeep {
-            path: path.to_path_buf(),
-        });
+        return Err(ResponseFileError::TooDeep { path: path.into() });
     }
 
-    let canonical = path
+    let canonical: NormalizedPath = path
         .canonicalize()
         .map_err(|e| ResponseFileError::ReadError {
-            path: path.to_path_buf(),
+            path: path.into(),
             source: e,
-        })?;
+        })?
+        .into();
 
     if !seen.insert(canonical.clone()) {
         return Err(ResponseFileError::CircularReference {
@@ -2273,10 +2282,10 @@ fn expand_rsp_recursive(
                 expanded.push(child);
                 continue;
             }
-            let child_path = if Path::new(filename).is_absolute() {
-                PathBuf::from(filename)
+            let child_path: NormalizedPath = if Path::new(filename).is_absolute() {
+                filename.into()
             } else {
-                base_dir.join(filename)
+                base_dir.join(filename).into()
             };
             expanded.extend(expand_rsp_recursive(
                 state,
@@ -2305,7 +2314,7 @@ fn context_files_fresh(
     since: Clock,
 ) -> bool {
     let journal = state.cache_system.journal();
-    if journal.changed_since(source_path, since) {
+    if journal.changed_since(&source_path.into(), since) {
         return false;
     }
     if let Some(includes) = state.dep_graph.get_includes(context_key) {
@@ -2327,13 +2336,15 @@ fn context_files_fresh(
 fn request_fingerprint(compiler: &Path, args: &[String], cwd: &Path) -> ContentHash {
     let mut h = zccache_hash::StreamHasher::new();
     h.update(b"zccache-request-v1\0");
-    h.update(compiler.to_string_lossy().as_bytes());
+    let compiler = zccache_core::path::normalize_for_key(compiler);
+    h.update(compiler.as_bytes());
     h.update(&[0]);
     for arg in args {
         h.update(arg.as_bytes());
         h.update(&[0]);
     }
-    h.update(cwd.to_string_lossy().as_bytes());
+    let cwd = zccache_core::path::normalize_for_key(cwd);
+    h.update(cwd.as_bytes());
     h.finalize()
 }
 
@@ -2399,7 +2410,7 @@ async fn handle_compile(
                                 let out_path = if i == 0 {
                                     req_entry.output_path.clone()
                                 } else {
-                                    cwd.join(&names[i])
+                                    cwd.join(&names[i]).into()
                                 };
                                 let cache_file =
                                     state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
@@ -2444,7 +2455,7 @@ async fn handle_compile(
         };
     }
 
-    let compiler = compiler_path.to_path_buf();
+    let compiler: NormalizedPath = compiler_path.into();
 
     // Discover system includes for this compiler (cached per compiler path)
     let system_includes = {
@@ -2498,7 +2509,7 @@ async fn handle_compile(
                 compilations,
                 original_args,
                 source_indices,
-                cwd.to_path_buf(),
+                cwd.into(),
                 system_includes,
                 client_env,
             )
@@ -2507,7 +2518,7 @@ async fn handle_compile(
     };
     let parse_args_ns = t0.elapsed().as_nanos() as u64;
 
-    let cwd_path = cwd.to_path_buf();
+    let cwd_path: NormalizedPath = cwd.into();
     let source_path = if compilation.source_file.is_absolute() {
         compilation.source_file.clone()
     } else {
@@ -2578,13 +2589,13 @@ async fn handle_compile(
                         let secondary_dir = if is_rustc {
                             output_path.parent().unwrap_or(&cwd_path).to_path_buf()
                         } else {
-                            cwd_path.clone()
+                            cwd_path.clone().to_path_buf()
                         };
                         for (i, payload) in payloads.iter().enumerate() {
                             let out_path = if i == 0 {
                                 output_path.clone()
                             } else {
-                                secondary_dir.join(&names[i])
+                                secondary_dir.join(&names[i]).into()
                             };
                             let cache_file =
                                 state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
@@ -2668,7 +2679,7 @@ async fn handle_compile(
 
     // ── Phase: hash source ───────────────────────────────────────────
     let t2 = std::time::Instant::now();
-    let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
+    let mut hash_map: HashMap<NormalizedPath, ContentHash> = HashMap::new();
     if !context_is_cold {
         match hash_file(&state.cache_system, &source_path, snap_clock) {
             Ok(h) => {
@@ -2751,20 +2762,28 @@ async fn handle_compile(
         // ── Phase: depgraph check ────────────────────────────────────
         // Fast path: recompute artifact key from fresh hashes and compare
         // with the stored key.  Skips redundant journal freshness checks
-        // and PathBuf clones that check_diagnostic performs.
-        if let Some(artifact_key) = state
-            .dep_graph
-            .try_fast_hit(&context_key, |p| hash_map.get(p).copied())
-        {
+        // and path clones that check_diagnostic performs.
+        if let Some(artifact_key) = state.dep_graph.try_fast_hit(&context_key, |p| {
+            let path = NormalizedPath::new(p);
+            hash_map.get(&path).copied()
+        }) {
             depgraph_check_ns = 0;
             verdict = zccache_depgraph::CacheVerdict::Hit { artifact_key };
             diag_reason = "fast_key_match".to_string();
         } else {
             let t4 = std::time::Instant::now();
             let result = {
-                let is_fresh =
-                    |p: &Path| !state.cache_system.journal().changed_since(p, snap_clock);
-                let get_hash = |p: &Path| hash_map.get(p).copied();
+                let is_fresh = |p: &Path| {
+                    let path = NormalizedPath::new(p);
+                    !state
+                        .cache_system
+                        .journal()
+                        .changed_since(&path, snap_clock)
+                };
+                let get_hash = |p: &Path| {
+                    let path = NormalizedPath::new(p);
+                    hash_map.get(&path).copied()
+                };
                 state
                     .dep_graph
                     .check_diagnostic(&context_key, is_fresh, get_hash)
@@ -2822,13 +2841,13 @@ async fn handle_compile(
                     let secondary_dir = if is_rustc {
                         output_path.parent().unwrap_or(&cwd_path).to_path_buf()
                     } else {
-                        cwd_path.clone()
+                        cwd_path.clone().to_path_buf()
                     };
                     for (i, payload) in payloads.iter().enumerate() {
                         let out_path = if i == 0 {
                             output_path.clone()
                         } else {
-                            secondary_dir.join(&names[i])
+                            secondary_dir.join(&names[i]).into()
                         };
                         let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
                         if write_cached_output(&out_path, &cache_file, payload).is_err() {
@@ -3073,7 +3092,7 @@ async fn handle_compile(
                 DepfileStrategy::Injected { path }
                 | DepfileStrategy::UserSpecified { path }
                 | DepfileStrategy::UserDefault { path } => {
-                    let cwd_path = PathBuf::from(cwd);
+                    let cwd_path: NormalizedPath = cwd.into();
                     match zccache_depgraph::depfile::parse_depfile_path(
                         path,
                         &source_path,
@@ -3119,7 +3138,7 @@ async fn handle_compile(
         let include_scan_ns = t_scan.elapsed().as_nanos() as u64;
 
         // Register scanned paths for zero-syscall fast path on future hits.
-        let tracked_paths: Vec<PathBuf> = std::iter::once(source_path.clone())
+        let tracked_paths: Vec<NormalizedPath> = std::iter::once(source_path.clone())
             .chain(scan_result.resolved.iter().cloned())
             .chain(ctx.force_includes.iter().cloned())
             .collect();
@@ -3128,20 +3147,20 @@ async fn handle_compile(
         // Collect directories to watch. The actual watch_directories call
         // (which involves expensive canonicalize() on Windows) is deferred
         // to a background task to avoid blocking the response.
-        let dep_dirs: Vec<PathBuf> = {
+        let dep_dirs: Vec<NormalizedPath> = {
             let mut dirs = HashSet::new();
             if let Some(parent) = source_path.parent() {
-                dirs.insert(parent.to_path_buf());
+                dirs.insert(parent.into());
             }
             for header in &scan_result.resolved {
                 if let Some(parent) = header.parent() {
-                    dirs.insert(parent.to_path_buf());
+                    dirs.insert(parent.into());
                 }
             }
             // Also watch force-include parent dirs (PCH files, etc.).
             for fi in &ctx.force_includes {
                 if let Some(parent) = fi.parent() {
-                    dirs.insert(parent.to_path_buf());
+                    dirs.insert(parent.into());
                 }
             }
             dirs.into_iter().collect()
@@ -3151,11 +3170,11 @@ async fn handle_compile(
         // Hash source + resolved headers + force-includes using rayon
         // parallel iteration, matching the hit path's parallel strategy.
         let t_hash = std::time::Instant::now();
-        let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
+        let mut hash_map: HashMap<NormalizedPath, ContentHash> = HashMap::new();
         {
             use rayon::prelude::*;
             let header_iter = scan_result.resolved.iter().chain(ctx.force_includes.iter());
-            let all_paths: Vec<&PathBuf> =
+            let all_paths: Vec<&NormalizedPath> =
                 std::iter::once(&source_path).chain(header_iter).collect();
 
             let results: Vec<_> = all_paths
@@ -3196,7 +3215,10 @@ async fn handle_compile(
 
         // ── Phase: store artifact ────────────────────────────────────
         let t_store = std::time::Instant::now();
-        let get_hash = |p: &Path| hash_map.get(p).copied();
+        let get_hash = |p: &Path| {
+            let path = NormalizedPath::new(p);
+            hash_map.get(&path).copied()
+        };
         let include_count = scan_result.resolved.len();
         if let Some(artifact_key) = state.dep_graph.update(&context_key, scan_result, get_hash) {
             let artifact_key_hex = artifact_key.hash().to_hex();
@@ -3357,8 +3379,8 @@ fn apply_client_env(cmd: &mut tokio::process::Command, client_env: &Option<Vec<(
 
 /// A deferred output write for a cache hit.
 struct PendingWrite {
-    out_path: PathBuf,
-    cache_file: PathBuf,
+    out_path: NormalizedPath,
+    cache_file: NormalizedPath,
     data: Vec<u8>,
 }
 
@@ -3369,13 +3391,13 @@ enum UnitCacheResult {
         stdout: Arc<Vec<u8>>,
         stderr: Arc<Vec<u8>>,
         artifact_bytes: u64,
-        source_path: PathBuf,
+        source_path: NormalizedPath,
         pending_writes: Vec<PendingWrite>,
     },
     /// Cache miss — needs compilation.
     Miss {
-        source_path: PathBuf,
-        output_path: PathBuf,
+        source_path: NormalizedPath,
+        output_path: NormalizedPath,
         context_key: ContextKey,
         ctx: Box<CompileContext>,
     },
@@ -3390,7 +3412,7 @@ fn check_unit_cache(
     state: &SharedState,
     compilation: &zccache_compiler::CacheableCompilation,
     cwd_path: &Path,
-    system_includes: &[PathBuf],
+    system_includes: &[NormalizedPath],
     shared_base: Option<&CompileContext>,
 ) -> UnitCacheResult {
     let t0 = std::time::Instant::now();
@@ -3400,12 +3422,12 @@ fn check_unit_cache(
     let source_path = if compilation.source_file.is_absolute() {
         compilation.source_file.clone()
     } else {
-        cwd_path.join(&compilation.source_file)
+        cwd_path.join(&compilation.source_file).into()
     };
     let output_path = if compilation.output_file.is_absolute() {
         compilation.output_file.clone()
     } else {
-        cwd_path.join(&compilation.output_file)
+        cwd_path.join(&compilation.output_file).into()
     };
 
     let (ctx, _dep_flags) = if let Some(base) = shared_base {
@@ -3458,7 +3480,7 @@ fn check_unit_cache(
                             let out_path = if i == 0 {
                                 output_path.clone()
                             } else {
-                                cwd_path.join(&names[i])
+                                cwd_path.join(&names[i]).into()
                             };
                             let cache_file =
                                 state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
@@ -3505,13 +3527,14 @@ fn check_unit_cache(
     let t_hash_source = t0.elapsed();
 
     // Hash known headers + force-includes in parallel
-    let mut hash_map: HashMap<PathBuf, ContentHash> = HashMap::new();
+    let mut hash_map: HashMap<NormalizedPath, ContentHash> = HashMap::new();
     hash_map.insert(source_path.clone(), source_hash);
     {
         use rayon::prelude::*;
         let includes = state.dep_graph.get_includes(&context_key);
         let include_iter = includes.iter().flat_map(|v| v.iter());
-        let all_paths: Vec<&PathBuf> = include_iter.chain(ctx.force_includes.iter()).collect();
+        let all_paths: Vec<&NormalizedPath> =
+            include_iter.chain(ctx.force_includes.iter()).collect();
         let hashes: Vec<_> = all_paths
             .par_iter()
             .filter_map(|path| {
@@ -3528,8 +3551,17 @@ fn check_unit_cache(
 
     // Depgraph check
     let verdict = {
-        let is_fresh = |p: &Path| !state.cache_system.journal().changed_since(p, snap_clock);
-        let get_hash = |p: &Path| hash_map.get(p).copied();
+        let is_fresh = |p: &Path| {
+            let path = NormalizedPath::new(p);
+            !state
+                .cache_system
+                .journal()
+                .changed_since(&path, snap_clock)
+        };
+        let get_hash = |p: &Path| {
+            let path = NormalizedPath::new(p);
+            hash_map.get(&path).copied()
+        };
         state.dep_graph.check(&context_key, is_fresh, get_hash)
     };
     let t_depgraph = t0.elapsed();
@@ -3556,7 +3588,7 @@ fn check_unit_cache(
                     let out_path = if i == 0 {
                         output_path.clone()
                     } else {
-                        cwd_path.join(&names[i])
+                        cwd_path.join(&names[i]).into()
                     };
                     let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
                     let _ = write_cached_output(&out_path, &cache_file, payload);
@@ -3613,12 +3645,12 @@ fn check_unit_cache(
 async fn handle_compile_multi(
     state: Arc<SharedState>,
     sid: SessionId,
-    compiler: PathBuf,
+    compiler: NormalizedPath,
     compilations: Vec<zccache_compiler::CacheableCompilation>,
     original_args: Arc<[String]>,
     source_indices: Vec<usize>,
-    cwd_path: PathBuf,
-    system_includes: Vec<PathBuf>,
+    cwd_path: NormalizedPath,
+    system_includes: Vec<NormalizedPath>,
     client_env: Option<Vec<(String, String)>>,
 ) -> Response {
     let snap_clock = state.cache_system.current_clock();
@@ -3744,17 +3776,17 @@ async fn handle_compile_multi(
                 cwd_path.join(&comp.output_file)
             };
             if let Some(parent) = out.parent() {
-                output_dirs.insert(parent.to_path_buf());
+                output_dirs.insert(parent.into());
             }
             if matches!(&unit_results[idx], UnitCacheResult::Hit { .. }) {
                 state.cache_system.metadata().downgrade(&out);
             }
         }
-        let dirs: Vec<PathBuf> = output_dirs.into_iter().collect();
+        let dirs: Vec<NormalizedPath> = output_dirs.into_iter().collect();
         watch_directories(&state, &dirs).await;
     }
 
-    let miss_sources: Vec<&PathBuf> = unit_results
+    let miss_sources: Vec<&NormalizedPath> = unit_results
         .iter()
         .filter_map(|r| match r {
             UnitCacheResult::Miss { source_path, .. } => Some(source_path),
@@ -3785,7 +3817,7 @@ async fn handle_compile_multi(
     // This preserves all original flags (including unknown ones) exactly as passed.
     let supports_depfile = compilations[0].family.supports_depfile();
     let hit_indices: HashSet<usize> = {
-        let miss_set: HashSet<&PathBuf> = miss_sources.iter().copied().collect();
+        let miss_set: HashSet<&NormalizedPath> = miss_sources.iter().copied().collect();
         source_indices
             .iter()
             .enumerate()
@@ -3885,8 +3917,8 @@ async fn handle_compile_multi(
                     .file_name()
                     .unwrap_or_else(|| std::ffi::OsStr::new("deps.d")),
             );
-            let depfile_path = if d_path.exists() {
-                d_path
+            let depfile_path: NormalizedPath = if d_path.exists() {
+                d_path.into()
             } else if cwd_d_path.exists() {
                 cwd_d_path
             } else {
@@ -3894,7 +3926,7 @@ async fn handle_compile_multi(
                 let stem = source_path
                     .file_stem()
                     .unwrap_or_else(|| std::ffi::OsStr::new("out"));
-                cwd_path.join(stem).with_extension("d")
+                cwd_path.join(stem).with_extension("d").into()
             };
             match zccache_depgraph::depfile::parse_depfile_path(
                 &depfile_path,
@@ -3917,21 +3949,21 @@ async fn handle_compile_multi(
             zccache_depgraph::scanner::scan_recursive(source_path, &ctx.include_search)
         };
 
-        let tracked_paths: Vec<PathBuf> = std::iter::once(source_path.clone())
+        let tracked_paths: Vec<NormalizedPath> = std::iter::once(source_path.clone())
             .chain(scan_result.resolved.iter().cloned())
             .collect();
         state.cache_system.register_tracked(&tracked_paths);
 
         // Watch parent directories of source file AND discovered headers.
         {
-            let dep_dirs: Vec<PathBuf> = {
+            let dep_dirs: Vec<NormalizedPath> = {
                 let mut dirs = HashSet::new();
                 if let Some(parent) = source_path.parent() {
-                    dirs.insert(parent.to_path_buf());
+                    dirs.insert(parent.into());
                 }
                 for header in &scan_result.resolved {
                     if let Some(parent) = header.parent() {
-                        dirs.insert(parent.to_path_buf());
+                        dirs.insert(parent.into());
                     }
                 }
                 dirs.into_iter().collect()
@@ -3940,9 +3972,9 @@ async fn handle_compile_multi(
         }
 
         // Hash all files (source + headers) in parallel
-        let hash_map: HashMap<PathBuf, ContentHash> = {
+        let hash_map: HashMap<NormalizedPath, ContentHash> = {
             use rayon::prelude::*;
-            let all_paths: Vec<&PathBuf> = std::iter::once(source_path)
+            let all_paths: Vec<&NormalizedPath> = std::iter::once(source_path)
                 .chain(scan_result.resolved.iter())
                 .collect();
             all_paths
@@ -3956,7 +3988,10 @@ async fn handle_compile_multi(
         };
 
         // Store artifact
-        let get_hash = |p: &Path| hash_map.get(p).copied();
+        let get_hash = |p: &Path| {
+            let path = NormalizedPath::new(p);
+            hash_map.get(&path).copied()
+        };
         let update_result = state.dep_graph.update(context_key, scan_result, get_hash);
         if let Some(artifact_key) = update_result {
             let artifact = ArtifactData {
@@ -4057,7 +4092,7 @@ async fn handle_compile_multi(
 
 /// Run the compiler directly without caching.
 async fn run_compiler_direct(
-    compiler: &PathBuf,
+    compiler: &NormalizedPath,
     args: &[String],
     cwd: &Path,
     sessions: &SessionManager,
@@ -4113,6 +4148,23 @@ mod tests {
             server.run(0).await.unwrap();
         });
         (endpoint, handle, shutdown)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn request_fingerprint_normalizes_equivalent_windows_paths() {
+        let args = vec!["-c".to_string(), "src/main.cpp".to_string()];
+        let a = request_fingerprint(
+            Path::new(r"C:\LLVM\bin\clang++.exe"),
+            &args,
+            Path::new(r"C:\Work\Project"),
+        );
+        let b = request_fingerprint(
+            Path::new("c:/llvm/bin/clang++.exe"),
+            &args,
+            Path::new("c:/work/project"),
+        );
+        assert_eq!(a, b);
     }
 
     #[tokio::test]
@@ -4667,7 +4719,7 @@ mod tests {
         std::fs::write(&pch, "binary").unwrap();
 
         let result = pch_source_header(&pch);
-        assert_eq!(result, Some(header));
+        assert_eq!(result, Some(header.into()));
     }
 
     #[test]
@@ -4688,7 +4740,7 @@ mod tests {
         std::fs::write(&pch, "binary").unwrap();
 
         let result = pch_source_header(&pch);
-        assert_eq!(result, Some(header));
+        assert_eq!(result, Some(header.into()));
     }
 
     #[test]
@@ -4722,16 +4774,16 @@ mod tests {
         std::fs::write(&gch, "binary").unwrap();
 
         let result = pch_source_header(&gch);
-        assert_eq!(result, Some(header));
+        assert_eq!(result, Some(header.into()));
     }
 
     // ── resolve_pch_source unit tests ───────────────────────────────────
 
     #[test]
     fn resolve_pch_source_registry_hit() {
-        let pch_map: DashMap<PathBuf, PathBuf> = DashMap::new();
-        let pch_path = PathBuf::from("/build/tests/pch.h.pch");
-        let src_path = PathBuf::from("/src/tests/pch.h");
+        let pch_map: DashMap<NormalizedPath, NormalizedPath> = DashMap::new();
+        let pch_path = NormalizedPath::from("/build/tests/pch.h.pch");
+        let src_path = NormalizedPath::from("/src/tests/pch.h");
         pch_map.insert(pch_path.clone(), src_path.clone());
 
         let result = resolve_pch_source(&pch_path, &pch_map);
@@ -4746,14 +4798,14 @@ mod tests {
         std::fs::write(&header, "// pch").unwrap();
         std::fs::write(&pch, "binary").unwrap();
 
-        let pch_map: DashMap<PathBuf, PathBuf> = DashMap::new();
+        let pch_map: DashMap<NormalizedPath, NormalizedPath> = DashMap::new();
         let result = resolve_pch_source(&pch, &pch_map);
-        assert_eq!(result, Some(header));
+        assert_eq!(result, Some(header.into()));
     }
 
     #[test]
     fn resolve_pch_source_non_pch_returns_none() {
-        let pch_map: DashMap<PathBuf, PathBuf> = DashMap::new();
+        let pch_map: DashMap<NormalizedPath, NormalizedPath> = DashMap::new();
         let result = resolve_pch_source(Path::new("/build/foo.o"), &pch_map);
         assert_eq!(result, None);
     }

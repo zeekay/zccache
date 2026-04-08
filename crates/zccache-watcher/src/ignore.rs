@@ -68,7 +68,6 @@ impl Default for IgnoreFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn default_patterns_include_common_dirs() {
@@ -134,6 +133,6 @@ mod tests {
     fn root_path_not_ignored() {
         let filter = IgnoreFilter::default();
         assert!(!filter.should_ignore(Path::new("main.c")));
-        assert!(!filter.should_ignore(&PathBuf::from(".")));
+        assert!(!filter.should_ignore(Path::new(".")));
     }
 }

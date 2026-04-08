@@ -3,7 +3,7 @@
 //! Handles parsing command-line arguments for `ar`, `llvm-ar`, and MSVC `lib.exe`
 //! to determine cacheability and extract cache-relevant information.
 
-use std::path::PathBuf;
+use zccache_core::NormalizedPath;
 
 /// Supported archiver tool families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,13 +32,13 @@ pub enum ParsedArchiveInvocation {
 #[derive(Debug, Clone)]
 pub struct CacheableArchive {
     /// The archiver executable path.
-    pub tool: PathBuf,
+    pub tool: NormalizedPath,
     /// The detected archiver family.
     pub family: ArchiverFamily,
-    /// Input object files (order preserved — matters for ar).
-    pub input_files: Vec<PathBuf>,
+    /// Input object files (order preserved â€” matters for ar).
+    pub input_files: Vec<NormalizedPath>,
     /// The output archive file path.
-    pub output_file: PathBuf,
+    pub output_file: NormalizedPath,
     /// Flags relevant to cache keying (e.g., "rcs", "rcsD").
     pub cache_relevant_flags: Vec<String>,
     /// The full original argument list (for fallback execution).
@@ -65,13 +65,13 @@ fn detect_family(tool: &str) -> Option<ArchiverFamily> {
         return Some(ArchiverFamily::MsvcLib);
     }
 
-    // llvm-ar, llvm-ar-15, etc. — check before plain "ar" to avoid false match
+    // llvm-ar, llvm-ar-15, etc. â€” check before plain "ar" to avoid false match
     if name.starts_with("llvm-ar") || name.starts_with("llvm_ar") {
         return Some(ArchiverFamily::LlvmAr);
     }
 
     // GNU ar: ar, x86_64-linux-gnu-ar, aarch64-linux-gnu-ar, etc.
-    // Must end with "ar" (not just contain it — "lzma-archiver" is not ar)
+    // Must end with "ar" (not just contain it â€” "lzma-archiver" is not ar)
     if name == "ar" || name.ends_with("-ar") {
         return Some(ArchiverFamily::Ar);
     }
@@ -116,7 +116,7 @@ fn parse_gnu_ar(tool: &str, family: ArchiverFamily, args: &[String]) -> ParsedAr
     }
 
     // Find the operation string. It's the first arg that doesn't start with '--'.
-    // (GNU ar allows `-rcs` or `rcs` — the dash prefix is optional.)
+    // (GNU ar allows `-rcs` or `rcs` â€” the dash prefix is optional.)
     let mut op_idx = 0;
     let mut long_flags = Vec::new();
 
@@ -179,9 +179,9 @@ fn parse_gnu_ar(tool: &str, family: ArchiverFamily, args: &[String]) -> ParsedAr
 
     // After the operation, next arg is the archive name, then member files.
     // But some modifiers consume extra positional args:
-    //   'a', 'b', 'i' → next arg is relpos (a member name for positioning)
+    //   'a', 'b', 'i' â†’ next arg is relpos (a member name for positioning)
     let has_relpos = op_str.contains('a') || op_str.contains('b') || op_str.contains('i');
-    // 'N' → next arg is count
+    // 'N' â†’ next arg is count
     let has_count = op_str.contains('N');
 
     let mut pos = op_idx + 1;
@@ -201,11 +201,11 @@ fn parse_gnu_ar(tool: &str, family: ArchiverFamily, args: &[String]) -> ParsedAr
         };
     }
 
-    let output_file = PathBuf::from(&args[pos]);
+    let output_file = NormalizedPath::new(&args[pos]);
     pos += 1;
 
     // Remaining args are input member files
-    let input_files: Vec<PathBuf> = args[pos..].iter().map(PathBuf::from).collect();
+    let input_files: Vec<NormalizedPath> = args[pos..].iter().map(NormalizedPath::from).collect();
 
     if input_files.is_empty() {
         return ParsedArchiveInvocation::NonCacheable {
@@ -217,7 +217,7 @@ fn parse_gnu_ar(tool: &str, family: ArchiverFamily, args: &[String]) -> ParsedAr
     cache_relevant_flags.extend(long_flags);
 
     ParsedArchiveInvocation::Cacheable(CacheableArchive {
-        tool: PathBuf::from(tool),
+        tool: NormalizedPath::new(tool),
         family,
         input_files,
         output_file,
@@ -240,8 +240,8 @@ fn parse_msvc_lib(tool: &str, args: &[String]) -> ParsedArchiveInvocation {
         };
     }
 
-    let mut output_file: Option<PathBuf> = None;
-    let mut input_files: Vec<PathBuf> = Vec::new();
+    let mut output_file: Option<NormalizedPath> = None;
+    let mut input_files: Vec<NormalizedPath> = Vec::new();
     let mut cache_relevant_flags: Vec<String> = Vec::new();
     let mut is_extract = false;
     let mut has_brepro = false;
@@ -250,24 +250,24 @@ fn parse_msvc_lib(tool: &str, args: &[String]) -> ParsedArchiveInvocation {
     for arg in args {
         let upper = arg.to_uppercase();
 
-        // /EXTRACT:member — extraction mode
+        // /EXTRACT:member â€” extraction mode
         if upper.starts_with("/EXTRACT:") || upper.starts_with("-EXTRACT:") {
             is_extract = true;
             break;
         }
 
-        // /LIST — list mode
+        // /LIST â€” list mode
         if upper == "/LIST" || upper == "-LIST" {
             has_list = true;
         }
 
         // /OUT:filename
         if upper.starts_with("/OUT:") || upper.starts_with("-OUT:") {
-            output_file = Some(PathBuf::from(&arg[5..]));
+            output_file = Some(NormalizedPath::new(&arg[5..]));
             continue;
         }
 
-        // /BREPRO — binary reproducibility
+        // /BREPRO â€” binary reproducibility
         if upper == "/BREPRO" || upper == "-BREPRO" {
             has_brepro = true;
             cache_relevant_flags.push(arg.clone());
@@ -280,8 +280,8 @@ fn parse_msvc_lib(tool: &str, args: &[String]) -> ParsedArchiveInvocation {
             continue;
         }
 
-        // Positional — input file
-        input_files.push(PathBuf::from(arg));
+        // Positional â€” input file
+        input_files.push(NormalizedPath::new(arg));
     }
 
     if is_extract {
@@ -305,11 +305,11 @@ fn parse_msvc_lib(tool: &str, args: &[String]) -> ParsedArchiveInvocation {
     // If no /OUT:, lib.exe defaults to first input file with .lib extension
     let output_file = output_file.unwrap_or_else(|| {
         let first = &input_files[0];
-        first.with_extension("lib")
+        NormalizedPath::new(first.with_extension("lib"))
     });
 
     ParsedArchiveInvocation::Cacheable(CacheableArchive {
-        tool: PathBuf::from(tool),
+        tool: NormalizedPath::new(tool),
         family: ArchiverFamily::MsvcLib,
         input_files,
         output_file,
@@ -327,7 +327,7 @@ mod tests {
         s.iter().map(|x| x.to_string()).collect()
     }
 
-    // ─── Detection ─────────────────────────────────────────────────────
+    // â”€â”€â”€ Detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn detect_gnu_ar() {
@@ -378,7 +378,7 @@ mod tests {
         assert!(!is_archiver("ld"));
     }
 
-    // ─── GNU ar parsing ────────────────────────────────────────────────
+    // â”€â”€â”€ GNU ar parsing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn basic_ar_rcs() {
@@ -386,10 +386,10 @@ mod tests {
         match result {
             ParsedArchiveInvocation::Cacheable(c) => {
                 assert_eq!(c.family, ArchiverFamily::Ar);
-                assert_eq!(c.output_file, PathBuf::from("libfoo.a"));
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.a"));
                 assert_eq!(c.input_files.len(), 2);
-                assert_eq!(c.input_files[0], PathBuf::from("a.o"));
-                assert_eq!(c.input_files[1], PathBuf::from("b.o"));
+                assert_eq!(c.input_files[0], NormalizedPath::new("a.o"));
+                assert_eq!(c.input_files[1], NormalizedPath::new("b.o"));
                 assert!(c.non_deterministic); // no D flag
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -401,8 +401,8 @@ mod tests {
         let result = parse_archive_invocation("ar", &args(&["-rcs", "libfoo.a", "a.o"]));
         match result {
             ParsedArchiveInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("libfoo.a"));
-                assert_eq!(c.input_files, vec![PathBuf::from("a.o")]);
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.a"));
+                assert_eq!(c.input_files, vec![NormalizedPath::new("a.o")]);
                 assert_eq!(c.cache_relevant_flags, vec!["rcs"]);
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -492,9 +492,9 @@ mod tests {
             parse_archive_invocation("ar", &args(&["rcs", "libfoo.a", "z.o", "a.o", "m.o"]));
         match result {
             ParsedArchiveInvocation::Cacheable(c) => {
-                assert_eq!(c.input_files[0], PathBuf::from("z.o"));
-                assert_eq!(c.input_files[1], PathBuf::from("a.o"));
-                assert_eq!(c.input_files[2], PathBuf::from("m.o"));
+                assert_eq!(c.input_files[0], NormalizedPath::new("z.o"));
+                assert_eq!(c.input_files[1], NormalizedPath::new("a.o"));
+                assert_eq!(c.input_files[2], NormalizedPath::new("m.o"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -508,8 +508,8 @@ mod tests {
             parse_archive_invocation("ar", &args(&["rcsb", "existing.o", "libfoo.a", "new.o"]));
         match result {
             ParsedArchiveInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("libfoo.a"));
-                assert_eq!(c.input_files, vec![PathBuf::from("new.o")]);
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.a"));
+                assert_eq!(c.input_files, vec![NormalizedPath::new("new.o")]);
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -523,8 +523,8 @@ mod tests {
         );
         match result {
             ParsedArchiveInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("libfoo.a"));
-                assert_eq!(c.input_files, vec![PathBuf::from("a.o")]);
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.a"));
+                assert_eq!(c.input_files, vec![NormalizedPath::new("a.o")]);
                 assert!(c.cache_relevant_flags.contains(&"--plugin".to_string()));
                 assert!(c
                     .cache_relevant_flags
@@ -540,7 +540,7 @@ mod tests {
         match result {
             ParsedArchiveInvocation::Cacheable(c) => {
                 assert_eq!(c.family, ArchiverFamily::LlvmAr);
-                assert_eq!(c.output_file, PathBuf::from("libfoo.a"));
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.a"));
                 assert_eq!(c.input_files.len(), 2);
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -554,13 +554,13 @@ mod tests {
         match result {
             ParsedArchiveInvocation::Cacheable(c) => {
                 assert_eq!(c.family, ArchiverFamily::Ar);
-                assert_eq!(c.tool, PathBuf::from("x86_64-linux-gnu-ar"));
+                assert_eq!(c.tool, NormalizedPath::new("x86_64-linux-gnu-ar"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
-    // ─── MSVC lib.exe parsing ──────────────────────────────────────────
+    // â”€â”€â”€ MSVC lib.exe parsing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn basic_msvc_lib() {
@@ -569,10 +569,10 @@ mod tests {
         match result {
             ParsedArchiveInvocation::Cacheable(c) => {
                 assert_eq!(c.family, ArchiverFamily::MsvcLib);
-                assert_eq!(c.output_file, PathBuf::from("foo.lib"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.lib"));
                 assert_eq!(c.input_files.len(), 2);
-                assert_eq!(c.input_files[0], PathBuf::from("a.obj"));
-                assert_eq!(c.input_files[1], PathBuf::from("b.obj"));
+                assert_eq!(c.input_files[0], NormalizedPath::new("a.obj"));
+                assert_eq!(c.input_files[1], NormalizedPath::new("b.obj"));
                 assert!(c.non_deterministic); // no /BREPRO
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -616,7 +616,7 @@ mod tests {
         let result = parse_archive_invocation("lib.exe", &args(&["a.obj", "b.obj"]));
         match result {
             ParsedArchiveInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("a.lib"));
+                assert_eq!(c.output_file, NormalizedPath::new("a.lib"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -654,9 +654,9 @@ mod tests {
         );
         match result {
             ParsedArchiveInvocation::Cacheable(c) => {
-                assert_eq!(c.input_files[0], PathBuf::from("z.obj"));
-                assert_eq!(c.input_files[1], PathBuf::from("a.obj"));
-                assert_eq!(c.input_files[2], PathBuf::from("m.obj"));
+                assert_eq!(c.input_files[0], NormalizedPath::new("z.obj"));
+                assert_eq!(c.input_files[1], NormalizedPath::new("a.obj"));
+                assert_eq!(c.input_files[2], NormalizedPath::new("m.obj"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -669,14 +669,14 @@ mod tests {
             parse_archive_invocation("lib.exe", &args(&["-OUT:foo.lib", "-BREPRO", "a.obj"]));
         match result {
             ParsedArchiveInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("foo.lib"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.lib"));
                 assert!(!c.non_deterministic);
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
-    // ─── Unknown tool ──────────────────────────────────────────────────
+    // â”€â”€â”€ Unknown tool â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn unknown_tool_non_cacheable() {

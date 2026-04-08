@@ -4,7 +4,7 @@
 //! and compiler drivers (`gcc`, `clang`) to determine cacheability for
 //! linking (shared libraries, DLLs, and executables).
 
-use std::path::PathBuf;
+use zccache_core::NormalizedPath;
 
 /// Supported linker tool families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,17 +35,17 @@ pub enum ParsedLinkerInvocation {
 #[derive(Debug, Clone)]
 pub struct CacheableLink {
     /// The linker executable path.
-    pub tool: PathBuf,
+    pub tool: NormalizedPath,
     /// The detected linker family.
     pub family: LinkerFamily,
-    /// Input object files and libraries (order preserved — matters for linker).
-    pub input_files: Vec<PathBuf>,
+    /// Input object files and libraries (order preserved â€” matters for linker).
+    pub input_files: Vec<NormalizedPath>,
     /// The output file path (shared library, DLL, or executable).
-    pub output_file: PathBuf,
+    pub output_file: NormalizedPath,
     /// Secondary output files produced alongside the primary output.
     /// E.g., MSVC `/IMPLIB:foo.lib` produces `foo.lib` + `foo.exp`.
-    /// May not all exist after linking — the server should skip missing ones.
-    pub secondary_outputs: Vec<PathBuf>,
+    /// May not all exist after linking â€” the server should skip missing ones.
+    pub secondary_outputs: Vec<NormalizedPath>,
     /// Flags relevant to cache keying (optimization, target, etc.).
     pub cache_relevant_flags: Vec<String>,
     /// The full original argument list (for fallback execution).
@@ -64,9 +64,9 @@ pub fn is_linker(tool: &str) -> bool {
 ///
 /// This checks both direct linkers (ld, lld, link.exe) and compiler drivers
 /// used for linking. For compiler drivers, returns true when no compile-only
-/// flag (`-c`, `-E`, `-S`) is present — this routes exe links to the link path.
+/// flag (`-c`, `-E`, `-S`) is present â€” this routes exe links to the link path.
 /// Cases like `gcc main.c -o main` (compile+link) will be routed here too,
-/// but the parser will find no object inputs and return NonCacheable → passthrough.
+/// but the parser will find no object inputs and return NonCacheable â†’ passthrough.
 ///
 /// Response files (`@file`) are expanded before checking for compile-only flags,
 /// since build systems may place all flags (including `-c`) inside a response file.
@@ -103,7 +103,7 @@ pub fn is_link_invocation(tool: &str, args: &[String]) -> bool {
     }
     // Check for `-x` language modes that imply compilation (not linking):
     // header (PCH) and header-unit (C++20) imply compilation without `-c`.
-    // Module mode does NOT imply compilation — it needs `-c` or `--precompile`.
+    // Module mode does NOT imply compilation â€” it needs `-c` or `--precompile`.
     for pair in effective_args.windows(2) {
         if pair[0] == "-x" {
             if let Some(mode) = super::source_mode_from_language(&pair[1]) {
@@ -137,7 +137,7 @@ fn detect_family(tool: &str) -> Option<LinkerFamily> {
     let full_name = cross_platform_file_name(tool);
     let stem = file_stem(full_name);
 
-    // MSVC link.exe (case-insensitive) — check stem so "link.exe" matches
+    // MSVC link.exe (case-insensitive) â€” check stem so "link.exe" matches
     if stem.eq_ignore_ascii_case("link") {
         return Some(LinkerFamily::MsvcLink);
     }
@@ -213,19 +213,19 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: Vec<String>) -> ParsedLi
         };
     }
 
-    let mut output_file: Option<PathBuf> = None;
-    let mut input_files: Vec<PathBuf> = Vec::new();
+    let mut output_file: Option<NormalizedPath> = None;
+    let mut input_files: Vec<NormalizedPath> = Vec::new();
     let mut cache_relevant_flags: Vec<String> = Vec::new();
     let mut has_build_id_uuid = false;
-    let mut secondary_outputs: Vec<PathBuf> = Vec::new();
+    let mut secondary_outputs: Vec<NormalizedPath> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
 
-        // --out-implib=<path> — GNU/LLD import library (secondary output on Windows)
+        // --out-implib=<path> â€” GNU/LLD import library (secondary output on Windows)
         if let Some(implib) = arg.strip_prefix("--out-implib=") {
-            secondary_outputs.push(PathBuf::from(implib));
+            secondary_outputs.push(NormalizedPath::new(implib));
             cache_relevant_flags.push(arg.clone());
             i += 1;
             continue;
@@ -235,14 +235,14 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: Vec<String>) -> ParsedLi
             cache_relevant_flags.push(arg.clone());
             i += 1;
             if i < args.len() {
-                secondary_outputs.push(PathBuf::from(&args[i]));
+                secondary_outputs.push(NormalizedPath::new(&args[i]));
                 cache_relevant_flags.push(args[i].clone());
             }
             i += 1;
             continue;
         }
 
-        // -shared or --shared — shared library mode (cache-relevant: affects output type)
+        // -shared or --shared â€” shared library mode (cache-relevant: affects output type)
         if arg == "-shared" || arg == "--shared" {
             cache_relevant_flags.push(arg.clone());
             i += 1;
@@ -260,18 +260,18 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: Vec<String>) -> ParsedLi
         if arg == "-o" {
             i += 1;
             if i < args.len() {
-                output_file = Some(PathBuf::from(&args[i]));
+                output_file = Some(NormalizedPath::new(&args[i]));
             }
             i += 1;
             continue;
         }
         if let Some(rest) = arg.strip_prefix("--output=") {
-            output_file = Some(PathBuf::from(rest));
+            output_file = Some(NormalizedPath::new(rest));
             i += 1;
             continue;
         }
 
-        // --build-id=uuid → non-deterministic
+        // --build-id=uuid â†’ non-deterministic
         if arg == "--build-id=uuid" {
             has_build_id_uuid = true;
             cache_relevant_flags.push(arg.clone());
@@ -279,7 +279,7 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: Vec<String>) -> ParsedLi
             continue;
         }
 
-        // --build-id=<style> (sha1, md5, none, etc.) → deterministic
+        // --build-id=<style> (sha1, md5, none, etc.) â†’ deterministic
         if arg.starts_with("--build-id") {
             cache_relevant_flags.push(arg.clone());
             i += 1;
@@ -313,7 +313,7 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: Vec<String>) -> ParsedLi
             continue;
         }
 
-        // -L<path> or -L <path> — library search path (cache-relevant)
+        // -L<path> or -L <path> â€” library search path (cache-relevant)
         if arg == "-L" {
             cache_relevant_flags.push(arg.clone());
             i += 1;
@@ -329,7 +329,7 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: Vec<String>) -> ParsedLi
             continue;
         }
 
-        // -l<lib> — library dependency (cache-relevant, order matters)
+        // -l<lib> â€” library dependency (cache-relevant, order matters)
         if arg.starts_with("-l") {
             cache_relevant_flags.push(arg.clone());
             i += 1;
@@ -351,7 +351,7 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: Vec<String>) -> ParsedLi
                 cache_relevant_flags.push(args[i].clone());
                 // -T (linker script) and --version-script are input files that affect output
                 if arg == "-T" || arg == "--script" || arg == "--version-script" {
-                    input_files.push(PathBuf::from(&args[i]));
+                    input_files.push(NormalizedPath::new(&args[i]));
                 }
             }
             i += 1;
@@ -361,7 +361,7 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: Vec<String>) -> ParsedLi
         // Flags with = syntax
         if let Some(rest) = arg.strip_prefix("--version-script=") {
             cache_relevant_flags.push(arg.clone());
-            input_files.push(PathBuf::from(rest));
+            input_files.push(NormalizedPath::new(rest));
             i += 1;
             continue;
         }
@@ -373,8 +373,8 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: Vec<String>) -> ParsedLi
             continue;
         }
 
-        // Positional argument — input file (object file or library)
-        input_files.push(PathBuf::from(arg));
+        // Positional argument â€” input file (object file or library)
+        input_files.push(NormalizedPath::new(arg));
         i += 1;
     }
 
@@ -394,7 +394,7 @@ fn parse_gnu_ld(tool: &str, family: LinkerFamily, args: Vec<String>) -> ParsedLi
     }
 
     ParsedLinkerInvocation::Cacheable(CacheableLink {
-        tool: PathBuf::from(tool),
+        tool: NormalizedPath::new(tool),
         family,
         input_files,
         output_file,
@@ -417,16 +417,16 @@ fn parse_msvc_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvocation {
     }
 
     let mut is_dll = false;
-    let mut output_file: Option<PathBuf> = None;
-    let mut input_files: Vec<PathBuf> = Vec::new();
+    let mut output_file: Option<NormalizedPath> = None;
+    let mut input_files: Vec<NormalizedPath> = Vec::new();
     let mut cache_relevant_flags: Vec<String> = Vec::new();
     let mut has_deterministic = false;
-    let mut secondary_outputs: Vec<PathBuf> = Vec::new();
+    let mut secondary_outputs: Vec<NormalizedPath> = Vec::new();
 
     for arg in &args {
         let upper = arg.to_uppercase();
 
-        // /DLL — DLL mode (cache-relevant: affects output type)
+        // /DLL â€” DLL mode (cache-relevant: affects output type)
         if upper == "/DLL" || upper == "-DLL" {
             is_dll = true;
             cache_relevant_flags.push(arg.clone());
@@ -435,7 +435,7 @@ fn parse_msvc_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvocation {
 
         // /OUT:filename
         if upper.starts_with("/OUT:") || upper.starts_with("-OUT:") {
-            output_file = Some(PathBuf::from(&arg[5..]));
+            output_file = Some(NormalizedPath::new(&arg[5..]));
             continue;
         }
 
@@ -446,11 +446,11 @@ fn parse_msvc_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvocation {
             continue;
         }
 
-        // /IMPLIB:filename — import library (secondary output)
+        // /IMPLIB:filename â€” import library (secondary output)
         // MSVC also auto-generates a .exp alongside the .lib
         if upper.starts_with("/IMPLIB:") || upper.starts_with("-IMPLIB:") {
-            let implib_path = PathBuf::from(&arg[8..]);
-            let exp_path = implib_path.with_extension("exp");
+            let implib_path = NormalizedPath::new(&arg[8..]);
+            let exp_path = NormalizedPath::new(implib_path.with_extension("exp"));
             secondary_outputs.push(implib_path);
             secondary_outputs.push(exp_path);
             cache_relevant_flags.push(arg.clone());
@@ -463,8 +463,8 @@ fn parse_msvc_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvocation {
             continue;
         }
 
-        // Positional — input file
-        input_files.push(PathBuf::from(arg));
+        // Positional â€” input file
+        input_files.push(NormalizedPath::new(arg));
     }
 
     if input_files.is_empty() {
@@ -477,11 +477,11 @@ fn parse_msvc_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvocation {
     let output_file = output_file.unwrap_or_else(|| {
         let first = &input_files[0];
         let ext = if is_dll { "dll" } else { "exe" };
-        first.with_extension(ext)
+        NormalizedPath::new(first.with_extension(ext))
     });
 
     ParsedLinkerInvocation::Cacheable(CacheableLink {
-        tool: PathBuf::from(tool),
+        tool: NormalizedPath::new(tool),
         family: LinkerFamily::MsvcLink,
         input_files,
         output_file,
@@ -521,24 +521,24 @@ fn parse_compiler_driver_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvo
     }
 
     let mut has_compile_only = false;
-    let mut output_file: Option<PathBuf> = None;
-    let mut input_files: Vec<PathBuf> = Vec::new();
+    let mut output_file: Option<NormalizedPath> = None;
+    let mut input_files: Vec<NormalizedPath> = Vec::new();
     let mut cache_relevant_flags: Vec<String> = Vec::new();
     let mut has_build_id_uuid = false;
-    let mut secondary_outputs: Vec<PathBuf> = Vec::new();
+    let mut secondary_outputs: Vec<NormalizedPath> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
 
-        // -shared — shared library mode (cache-relevant: affects output type)
+        // -shared â€” shared library mode (cache-relevant: affects output type)
         if arg == "-shared" || arg == "--shared" {
             cache_relevant_flags.push(arg.clone());
             i += 1;
             continue;
         }
 
-        // -c — compile only, NOT linking
+        // -c â€” compile only, NOT linking
         if arg == "-c" {
             has_compile_only = true;
             i += 1;
@@ -549,13 +549,13 @@ fn parse_compiler_driver_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvo
         if arg == "-o" {
             i += 1;
             if i < args.len() {
-                output_file = Some(PathBuf::from(&args[i]));
+                output_file = Some(NormalizedPath::new(&args[i]));
             }
             i += 1;
             continue;
         }
 
-        // -Wl, pass-through to linker — check for non-determinism and secondary outputs
+        // -Wl, pass-through to linker â€” check for non-determinism and secondary outputs
         if arg.starts_with("-Wl,") {
             for part in arg.split(',') {
                 if part == "--build-id=uuid" {
@@ -564,7 +564,7 @@ fn parse_compiler_driver_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvo
                 // GNU/LLD --out-implib produces an import library (.dll.a) as a side effect.
                 // Meson/ninja uses: -Wl,--out-implib=path/to/foo.dll.a
                 if let Some(implib) = part.strip_prefix("--out-implib=") {
-                    secondary_outputs.push(PathBuf::from(implib));
+                    secondary_outputs.push(NormalizedPath::new(implib));
                 }
             }
             cache_relevant_flags.push(arg.clone());
@@ -613,12 +613,12 @@ fn parse_compiler_driver_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvo
             continue;
         }
 
-        // Positional argument — input file (object or source)
+        // Positional argument â€” input file (object or source)
         if is_linker_input(arg) {
-            input_files.push(PathBuf::from(arg));
+            input_files.push(NormalizedPath::new(arg));
         }
         // Ignore non-object positional args (e.g., source files passed to gcc
-        // during combined compile-and-link — too complex to cache)
+        // during combined compile-and-link â€” too complex to cache)
         i += 1;
     }
 
@@ -644,7 +644,7 @@ fn parse_compiler_driver_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvo
     }
 
     ParsedLinkerInvocation::Cacheable(CacheableLink {
-        tool: PathBuf::from(tool),
+        tool: NormalizedPath::new(tool),
         family: LinkerFamily::CompilerDriver,
         input_files,
         output_file,
@@ -663,7 +663,7 @@ mod tests {
         s.iter().map(|x| x.to_string()).collect()
     }
 
-    // ─── Detection ─────────────────────────────────────────────────────
+    // â”€â”€â”€ Detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn detect_gnu_ld() {
@@ -724,7 +724,7 @@ mod tests {
         assert!(!is_linker("lib.exe"));
     }
 
-    // ─── GNU ld shared library parsing ────────────────────────────────
+    // â”€â”€â”€ GNU ld shared library parsing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn basic_shared_lib() {
@@ -733,10 +733,10 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::Ld);
-                assert_eq!(c.output_file, PathBuf::from("libfoo.so"));
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.so"));
                 assert_eq!(c.input_files.len(), 2);
-                assert_eq!(c.input_files[0], PathBuf::from("a.o"));
-                assert_eq!(c.input_files[1], PathBuf::from("b.o"));
+                assert_eq!(c.input_files[0], NormalizedPath::new("a.o"));
+                assert_eq!(c.input_files[1], NormalizedPath::new("b.o"));
                 assert!(!c.non_deterministic); // GNU ld is deterministic by default
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -758,7 +758,7 @@ mod tests {
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("libfoo.so.1.0"));
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.so.1.0"));
                 assert!(c.cache_relevant_flags.contains(&"-soname".to_string()));
                 assert!(c.cache_relevant_flags.contains(&"libfoo.so.1".to_string()));
             }
@@ -782,7 +782,7 @@ mod tests {
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert_eq!(c.input_files, vec![PathBuf::from("a.o")]);
+                assert_eq!(c.input_files, vec![NormalizedPath::new("a.o")]);
                 assert!(c.cache_relevant_flags.contains(&"-lm".to_string()));
                 assert!(c.cache_relevant_flags.contains(&"-lpthread".to_string()));
                 assert!(c.cache_relevant_flags.contains(&"-L/usr/lib".to_string()));
@@ -798,8 +798,8 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::Ld);
-                assert_eq!(c.output_file, PathBuf::from("a.out"));
-                assert_eq!(c.input_files, vec![PathBuf::from("main.o")]);
+                assert_eq!(c.output_file, NormalizedPath::new("a.out"));
+                assert_eq!(c.input_files, vec![NormalizedPath::new("main.o")]);
                 assert!(!c.non_deterministic);
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -841,15 +841,15 @@ mod tests {
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert_eq!(c.input_files[0], PathBuf::from("z.o"));
-                assert_eq!(c.input_files[1], PathBuf::from("a.o"));
-                assert_eq!(c.input_files[2], PathBuf::from("m.o"));
+                assert_eq!(c.input_files[0], NormalizedPath::new("z.o"));
+                assert_eq!(c.input_files[1], NormalizedPath::new("a.o"));
+                assert_eq!(c.input_files[2], NormalizedPath::new("m.o"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
-    // ─── Non-determinism (timestamps, build-id) ──────────────────────
+    // â”€â”€â”€ Non-determinism (timestamps, build-id) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn build_id_uuid_is_non_deterministic() {
@@ -861,7 +861,7 @@ mod tests {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert!(
                     c.non_deterministic,
-                    "--build-id=uuid produces random output — must be flagged"
+                    "--build-id=uuid produces random output â€” must be flagged"
                 );
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -878,7 +878,7 @@ mod tests {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert!(
                     !c.non_deterministic,
-                    "--build-id=sha1 is content-derived — deterministic"
+                    "--build-id=sha1 is content-derived â€” deterministic"
                 );
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -911,7 +911,7 @@ mod tests {
         }
     }
 
-    // ─── macOS dylib ──────────────────────────────────────────────────
+    // â”€â”€â”€ macOS dylib â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn macos_dylib() {
@@ -919,7 +919,7 @@ mod tests {
             parse_linker_invocation("ld", args(&["-dylib", "-o", "libfoo.dylib", "a.o", "b.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("libfoo.dylib"));
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.dylib"));
                 assert_eq!(c.input_files.len(), 2);
                 assert!(!c.non_deterministic);
             }
@@ -953,7 +953,7 @@ mod tests {
         }
     }
 
-    // ─── LLD ──────────────────────────────────────────────────────────
+    // â”€â”€â”€ LLD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn lld_shared_lib() {
@@ -964,13 +964,13 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::Lld);
-                assert_eq!(c.output_file, PathBuf::from("libfoo.so"));
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.so"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
-    // ─── Linker script and version script ─────────────────────────────
+    // â”€â”€â”€ Linker script and version script â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn with_linker_script() {
@@ -981,8 +981,8 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 // Linker script is an input file (affects output)
-                assert!(c.input_files.contains(&PathBuf::from("link.ld")));
-                assert!(c.input_files.contains(&PathBuf::from("a.o")));
+                assert!(c.input_files.contains(&NormalizedPath::new("link.ld")));
+                assert!(c.input_files.contains(&NormalizedPath::new("a.o")));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1003,13 +1003,13 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 // Version script is an input file
-                assert!(c.input_files.contains(&PathBuf::from("libfoo.map")));
+                assert!(c.input_files.contains(&NormalizedPath::new("libfoo.map")));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
-    // ─── MSVC link.exe DLL parsing ────────────────────────────────────
+    // â”€â”€â”€ MSVC link.exe DLL parsing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn basic_msvc_dll() {
@@ -1020,10 +1020,10 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::MsvcLink);
-                assert_eq!(c.output_file, PathBuf::from("foo.dll"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.dll"));
                 assert_eq!(c.input_files.len(), 2);
-                assert_eq!(c.input_files[0], PathBuf::from("a.obj"));
-                assert_eq!(c.input_files[1], PathBuf::from("b.obj"));
+                assert_eq!(c.input_files[0], NormalizedPath::new("a.obj"));
+                assert_eq!(c.input_files[1], NormalizedPath::new("b.obj"));
                 assert!(c.non_deterministic); // no /DETERMINISTIC
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -1051,8 +1051,8 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::MsvcLink);
-                assert_eq!(c.output_file, PathBuf::from("foo.exe"));
-                assert_eq!(c.input_files, vec![PathBuf::from("main.obj")]);
+                assert_eq!(c.output_file, NormalizedPath::new("foo.exe"));
+                assert_eq!(c.input_files, vec![NormalizedPath::new("main.obj")]);
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1064,7 +1064,7 @@ mod tests {
         let result = parse_linker_invocation("link.exe", args(&["main.obj", "util.obj"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("main.exe"));
+                assert_eq!(c.output_file, NormalizedPath::new("main.exe"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1085,7 +1085,7 @@ mod tests {
         let result = parse_linker_invocation("link.exe", args(&["/DLL", "a.obj", "b.obj"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("a.dll"));
+                assert_eq!(c.output_file, NormalizedPath::new("a.dll"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1099,9 +1099,9 @@ mod tests {
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert_eq!(c.input_files[0], PathBuf::from("z.obj"));
-                assert_eq!(c.input_files[1], PathBuf::from("a.obj"));
-                assert_eq!(c.input_files[2], PathBuf::from("m.obj"));
+                assert_eq!(c.input_files[0], NormalizedPath::new("z.obj"));
+                assert_eq!(c.input_files[1], NormalizedPath::new("a.obj"));
+                assert_eq!(c.input_files[2], NormalizedPath::new("m.obj"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1120,8 +1120,8 @@ mod tests {
                     .contains(&"/IMPLIB:foo.lib".to_string()));
                 // /IMPLIB: extracts secondary outputs: .lib + inferred .exp
                 assert_eq!(c.secondary_outputs.len(), 2);
-                assert_eq!(c.secondary_outputs[0], PathBuf::from("foo.lib"));
-                assert_eq!(c.secondary_outputs[1], PathBuf::from("foo.exp"));
+                assert_eq!(c.secondary_outputs[0], NormalizedPath::new("foo.lib"));
+                assert_eq!(c.secondary_outputs[1], NormalizedPath::new("foo.exp"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1147,8 +1147,8 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.secondary_outputs.len(), 2);
-                assert_eq!(c.secondary_outputs[0], PathBuf::from("mylib.lib"));
-                assert_eq!(c.secondary_outputs[1], PathBuf::from("mylib.exp"));
+                assert_eq!(c.secondary_outputs[0], NormalizedPath::new("mylib.lib"));
+                assert_eq!(c.secondary_outputs[1], NormalizedPath::new("mylib.exp"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1200,7 +1200,7 @@ mod tests {
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("foo.dll"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.dll"));
                 assert!(!c.non_deterministic);
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -1216,7 +1216,7 @@ mod tests {
         ));
     }
 
-    // ─── Unknown tool ──────────────────────────────────────────────────
+    // â”€â”€â”€ Unknown tool â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn unknown_tool_non_cacheable() {
@@ -1227,7 +1227,7 @@ mod tests {
         ));
     }
 
-    // ─── Cross-compile linker ──────────────────────────────────────────
+    // â”€â”€â”€ Cross-compile linker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn cross_compile_ld() {
@@ -1238,26 +1238,26 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::Ld);
-                assert_eq!(c.tool, PathBuf::from("x86_64-linux-gnu-ld"));
+                assert_eq!(c.tool, NormalizedPath::new("x86_64-linux-gnu-ld"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
-    // ─── --output= syntax ──────────────────────────────────────────────
+    // â”€â”€â”€ --output= syntax â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn output_equals_syntax() {
         let result = parse_linker_invocation("ld", args(&["-shared", "--output=libfoo.so", "a.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("libfoo.so"));
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.so"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
-    // ─── Edge cases: -z flags, -rpath, mixed inputs ───────────────────
+    // â”€â”€â”€ Edge cases: -z flags, -rpath, mixed inputs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn z_relro_and_now_flags() {
@@ -1308,9 +1308,9 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.input_files.len(), 3);
-                assert_eq!(c.input_files[0], PathBuf::from("a.o"));
-                assert_eq!(c.input_files[1], PathBuf::from("libbar.a"));
-                assert_eq!(c.input_files[2], PathBuf::from("c.o"));
+                assert_eq!(c.input_files[0], NormalizedPath::new("a.o"));
+                assert_eq!(c.input_files[1], NormalizedPath::new("libbar.a"));
+                assert_eq!(c.input_files[2], NormalizedPath::new("c.o"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1353,8 +1353,8 @@ mod tests {
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert!(c.input_files.contains(&PathBuf::from("libfoo.map")));
-                assert!(c.input_files.contains(&PathBuf::from("a.o")));
+                assert!(c.input_files.contains(&NormalizedPath::new("libfoo.map")));
+                assert!(c.input_files.contains(&NormalizedPath::new("a.o")));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1369,7 +1369,7 @@ mod tests {
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("libfoo.so"));
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.so"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1382,7 +1382,7 @@ mod tests {
             parse_linker_invocation("ld", args(&["-Wl,-shared", "-o", "libfoo.so", "a.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("libfoo.so"));
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.so"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1407,13 +1407,13 @@ mod tests {
         let result = parse_linker_invocation("link.exe", args(&["/dll", "/out:foo.dll", "a.obj"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("foo.dll"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.dll"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
-    // ─── Compiler driver as linker (gcc -shared, clang -shared) ───────
+    // â”€â”€â”€ Compiler driver as linker (gcc -shared, clang -shared) â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn compiler_driver_detection() {
@@ -1459,7 +1459,7 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::Lld);
-                assert_eq!(c.output_file, PathBuf::from("output.wasm"));
+                assert_eq!(c.output_file, NormalizedPath::new("output.wasm"));
                 assert_eq!(c.input_files.len(), 2);
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -1472,7 +1472,7 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::CompilerDriver);
-                assert_eq!(c.output_file, PathBuf::from("output.js"));
+                assert_eq!(c.output_file, NormalizedPath::new("output.js"));
                 assert_eq!(c.input_files.len(), 2);
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -1486,7 +1486,7 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::CompilerDriver);
-                assert_eq!(c.output_file, PathBuf::from("libfoo.so"));
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.so"));
                 assert_eq!(c.input_files.len(), 2);
                 assert!(!c.non_deterministic);
             }
@@ -1501,7 +1501,7 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::CompilerDriver);
-                assert_eq!(c.output_file, PathBuf::from("foo.dll"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.dll"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1515,7 +1515,7 @@ mod tests {
         );
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
-                assert_eq!(c.input_files, vec![PathBuf::from("a.o")]);
+                assert_eq!(c.input_files, vec![NormalizedPath::new("a.o")]);
                 assert!(c.cache_relevant_flags.contains(&"-fPIC".to_string()));
                 assert!(c.cache_relevant_flags.contains(&"-O2".to_string()));
                 assert!(c.cache_relevant_flags.contains(&"-lm".to_string()));
@@ -1551,13 +1551,13 @@ mod tests {
 
     #[test]
     fn gcc_exe_cacheable() {
-        // gcc without -shared is executable linking — cacheable
+        // gcc without -shared is executable linking â€” cacheable
         let result = parse_linker_invocation("gcc", args(&["-o", "a.out", "main.o"]));
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::CompilerDriver);
-                assert_eq!(c.output_file, PathBuf::from("a.out"));
-                assert_eq!(c.input_files, vec![PathBuf::from("main.o")]);
+                assert_eq!(c.output_file, NormalizedPath::new("a.out"));
+                assert_eq!(c.input_files, vec![NormalizedPath::new("main.o")]);
                 assert!(!c.non_deterministic);
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -1575,7 +1575,7 @@ mod tests {
 
     #[test]
     fn gcc_shared_no_object_inputs_non_cacheable() {
-        // Source files (.c) are not valid linker inputs — need pre-compiled .o
+        // Source files (.c) are not valid linker inputs â€” need pre-compiled .o
         let result = parse_linker_invocation("gcc", args(&["-shared", "-o", "libfoo.so", "foo.c"]));
         assert!(matches!(
             result,
@@ -1592,7 +1592,7 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::CompilerDriver);
-                assert_eq!(c.tool, PathBuf::from("x86_64-w64-mingw32-gcc"));
+                assert_eq!(c.tool, NormalizedPath::new("x86_64-w64-mingw32-gcc"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1620,7 +1620,7 @@ mod tests {
         }
     }
 
-    // ─── is_link_invocation (combined tool + args check) ──────────────
+    // â”€â”€â”€ is_link_invocation (combined tool + args check) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn is_link_invocation_direct_linker() {
@@ -1687,7 +1687,7 @@ mod tests {
                 "-Iinclude",
             ])
         ));
-        // With -c AND -x c++-header — still not a link
+        // With -c AND -x c++-header â€” still not a link
         assert!(!is_link_invocation(
             "clang++",
             &args(&["-x", "c++-header", "-c", "header.h", "-o", "header.pch"])
@@ -1715,7 +1715,7 @@ mod tests {
             "clang++",
             &args(&["-x", "c++-header-unit", "foo.h", "-o", "foo.pcm"])
         ));
-        // Module mode does NOT imply compilation — without -c/--precompile, it's still a link.
+        // Module mode does NOT imply compilation â€” without -c/--precompile, it's still a link.
         assert!(is_link_invocation(
             "clang++",
             &args(&["-x", "c++-module", "interface.cpp", "-o", "interface"])
@@ -1770,7 +1770,7 @@ mod tests {
         );
     }
 
-    // ─── GNU/LLD --out-implib secondary output ───────────────────────
+    // â”€â”€â”€ GNU/LLD --out-implib secondary output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn gnu_ld_out_implib_equals() {
@@ -1787,7 +1787,7 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.secondary_outputs.len(), 1);
-                assert_eq!(c.secondary_outputs[0], PathBuf::from("libfoo.dll.a"));
+                assert_eq!(c.secondary_outputs[0], NormalizedPath::new("libfoo.dll.a"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1809,7 +1809,7 @@ mod tests {
         match result {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.secondary_outputs.len(), 1);
-                assert_eq!(c.secondary_outputs[0], PathBuf::from("libfoo.dll.a"));
+                assert_eq!(c.secondary_outputs[0], NormalizedPath::new("libfoo.dll.a"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1833,7 +1833,7 @@ mod tests {
                 assert_eq!(c.secondary_outputs.len(), 1);
                 assert_eq!(
                     c.secondary_outputs[0],
-                    PathBuf::from("ci/meson/native/fastled.dll.a")
+                    NormalizedPath::new("ci/meson/native/fastled.dll.a")
                 );
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -1857,7 +1857,7 @@ mod tests {
             ParsedLinkerInvocation::Cacheable(c) => {
                 assert_eq!(c.family, LinkerFamily::CompilerDriver);
                 assert_eq!(c.secondary_outputs.len(), 1);
-                assert_eq!(c.secondary_outputs[0], PathBuf::from("foo.dll.a"));
+                assert_eq!(c.secondary_outputs[0], NormalizedPath::new("foo.dll.a"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1884,7 +1884,7 @@ mod tests {
                 assert_eq!(c.secondary_outputs.len(), 1);
                 assert_eq!(
                     c.secondary_outputs[0],
-                    PathBuf::from("ci/meson/native\\fastled.dll.a")
+                    NormalizedPath::new("ci/meson/native\\fastled.dll.a")
                 );
             }
             other => panic!("expected cacheable, got: {other:?}"),

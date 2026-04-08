@@ -125,16 +125,16 @@ impl OverflowRecovery {
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use zccache_core::NormalizedPath;
     use zccache_fscache::clock::Clock;
     use zccache_fscache::Confidence;
 
-    fn create_file(dir: &TempDir, name: &str, content: &str) -> PathBuf {
+    fn create_file(dir: &TempDir, name: &str, content: &str) -> NormalizedPath {
         let path = dir.path().join(name);
         fs::write(&path, content).expect("failed to create test file");
-        path
+        path.into()
     }
 
     #[tokio::test]

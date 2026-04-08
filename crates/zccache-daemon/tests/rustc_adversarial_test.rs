@@ -12,7 +12,7 @@
 //! Run all:    uv run cargo test -p zccache-daemon --test rustc_adversarial_test -- --nocapture --ignored --test-threads=1
 //! Run single: uv run cargo test -p zccache-daemon --test rustc_adversarial_test -- <test_name> --nocapture --ignored
 
-use std::path::PathBuf;
+use zccache_core::NormalizedPath;
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
@@ -83,7 +83,7 @@ async fn compile(
 
 /// Convenience harness: daemon + session + temp dir + rustc path.
 struct TestHarness {
-    rustc: PathBuf,
+    rustc: NormalizedPath,
     tmp: tempfile::TempDir,
     #[expect(dead_code)]
     endpoint: String,
@@ -116,11 +116,11 @@ impl TestHarness {
         self.tmp.path().to_string_lossy().into_owned()
     }
 
-    fn path(&self, name: &str) -> PathBuf {
-        self.tmp.path().join(name)
+    fn path(&self, name: &str) -> NormalizedPath {
+        self.tmp.path().join(name).into()
     }
 
-    fn write_file(&self, name: &str, content: &str) -> PathBuf {
+    fn write_file(&self, name: &str, content: &str) -> NormalizedPath {
         let p = self.path(name);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).unwrap();

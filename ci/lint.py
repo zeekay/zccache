@@ -9,6 +9,7 @@ Usage:
 import os
 import subprocess
 import sys
+from shutil import which
 from pathlib import Path
 
 from ci.env import activate, clean_env
@@ -76,8 +77,31 @@ def lint_workspace():
         return result.returncode
 
     result = run_cmd([
+        "cargo", "fmt",
+        "--manifest-path", "dylints/ban_std_pathbuf/Cargo.toml",
+        "--all", "--check",
+    ])
+    if result.returncode != 0:
+        print("Dylint library formatting issues found.", file=sys.stderr)
+        return result.returncode
+
+    result = run_cmd([
         "cargo", "clippy", "--workspace", "--all-targets",
         "--", "-D", "warnings",
+    ])
+    if result.returncode != 0:
+        return result.returncode
+
+    if which("cargo-dylint") is None:
+        print(
+            "cargo-dylint is required for workspace linting. Install with "
+            "'cargo install cargo-dylint dylint-link'.",
+            file=sys.stderr,
+        )
+        return 1
+
+    result = run_cmd([
+        "cargo", "dylint", "--all", "--workspace",
     ])
     if result.returncode != 0:
         return result.returncode

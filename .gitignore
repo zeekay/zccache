@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+dylints/*/target/
 **/*.rs.bk
 
 # IDE
@@ -25,6 +26,7 @@ Thumbs.db
 
 # Cargo lock is checked in for binaries
 # (workspace contains binary crates)
+dylints/*/Cargo.lock
 .loop
 
 # Python / uv

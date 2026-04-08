@@ -44,9 +44,9 @@ async fn test_fingerprint_check_miss_then_skip() {
         let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
         client
             .send(&Request::FingerprintCheck {
-                cache_file: cache_file.clone(),
+                cache_file: cache_file.clone().into(),
                 cache_type: "two-layer".into(),
-                root: src.path().to_path_buf(),
+                root: src.path().to_path_buf().into(),
                 extensions: vec![],
                 include_globs: vec![],
                 exclude: vec![],
@@ -65,7 +65,7 @@ async fn test_fingerprint_check_miss_then_skip() {
         // Mark success.
         client
             .send(&Request::FingerprintMarkSuccess {
-                cache_file: cache_file.clone(),
+                cache_file: cache_file.clone().into(),
             })
             .await
             .unwrap();
@@ -75,9 +75,9 @@ async fn test_fingerprint_check_miss_then_skip() {
         // Second check: should return "skip" (clean).
         client
             .send(&Request::FingerprintCheck {
-                cache_file: cache_file.clone(),
+                cache_file: cache_file.clone().into(),
                 cache_type: "two-layer".into(),
-                root: src.path().to_path_buf(),
+                root: src.path().to_path_buf().into(),
                 extensions: vec![],
                 include_globs: vec![],
                 exclude: vec![],
@@ -115,9 +115,9 @@ async fn test_fingerprint_mark_failure_forces_rerun() {
         // Check → mark failure.
         client
             .send(&Request::FingerprintCheck {
-                cache_file: cache_file.clone(),
+                cache_file: cache_file.clone().into(),
                 cache_type: "two-layer".into(),
-                root: src.path().to_path_buf(),
+                root: src.path().to_path_buf().into(),
                 extensions: vec![],
                 include_globs: vec![],
                 exclude: vec![],
@@ -128,7 +128,7 @@ async fn test_fingerprint_mark_failure_forces_rerun() {
 
         client
             .send(&Request::FingerprintMarkFailure {
-                cache_file: cache_file.clone(),
+                cache_file: cache_file.clone().into(),
             })
             .await
             .unwrap();
@@ -138,9 +138,9 @@ async fn test_fingerprint_mark_failure_forces_rerun() {
         // Next check should return "run" (previous failure).
         client
             .send(&Request::FingerprintCheck {
-                cache_file: cache_file.clone(),
+                cache_file: cache_file.clone().into(),
                 cache_type: "two-layer".into(),
-                root: src.path().to_path_buf(),
+                root: src.path().to_path_buf().into(),
                 extensions: vec![],
                 include_globs: vec![],
                 exclude: vec![],
@@ -181,9 +181,9 @@ async fn test_fingerprint_invalidate() {
         // Check → mark success.
         client
             .send(&Request::FingerprintCheck {
-                cache_file: cache_file.clone(),
+                cache_file: cache_file.clone().into(),
                 cache_type: "two-layer".into(),
-                root: src.path().to_path_buf(),
+                root: src.path().to_path_buf().into(),
                 extensions: vec![],
                 include_globs: vec![],
                 exclude: vec![],
@@ -194,7 +194,7 @@ async fn test_fingerprint_invalidate() {
 
         client
             .send(&Request::FingerprintMarkSuccess {
-                cache_file: cache_file.clone(),
+                cache_file: cache_file.clone().into(),
             })
             .await
             .unwrap();
@@ -203,7 +203,7 @@ async fn test_fingerprint_invalidate() {
         // Invalidate.
         client
             .send(&Request::FingerprintInvalidate {
-                cache_file: cache_file.clone(),
+                cache_file: cache_file.clone().into(),
             })
             .await
             .unwrap();
@@ -213,9 +213,9 @@ async fn test_fingerprint_invalidate() {
         // Next check should return "run" (no cache after invalidation).
         client
             .send(&Request::FingerprintCheck {
-                cache_file: cache_file.clone(),
+                cache_file: cache_file.clone().into(),
                 cache_type: "two-layer".into(),
-                root: src.path().to_path_buf(),
+                root: src.path().to_path_buf().into(),
                 extensions: vec![],
                 include_globs: vec![],
                 exclude: vec![],
@@ -254,9 +254,9 @@ async fn test_fingerprint_two_watches_independent() {
         // Initialize cache1 and mark success.
         client
             .send(&Request::FingerprintCheck {
-                cache_file: cache1.clone(),
+                cache_file: cache1.clone().into(),
                 cache_type: "two-layer".into(),
-                root: src.path().to_path_buf(),
+                root: src.path().to_path_buf().into(),
                 extensions: vec![],
                 include_globs: vec![],
                 exclude: vec![],
@@ -266,7 +266,7 @@ async fn test_fingerprint_two_watches_independent() {
         let _: Option<Response> = client.recv().await.unwrap();
         client
             .send(&Request::FingerprintMarkSuccess {
-                cache_file: cache1.clone(),
+                cache_file: cache1.clone().into(),
             })
             .await
             .unwrap();
@@ -275,9 +275,9 @@ async fn test_fingerprint_two_watches_independent() {
         // cache2 should still return run (independent).
         client
             .send(&Request::FingerprintCheck {
-                cache_file: cache2.clone(),
+                cache_file: cache2.clone().into(),
                 cache_type: "hash".into(),
-                root: src.path().to_path_buf(),
+                root: src.path().to_path_buf().into(),
                 extensions: vec![],
                 include_globs: vec![],
                 exclude: vec![],
@@ -295,9 +295,9 @@ async fn test_fingerprint_two_watches_independent() {
         // cache1 should still return skip.
         client
             .send(&Request::FingerprintCheck {
-                cache_file: cache1.clone(),
+                cache_file: cache1.clone().into(),
                 cache_type: "two-layer".into(),
-                root: src.path().to_path_buf(),
+                root: src.path().to_path_buf().into(),
                 extensions: vec![],
                 include_globs: vec![],
                 exclude: vec![],

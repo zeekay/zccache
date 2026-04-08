@@ -1,5 +1,6 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use zccache_core::NormalizedPath;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
@@ -9,7 +10,7 @@ use crate::error::{FingerprintError, Result};
 #[derive(Debug)]
 pub struct ScannedFile {
     /// Absolute path on disk.
-    pub absolute: PathBuf,
+    pub absolute: NormalizedPath,
     /// Path relative to scan root, with forward slashes for cross-platform determinism.
     pub relative: String,
 }
@@ -28,7 +29,7 @@ pub fn walk_files(
     exclude_dirs: &[&str],
 ) -> Result<Vec<ScannedFile>> {
     let root = root.canonicalize().map_err(|e| FingerprintError::Scan {
-        path: root.to_path_buf(),
+        path: root.to_path_buf().into(),
         message: format!("cannot canonicalize root: {e}"),
     })?;
 
@@ -59,7 +60,7 @@ pub fn walk_files(
 
     for entry in walker {
         let entry = entry.map_err(|e| FingerprintError::Scan {
-            path: root.clone(),
+            path: root.clone().into(),
             message: format!("jwalk error: {e}"),
         })?;
 
@@ -83,14 +84,14 @@ pub fn walk_files(
         let rel = abs
             .strip_prefix(&root)
             .map_err(|_| FingerprintError::Scan {
-                path: abs.clone(),
+                path: abs.clone().into(),
                 message: "path is not under root".to_string(),
             })?;
 
         let relative = normalize_slashes(rel);
 
         files.push(ScannedFile {
-            absolute: abs,
+            absolute: abs.into(),
             relative,
         });
     }
@@ -117,13 +118,13 @@ fn build_globset(patterns: &[&str]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
         let glob = Glob::new(pattern).map_err(|e| FingerprintError::Scan {
-            path: PathBuf::from(pattern),
+            path: NormalizedPath::from(*pattern),
             message: format!("invalid glob pattern: {e}"),
         })?;
         builder.add(glob);
     }
     builder.build().map_err(|e| FingerprintError::Scan {
-        path: PathBuf::new(),
+        path: NormalizedPath::new(""),
         message: format!("failed to compile glob set: {e}"),
     })
 }
@@ -136,14 +137,14 @@ fn build_dir_exclude_set(exclude: &[&str]) -> Result<GlobSet> {
         // If pattern ends with "/**" we can skip the directory entirely.
         if let Some(prefix) = pattern.strip_suffix("/**") {
             let glob = Glob::new(prefix).map_err(|e| FingerprintError::Scan {
-                path: PathBuf::from(pattern),
+                path: NormalizedPath::from(*pattern),
                 message: format!("invalid glob pattern: {e}"),
             })?;
             builder.add(glob);
         }
     }
     builder.build().map_err(|e| FingerprintError::Scan {
-        path: PathBuf::new(),
+        path: NormalizedPath::new(""),
         message: format!("failed to compile dir exclude set: {e}"),
     })
 }
@@ -215,7 +216,7 @@ pub fn walk_files_glob(
     exclude: &[&str],
 ) -> Result<Vec<ScannedFile>> {
     let root = root.canonicalize().map_err(|e| FingerprintError::Scan {
-        path: root.to_path_buf(),
+        path: root.to_path_buf().into(),
         message: format!("cannot canonicalize root: {e}"),
     })?;
 
@@ -270,7 +271,7 @@ pub fn walk_files_glob(
 
     for entry in walker {
         let entry = entry.map_err(|e| FingerprintError::Scan {
-            path: root.clone(),
+            path: root.clone().into(),
             message: format!("jwalk error: {e}"),
         })?;
 
@@ -282,7 +283,7 @@ pub fn walk_files_glob(
         let rel = abs
             .strip_prefix(&root)
             .map_err(|_| FingerprintError::Scan {
-                path: abs.clone(),
+                path: abs.clone().into(),
                 message: "path is not under root".to_string(),
             })?;
 
@@ -318,7 +319,7 @@ pub fn walk_files_glob(
         }
 
         files.push(ScannedFile {
-            absolute: abs,
+            absolute: abs.into(),
             relative,
         });
     }

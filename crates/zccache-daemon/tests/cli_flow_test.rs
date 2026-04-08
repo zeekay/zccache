@@ -7,6 +7,7 @@
 
 use std::sync::Once;
 
+use zccache_core::NormalizedPath;
 use zccache_daemon::DaemonServer;
 
 /// Build the CLI binary once across all tests (avoids Cargo lock contention).
@@ -22,16 +23,17 @@ fn ensure_cli_built() {
     });
 }
 
-fn cli_binary_path() -> std::path::PathBuf {
+fn cli_binary_path() -> NormalizedPath {
     ensure_cli_built();
     let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_zccache-daemon"))
         .parent()
         .unwrap();
-    if cfg!(windows) {
+    let path = if cfg!(windows) {
         bin_dir.join("zccache.exe")
     } else {
         bin_dir.join("zccache")
-    }
+    };
+    NormalizedPath::new(path)
 }
 
 /// Parse `session_id` from the CLI's one-line JSON output:

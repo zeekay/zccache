@@ -3,7 +3,9 @@
 //! Extracts include paths, defines, and cache-relevant flags from
 //! MSVC-style compiler command-line arguments.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use zccache_core::NormalizedPath;
 
 use crate::args::{ParsedArgs, UserDepFlags};
 use crate::search_paths::IncludeSearchPaths;
@@ -16,7 +18,7 @@ use crate::search_paths::IncludeSearchPaths;
 /// Relative paths are resolved against `cwd`.
 pub fn parse_msvc_args(args: &[String], cwd: &Path) -> ParsedArgs {
     let mut result = ParsedArgs {
-        source_file: PathBuf::new(),
+        source_file: NormalizedPath::new(""),
         output_file: None,
         include_search: IncludeSearchPaths::default(),
         defines: Vec::new(),
@@ -29,7 +31,7 @@ pub fn parse_msvc_args(args: &[String], cwd: &Path) -> ParsedArgs {
     };
 
     let mut i = 0;
-    let mut source_candidates: Vec<PathBuf> = Vec::new();
+    let mut source_candidates: Vec<NormalizedPath> = Vec::new();
 
     while i < args.len() {
         let arg = &args[i];
@@ -165,39 +167,39 @@ pub fn parse_msvc_args(args: &[String], cwd: &Path) -> ParsedArgs {
             continue;
         }
 
-        // /c (compile only) — skip, recognized but not a cache flag
+        // /c (compile only) â€” skip, recognized but not a cache flag
         if arg == "/c" {
             i += 1;
             continue;
         }
 
-        // /nologo — skip
+        // /nologo â€” skip
         if arg == "/nologo" {
             i += 1;
             continue;
         }
 
-        // /showIncludes — MSVC's dep tracking (like -MD for gcc)
+        // /showIncludes â€” MSVC's dep tracking (like -MD for gcc)
         if arg == "/showIncludes" {
             result.dep_flags.has_md = true;
             i += 1;
             continue;
         }
 
-        // /Fp<file> (PCH file path) — takes value
+        // /Fp<file> (PCH file path) â€” takes value
         if arg.starts_with("/Fp") {
             result.flags.push(arg.clone());
             i += 1;
             continue;
         }
 
-        // /Fe<file> (executable output) — skip with value
+        // /Fe<file> (executable output) â€” skip with value
         if arg.starts_with("/Fe") {
             i += 1;
             continue;
         }
 
-        // /Fd<file> (PDB path) — skip
+        // /Fd<file> (PDB path) â€” skip
         if arg.starts_with("/Fd") {
             i += 1;
             continue;
@@ -210,7 +212,7 @@ pub fn parse_msvc_args(args: &[String], cwd: &Path) -> ParsedArgs {
             continue;
         }
 
-        // Positional arg — source file candidate
+        // Positional arg â€” source file candidate
         source_candidates.push(resolve_path(arg, cwd));
         i += 1;
     }
@@ -235,12 +237,12 @@ pub fn parse_msvc_args(args: &[String], cwd: &Path) -> ParsedArgs {
     result
 }
 
-fn resolve_path(path: &str, cwd: &Path) -> PathBuf {
+fn resolve_path(path: &str, cwd: &Path) -> NormalizedPath {
     let p = Path::new(path);
     if p.is_absolute() {
-        p.to_path_buf()
+        NormalizedPath::new(p)
     } else {
-        cwd.join(p)
+        NormalizedPath::new(cwd.join(p))
     }
 }
 

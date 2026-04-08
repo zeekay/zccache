@@ -1,13 +1,13 @@
 //! Configuration types for zccache.
 
-use std::path::PathBuf;
+use crate::NormalizedPath;
 
 /// Top-level configuration for zccache.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Path to the artifact cache directory.
-    pub cache_dir: PathBuf,
+    pub cache_dir: NormalizedPath,
     /// Maximum artifact cache size in bytes.
     pub max_cache_size: u64,
     /// Daemon idle timeout in seconds before auto-shutdown.
@@ -44,19 +44,19 @@ impl Default for Config {
 
 /// Returns the default cache directory path: `~/.zccache` on all platforms.
 #[must_use]
-pub fn default_cache_dir() -> PathBuf {
+pub fn default_cache_dir() -> NormalizedPath {
     dirs_fallback().join(".zccache")
 }
 
 /// Returns the directory for content-addressed compiled outputs.
 #[must_use]
-pub fn artifacts_dir() -> PathBuf {
+pub fn artifacts_dir() -> NormalizedPath {
     default_cache_dir().join("artifacts")
 }
 
 /// Returns the directory for in-progress artifact writes (cleaned on startup).
 #[must_use]
-pub fn tmp_dir() -> PathBuf {
+pub fn tmp_dir() -> NormalizedPath {
     default_cache_dir().join("tmp")
 }
 
@@ -65,7 +65,7 @@ pub fn tmp_dir() -> PathBuf {
 /// Each daemon instance creates a `{pid}-{instance}` subdirectory here.
 /// Stale subdirectories from dead daemon processes are cleaned on startup.
 #[must_use]
-pub fn depfile_dir() -> PathBuf {
+pub fn depfile_dir() -> NormalizedPath {
     tmp_dir().join("depfiles")
 }
 
@@ -118,33 +118,33 @@ where
 
 /// Returns the directory for serialized dependency graph storage (future).
 #[must_use]
-pub fn depgraph_dir() -> PathBuf {
+pub fn depgraph_dir() -> NormalizedPath {
     default_cache_dir().join("depgraph")
 }
 
 /// Returns the path to the artifact index database.
 #[must_use]
-pub fn index_path() -> PathBuf {
+pub fn index_path() -> NormalizedPath {
     default_cache_dir().join("index.redb")
 }
 
 /// Returns the directory for crash dump files.
 #[must_use]
-pub fn crash_dump_dir() -> PathBuf {
+pub fn crash_dump_dir() -> NormalizedPath {
     default_cache_dir().join("crashes")
 }
 
 /// Returns the directory for daemon log files.
 #[must_use]
-pub fn log_dir() -> PathBuf {
+pub fn log_dir() -> NormalizedPath {
     default_cache_dir().join("logs")
 }
 
-fn dirs_fallback() -> PathBuf {
+fn dirs_fallback() -> NormalizedPath {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+        .map(NormalizedPath::from)
+        .unwrap_or_else(|_| ".".into())
 }
 
 #[cfg(test)]

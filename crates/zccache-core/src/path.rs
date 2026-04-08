@@ -2,18 +2,98 @@
 //!
 //! Handles path normalization, case sensitivity, and platform differences.
 
+use std::cmp::Ordering;
+use std::ffi::OsStr;
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A normalized, platform-aware path representation.
 ///
 /// On case-insensitive filesystems (Windows, default macOS), paths are
 /// stored in a canonical form for consistent cache keying.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct NormalizedPath {
     /// The original path, normalized but preserving original casing.
     path: PathBuf,
     /// Lowercased version for case-insensitive comparison, if applicable.
     case_key: Option<String>,
+}
+
+impl PartialEq for NormalizedPath {
+    fn eq(&self, other: &Self) -> bool {
+        normalize_for_key(&self.path) == normalize_for_key(&other.path)
+    }
+}
+
+impl PartialEq<PathBuf> for NormalizedPath {
+    fn eq(&self, other: &PathBuf) -> bool {
+        self == &Self::new(other)
+    }
+}
+
+impl PartialEq<NormalizedPath> for PathBuf {
+    fn eq(&self, other: &NormalizedPath) -> bool {
+        other == self
+    }
+}
+
+impl PartialEq<Path> for NormalizedPath {
+    fn eq(&self, other: &Path) -> bool {
+        self == &Self::new(other)
+    }
+}
+
+impl PartialEq<&Path> for NormalizedPath {
+    fn eq(&self, other: &&Path) -> bool {
+        self == *other
+    }
+}
+
+impl PartialEq<NormalizedPath> for Path {
+    fn eq(&self, other: &NormalizedPath) -> bool {
+        other == self
+    }
+}
+
+impl PartialEq<&NormalizedPath> for Path {
+    fn eq(&self, other: &&NormalizedPath) -> bool {
+        *other == self
+    }
+}
+
+impl PartialEq<&PathBuf> for NormalizedPath {
+    fn eq(&self, other: &&PathBuf) -> bool {
+        self == *other
+    }
+}
+
+impl PartialEq<&NormalizedPath> for PathBuf {
+    fn eq(&self, other: &&NormalizedPath) -> bool {
+        *other == self
+    }
+}
+
+impl Eq for NormalizedPath {}
+
+impl Hash for NormalizedPath {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        normalize_for_key(&self.path).hash(state);
+    }
+}
+
+impl PartialOrd for NormalizedPath {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NormalizedPath {
+    fn cmp(&self, other: &Self) -> Ordering {
+        normalize_for_key(&self.path).cmp(&normalize_for_key(&other.path))
+    }
 }
 
 impl NormalizedPath {
@@ -23,7 +103,7 @@ impl NormalizedPath {
     pub fn new(path: impl AsRef<Path>) -> Self {
         let path = normalize(path.as_ref());
         let case_key = if cfg!(windows) || cfg!(target_os = "macos") {
-            path.to_str().map(|s| s.to_lowercase())
+            Some(normalize_for_key(&path))
         } else {
             None
         };
@@ -40,6 +120,86 @@ impl NormalizedPath {
     #[must_use]
     pub fn case_key(&self) -> Option<&str> {
         self.case_key.as_deref()
+    }
+
+    /// Convert back to an owned normalized `PathBuf`.
+    #[must_use]
+    pub fn into_path_buf(self) -> PathBuf {
+        self.path
+    }
+
+    /// Join a path segment onto this normalized path.
+    #[must_use]
+    pub fn join(&self, path: impl AsRef<Path>) -> Self {
+        Self::new(self.path.join(path))
+    }
+}
+
+impl AsRef<Path> for NormalizedPath {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+impl AsRef<OsStr> for NormalizedPath {
+    fn as_ref(&self) -> &OsStr {
+        self.as_path().as_os_str()
+    }
+}
+
+impl Deref for NormalizedPath {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_path()
+    }
+}
+
+impl From<PathBuf> for NormalizedPath {
+    fn from(path: PathBuf) -> Self {
+        Self::new(path)
+    }
+}
+
+impl From<&Path> for NormalizedPath {
+    fn from(path: &Path) -> Self {
+        Self::new(path)
+    }
+}
+
+impl From<String> for NormalizedPath {
+    fn from(path: String) -> Self {
+        Self::new(path)
+    }
+}
+
+impl From<&str> for NormalizedPath {
+    fn from(path: &str) -> Self {
+        Self::new(path)
+    }
+}
+
+impl From<&String> for NormalizedPath {
+    fn from(path: &String) -> Self {
+        Self::new(path)
+    }
+}
+
+impl Serialize for NormalizedPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.path.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for NormalizedPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        PathBuf::deserialize(deserializer).map(Self::new)
     }
 }
 
@@ -67,6 +227,36 @@ pub fn normalize(path: &Path) -> PathBuf {
         }
     }
     components.iter().collect()
+}
+
+/// Normalize a path into a stable string key for hashing and comparisons.
+///
+/// This is the shared representation for path-based cache keys. It avoids
+/// filesystem access, strips Windows extended-length prefixes, normalizes
+/// separators, and folds case on case-insensitive platforms.
+#[must_use]
+pub fn normalize_for_key(path: &Path) -> String {
+    let normalized = normalize(path);
+
+    #[cfg(windows)]
+    {
+        let mut s = normalized.to_string_lossy().replace('\\', "/");
+        if let Some(stripped) = s.strip_prefix("//?/") {
+            s = stripped.to_string();
+        }
+        s.make_ascii_lowercase();
+        s
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return normalized.to_string_lossy().to_lowercase();
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        normalized.to_string_lossy().into_owned()
+    }
 }
 
 /// Convert an MSYS2/Git Bash style path to a native Windows path.
@@ -113,6 +303,14 @@ mod tests {
     fn normalize_resolves_dotdot() {
         let p = normalize(Path::new("a/b/../c"));
         assert_eq!(p, PathBuf::from("a/c"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_for_key_windows_equivalent_spellings_match() {
+        let a = normalize_for_key(Path::new(r"\\?\C:\Work\src\..\src\main.cpp"));
+        let b = normalize_for_key(Path::new("c:/work/src/main.cpp"));
+        assert_eq!(a, b);
     }
 
     #[test]

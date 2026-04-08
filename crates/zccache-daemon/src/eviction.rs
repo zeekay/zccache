@@ -12,6 +12,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
+use zccache_core::NormalizedPath;
 use zccache_depgraph::{ContextKey, DepGraph};
 use zccache_fscache::CacheSystem;
 
@@ -181,7 +182,7 @@ struct DiskArtifact {
     key: String,
     total_size: u64,
     mtime: std::time::SystemTime,
-    files: Vec<std::path::PathBuf>,
+    files: Vec<NormalizedPath>,
 }
 
 /// Evict on-disk artifacts when total disk usage exceeds `max_cache_size`.
@@ -242,7 +243,7 @@ pub(crate) fn evict_disk_artifacts(
                 group.mtime = mtime;
             }
         }
-        group.files.push(path);
+        group.files.push(path.into());
     }
 
     if total_disk <= max_cache_size {
@@ -273,7 +274,7 @@ pub(crate) fn evict_disk_artifacts(
     }
 
     // Delete files in parallel across all evicted artifacts.
-    let all_files: Vec<&std::path::PathBuf> = to_evict.iter().flat_map(|a| &a.files).collect();
+    let all_files: Vec<&NormalizedPath> = to_evict.iter().flat_map(|a| &a.files).collect();
     all_files.par_iter().for_each(|file| {
         let _ = std::fs::remove_file(file);
     });
@@ -289,7 +290,6 @@ pub(crate) fn evict_disk_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::time::{Instant, SystemTime};
     use zccache_depgraph::CompileContext;
     use zccache_fscache::{Confidence, FileMetadata};
@@ -310,7 +310,7 @@ mod tests {
 
     fn make_ctx(source: &str) -> CompileContext {
         CompileContext {
-            source_file: PathBuf::from(source),
+            source_file: source.into(),
             include_search: zccache_depgraph::IncludeSearchPaths::default(),
             defines: Vec::new(),
             flags: Vec::new(),
@@ -390,7 +390,7 @@ mod tests {
         // Add metadata entries.
         for i in 0..50 {
             cs.metadata().insert(
-                PathBuf::from(format!("/tmp/meta{i}.c")),
+                NormalizedPath::from(format!("/tmp/meta{i}.c")),
                 FileMetadata {
                     mtime: SystemTime::now(),
                     size: 100,
@@ -401,8 +401,8 @@ mod tests {
             );
         }
         // Track in journal.
-        let paths: Vec<PathBuf> = (0..50)
-            .map(|i| PathBuf::from(format!("/tmp/meta{i}.c")))
+        let paths: Vec<NormalizedPath> = (0..50)
+            .map(|i| NormalizedPath::from(format!("/tmp/meta{i}.c")))
             .collect();
         cs.apply_changes(paths);
 
@@ -426,7 +426,7 @@ mod tests {
         // Also add metadata so metadata eviction happens first.
         for i in 0..10 {
             cs.metadata().insert(
-                PathBuf::from(format!("/tmp/m{i}.c")),
+                NormalizedPath::from(format!("/tmp/m{i}.c")),
                 FileMetadata {
                     mtime: SystemTime::now(),
                     size: 100,

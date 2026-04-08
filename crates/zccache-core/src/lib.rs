@@ -9,6 +9,7 @@ pub mod path;
 pub mod version;
 
 pub use error::{Error, Result};
+pub use path::{normalize, normalize_for_key, normalize_msys_path, NormalizedPath};
 
 /// The version string from Cargo.toml (workspace version).
 ///

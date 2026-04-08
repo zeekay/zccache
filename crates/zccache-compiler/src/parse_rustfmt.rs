@@ -3,19 +3,20 @@
 //! Parses `rustfmt` command-line arguments to extract source files,
 //! mode flags, and configuration for cache key computation.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use zccache_core::NormalizedPath;
 
 /// Parsed rustfmt invocation.
 #[derive(Debug, Clone)]
 pub struct ParsedRustfmt {
     /// Source files to format (positional `.rs` args).
-    pub source_files: Vec<PathBuf>,
+    pub source_files: Vec<NormalizedPath>,
     /// Whether `--check` mode was requested (no file modification, exit code only).
     pub check_mode: bool,
     /// Edition override (e.g., "2021"), if specified via `--edition`.
     pub edition: Option<String>,
     /// Explicit config path from `--config-path`.
-    pub config_path: Option<PathBuf>,
+    pub config_path: Option<NormalizedPath>,
     /// All flags (excluding source files) for cache key computation.
     pub flags: Vec<String>,
 }
@@ -37,10 +38,10 @@ const RUSTFMT_FLAGS_WITH_VALUE: &[&str] = &[
 /// Returns `None` if stdin mode (no source files) or `--help`/`--version`.
 #[must_use]
 pub fn parse_rustfmt_invocation(args: &[String]) -> Option<ParsedRustfmt> {
-    let mut source_files: Vec<PathBuf> = Vec::new();
+    let mut source_files: Vec<NormalizedPath> = Vec::new();
     let mut check_mode = false;
     let mut edition: Option<String> = None;
-    let mut config_path: Option<PathBuf> = None;
+    let mut config_path: Option<NormalizedPath> = None;
     let mut flags: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -79,20 +80,20 @@ pub fn parse_rustfmt_invocation(args: &[String]) -> Option<ParsedRustfmt> {
         // --config-path <path> or --config-path=<path>
         if arg == "--config-path" {
             if let Some(next) = args.get(i + 1) {
-                config_path = Some(PathBuf::from(next));
+                config_path = Some(NormalizedPath::new(next));
                 flags.push(arg.clone());
                 flags.push(next.clone());
                 i += 2;
                 continue;
             }
         } else if let Some(val) = arg.strip_prefix("--config-path=") {
-            config_path = Some(PathBuf::from(val));
+            config_path = Some(NormalizedPath::new(val));
             flags.push(arg.clone());
             i += 1;
             continue;
         }
 
-        // Known flags that take a value — skip both
+        // Known flags that take a value â€” skip both
         if let Some(&_flag) = RUSTFMT_FLAGS_WITH_VALUE
             .iter()
             .find(|&&f| f == arg.as_str())
@@ -119,15 +120,15 @@ pub fn parse_rustfmt_invocation(args: &[String]) -> Option<ParsedRustfmt> {
             continue;
         }
 
-        // Positional arg — source file (.rs)
+        // Positional arg â€” source file (.rs)
         if arg.ends_with(".rs") {
-            source_files.push(PathBuf::from(arg));
+            source_files.push(NormalizedPath::new(arg));
         }
 
         i += 1;
     }
 
-    // No source files → stdin mode, not cacheable
+    // No source files â†’ stdin mode, not cacheable
     if source_files.is_empty() {
         return None;
     }
@@ -146,14 +147,14 @@ pub fn parse_rustfmt_invocation(args: &[String]) -> Option<ParsedRustfmt> {
 /// Searches for `rustfmt.toml` or `.rustfmt.toml` starting from `start_dir`
 /// and walking up to the filesystem root. Returns the first match.
 #[must_use]
-pub fn find_rustfmt_config(start_dir: &Path) -> Option<PathBuf> {
+pub fn find_rustfmt_config(start_dir: &Path) -> Option<NormalizedPath> {
     let mut dir = start_dir;
     loop {
-        let candidate = dir.join("rustfmt.toml");
+        let candidate = NormalizedPath::new(dir).join("rustfmt.toml");
         if candidate.exists() {
             return Some(candidate);
         }
-        let hidden = dir.join(".rustfmt.toml");
+        let hidden = NormalizedPath::new(dir).join(".rustfmt.toml");
         if hidden.exists() {
             return Some(hidden);
         }
@@ -175,7 +176,10 @@ mod tests {
     #[test]
     fn basic_rustfmt_invocation() {
         let result = parse_rustfmt_invocation(&args(&["src/main.rs"])).unwrap();
-        assert_eq!(result.source_files, vec![PathBuf::from("src/main.rs")]);
+        assert_eq!(
+            result.source_files,
+            vec![NormalizedPath::new("src/main.rs")]
+        );
         assert!(!result.check_mode);
         assert!(result.edition.is_none());
     }
@@ -184,7 +188,7 @@ mod tests {
     fn rustfmt_check_mode() {
         let result = parse_rustfmt_invocation(&args(&["--check", "src/lib.rs"])).unwrap();
         assert!(result.check_mode);
-        assert_eq!(result.source_files, vec![PathBuf::from("src/lib.rs")]);
+        assert_eq!(result.source_files, vec![NormalizedPath::new("src/lib.rs")]);
     }
 
     #[test]
@@ -210,7 +214,10 @@ mod tests {
         let result =
             parse_rustfmt_invocation(&args(&["--config-path", "/my/rustfmt.toml", "src/lib.rs"]))
                 .unwrap();
-        assert_eq!(result.config_path, Some(PathBuf::from("/my/rustfmt.toml")));
+        assert_eq!(
+            result.config_path,
+            Some(NormalizedPath::new("/my/rustfmt.toml"))
+        );
     }
 
     #[test]
@@ -262,7 +269,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("rustfmt.toml"), "max_width = 100").unwrap();
         let result = find_rustfmt_config(tmp.path());
-        assert_eq!(result, Some(tmp.path().join("rustfmt.toml")));
+        assert_eq!(result, Some(tmp.path().join("rustfmt.toml").into()));
     }
 
     #[test]
@@ -270,7 +277,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".rustfmt.toml"), "max_width = 100").unwrap();
         let result = find_rustfmt_config(tmp.path());
-        assert_eq!(result, Some(tmp.path().join(".rustfmt.toml")));
+        assert_eq!(result, Some(tmp.path().join(".rustfmt.toml").into()));
     }
 
     #[test]
@@ -280,7 +287,7 @@ mod tests {
         let subdir = tmp.path().join("src");
         std::fs::create_dir(&subdir).unwrap();
         let result = find_rustfmt_config(&subdir);
-        assert_eq!(result, Some(tmp.path().join("rustfmt.toml")));
+        assert_eq!(result, Some(tmp.path().join("rustfmt.toml").into()));
     }
 
     #[test]
@@ -298,6 +305,6 @@ mod tests {
         std::fs::write(tmp.path().join("rustfmt.toml"), "plain").unwrap();
         std::fs::write(tmp.path().join(".rustfmt.toml"), "hidden").unwrap();
         let result = find_rustfmt_config(tmp.path());
-        assert_eq!(result, Some(tmp.path().join("rustfmt.toml")));
+        assert_eq!(result, Some(tmp.path().join("rustfmt.toml").into()));
     }
 }

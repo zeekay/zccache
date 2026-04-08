@@ -3,12 +3,13 @@
 //! Saves/loads the graph to `~/.zccache/depgraph/depgraph.bin` so warm contexts
 //! survive daemon restarts and cache hits resume immediately.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
+use zccache_core::NormalizedPath;
 use zccache_hash::ContentHash;
 
 use crate::context::{ArtifactKey, CompileContext, ContextKey};
@@ -187,9 +188,9 @@ impl DepGraph {
 
     /// Reconstruct a `DepGraph` from a deserialized snapshot.
     pub fn from_snapshot(snap: DepGraphSnapshot) -> Self {
-        let files: DashMap<PathBuf, FileEntry> = DashMap::new();
+        let files: DashMap<NormalizedPath, FileEntry> = DashMap::new();
         snap.files.into_par_iter().for_each(|f| {
-            let path = PathBuf::from(&f.path);
+            let path = NormalizedPath::from(f.path.as_str());
             let includes = f
                 .includes
                 .into_iter()
@@ -219,7 +220,7 @@ impl DepGraph {
         snap.contexts.into_par_iter().for_each(|c| {
             let key = ContextKey::from_raw(c.context_key);
             let context = CompileContext {
-                source_file: PathBuf::from(&c.source_file),
+                source_file: NormalizedPath::from(c.source_file.as_str()),
                 include_search: IncludeSearchPaths {
                     iquote: strings_to_paths(c.iquote),
                     user: strings_to_paths(c.user),
@@ -240,7 +241,7 @@ impl DepGraph {
                 last_file_hashes: c
                     .last_file_hashes
                     .into_iter()
-                    .map(|(p, h)| (PathBuf::from(p), ContentHash::from_bytes(h)))
+                    .map(|(p, h)| (NormalizedPath::from(p.as_str()), ContentHash::from_bytes(h)))
                     .collect(),
                 last_accessed: Instant::now(),
                 state: match c.state {
@@ -256,15 +257,15 @@ impl DepGraph {
     }
 }
 
-fn paths_to_strings(paths: &[PathBuf]) -> Vec<String> {
+fn paths_to_strings<P: AsRef<Path>>(paths: &[P]) -> Vec<String> {
     paths
         .iter()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| p.as_ref().to_string_lossy().into_owned())
         .collect()
 }
 
-fn strings_to_paths(strings: Vec<String>) -> Vec<PathBuf> {
-    strings.into_iter().map(PathBuf::from).collect()
+fn strings_to_paths(strings: Vec<String>) -> Vec<NormalizedPath> {
+    strings.into_iter().map(NormalizedPath::from).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +274,7 @@ fn strings_to_paths(strings: Vec<String>) -> Vec<PathBuf> {
 
 /// Returns the default path for the depgraph snapshot file.
 #[must_use]
-pub fn depgraph_file_path() -> PathBuf {
+pub fn depgraph_file_path() -> NormalizedPath {
     zccache_core::config::depgraph_dir().join("depgraph.bin")
 }
 
@@ -377,13 +378,13 @@ mod tests {
     use crate::scanner::ScanResult;
     use tempfile::TempDir;
 
-    fn test_path(dir: &TempDir) -> PathBuf {
-        dir.path().join("depgraph.bin")
+    fn test_path(dir: &TempDir) -> NormalizedPath {
+        dir.path().join("depgraph.bin").into()
     }
 
     fn make_ctx(source: &str) -> CompileContext {
         CompileContext {
-            source_file: PathBuf::from(source),
+            source_file: NormalizedPath::from(source),
             include_search: IncludeSearchPaths::default(),
             defines: Vec::new(),
             flags: Vec::new(),
@@ -414,7 +415,7 @@ mod tests {
 
         // Add file entries with all IncludeKind variants.
         graph.store_file_includes(
-            PathBuf::from("/src/main.cpp"),
+            NormalizedPath::from("/src/main.cpp"),
             vec![
                 IncludeDirective {
                     kind: IncludeKind::Quoted,
@@ -436,16 +437,16 @@ mod tests {
 
         // Add a context entry with all fields populated.
         let ctx = CompileContext {
-            source_file: PathBuf::from("/src/main.cpp"),
+            source_file: NormalizedPath::from("/src/main.cpp"),
             include_search: IncludeSearchPaths {
-                iquote: vec![PathBuf::from("/src")],
-                user: vec![PathBuf::from("/include")],
-                system: vec![PathBuf::from("/usr/include")],
-                after: vec![PathBuf::from("/after")],
+                iquote: vec![NormalizedPath::from("/src")],
+                user: vec![NormalizedPath::from("/include")],
+                system: vec![NormalizedPath::from("/usr/include")],
+                after: vec![NormalizedPath::from("/after")],
             },
             defines: vec!["DEBUG=1".into()],
             flags: vec!["-std=c++17".into()],
-            force_includes: vec![PathBuf::from("/pch.h")],
+            force_includes: vec![NormalizedPath::from("/pch.h")],
             unknown_flags: vec!["--custom".into()],
         };
         let key = graph.register(ctx);
@@ -454,10 +455,10 @@ mod tests {
         let source_hash = zccache_hash::hash_bytes(b"source content");
         let header_hash = zccache_hash::hash_bytes(b"header content");
         let pch_hash = zccache_hash::hash_bytes(b"pch content");
-        let hashes: std::collections::HashMap<PathBuf, ContentHash> = [
-            (PathBuf::from("/src/main.cpp"), source_hash),
-            (PathBuf::from("/include/header.h"), header_hash),
-            (PathBuf::from("/pch.h"), pch_hash),
+        let hashes: std::collections::HashMap<NormalizedPath, ContentHash> = [
+            (NormalizedPath::from("/src/main.cpp"), source_hash),
+            (NormalizedPath::from("/include/header.h"), header_hash),
+            (NormalizedPath::from("/pch.h"), pch_hash),
         ]
         .into_iter()
         .collect();
@@ -465,11 +466,11 @@ mod tests {
         graph.update(
             &key,
             ScanResult {
-                resolved: vec![PathBuf::from("/include/header.h")],
+                resolved: vec![NormalizedPath::from("/include/header.h")],
                 unresolved: vec!["missing.h".into()],
                 has_computed: true,
             },
-            |path| hashes.get(path).copied(),
+            |path| hashes.get(&NormalizedPath::new(path)).copied(),
         );
 
         // Save and load.
@@ -482,7 +483,7 @@ mod tests {
 
         // Verify file entry.
         let includes = loaded
-            .get_file_includes(&PathBuf::from("/src/main.cpp"))
+            .get_file_includes(&NormalizedPath::from("/src/main.cpp"))
             .unwrap();
         assert_eq!(includes.len(), 3);
         assert_eq!(includes[0].kind, IncludeKind::Quoted);
@@ -492,7 +493,7 @@ mod tests {
         // Verify context state survived.
         assert_eq!(loaded.get_state(&key), Some(ContextState::Warm));
         let resolved = loaded.get_includes(&key).unwrap();
-        assert_eq!(resolved, vec![PathBuf::from("/include/header.h")]);
+        assert_eq!(resolved, vec![NormalizedPath::from("/include/header.h")]);
     }
 
     #[test]
@@ -583,9 +584,9 @@ mod tests {
         let key = graph.register(make_ctx("/src/a.cpp"));
         let hash1 = zccache_hash::hash_bytes(b"content1");
         let hash2 = zccache_hash::hash_bytes(b"content2");
-        let hashes: std::collections::HashMap<PathBuf, ContentHash> = [
-            (PathBuf::from("/src/a.cpp"), hash1),
-            (PathBuf::from("/inc/b.h"), hash2),
+        let hashes: std::collections::HashMap<NormalizedPath, ContentHash> = [
+            (NormalizedPath::from("/src/a.cpp"), hash1),
+            (NormalizedPath::from("/inc/b.h"), hash2),
         ]
         .into_iter()
         .collect();
@@ -593,11 +594,11 @@ mod tests {
         graph.update(
             &key,
             ScanResult {
-                resolved: vec![PathBuf::from("/inc/b.h")],
+                resolved: vec![NormalizedPath::from("/inc/b.h")],
                 unresolved: Vec::new(),
                 has_computed: false,
             },
-            |path| hashes.get(path).copied(),
+            |path| hashes.get(&NormalizedPath::new(path)).copied(),
         );
 
         save_to_file(&graph, &path).unwrap();
@@ -620,8 +621,10 @@ mod tests {
 
         let key = graph.register(make_ctx("/src/c.cpp"));
         let hash = zccache_hash::hash_bytes(b"source");
-        let hashes: std::collections::HashMap<PathBuf, ContentHash> =
-            [(PathBuf::from("/src/c.cpp"), hash)].into_iter().collect();
+        let hashes: std::collections::HashMap<NormalizedPath, ContentHash> =
+            [(NormalizedPath::from("/src/c.cpp"), hash)]
+                .into_iter()
+                .collect();
 
         graph.update(
             &key,
@@ -630,7 +633,7 @@ mod tests {
                 unresolved: Vec::new(),
                 has_computed: false,
             },
-            |path| hashes.get(path).copied(),
+            |path| hashes.get(&NormalizedPath::new(path)).copied(),
         );
 
         save_to_file(&graph, &path).unwrap();
@@ -655,7 +658,7 @@ mod tests {
         assert_eq!(graph.stats().context_count, 0);
     }
 
-    // ── Adversarial tests ─────────────────────────────────────────────
+    // â”€â”€ Adversarial tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     fn dummy_hash(path: &std::path::Path) -> Option<ContentHash> {
         Some(zccache_hash::hash_bytes(path.to_string_lossy().as_bytes()))
@@ -675,29 +678,32 @@ mod tests {
         let graph = DepGraph::new();
 
         let ctx = CompileContext {
-            source_file: PathBuf::from("/src/main.cpp"),
+            source_file: NormalizedPath::from("/src/main.cpp"),
             include_search: IncludeSearchPaths {
-                user: vec![PathBuf::from("/include")],
-                system: vec![PathBuf::from("/usr/include")],
+                user: vec![NormalizedPath::from("/include")],
+                system: vec![NormalizedPath::from("/usr/include")],
                 ..Default::default()
             },
             defines: vec!["NDEBUG".into()],
             flags: vec!["-O2".into(), "-std=c++17".into()],
-            force_includes: vec![PathBuf::from("/pch.h")],
+            force_includes: vec![NormalizedPath::from("/pch.h")],
             unknown_flags: Vec::new(),
         };
         let key = graph.register(ctx);
 
-        let hashes: std::collections::HashMap<PathBuf, ContentHash> = [
+        let hashes: std::collections::HashMap<NormalizedPath, ContentHash> = [
             (
-                PathBuf::from("/src/main.cpp"),
+                NormalizedPath::from("/src/main.cpp"),
                 zccache_hash::hash_bytes(b"src"),
             ),
             (
-                PathBuf::from("/include/a.h"),
+                NormalizedPath::from("/include/a.h"),
                 zccache_hash::hash_bytes(b"a"),
             ),
-            (PathBuf::from("/pch.h"), zccache_hash::hash_bytes(b"pch")),
+            (
+                NormalizedPath::from("/pch.h"),
+                zccache_hash::hash_bytes(b"pch"),
+            ),
         ]
         .into_iter()
         .collect();
@@ -705,15 +711,17 @@ mod tests {
         graph.update(
             &key,
             ScanResult {
-                resolved: vec![PathBuf::from("/include/a.h")],
+                resolved: vec![NormalizedPath::from("/include/a.h")],
                 unresolved: Vec::new(),
                 has_computed: false,
             },
-            |p| hashes.get(p).copied(),
+            |p| hashes.get(&NormalizedPath::new(p)).copied(),
         );
 
         // Verify original graph serves hits.
-        let verdict = graph.check(&key, always_fresh, |p| hashes.get(p).copied());
+        let verdict = graph.check(&key, always_fresh, |p| {
+            hashes.get(&NormalizedPath::new(p)).copied()
+        });
         assert!(
             matches!(verdict, CacheVerdict::Hit { .. }),
             "original graph should hit, got {verdict:?}"
@@ -723,7 +731,9 @@ mod tests {
         save_to_file(&graph, &path).unwrap();
         let loaded = load_from_file(&path).unwrap();
 
-        let verdict = loaded.check(&key, always_fresh, |p| hashes.get(p).copied());
+        let verdict = loaded.check(&key, always_fresh, |p| {
+            hashes.get(&NormalizedPath::new(p)).copied()
+        });
         assert!(
             matches!(verdict, CacheVerdict::Hit { .. }),
             "loaded graph should still serve hit, got {verdict:?}"
@@ -731,7 +741,7 @@ mod tests {
     }
 
     /// The stored context key must match the key recomputed from the
-    /// loaded CompileContext. If lossy PathBuf→String→PathBuf conversion
+    /// loaded CompileContext. If lossy PathBufâ†’Stringâ†’NormalizedPath conversion
     /// corrupts paths, the key will diverge and lookups will silently fail.
     #[test]
     fn context_key_consistent_after_roundtrip() {
@@ -740,25 +750,25 @@ mod tests {
         let graph = DepGraph::new();
 
         let ctx = CompileContext {
-            source_file: PathBuf::from("/src/main.cpp"),
+            source_file: NormalizedPath::from("/src/main.cpp"),
             include_search: IncludeSearchPaths {
-                iquote: vec![PathBuf::from("/iquote/dir")],
-                user: vec![PathBuf::from("/user/dir")],
-                system: vec![PathBuf::from("/system/dir")],
-                after: vec![PathBuf::from("/after/dir")],
+                iquote: vec![NormalizedPath::from("/iquote/dir")],
+                user: vec![NormalizedPath::from("/user/dir")],
+                system: vec![NormalizedPath::from("/system/dir")],
+                after: vec![NormalizedPath::from("/after/dir")],
             },
             defines: vec!["FOO=1".into(), "BAR=2".into()],
             flags: vec!["-Wall".into()],
-            force_includes: vec![PathBuf::from("/fi/pch.h")],
+            force_includes: vec![NormalizedPath::from("/fi/pch.h")],
             unknown_flags: vec!["--custom".into()],
         };
         let original_key = ctx.context_key();
         graph.register(ctx);
 
         let hash = zccache_hash::hash_bytes(b"x");
-        let hashes: std::collections::HashMap<PathBuf, ContentHash> = [
-            (PathBuf::from("/src/main.cpp"), hash),
-            (PathBuf::from("/fi/pch.h"), hash),
+        let hashes: std::collections::HashMap<NormalizedPath, ContentHash> = [
+            (NormalizedPath::from("/src/main.cpp"), hash),
+            (NormalizedPath::from("/fi/pch.h"), hash),
         ]
         .into_iter()
         .collect();
@@ -769,7 +779,7 @@ mod tests {
                 unresolved: Vec::new(),
                 has_computed: false,
             },
-            |p| hashes.get(p).copied(),
+            |p| hashes.get(&NormalizedPath::new(p)).copied(),
         );
 
         save_to_file(&graph, &path).unwrap();
@@ -786,7 +796,7 @@ mod tests {
         let snap = loaded.to_snapshot();
         assert_eq!(snap.contexts.len(), 1);
         let loaded_ctx = CompileContext {
-            source_file: PathBuf::from(&snap.contexts[0].source_file),
+            source_file: NormalizedPath::from(&snap.contexts[0].source_file),
             include_search: IncludeSearchPaths {
                 iquote: strings_to_paths(snap.contexts[0].iquote.clone()),
                 user: strings_to_paths(snap.contexts[0].user.clone()),
@@ -806,7 +816,7 @@ mod tests {
         );
     }
 
-    /// Unicode paths must roundtrip correctly — they are common on macOS
+    /// Unicode paths must roundtrip correctly â€” they are common on macOS
     /// (NFC normalization) and Windows (wide chars).
     #[test]
     fn unicode_paths_roundtrip() {
@@ -814,15 +824,18 @@ mod tests {
         let path = test_path(&dir);
         let graph = DepGraph::new();
 
-        let unicode_source = "/src/日本語/main.cpp";
-        let unicode_header = "/inc/données/header.h";
-        let unicode_define = "NÄME=Ünïcödé";
-        let emoji_path = "/inc/🎉/emoji.h";
+        let unicode_source = "/src/æ—¥æœ¬èªž/main.cpp";
+        let unicode_header = "/inc/donnÃ©es/header.h";
+        let unicode_define = "NÃ„ME=ÃœnÃ¯cÃ¶dÃ©";
+        let emoji_path = "/inc/ðŸŽ‰/emoji.h";
 
         let ctx = CompileContext {
-            source_file: PathBuf::from(unicode_source),
+            source_file: NormalizedPath::from(unicode_source),
             include_search: IncludeSearchPaths {
-                user: vec![PathBuf::from(unicode_header), PathBuf::from(emoji_path)],
+                user: vec![
+                    NormalizedPath::from(unicode_header),
+                    NormalizedPath::from(emoji_path),
+                ],
                 ..Default::default()
             },
             defines: vec![unicode_define.into()],
@@ -832,8 +845,8 @@ mod tests {
         };
         let key = graph.register(ctx);
         let hash = zccache_hash::hash_bytes(b"x");
-        let hashes: std::collections::HashMap<PathBuf, ContentHash> =
-            [(PathBuf::from(unicode_source), hash)]
+        let hashes: std::collections::HashMap<NormalizedPath, ContentHash> =
+            [(NormalizedPath::from(unicode_source), hash)]
                 .into_iter()
                 .collect();
         graph.update(
@@ -843,12 +856,12 @@ mod tests {
                 unresolved: Vec::new(),
                 has_computed: false,
             },
-            |p| hashes.get(p).copied(),
+            |p| hashes.get(&NormalizedPath::new(p)).copied(),
         );
 
         // Also store file includes with unicode paths.
         graph.store_file_includes(
-            PathBuf::from(unicode_source),
+            NormalizedPath::from(unicode_source),
             vec![IncludeDirective {
                 kind: IncludeKind::Quoted,
                 path: unicode_header.into(),
@@ -861,21 +874,28 @@ mod tests {
 
         assert_eq!(loaded.get_state(&key), Some(ContextState::Warm));
         let includes = loaded
-            .get_file_includes(&PathBuf::from(unicode_source))
+            .get_file_includes(&NormalizedPath::from(unicode_source))
             .unwrap();
         assert_eq!(includes[0].path, unicode_header);
 
         // Verify the context's include search paths survived.
         let snap = loaded.to_snapshot();
-        assert_eq!(snap.contexts[0].source_file, unicode_source);
-        assert!(snap.contexts[0].user.contains(&unicode_header.to_string()));
-        assert!(snap.contexts[0].user.contains(&emoji_path.to_string()));
+        assert_eq!(
+            snap.contexts[0].source_file,
+            NormalizedPath::from(unicode_source).display().to_string()
+        );
+        assert!(snap.contexts[0]
+            .user
+            .contains(&NormalizedPath::from(unicode_header).display().to_string()));
+        assert!(snap.contexts[0]
+            .user
+            .contains(&NormalizedPath::from(emoji_path).display().to_string()));
         assert!(snap.contexts[0]
             .defines
             .contains(&unicode_define.to_string()));
     }
 
-    /// Save→load→save→load must produce an identical graph. Tests for
+    /// Saveâ†’loadâ†’saveâ†’load must produce an identical graph. Tests for
     /// any drift introduced by a single roundtrip (e.g., path
     /// normalization, field reordering, floating precision).
     #[test]
@@ -888,10 +908,10 @@ mod tests {
         // Build a non-trivial graph.
         for i in 0..5 {
             let ctx = CompileContext {
-                source_file: PathBuf::from(format!("/src/file{i}.cpp")),
+                source_file: NormalizedPath::from(format!("/src/file{i}.cpp")),
                 include_search: IncludeSearchPaths {
-                    user: vec![PathBuf::from(format!("/inc{i}"))],
-                    system: vec![PathBuf::from("/sys")],
+                    user: vec![NormalizedPath::from(format!("/inc{i}"))],
+                    system: vec![NormalizedPath::from("/sys")],
                     ..Default::default()
                 },
                 defines: vec![format!("VAR{i}=1")],
@@ -903,14 +923,14 @@ mod tests {
             graph.update(
                 &key,
                 ScanResult {
-                    resolved: vec![PathBuf::from(format!("/inc{i}/h.h"))],
+                    resolved: vec![NormalizedPath::from(format!("/inc{i}/h.h"))],
                     unresolved: vec![format!("missing{i}.h")],
                     has_computed: i == 0, // one with computed includes
                 },
                 dummy_hash,
             );
             graph.store_file_includes(
-                PathBuf::from(format!("/src/file{i}.cpp")),
+                NormalizedPath::from(format!("/src/file{i}.cpp")),
                 vec![IncludeDirective {
                     kind: IncludeKind::Quoted,
                     path: format!("h{i}.h"),
@@ -959,13 +979,13 @@ mod tests {
         let path = test_path(&dir);
         let graph = DepGraph::new();
 
-        let shared_header = PathBuf::from("/inc/shared.h");
+        let shared_header = NormalizedPath::from("/inc/shared.h");
 
         // Two contexts that share the same header.
         let ctx_a = CompileContext {
-            source_file: PathBuf::from("/src/a.cpp"),
+            source_file: NormalizedPath::from("/src/a.cpp"),
             include_search: IncludeSearchPaths {
-                user: vec![PathBuf::from("/inc")],
+                user: vec![NormalizedPath::from("/inc")],
                 ..Default::default()
             },
             defines: vec!["A=1".into()],
@@ -974,9 +994,9 @@ mod tests {
             unknown_flags: Vec::new(),
         };
         let ctx_b = CompileContext {
-            source_file: PathBuf::from("/src/b.cpp"),
+            source_file: NormalizedPath::from("/src/b.cpp"),
             include_search: IncludeSearchPaths {
-                user: vec![PathBuf::from("/inc")],
+                user: vec![NormalizedPath::from("/inc")],
                 ..Default::default()
             },
             defines: vec!["B=1".into()],
@@ -988,9 +1008,15 @@ mod tests {
         let key_a = graph.register(ctx_a);
         let key_b = graph.register(ctx_b);
 
-        let hashes: std::collections::HashMap<PathBuf, ContentHash> = [
-            (PathBuf::from("/src/a.cpp"), zccache_hash::hash_bytes(b"a")),
-            (PathBuf::from("/src/b.cpp"), zccache_hash::hash_bytes(b"b")),
+        let hashes: std::collections::HashMap<NormalizedPath, ContentHash> = [
+            (
+                NormalizedPath::from("/src/a.cpp"),
+                zccache_hash::hash_bytes(b"a"),
+            ),
+            (
+                NormalizedPath::from("/src/b.cpp"),
+                zccache_hash::hash_bytes(b"b"),
+            ),
             (shared_header.clone(), zccache_hash::hash_bytes(b"shared")),
         ]
         .into_iter()
@@ -1003,7 +1029,7 @@ mod tests {
                 unresolved: Vec::new(),
                 has_computed: false,
             },
-            |p| hashes.get(p).copied(),
+            |p| hashes.get(&NormalizedPath::new(p)).copied(),
         );
         graph.update(
             &key_b,
@@ -1012,7 +1038,7 @@ mod tests {
                 unresolved: Vec::new(),
                 has_computed: false,
             },
-            |p| hashes.get(p).copied(),
+            |p| hashes.get(&NormalizedPath::new(p)).copied(),
         );
 
         save_to_file(&graph, &path).unwrap();
@@ -1023,8 +1049,12 @@ mod tests {
         assert_eq!(loaded.get_state(&key_b), Some(ContextState::Warm));
 
         // Both should serve hits.
-        let verdict_a = loaded.check(&key_a, always_fresh, |p| hashes.get(p).copied());
-        let verdict_b = loaded.check(&key_b, always_fresh, |p| hashes.get(p).copied());
+        let verdict_a = loaded.check(&key_a, always_fresh, |p| {
+            hashes.get(&NormalizedPath::new(p)).copied()
+        });
+        let verdict_b = loaded.check(&key_b, always_fresh, |p| {
+            hashes.get(&NormalizedPath::new(p)).copied()
+        });
         assert!(matches!(verdict_a, CacheVerdict::Hit { .. }));
         assert!(matches!(verdict_b, CacheVerdict::Hit { .. }));
 
@@ -1113,7 +1143,7 @@ mod tests {
         graph.update(
             &key,
             ScanResult {
-                resolved: vec![PathBuf::from("/inc/b.h")],
+                resolved: vec![NormalizedPath::from("/inc/b.h")],
                 unresolved: Vec::new(),
                 has_computed: false,
             },
@@ -1134,7 +1164,7 @@ mod tests {
             Err(SnapshotError::Corrupt(_)) => {} // Expected
             Ok(_) => {
                 // rkyv might not catch every bit-flip if it lands on
-                // a valid-looking field. This is acceptable — we just
+                // a valid-looking field. This is acceptable â€” we just
                 // want to verify the validation path exists.
             }
             Err(other) => panic!("unexpected error: {other}"),
@@ -1149,24 +1179,24 @@ mod tests {
         let graph = DepGraph::new();
 
         let ctx = CompileContext {
-            source_file: PathBuf::from(""),
+            source_file: NormalizedPath::from(""),
             include_search: IncludeSearchPaths {
-                iquote: vec![PathBuf::from("")],
-                user: vec![PathBuf::from("")],
-                system: vec![PathBuf::from("")],
-                after: vec![PathBuf::from("")],
+                iquote: vec![NormalizedPath::from("")],
+                user: vec![NormalizedPath::from("")],
+                system: vec![NormalizedPath::from("")],
+                after: vec![NormalizedPath::from("")],
             },
             defines: vec![String::new()],
             flags: vec![String::new()],
-            force_includes: vec![PathBuf::from("")],
+            force_includes: vec![NormalizedPath::from("")],
             unknown_flags: vec![String::new()],
         };
         let key = graph.register(ctx);
 
         // Empty path hash.
         let hash = zccache_hash::hash_bytes(b"");
-        let hashes: std::collections::HashMap<PathBuf, ContentHash> =
-            [(PathBuf::from(""), hash)].into_iter().collect();
+        let hashes: std::collections::HashMap<NormalizedPath, ContentHash> =
+            [(NormalizedPath::from(""), hash)].into_iter().collect();
         graph.update(
             &key,
             ScanResult {
@@ -1174,7 +1204,7 @@ mod tests {
                 unresolved: vec![String::new()],
                 has_computed: false,
             },
-            |p| hashes.get(p).copied(),
+            |p| hashes.get(&NormalizedPath::new(p)).copied(),
         );
 
         save_to_file(&graph, &path).unwrap();
@@ -1203,9 +1233,9 @@ mod tests {
 
         for i in 0..n_contexts {
             let ctx = CompileContext {
-                source_file: PathBuf::from(format!("/src/file{i}.cpp")),
+                source_file: NormalizedPath::from(format!("/src/file{i}.cpp")),
                 include_search: IncludeSearchPaths {
-                    user: vec![PathBuf::from(format!("/inc{i}"))],
+                    user: vec![NormalizedPath::from(format!("/inc{i}"))],
                     ..Default::default()
                 },
                 defines: (0..5).map(|d| format!("DEF{d}={i}")).collect(),
@@ -1215,8 +1245,8 @@ mod tests {
             };
             let key = graph.register(ctx);
 
-            let resolved: Vec<PathBuf> = (0..n_headers_per_ctx)
-                .map(|h| PathBuf::from(format!("/inc{i}/header{h}.h")))
+            let resolved: Vec<NormalizedPath> = (0..n_headers_per_ctx)
+                .map(|h| NormalizedPath::from(format!("/inc{i}/header{h}.h")))
                 .collect();
             graph.update(
                 &key,
@@ -1299,7 +1329,7 @@ mod tests {
         }
     }
 
-    /// Just the magic bytes and nothing else — shorter than header.
+    /// Just the magic bytes and nothing else â€” shorter than header.
     #[test]
     fn header_too_short() {
         let dir = TempDir::new().unwrap();
@@ -1322,7 +1352,7 @@ mod tests {
         let path = test_path(&dir);
         let graph = DepGraph::new();
 
-        // Register but don't update — artifact_key stays None.
+        // Register but don't update â€” artifact_key stays None.
         graph.register(make_ctx("/src/cold.cpp"));
 
         save_to_file(&graph, &path).unwrap();
@@ -1397,15 +1427,21 @@ mod tests {
         let loaded = load_from_file(&path).unwrap();
 
         let snap = loaded.to_snapshot();
+        let with_computed = NormalizedPath::new("/src/with_computed.cpp")
+            .display()
+            .to_string();
+        let without_computed = NormalizedPath::new("/src/without_computed.cpp")
+            .display()
+            .to_string();
         let ctx_with = snap
             .contexts
             .iter()
-            .find(|c| c.source_file == "/src/with_computed.cpp")
+            .find(|c| c.source_file == with_computed)
             .unwrap();
         let ctx_without = snap
             .contexts
             .iter()
-            .find(|c| c.source_file == "/src/without_computed.cpp")
+            .find(|c| c.source_file == without_computed)
             .unwrap();
         assert!(ctx_with.has_computed_includes);
         assert!(!ctx_without.has_computed_includes);
@@ -1428,7 +1464,7 @@ mod tests {
 
         let macro_name = "MY_PLATFORM_HEADER";
         graph.store_file_includes(
-            PathBuf::from("/src/test.cpp"),
+            NormalizedPath::from("/src/test.cpp"),
             vec![
                 IncludeDirective {
                     kind: IncludeKind::Quoted,
@@ -1464,7 +1500,7 @@ mod tests {
         let loaded = load_from_file(&path).unwrap();
 
         let includes = loaded
-            .get_file_includes(&PathBuf::from("/src/test.cpp"))
+            .get_file_includes(&NormalizedPath::from("/src/test.cpp"))
             .unwrap();
         assert_eq!(includes.len(), 3);
         assert_eq!(includes[0].kind, IncludeKind::Quoted);
@@ -1492,9 +1528,9 @@ mod tests {
         let graph = DepGraph::new();
 
         let ctx = CompileContext {
-            source_file: PathBuf::from("/src/main.cpp"),
+            source_file: NormalizedPath::from("/src/main.cpp"),
             include_search: IncludeSearchPaths {
-                user: vec![PathBuf::from("/inc")],
+                user: vec![NormalizedPath::from("/inc")],
                 ..Default::default()
             },
             defines: vec!["X=1".into()],
@@ -1506,7 +1542,7 @@ mod tests {
         graph.update(
             &original_key,
             ScanResult {
-                resolved: vec![PathBuf::from("/inc/a.h")],
+                resolved: vec![NormalizedPath::from("/inc/a.h")],
                 unresolved: Vec::new(),
                 has_computed: false,
             },
@@ -1547,9 +1583,9 @@ mod tests {
         let source_hash = zccache_hash::hash_bytes(b"specific source content 12345");
         let header_hash = zccache_hash::hash_bytes(b"specific header content 67890");
 
-        let hashes: std::collections::HashMap<PathBuf, ContentHash> = [
-            (PathBuf::from("/src/a.cpp"), source_hash),
-            (PathBuf::from("/inc/b.h"), header_hash),
+        let hashes: std::collections::HashMap<NormalizedPath, ContentHash> = [
+            (NormalizedPath::from("/src/a.cpp"), source_hash),
+            (NormalizedPath::from("/inc/b.h"), header_hash),
         ]
         .into_iter()
         .collect();
@@ -1557,11 +1593,11 @@ mod tests {
         graph.update(
             &key,
             ScanResult {
-                resolved: vec![PathBuf::from("/inc/b.h")],
+                resolved: vec![NormalizedPath::from("/inc/b.h")],
                 unresolved: Vec::new(),
                 has_computed: false,
             },
-            |p| hashes.get(p).copied(),
+            |p| hashes.get(&NormalizedPath::new(p)).copied(),
         );
 
         save_to_file(&graph, &path).unwrap();
@@ -1572,7 +1608,7 @@ mod tests {
 
         // Verify each hash byte-for-byte.
         for (snap_path, snap_hash) in &ctx.last_file_hashes {
-            let expected = hashes.get(&PathBuf::from(snap_path)).unwrap();
+            let expected = hashes.get(&NormalizedPath::from(snap_path)).unwrap();
             assert_eq!(
                 snap_hash,
                 expected.as_bytes(),
@@ -1708,7 +1744,7 @@ mod tests {
         data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF]);
         std::fs::write(&path, &data).unwrap();
 
-        // Should still load fine — trailing data is beyond payload_len.
+        // Should still load fine â€” trailing data is beyond payload_len.
         let loaded = load_from_file(&path).unwrap();
         assert_eq!(loaded.stats().context_count, 1);
         assert_eq!(loaded.get_state(&key), Some(ContextState::Warm));
@@ -1729,7 +1765,7 @@ mod tests {
             graph.update(
                 &key,
                 ScanResult {
-                    resolved: vec![PathBuf::from(format!("/inc/h{i}.h"))],
+                    resolved: vec![NormalizedPath::from(format!("/inc/h{i}.h"))],
                     unresolved: Vec::new(),
                     has_computed: false,
                 },
@@ -1758,7 +1794,7 @@ mod tests {
             let p = path.clone();
             handles.push(std::thread::spawn(move || {
                 for _ in 0..5 {
-                    // May fail if file is being rewritten — that's OK.
+                    // May fail if file is being rewritten â€” that's OK.
                     let _ = load_from_file(&p);
                 }
             }));

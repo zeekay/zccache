@@ -1,6 +1,6 @@
 //! Error types for zccache.
 
-use std::path::PathBuf;
+use crate::NormalizedPath;
 
 /// Top-level error type for zccache operations.
 #[derive(Debug, thiserror::Error)]
@@ -18,7 +18,7 @@ pub enum Error {
     Cache { message: String },
 
     #[error("file not found: {0}")]
-    FileNotFound(PathBuf),
+    FileNotFound(NormalizedPath),
 
     #[error("daemon not running")]
     DaemonNotRunning,

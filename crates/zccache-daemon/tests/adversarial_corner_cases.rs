@@ -8,10 +8,11 @@
 //! Run all:    uv run cargo test -p zccache-daemon --test adversarial_corner_cases -- --nocapture
 //! Run single: uv run cargo test -p zccache-daemon --test adversarial_corner_cases -- <test_name> --nocapture
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use zccache_core::NormalizedPath;
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
@@ -101,7 +102,7 @@ async fn compile_and_read(
 }
 
 struct TestHarness {
-    clang: PathBuf,
+    clang: NormalizedPath,
     tmp: tempfile::TempDir,
     #[expect(dead_code)]
     endpoint: String,
@@ -137,11 +138,11 @@ impl TestHarness {
         self.tmp.path().to_string_lossy().into_owned()
     }
 
-    fn path(&self, name: &str) -> PathBuf {
-        self.tmp.path().join(name)
+    fn path(&self, name: &str) -> NormalizedPath {
+        NormalizedPath::new(self.tmp.path().join(name))
     }
 
-    fn write_file(&self, name: &str, content: &str) -> PathBuf {
+    fn write_file(&self, name: &str, content: &str) -> NormalizedPath {
         let p = self.path(name);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -366,7 +367,7 @@ async fn corner_thundering_herd_same_file() {
             let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
 
             let obj_name = format!("out_{i}/herd.o");
-            let obj_path = PathBuf::from(&cwd).join(&obj_name);
+            let obj_path = NormalizedPath::new(Path::new(&cwd).join(&obj_name));
             let (exit, cached, obj) = compile_and_read(
                 &mut client,
                 &sid,
@@ -473,7 +474,7 @@ async fn corner_thundering_herd_all_warm() {
             let sid = start_session(&mut client, &clang, &cwd, &log.to_string_lossy()).await;
 
             let obj_name = format!("warm_out_{i}/warm.o");
-            let obj_path = PathBuf::from(&cwd).join(&obj_name);
+            let obj_path = NormalizedPath::new(Path::new(&cwd).join(&obj_name));
             let (exit, cached, obj) = compile_and_read(
                 &mut client,
                 &sid,

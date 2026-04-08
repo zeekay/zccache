@@ -3,7 +3,7 @@
 //! Supports both the `"command"` (string) and `"arguments"` (array)
 //! forms as defined by the clang compilation database specification.
 
-use std::path::PathBuf;
+use zccache_core::NormalizedPath;
 
 use serde::Deserialize;
 
@@ -13,15 +13,15 @@ use crate::args::{parse_compile_args, split_command, ParsedArgs};
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompileCommand {
     /// The working directory of the compilation.
-    pub directory: PathBuf,
+    pub directory: NormalizedPath,
     /// The source file (may be relative to `directory`).
-    pub file: PathBuf,
+    pub file: NormalizedPath,
     /// The compile command as a single string (shell-quoted).
     pub command: Option<String>,
     /// The compile command as an argument array.
     pub arguments: Option<Vec<String>>,
     /// The output file.
-    pub output: Option<PathBuf>,
+    pub output: Option<NormalizedPath>,
 }
 
 impl CompileCommand {
@@ -47,11 +47,14 @@ impl CompileCommand {
     }
 
     /// Extract the compiler executable from the command.
-    pub fn compiler(&self) -> Option<PathBuf> {
+    pub fn compiler(&self) -> Option<NormalizedPath> {
         if let Some(ref args) = self.arguments {
-            args.first().map(PathBuf::from)
+            args.first().map(|s| s.as_str().into())
         } else if let Some(ref cmd) = self.command {
-            split_command(cmd).into_iter().next().map(PathBuf::from)
+            split_command(cmd)
+                .into_iter()
+                .next()
+                .map(|s| s.as_str().into())
         } else {
             None
         }
@@ -88,6 +91,7 @@ pub fn parse_compile_commands_json(json: &str) -> Result<Vec<CompileCommand>, se
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use zccache_core::NormalizedPath;
 
     use super::*;
 
@@ -119,7 +123,7 @@ mod tests {
         );
         assert_eq!(parsed.defines, vec!["NDEBUG"]);
         assert!(parsed.flags.contains(&"-std=c17".to_string()));
-        assert_eq!(parsed.compiler, Some(PathBuf::from("cc")));
+        assert_eq!(parsed.compiler, Some("cc".into()));
     }
 
     #[test]
@@ -137,7 +141,7 @@ mod tests {
         assert_eq!(parsed.source_file, Path::new("/build/main.cpp"));
         assert_eq!(parsed.include_search.user, vec![Path::new("/include")]);
         assert!(parsed.flags.contains(&"-std=c++17".to_string()));
-        assert_eq!(parsed.compiler, Some(PathBuf::from("clang++")));
+        assert_eq!(parsed.compiler, Some("clang++".into()));
     }
 
     #[test]
@@ -216,7 +220,7 @@ mod tests {
         ]"#;
 
         let commands = parse_compile_commands_json(json).unwrap();
-        assert_eq!(commands[0].output, Some(PathBuf::from("foo.o")));
+        assert_eq!(commands[0].output, Some("foo.o".into()));
     }
 
     #[test]
@@ -242,6 +246,6 @@ mod tests {
         assert!(parsed.flags.contains(&"-O2".to_string()));
         assert!(parsed.flags.contains(&"-fPIC".to_string()));
         assert!(parsed.flags.contains(&"-pthread".to_string()));
-        assert_eq!(parsed.compiler, Some(PathBuf::from("/usr/bin/g++")));
+        assert_eq!(parsed.compiler, Some(NormalizedPath::from("/usr/bin/g++")));
     }
 }

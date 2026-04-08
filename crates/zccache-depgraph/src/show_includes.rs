@@ -4,8 +4,8 @@
 //! file to stderr.  The prefix is locale-dependent:
 //!
 //! - English:  `Note: including file:`
-//! - Japanese: `メモ: インクルード ファイル:`
-//! - Chinese:  `注意: 包含文件:`
+//! - Japanese: `ãƒ¡ãƒ¢: ã‚¤ãƒ³ã‚¯ãƒ«ãƒ¼ãƒ‰ ãƒ•ã‚¡ã‚¤ãƒ«:`
+//! - Chinese:  `æ³¨æ„: åŒ…å«æ–‡ä»¶:`
 //! - German:   `Hinweis: Einlesen der Datei:`
 //!
 //! We auto-detect the prefix from the output rather than hardcoding a single
@@ -17,7 +17,7 @@ use std::path::Path;
 use crate::depfile::canonicalize_path;
 use crate::scanner::ScanResult;
 
-/// Well-known English prefix — checked first as a fast path.
+/// Well-known English prefix â€” checked first as a fast path.
 const ENGLISH_PREFIX: &str = "Note: including file:";
 
 /// Parse MSVC `/showIncludes` stderr output into a [`ScanResult`].
@@ -76,7 +76,7 @@ pub fn parse_show_includes(stderr: &[u8], source: &Path, cwd: &Path) -> (ScanRes
     (scan, filtered)
 }
 
-// ── Prefix detection ────────────────────────────────────────────────
+// â”€â”€ Prefix detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Detect the `/showIncludes` prefix from stderr output.
 ///
@@ -121,25 +121,42 @@ fn extract_prefix_candidate(line: &str) -> Option<String> {
         return None;
     }
 
-    for i in 0..bytes.len().saturating_sub(2) {
-        if bytes[i].is_ascii_alphabetic() && bytes[i + 1] == b':' && bytes[i + 2] == b'\\' {
-            // Drive path at start of line is an error/warning location, not /showIncludes.
-            if i == 0 {
-                continue;
-            }
+    for i in 0..bytes.len().saturating_sub(1) {
+        if !looks_like_windows_path_start(bytes, i) {
+            continue;
+        }
+        // Drive path at start of line is an error/warning location, not /showIncludes.
+        if i == 0 {
+            continue;
+        }
 
-            let before = &line[..i];
-            let trimmed = before.trim_end();
-            // Prefix must end with ':' and have some text before it.
-            if trimmed.len() >= 2 && trimmed.ends_with(':') {
-                return Some(trimmed.to_string());
-            }
+        let before = &line[..i];
+        let trimmed = before.trim_end();
+        // Prefix must end with ':' and have some text before it.
+        if trimmed.len() >= 2 && trimmed.ends_with(':') {
+            return Some(trimmed.to_string());
         }
     }
     None
 }
 
-// ── Line splitting ──────────────────────────────────────────────────
+fn looks_like_windows_path_start(bytes: &[u8], i: usize) -> bool {
+    let len = bytes.len();
+
+    // X:\path
+    if i + 2 < len
+        && bytes[i].is_ascii_alphabetic()
+        && bytes[i + 1] == b':'
+        && bytes[i + 2] == b'\\'
+    {
+        return true;
+    }
+
+    // \\server\share or \\?\C:\...
+    i + 1 < len && bytes[i] == b'\\' && bytes[i + 1] == b'\\'
+}
+
+// â”€â”€ Line splitting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Split bytes into `(text, raw)` pairs where `text` has line terminators
 /// stripped and `raw` preserves the original bytes including terminators.
@@ -192,8 +209,8 @@ mod tests {
 
         assert!(!scan.has_computed);
         assert_eq!(scan.resolved.len(), 2);
-        let canon_h1 = strip_win_prefix(std::fs::canonicalize(&h1).unwrap());
-        let canon_h2 = strip_win_prefix(std::fs::canonicalize(&h2).unwrap());
+        let canon_h1 = strip_win_prefix(std::fs::canonicalize(&h1).unwrap().into());
+        let canon_h2 = strip_win_prefix(std::fs::canonicalize(&h2).unwrap().into());
         assert!(scan.resolved.contains(&canon_h1));
         assert!(scan.resolved.contains(&canon_h2));
         assert!(filtered.is_empty());
@@ -232,6 +249,16 @@ mod tests {
         let filtered_str = String::from_utf8(filtered).unwrap();
         assert!(filtered_str.contains("warning C4996"));
         assert!(!filtered_str.contains("including file"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detect_prefix_accepts_unc_paths() {
+        let line = "Hinweis: Einlesen der Datei: \\\\server\\share\\sdk\\foo.h";
+        assert_eq!(
+            extract_prefix_candidate(line),
+            Some("Hinweis: Einlesen der Datei:".to_string())
+        );
     }
 
     #[test]
@@ -382,7 +409,7 @@ mod tests {
         std::fs::write(&source, "").unwrap();
 
         let stderr = format!(
-            "メモ: インクルード ファイル: {}\r\nメモ: インクルード ファイル: {}\r\n",
+            "ãƒ¡ãƒ¢: ã‚¤ãƒ³ã‚¯ãƒ«ãƒ¼ãƒ‰ ãƒ•ã‚¡ã‚¤ãƒ«: {}\r\nãƒ¡ãƒ¢: ã‚¤ãƒ³ã‚¯ãƒ«ãƒ¼ãƒ‰ ãƒ•ã‚¡ã‚¤ãƒ«: {}\r\n",
             h1.display(),
             h2.display(),
         );
@@ -410,19 +437,19 @@ mod tests {
 
     #[test]
     fn prefix_candidate_japanese() {
-        let line = "メモ: インクルード ファイル: C:\\Windows\\stdio.h";
+        let line = "ãƒ¡ãƒ¢: ã‚¤ãƒ³ã‚¯ãƒ«ãƒ¼ãƒ‰ ãƒ•ã‚¡ã‚¤ãƒ«: C:\\Windows\\stdio.h";
         assert_eq!(
             extract_prefix_candidate(line),
-            Some("メモ: インクルード ファイル:".to_string())
+            Some("ãƒ¡ãƒ¢: ã‚¤ãƒ³ã‚¯ãƒ«ãƒ¼ãƒ‰ ãƒ•ã‚¡ã‚¤ãƒ«:".to_string())
         );
     }
 
     #[test]
     fn prefix_candidate_chinese() {
-        let line = "注意: 包含文件: C:\\Windows\\stdio.h";
+        let line = "æ³¨æ„: åŒ…å«æ–‡ä»¶: C:\\Windows\\stdio.h";
         assert_eq!(
             extract_prefix_candidate(line),
-            Some("注意: 包含文件:".to_string())
+            Some("æ³¨æ„: åŒ…å«æ–‡ä»¶:".to_string())
         );
     }
 }

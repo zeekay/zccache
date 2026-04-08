@@ -9,8 +9,9 @@
 //!
 //! Run with: uv run cargo test -p zccache-daemon --test perf_bench_test -- --nocapture --ignored
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
+use zccache_core::NormalizedPath;
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
@@ -36,9 +37,9 @@ async fn start_daemon() -> (
     (endpoint, handle, shutdown)
 }
 
-fn find_sccache() -> Option<PathBuf> {
+fn find_sccache() -> Option<NormalizedPath> {
     for path in &["sccache", "C:/tools/python13/Scripts/sccache.exe"] {
-        let p = PathBuf::from(path);
+        let p = NormalizedPath::new(path);
         if p.exists() {
             return Some(p);
         }

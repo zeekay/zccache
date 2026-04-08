@@ -29,6 +29,7 @@ python = ["dep:pyo3"]
 
 [dependencies]
 clap = { workspace = true }
+zccache-core = { workspace = true }
 zccache-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"

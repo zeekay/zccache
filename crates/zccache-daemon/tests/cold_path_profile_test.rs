@@ -10,10 +10,11 @@
 //!
 //! Run with: ./_cargo test -p zccache-daemon --test cold_path_profile_test -- --nocapture --ignored
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use zccache_core::NormalizedPath;
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
@@ -143,11 +144,11 @@ namespace unit_{i:03} {{
     }
 }
 
-fn source_paths(dir: &Path, file_count: usize) -> Vec<(PathBuf, PathBuf)> {
+fn source_paths(dir: &Path, file_count: usize) -> Vec<(NormalizedPath, NormalizedPath)> {
     (0..file_count)
         .map(|i| {
-            let src = dir.join("src").join(format!("unit_{i:03}.cpp"));
-            let obj = dir.join(format!("unit_{i:03}.o"));
+            let src = NormalizedPath::new(dir.join("src").join(format!("unit_{i:03}.cpp")));
+            let obj = NormalizedPath::new(dir.join(format!("unit_{i:03}.o")));
             (src, obj)
         })
         .collect()

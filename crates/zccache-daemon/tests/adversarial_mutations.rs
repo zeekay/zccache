@@ -9,7 +9,8 @@
 //! Run all:    uv run cargo test -p zccache-daemon --test adversarial_mutations -- --nocapture
 //! Run single: uv run cargo test -p zccache-daemon --test adversarial_mutations -- <test_name> --nocapture
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use zccache_core::NormalizedPath;
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
@@ -105,7 +106,7 @@ async fn compile_and_read(
 
 /// Convenience: set up daemon + session + temp dir.
 struct TestHarness {
-    clang: PathBuf,
+    clang: NormalizedPath,
     tmp: tempfile::TempDir,
     #[expect(dead_code)]
     endpoint: String,
@@ -141,11 +142,11 @@ impl TestHarness {
         self.tmp.path().to_string_lossy().into_owned()
     }
 
-    fn path(&self, name: &str) -> PathBuf {
-        self.tmp.path().join(name)
+    fn path(&self, name: &str) -> NormalizedPath {
+        NormalizedPath::new(self.tmp.path().join(name))
     }
 
-    fn write_file(&self, name: &str, content: &str) -> PathBuf {
+    fn write_file(&self, name: &str, content: &str) -> NormalizedPath {
         let p = self.path(name);
         std::fs::write(&p, content).unwrap();
         p

@@ -6,8 +6,9 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
+use zccache_core::NormalizedPath;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use zccache_fingerprint::{
@@ -23,7 +24,7 @@ use zccache_fingerprint::{
 struct Cli {
     /// Path to the cache file (e.g., .cache/lint.json).
     #[arg(long)]
-    cache_file: PathBuf,
+    cache_file: NormalizedPath,
 
     /// Cache algorithm to use.
     #[arg(long, value_enum, default_value_t = CacheType::TwoLayer)]
@@ -51,7 +52,7 @@ enum Commands {
     Check {
         /// Root directory to scan (defaults to current directory).
         #[arg(long, default_value = ".")]
-        root: PathBuf,
+        root: NormalizedPath,
 
         /// File extensions to include (without dot, repeatable).
         /// Cannot be combined with --include.

@@ -10,8 +10,8 @@ pub mod parse_linker;
 pub mod parse_rustfmt;
 pub mod response_file;
 
-use std::path::PathBuf;
 use std::sync::Arc;
+use zccache_core::NormalizedPath;
 
 /// Supported compiler families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +24,7 @@ pub enum CompilerFamily {
     Msvc,
     /// Rust compiler (rustc)
     Rustc,
-    /// Rust formatter (rustfmt) — not a compiler, but cacheable as a tool.
+    /// Rust formatter (rustfmt) â€” not a compiler, but cacheable as a tool.
     Rustfmt,
 }
 
@@ -59,7 +59,7 @@ impl CompilerFamily {
 pub enum ParsedInvocation {
     /// A cacheable compilation (single source to single object).
     Cacheable(CacheableCompilation),
-    /// Multiple source files with `-c` — each is independently cacheable.
+    /// Multiple source files with `-c` â€” each is independently cacheable.
     MultiFile {
         /// One entry per source file, each with its own output path.
         compilations: Vec<CacheableCompilation>,
@@ -80,14 +80,14 @@ pub enum ParsedInvocation {
 #[derive(Debug, Clone)]
 pub struct CacheableCompilation {
     /// The compiler executable path.
-    pub compiler: PathBuf,
+    pub compiler: NormalizedPath,
     /// The detected compiler family.
     pub family: CompilerFamily,
     /// The source file being compiled.
-    pub source_file: PathBuf,
+    pub source_file: NormalizedPath,
     /// The output file path.
-    pub output_file: PathBuf,
-    /// The full original argument list — always passed to the compiler as-is.
+    pub output_file: NormalizedPath,
+    /// The full original argument list â€” always passed to the compiler as-is.
     pub original_args: Arc<[String]>,
     /// Flags not recognized by the parser but still part of the invocation.
     /// Preserved for completeness and consistency with the linker/archiver/
@@ -98,20 +98,20 @@ pub struct CacheableCompilation {
 /// The language mode for a source file, as determined by `-x <lang>` or file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceMode {
-    /// Normal C/C++ source (`.c`, `.cpp`, etc.) — compiles to `.o`.
+    /// Normal C/C++ source (`.c`, `.cpp`, etc.) â€” compiles to `.o`.
     Normal,
-    /// PCH header (`-x c-header` / `-x c++-header`) — compiles to `.pch`/`.gch`.
+    /// PCH header (`-x c-header` / `-x c++-header`) â€” compiles to `.pch`/`.gch`.
     Header,
-    /// Header unit (`-x c-header-unit` / `-x c++-header-unit`) — compiles to `.pcm`.
+    /// Header unit (`-x c-header-unit` / `-x c++-header-unit`) â€” compiles to `.pcm`.
     HeaderUnit,
-    /// Module interface (`-x c++-module` or `.cppm`/`.ixx`) — `.pcm` with `--precompile`, `.o` with `-c`.
+    /// Module interface (`-x c++-module` or `.cppm`/`.ixx`) â€” `.pcm` with `--precompile`, `.o` with `-c`.
     Module,
 }
 
 impl SourceMode {
     /// Whether this mode implies compilation without an explicit `-c` or `--precompile` flag.
     /// Header and header-unit modes imply compilation (like PCH generation).
-    /// Module mode does NOT — it requires `-c` or `--precompile`.
+    /// Module mode does NOT â€” it requires `-c` or `--precompile`.
     pub(crate) fn implies_compilation(self) -> bool {
         matches!(self, SourceMode::Header | SourceMode::HeaderUnit)
     }
@@ -190,15 +190,15 @@ fn is_source_file(path: &str) -> bool {
 /// Compute the default output path when `-o` is absent.
 ///
 /// For both normal compilation and PCH generation, the output is placed in
-/// the current working directory using just the filename — never preserving
+/// the current working directory using just the filename â€” never preserving
 /// directory components from the source path.
 ///
-/// Normal compilation: `src/foo.cpp` → `foo.o`
-/// PCH generation:     `src/pch.h`   → `pch.h.pch`  (clang)
-///                     `src/pch.h`   → `pch.h.gch`  (gcc)
+/// Normal compilation: `src/foo.cpp` â†’ `foo.o`
+/// PCH generation:     `src/pch.h`   â†’ `pch.h.pch`  (clang)
+///                     `src/pch.h`   â†’ `pch.h.gch`  (gcc)
 ///
 /// Note: real compilers place PCH output next to the source file
-/// (`src/pch.h` → `src/pch.h.pch`), but zccache intentionally uses only
+/// (`src/pch.h` â†’ `src/pch.h.pch`), but zccache intentionally uses only
 /// the filename. This prevents spurious `.pch` files from being written
 /// into the source tree when a compilation falls back to `default_output`
 /// (e.g., during cache restoration without an explicit `-o` flag).
@@ -276,18 +276,18 @@ const FLAGS_WITH_VALUE: &[&str] = &[
 /// Returns a `ParsedInvocation` indicating whether the invocation is
 /// cacheable, and if so, extracts the relevant information.
 ///
-/// Arg parsing is read-only analysis — it never modifies what goes to
+/// Arg parsing is read-only analysis â€” it never modifies what goes to
 /// the compiler. The compiler always receives the exact original args.
 #[must_use]
 pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     let family = detect_family(compiler);
-    // Rustfmt is not a compiler — reject here, CLI handles it separately.
+    // Rustfmt is not a compiler â€” reject here, CLI handles it separately.
     if family == CompilerFamily::Rustfmt {
         return ParsedInvocation::NonCacheable {
             reason: "rustfmt is handled via the format cache path, not compile cache".to_string(),
         };
     }
-    // Rustc has a completely different invocation model — dispatch early.
+    // Rustc has a completely different invocation model â€” dispatch early.
     if family == CompilerFamily::Rustc {
         return parse_rustc_invocation(compiler, args);
     }
@@ -345,7 +345,7 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             continue;
         }
 
-        // Flags that take a value in the next arg — skip both flag and value
+        // Flags that take a value in the next arg â€” skip both flag and value
         if let Some(&flag) = FLAGS_WITH_VALUE.iter().find(|&&f| f == arg.as_str()) {
             if flag == "-x" && i + 1 < args.len() {
                 current_mode =
@@ -355,14 +355,14 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             continue;
         }
 
-        // Any flag starting with - (including unknown flags) — preserve
+        // Any flag starting with - (including unknown flags) â€” preserve
         if arg.starts_with('-') {
             unknown_flags.push(arg.clone());
             i += 1;
             continue;
         }
 
-        // Positional arg — source file candidate.
+        // Positional arg â€” source file candidate.
         // In a special mode (Header/HeaderUnit/Module), any positional arg is a source.
         // Otherwise, check by file extension. Module extensions (.cppm/.ixx) also set
         // the effective mode to Module for correct default output.
@@ -379,7 +379,7 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     }
 
     // Header and header-unit modes imply compilation (no -c needed).
-    // Module mode does NOT imply compilation alone — requires -c or --precompile.
+    // Module mode does NOT imply compilation alone â€” requires -c or --precompile.
     // --precompile also implies compilation (like -c but for BMI output).
     if !has_c_flag && !has_precompile_flag && !current_mode.implies_compilation() {
         return ParsedInvocation::NonCacheable {
@@ -403,10 +403,15 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
         let compilations = source_files
             .iter()
             .map(|(src, _, mode)| CacheableCompilation {
-                compiler: PathBuf::from(compiler),
+                compiler: NormalizedPath::new(compiler),
                 family,
-                source_file: PathBuf::from(src),
-                output_file: PathBuf::from(default_output(src, family, *mode, has_precompile_flag)),
+                source_file: NormalizedPath::new(src),
+                output_file: NormalizedPath::new(default_output(
+                    src,
+                    family,
+                    *mode,
+                    has_precompile_flag,
+                )),
                 original_args: Arc::clone(&shared_args),
                 unknown_flags: unknown_flags.clone(),
             })
@@ -424,10 +429,10 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
         output_file.unwrap_or_else(|| default_output(&source, family, mode, has_precompile_flag));
 
     ParsedInvocation::Cacheable(CacheableCompilation {
-        compiler: PathBuf::from(compiler),
+        compiler: NormalizedPath::new(compiler),
         family,
-        source_file: PathBuf::from(source),
-        output_file: PathBuf::from(output),
+        source_file: NormalizedPath::new(source),
+        output_file: NormalizedPath::new(output),
         original_args: Arc::from(args.to_vec()),
         unknown_flags,
     })
@@ -570,7 +575,7 @@ fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             }
         }
 
-        // Known flags that take a value — skip both
+        // Known flags that take a value â€” skip both
         if let Some(&_flag) = RUSTC_FLAGS_WITH_VALUE.iter().find(|&&f| f == arg.as_str()) {
             i += 2;
             continue;
@@ -589,7 +594,7 @@ fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             continue;
         }
 
-        // Positional arg — source file candidate (.rs)
+        // Positional arg â€” source file candidate (.rs)
         if arg.ends_with(".rs") {
             source_file = Some(arg.clone());
         }
@@ -597,7 +602,7 @@ fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
         i += 1;
     }
 
-    // No source file → non-cacheable (e.g., `rustc --version`)
+    // No source file â†’ non-cacheable (e.g., `rustc --version`)
     let source = match source_file {
         Some(s) => s,
         None => {
@@ -610,7 +615,7 @@ fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     // Note: -C incremental is ignored for caching purposes.
     // The incremental dir is excluded from the cache key, and we let rustc
     // use it on a miss (doesn't affect output determinism for rlib/rmeta).
-    // sccache also allows incremental — cargo always passes it.
+    // sccache also allows incremental â€” cargo always passes it.
 
     // Default crate type is bin if not specified
     if crate_types.is_empty() {
@@ -645,8 +650,8 @@ fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     } else if let Some(ref dir) = out_dir {
         let name = crate_name.as_deref().unwrap_or("unknown");
         let suffix = extra_filename.as_deref().unwrap_or("");
-        // Use PathBuf::join to handle platform path separators correctly
-        PathBuf::from(dir)
+        // Use NormalizedPath::join to handle platform path separators correctly
+        NormalizedPath::new(dir)
             .join(format!("lib{name}{suffix}.{primary_ext}"))
             .to_string_lossy()
             .into_owned()
@@ -661,10 +666,10 @@ fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     };
 
     ParsedInvocation::Cacheable(CacheableCompilation {
-        compiler: PathBuf::from(compiler),
+        compiler: NormalizedPath::new(compiler),
         family: CompilerFamily::Rustc,
-        source_file: PathBuf::from(source),
-        output_file: PathBuf::from(output),
+        source_file: NormalizedPath::new(source),
+        output_file: NormalizedPath::new(output),
         original_args: Arc::from(args.to_vec()),
         unknown_flags,
     })
@@ -683,8 +688,8 @@ mod tests {
         let result = parse_invocation("clang++", &args(&["-c", "hello.cpp", "-o", "hello.o"]));
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("hello.cpp"));
-                assert_eq!(c.output_file, PathBuf::from("hello.o"));
+                assert_eq!(c.source_file, NormalizedPath::new("hello.cpp"));
+                assert_eq!(c.output_file, NormalizedPath::new("hello.o"));
                 assert_eq!(c.family, CompilerFamily::Clang);
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -713,10 +718,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(compilations.len(), 2);
-                assert_eq!(compilations[0].source_file, PathBuf::from("a.cpp"));
-                assert_eq!(compilations[0].output_file, PathBuf::from("a.o"));
-                assert_eq!(compilations[1].source_file, PathBuf::from("b.cpp"));
-                assert_eq!(compilations[1].output_file, PathBuf::from("b.o"));
+                assert_eq!(compilations[0].source_file, NormalizedPath::new("a.cpp"));
+                assert_eq!(compilations[0].output_file, NormalizedPath::new("a.o"));
+                assert_eq!(compilations[1].source_file, NormalizedPath::new("b.cpp"));
+                assert_eq!(compilations[1].output_file, NormalizedPath::new("b.o"));
                 assert_eq!(source_indices, vec![1, 2]);
             }
             other => panic!("expected MultiFile, got: {other:?}"),
@@ -736,8 +741,8 @@ mod tests {
                 source_indices,
             } => {
                 assert_eq!(compilations.len(), 2);
-                assert_eq!(compilations[0].source_file, PathBuf::from("main.cpp"));
-                assert_eq!(compilations[1].source_file, PathBuf::from("util.cpp"));
+                assert_eq!(compilations[0].source_file, NormalizedPath::new("main.cpp"));
+                assert_eq!(compilations[1].source_file, NormalizedPath::new("util.cpp"));
                 // Flags are in original_args, not per-compilation
                 assert!(original_args.contains(&"-O2".to_string()));
                 assert!(original_args.contains(&"-Wall".to_string()));
@@ -753,8 +758,11 @@ mod tests {
         match result {
             ParsedInvocation::MultiFile { compilations, .. } => {
                 assert_eq!(compilations.len(), 2);
-                assert_eq!(compilations[0].source_file, PathBuf::from("file1.c"));
-                assert_eq!(compilations[1].source_file, PathBuf::from("file2.cpp"));
+                assert_eq!(compilations[0].source_file, NormalizedPath::new("file1.c"));
+                assert_eq!(
+                    compilations[1].source_file,
+                    NormalizedPath::new("file2.cpp")
+                );
             }
             other => panic!("expected MultiFile, got: {other:?}"),
         }
@@ -771,7 +779,7 @@ mod tests {
         let result = parse_invocation("gcc", &args(&["-c", "foo.cpp"]));
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("foo.o"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.o"));
             }
             _ => panic!("expected cacheable"),
         }
@@ -803,8 +811,8 @@ mod tests {
         match result {
             ParsedInvocation::Cacheable(c) => {
                 assert_eq!(*c.original_args, *input);
-                assert_eq!(c.source_file, PathBuf::from("hello.cpp"));
-                assert_eq!(c.output_file, PathBuf::from("hello.o"));
+                assert_eq!(c.source_file, NormalizedPath::new("hello.cpp"));
+                assert_eq!(c.output_file, NormalizedPath::new("hello.o"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -819,7 +827,7 @@ mod tests {
         match result {
             ParsedInvocation::Cacheable(c) => {
                 // PCH path is NOT treated as a source file
-                assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
+                assert_eq!(c.source_file, NormalizedPath::new("foo.cpp"));
                 // Original args preserved
                 assert!(c.original_args.contains(&"-include-pch".to_string()));
                 assert!(c.original_args.contains(&"pch.h.pch".to_string()));
@@ -837,8 +845,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("pch.h"));
-                assert_eq!(c.output_file, PathBuf::from("pch.h.pch"));
+                assert_eq!(c.source_file, NormalizedPath::new("pch.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("pch.h.pch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -853,8 +861,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("stdafx.h"));
-                assert_eq!(c.output_file, PathBuf::from("stdafx.h.gch"));
+                assert_eq!(c.source_file, NormalizedPath::new("stdafx.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("stdafx.h.gch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -871,8 +879,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("FastLED.h"));
-                assert_eq!(c.output_file, PathBuf::from("FastLED.h.pch"));
+                assert_eq!(c.source_file, NormalizedPath::new("FastLED.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("FastLED.h.pch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -886,8 +894,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("stdafx.h"));
-                assert_eq!(c.output_file, PathBuf::from("stdafx.h.gch"));
+                assert_eq!(c.source_file, NormalizedPath::new("stdafx.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("stdafx.h.gch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -914,8 +922,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("FastLED.h"));
-                assert_eq!(c.output_file, PathBuf::from("FastLED.h.pch"));
+                assert_eq!(c.source_file, NormalizedPath::new("FastLED.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("FastLED.h.pch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -934,8 +942,8 @@ mod tests {
     #[test]
     fn x_flag_reset_disables_header_mode() {
         // `-x c++-header pch.h -x c++ main.cpp -c -o main.o`
-        // After `-x c++`, header_mode resets — main.cpp is a normal source,
-        // pch.h was collected as header-mode source → multi-file.
+        // After `-x c++`, header_mode resets â€” main.cpp is a normal source,
+        // pch.h was collected as header-mode source â†’ multi-file.
         let result = parse_invocation(
             "clang++",
             &args(&[
@@ -953,8 +961,8 @@ mod tests {
         match result {
             ParsedInvocation::MultiFile { compilations, .. } => {
                 assert_eq!(compilations.len(), 2);
-                assert_eq!(compilations[0].source_file, PathBuf::from("pch.h"));
-                assert_eq!(compilations[1].source_file, PathBuf::from("main.cpp"));
+                assert_eq!(compilations[0].source_file, NormalizedPath::new("pch.h"));
+                assert_eq!(compilations[1].source_file, NormalizedPath::new("main.cpp"));
             }
             other => panic!("expected MultiFile, got: {other:?}"),
         }
@@ -980,21 +988,21 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("main.cpp"));
-                assert_eq!(c.output_file, PathBuf::from("main.o"));
+                assert_eq!(c.source_file, NormalizedPath::new("main.cpp"));
+                assert_eq!(c.output_file, NormalizedPath::new("main.o"));
             }
             other => panic!("expected Cacheable, got: {other:?}"),
         }
     }
 
-    // ─── Regression tests: sticky header_mode bug ─────────────────────
+    // â”€â”€â”€ Regression tests: sticky header_mode bug â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn sticky_header_mode_cpp_not_spuriously_pch() {
         // BUG: old code set header_mode=true on `-x c++-header` but never
         // reset it on `-x c++`, so main.cpp was treated as a header file
         // needing PCH generation. After the fix, `-x c++` resets header_mode,
-        // and main.cpp is a normal source — not a PCH candidate.
+        // and main.cpp is a normal source â€” not a PCH candidate.
         let result = parse_invocation(
             "clang++",
             &args(&[
@@ -1018,9 +1026,9 @@ mod tests {
             ParsedInvocation::MultiFile { compilations, .. } => {
                 assert_eq!(compilations.len(), 2);
                 // pch.h picked up in header_mode
-                assert_eq!(compilations[0].source_file, PathBuf::from("pch.h"));
+                assert_eq!(compilations[0].source_file, NormalizedPath::new("pch.h"));
                 // main.cpp picked up by extension after reset
-                assert_eq!(compilations[1].source_file, PathBuf::from("main.cpp"));
+                assert_eq!(compilations[1].source_file, NormalizedPath::new("main.cpp"));
             }
             other => panic!("expected MultiFile, got: {other:?}"),
         }
@@ -1040,8 +1048,8 @@ mod tests {
         match &result {
             ParsedInvocation::MultiFile { compilations, .. } => {
                 assert_eq!(compilations.len(), 2);
-                assert_eq!(compilations[0].source_file, PathBuf::from("pch.h"));
-                assert_eq!(compilations[1].source_file, PathBuf::from("main.cpp"));
+                assert_eq!(compilations[0].source_file, NormalizedPath::new("pch.h"));
+                assert_eq!(compilations[1].source_file, NormalizedPath::new("main.cpp"));
             }
             other => panic!("expected MultiFile, got: {other:?}"),
         }
@@ -1073,8 +1081,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("foo.h"));
-                assert_eq!(c.output_file, PathBuf::from("foo.pcm"));
+                assert_eq!(c.source_file, NormalizedPath::new("foo.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1089,8 +1097,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("foo.h"));
-                assert_eq!(c.output_file, PathBuf::from("foo.pcm"));
+                assert_eq!(c.source_file, NormalizedPath::new("foo.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1150,16 +1158,16 @@ mod tests {
         assert!(!CompilerFamily::Msvc.supports_depfile());
     }
 
-    // ─── PCH default output tests ────────────────────────────────────
+    // â”€â”€â”€ PCH default output tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn pch_default_output_clang() {
-        // `clang++ -x c++-header src/pch.h` → output `pch.h.pch` (filename only, no dir)
+        // `clang++ -x c++-header src/pch.h` â†’ output `pch.h.pch` (filename only, no dir)
         let result = parse_invocation("clang++", &args(&["-x", "c++-header", "src/pch.h"]));
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("src/pch.h"));
-                assert_eq!(c.output_file, PathBuf::from("pch.h.pch"));
+                assert_eq!(c.source_file, NormalizedPath::new("src/pch.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("pch.h.pch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1167,12 +1175,12 @@ mod tests {
 
     #[test]
     fn pch_default_output_gcc() {
-        // `gcc -x c-header src/pch.h` → output `pch.h.gch` (filename only, no dir)
+        // `gcc -x c-header src/pch.h` â†’ output `pch.h.gch` (filename only, no dir)
         let result = parse_invocation("gcc", &args(&["-x", "c-header", "src/pch.h"]));
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("src/pch.h"));
-                assert_eq!(c.output_file, PathBuf::from("pch.h.gch"));
+                assert_eq!(c.source_file, NormalizedPath::new("src/pch.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("pch.h.gch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1180,7 +1188,7 @@ mod tests {
 
     #[test]
     fn pch_default_output_strips_directory() {
-        // `clang++ -x c++-header src/fl/audio/fft/fft.h` → output uses filename only.
+        // `clang++ -x c++-header src/fl/audio/fft/fft.h` â†’ output uses filename only.
         // Regression: old code produced `src/fl/audio/fft/fft.h.pch`, causing spurious
         // PCH files to be written into the source tree during cache restoration.
         let result = parse_invocation(
@@ -1189,8 +1197,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("src/fl/audio/fft/fft.h"));
-                assert_eq!(c.output_file, PathBuf::from("fft.h.pch"));
+                assert_eq!(c.source_file, NormalizedPath::new("src/fl/audio/fft/fft.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("fft.h.pch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1207,8 +1215,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("/abs/path/src/pch.h"));
-                assert_eq!(c.output_file, PathBuf::from("pch.h.pch"));
+                assert_eq!(c.source_file, NormalizedPath::new("/abs/path/src/pch.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("pch.h.pch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1216,15 +1224,15 @@ mod tests {
 
     #[test]
     fn pch_default_output_explicit_o_unchanged() {
-        // Explicit `-o` still honored — no change in behavior
+        // Explicit `-o` still honored â€” no change in behavior
         let result = parse_invocation(
             "clang++",
             &args(&["-x", "c++-header", "pch.h", "-o", "build/pch.h.pch"]),
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("pch.h"));
-                assert_eq!(c.output_file, PathBuf::from("build/pch.h.pch"));
+                assert_eq!(c.source_file, NormalizedPath::new("pch.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("build/pch.h.pch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1236,13 +1244,13 @@ mod tests {
         let result = parse_invocation("gcc", &args(&["-c", "foo.cpp"]));
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("foo.o"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.o"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
-    // ─── Concatenated -o flag tests ──────────────────────────────────
+    // â”€â”€â”€ Concatenated -o flag tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn concatenated_o_flag_parsed() {
@@ -1250,7 +1258,7 @@ mod tests {
         let result = parse_invocation("clang", &args(&["-c", "foo.cpp", "-obuild/foo.o"]));
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("build/foo.o"));
+                assert_eq!(c.output_file, NormalizedPath::new("build/foo.o"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1267,13 +1275,13 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("build/pch.h.pch"));
+                assert_eq!(c.output_file, NormalizedPath::new("build/pch.h.pch"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
-    // ─── Unknown flags preservation tests ────────────────────────────
+    // â”€â”€â”€ Unknown flags preservation tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn all_flags_preserved() {
@@ -1300,8 +1308,8 @@ mod tests {
         let result = parse_invocation("clang++", &input);
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
-                assert_eq!(c.output_file, PathBuf::from("foo.o"));
+                assert_eq!(c.source_file, NormalizedPath::new("foo.cpp"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.o"));
                 // Unknown flags are preserved, not dropped
                 assert!(c.unknown_flags.contains(&"-Wall".to_string()));
                 assert!(c.unknown_flags.contains(&"-Wextra".to_string()));
@@ -1338,8 +1346,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
-                // Only one source file — -fno-spell-checking must NOT be treated as source
+                assert_eq!(c.source_file, NormalizedPath::new("foo.cpp"));
+                // Only one source file â€” -fno-spell-checking must NOT be treated as source
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1353,13 +1361,13 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
+                assert_eq!(c.source_file, NormalizedPath::new("foo.cpp"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
-    // ─── PCH output path mismatch repro (BUG_LINKER.md) ─────────────
+    // â”€â”€â”€ PCH output path mismatch repro (BUG_LINKER.md) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn pch_output_path_mismatch_repro() {
@@ -1374,14 +1382,17 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("flowfield_q31.h.pch"));
-                assert_eq!(c.source_file, PathBuf::from("src/fl/fx/2d/flowfield_q31.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("flowfield_q31.h.pch"));
+                assert_eq!(
+                    c.source_file,
+                    NormalizedPath::new("src/fl/fx/2d/flowfield_q31.h")
+                );
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
     }
 
-    // ─── Rustc detection tests ──────────────────────────────────────
+    // â”€â”€â”€ Rustc detection tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn detect_rustc_family() {
@@ -1405,7 +1416,7 @@ mod tests {
         assert_eq!(CompilerFamily::Rustc.pch_extension(), None);
     }
 
-    // ─── Rustc cacheability tests ───────────────────────────────────
+    // â”€â”€â”€ Rustc cacheability tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn rustc_lib_crate_is_cacheable() {
@@ -1425,7 +1436,7 @@ mod tests {
         match result {
             ParsedInvocation::Cacheable(c) => {
                 assert_eq!(c.family, CompilerFamily::Rustc);
-                assert_eq!(c.source_file, PathBuf::from("src/lib.rs"));
+                assert_eq!(c.source_file, NormalizedPath::new("src/lib.rs"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1517,7 +1528,7 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("libfoo.rlib"));
+                assert_eq!(c.output_file, NormalizedPath::new("libfoo.rlib"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1525,7 +1536,7 @@ mod tests {
 
     #[test]
     fn rustc_metadata_only_output_is_rmeta() {
-        // cargo check: --emit=dep-info,metadata (no link) → primary output is .rmeta
+        // cargo check: --emit=dep-info,metadata (no link) â†’ primary output is .rmeta
         let result = parse_invocation(
             "rustc",
             &args(&[
@@ -1545,7 +1556,7 @@ mod tests {
             ParsedInvocation::Cacheable(c) => {
                 assert_eq!(
                     c.output_file,
-                    PathBuf::from("/target/debug/deps/libmylib-abc123.rmeta")
+                    NormalizedPath::new("/target/debug/deps/libmylib-abc123.rmeta")
                 );
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -1572,7 +1583,7 @@ mod tests {
             ParsedInvocation::Cacheable(c) => {
                 assert_eq!(
                     c.output_file,
-                    PathBuf::from("/target/debug/deps/libmylib-abc123.rlib")
+                    NormalizedPath::new("/target/debug/deps/libmylib-abc123.rlib")
                 );
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -1616,10 +1627,10 @@ mod tests {
         match result {
             ParsedInvocation::Cacheable(c) => {
                 assert_eq!(c.family, CompilerFamily::Rustc);
-                assert_eq!(c.source_file, PathBuf::from("src/lib.rs"));
+                assert_eq!(c.source_file, NormalizedPath::new("src/lib.rs"));
                 assert_eq!(
                     c.output_file,
-                    PathBuf::from("/target/release/deps/libserde-abc123def.rlib")
+                    NormalizedPath::new("/target/release/deps/libserde-abc123def.rlib")
                 );
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -1646,7 +1657,7 @@ mod tests {
 
     #[test]
     fn rustc_concatenated_c_incremental_is_cacheable() {
-        // -Cincremental= form (no space after -C) — still cacheable
+        // -Cincremental= form (no space after -C) â€” still cacheable
         let result = parse_invocation(
             "rustc",
             &args(&["--crate-type", "lib", "-Cincremental=/tmp", "src/lib.rs"]),
@@ -1690,7 +1701,7 @@ mod tests {
         assert!(matches!(result, ParsedInvocation::Cacheable(_)));
     }
 
-    // ─── clippy-driver detection and caching tests ──────────────────
+    // â”€â”€â”€ clippy-driver detection and caching tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn detect_clippy_driver_family() {
@@ -1734,8 +1745,8 @@ mod tests {
         match result {
             ParsedInvocation::Cacheable(c) => {
                 assert_eq!(c.family, CompilerFamily::Rustc);
-                assert_eq!(c.source_file, PathBuf::from("src/lib.rs"));
-                // metadata-only emit → .rmeta extension
+                assert_eq!(c.source_file, NormalizedPath::new("src/lib.rs"));
+                // metadata-only emit â†’ .rmeta extension
                 assert!(c.output_file.to_str().unwrap().ends_with(".rmeta"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -1780,7 +1791,7 @@ mod tests {
         assert!(matches!(result, ParsedInvocation::Cacheable(_)));
     }
 
-    // ─── C++20 Module support tests ─────────────────────────────────
+    // â”€â”€â”€ C++20 Module support tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     // Group A: Source extension recognition (.cppm, .ixx)
 
@@ -1789,8 +1800,8 @@ mod tests {
         let result = parse_invocation("clang++", &args(&["-c", "module.cppm", "-o", "module.pcm"]));
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("module.cppm"));
-                assert_eq!(c.output_file, PathBuf::from("module.pcm"));
+                assert_eq!(c.source_file, NormalizedPath::new("module.cppm"));
+                assert_eq!(c.output_file, NormalizedPath::new("module.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1801,8 +1812,8 @@ mod tests {
         let result = parse_invocation("g++", &args(&["-c", "module.ixx", "-o", "module.o"]));
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("module.ixx"));
-                assert_eq!(c.output_file, PathBuf::from("module.o"));
+                assert_eq!(c.source_file, NormalizedPath::new("module.ixx"));
+                assert_eq!(c.output_file, NormalizedPath::new("module.o"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1814,8 +1825,8 @@ mod tests {
         let result = parse_invocation("clang++", &args(&["--precompile", "module.cppm"]));
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("module.cppm"));
-                assert_eq!(c.output_file, PathBuf::from("module.pcm"));
+                assert_eq!(c.source_file, NormalizedPath::new("module.cppm"));
+                assert_eq!(c.output_file, NormalizedPath::new("module.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1827,8 +1838,8 @@ mod tests {
         let result = parse_invocation("clang++", &args(&["-c", "module.cppm"]));
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("module.cppm"));
-                assert_eq!(c.output_file, PathBuf::from("module.o"));
+                assert_eq!(c.source_file, NormalizedPath::new("module.cppm"));
+                assert_eq!(c.output_file, NormalizedPath::new("module.o"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1840,8 +1851,8 @@ mod tests {
         match result {
             ParsedInvocation::MultiFile { compilations, .. } => {
                 assert_eq!(compilations.len(), 2);
-                assert_eq!(compilations[0].source_file, PathBuf::from("a.cppm"));
-                assert_eq!(compilations[1].source_file, PathBuf::from("b.cppm"));
+                assert_eq!(compilations[0].source_file, NormalizedPath::new("a.cppm"));
+                assert_eq!(compilations[1].source_file, NormalizedPath::new("b.cppm"));
             }
             other => panic!("expected MultiFile, got: {other:?}"),
         }
@@ -1864,8 +1875,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("interface.cpp"));
-                assert_eq!(c.output_file, PathBuf::from("interface.pcm"));
+                assert_eq!(c.source_file, NormalizedPath::new("interface.cpp"));
+                assert_eq!(c.output_file, NormalizedPath::new("interface.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1886,8 +1897,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("interface.cpp"));
-                assert_eq!(c.output_file, PathBuf::from("interface.o"));
+                assert_eq!(c.source_file, NormalizedPath::new("interface.cpp"));
+                assert_eq!(c.output_file, NormalizedPath::new("interface.o"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1917,7 +1928,7 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("interface.mpp"));
+                assert_eq!(c.source_file, NormalizedPath::new("interface.mpp"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1925,14 +1936,14 @@ mod tests {
 
     #[test]
     fn x_cpp_module_default_output_precompile() {
-        // --precompile without -o → stem.pcm
+        // --precompile without -o â†’ stem.pcm
         let result = parse_invocation(
             "clang++",
             &args(&["-x", "c++-module", "--precompile", "interface.cpp"]),
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("interface.pcm"));
+                assert_eq!(c.output_file, NormalizedPath::new("interface.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1940,14 +1951,14 @@ mod tests {
 
     #[test]
     fn x_cpp_module_default_output_c_flag() {
-        // -c without -o → stem.o (even in module mode)
+        // -c without -o â†’ stem.o (even in module mode)
         let result = parse_invocation(
             "clang++",
             &args(&["-x", "c++-module", "-c", "interface.cpp"]),
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("interface.o"));
+                assert_eq!(c.output_file, NormalizedPath::new("interface.o"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -1972,8 +1983,11 @@ mod tests {
         match result {
             ParsedInvocation::MultiFile { compilations, .. } => {
                 assert_eq!(compilations.len(), 2);
-                assert_eq!(compilations[0].source_file, PathBuf::from("interface.mpp"));
-                assert_eq!(compilations[1].source_file, PathBuf::from("main.cpp"));
+                assert_eq!(
+                    compilations[0].source_file,
+                    NormalizedPath::new("interface.mpp")
+                );
+                assert_eq!(compilations[1].source_file, NormalizedPath::new("main.cpp"));
             }
             other => panic!("expected MultiFile, got: {other:?}"),
         }
@@ -1995,8 +2009,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("interface.cpp"));
-                assert_eq!(c.output_file, PathBuf::from("interface.pcm"));
+                assert_eq!(c.source_file, NormalizedPath::new("interface.cpp"));
+                assert_eq!(c.output_file, NormalizedPath::new("interface.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -2019,8 +2033,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("foo.h"));
-                assert_eq!(c.output_file, PathBuf::from("foo.pcm"));
+                assert_eq!(c.source_file, NormalizedPath::new("foo.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -2034,8 +2048,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("foo.h"));
-                assert_eq!(c.output_file, PathBuf::from("foo.pcm"));
+                assert_eq!(c.source_file, NormalizedPath::new("foo.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -2043,14 +2057,14 @@ mod tests {
 
     #[test]
     fn x_cpp_header_unit_default_output_is_pcm() {
-        // Header unit without -o → filename.pcm
+        // Header unit without -o â†’ filename.pcm
         let result = parse_invocation(
             "clang++",
             &args(&["-x", "c++-header-unit", "--precompile", "foo.h"]),
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.output_file, PathBuf::from("foo.h.pcm"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.h.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -2065,8 +2079,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("foo.h"));
-                assert_eq!(c.output_file, PathBuf::from("foo.pcm"));
+                assert_eq!(c.source_file, NormalizedPath::new("foo.h"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -2080,8 +2094,8 @@ mod tests {
         let result = parse_invocation("clang++", &args(&["--precompile", "foo.cpp"]));
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("foo.cpp"));
-                assert_eq!(c.output_file, PathBuf::from("foo.pcm"));
+                assert_eq!(c.source_file, NormalizedPath::new("foo.cpp"));
+                assert_eq!(c.output_file, NormalizedPath::new("foo.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -2106,8 +2120,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("module.cppm"));
-                assert_eq!(c.output_file, PathBuf::from("module.pcm"));
+                assert_eq!(c.source_file, NormalizedPath::new("module.cppm"));
+                assert_eq!(c.output_file, NormalizedPath::new("module.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }
@@ -2124,8 +2138,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("module.cppm"));
-                assert_eq!(c.output_file, PathBuf::from("module.o"));
+                assert_eq!(c.source_file, NormalizedPath::new("module.cppm"));
+                assert_eq!(c.output_file, NormalizedPath::new("module.o"));
                 assert!(c.unknown_flags.contains(&"-fmodules-ts".to_string()));
             }
             other => panic!("expected cacheable, got: {other:?}"),
@@ -2146,8 +2160,8 @@ mod tests {
         );
         match result {
             ParsedInvocation::Cacheable(c) => {
-                assert_eq!(c.source_file, PathBuf::from("interface.cpp"));
-                assert_eq!(c.output_file, PathBuf::from("interface.pcm"));
+                assert_eq!(c.source_file, NormalizedPath::new("interface.cpp"));
+                assert_eq!(c.output_file, NormalizedPath::new("interface.pcm"));
             }
             other => panic!("expected cacheable, got: {other:?}"),
         }

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use zccache_core::NormalizedPath;
 
 /// Errors that can occur during fingerprint operations.
 #[derive(Debug, thiserror::Error)]
@@ -10,10 +10,13 @@ pub enum FingerprintError {
     Json(#[from] serde_json::Error),
 
     #[error("scan error in {path}: {message}")]
-    Scan { path: PathBuf, message: String },
+    Scan {
+        path: NormalizedPath,
+        message: String,
+    },
 
     #[error("no pending data for {path}: run `check` before `mark-success`/`mark-failure`")]
-    NoPendingData { path: PathBuf },
+    NoPendingData { path: NormalizedPath },
 }
 
 pub type Result<T> = std::result::Result<T, FingerprintError>;

@@ -11,10 +11,11 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::mpsc;
+use zccache_core::NormalizedPath;
 use zccache_depgraph::{SessionId, SessionManager};
 
 /// Open a file in append mode with sharing flags that allow deletion on Windows.
@@ -84,7 +85,7 @@ enum LogMessage {
     /// Write a formatted line to daemon.log and optionally a session log.
     Write {
         line: String,
-        session_log_path: Option<PathBuf>,
+        session_log_path: Option<NormalizedPath>,
     },
 }
 
@@ -107,7 +108,7 @@ impl EventLogger {
     /// Create a new event logger writing to `log_dir/daemon.log`.
     ///
     /// Spawns a background thread for all I/O. Returns `noop()` on failure.
-    pub fn new(log_dir: PathBuf, max_size: u64, max_files: usize) -> Self {
+    pub fn new(log_dir: NormalizedPath, max_size: u64, max_files: usize) -> Self {
         match Self::try_new(log_dir, max_size, max_files) {
             Ok(logger) => logger,
             Err(e) => {
@@ -117,7 +118,7 @@ impl EventLogger {
         }
     }
 
-    fn try_new(log_dir: PathBuf, max_size: u64, max_files: usize) -> std::io::Result<Self> {
+    fn try_new(log_dir: NormalizedPath, max_size: u64, max_files: usize) -> std::io::Result<Self> {
         fs::create_dir_all(&log_dir)?;
         let log_path = log_dir.join("daemon.log");
         let current_size = log_path.metadata().map(|m| m.len()).unwrap_or(0);
@@ -173,7 +174,7 @@ impl EventLogger {
     }
 
     /// Post a message to the background writer. Lock-free, never blocks.
-    fn send(&self, line: String, session_log_path: Option<PathBuf>) {
+    fn send(&self, line: String, session_log_path: Option<NormalizedPath>) {
         if let Some(tx) = &self.sender {
             let _ = tx.send(LogMessage::Write {
                 line,
@@ -187,7 +188,7 @@ impl EventLogger {
 
 /// State owned exclusively by the background writer thread.
 struct LogWriter {
-    log_dir: PathBuf,
+    log_dir: NormalizedPath,
     log_file: File,
     max_size: u64,
     max_files: usize,
@@ -249,14 +250,14 @@ impl LogWriter {
     }
 
     fn gc_old_logs(&self) {
-        let mut rotated: Vec<PathBuf> = fs::read_dir(&self.log_dir)
+        let mut rotated: Vec<NormalizedPath> = fs::read_dir(&self.log_dir)
             .into_iter()
             .flatten()
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
                 if name.starts_with("daemon.log.") {
-                    Some(e.path())
+                    Some(e.path().into())
                 } else {
                     None
                 }
@@ -441,7 +442,7 @@ mod tests {
     fn test_rotation_triggers_at_threshold() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().to_path_buf();
-        let logger = EventLogger::new(log_dir.clone(), 100, 3);
+        let logger = EventLogger::new(log_dir.clone().into(), 100, 3);
 
         for i in 0..20 {
             logger.log_daemon_event(&format!("event {i} with some padding to fill space"));
@@ -473,7 +474,7 @@ mod tests {
         fs::write(log_dir.join("daemon.log"), "current").unwrap();
 
         // Logger construction starts the thread; writing triggers rotation+GC.
-        let logger = EventLogger::new(log_dir.clone(), 5, 3);
+        let logger = EventLogger::new(log_dir.clone().into(), 5, 3);
         logger.log_daemon_event("trigger");
         flush_logger(&logger);
 
@@ -495,13 +496,13 @@ mod tests {
         let log_dir = dir.path().join("logs");
         let session_log = dir.path().join("session.log");
 
-        let logger = EventLogger::new(log_dir.clone(), 10 * 1024 * 1024, 5);
+        let logger = EventLogger::new(log_dir.clone().into(), 10 * 1024 * 1024, 5);
 
         let sessions = SessionManager::new(Duration::from_secs(300));
         let sid = sessions.create(zccache_depgraph::SessionConfig {
             client_pid: 42,
-            working_dir: PathBuf::from("/test"),
-            log_file: Some(session_log.to_path_buf()),
+            working_dir: "/test".into(),
+            log_file: Some(session_log.to_path_buf().into()),
             track_stats: false,
             journal_path: None,
         });

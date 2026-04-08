@@ -1,22 +1,23 @@
 //! `#include` directive scanner.
 //!
 //! Scans C/C++ source files for `#include` directives, skipping comments
-//! and string literals. Does not evaluate preprocessor conditionals —
+//! and string literals. Does not evaluate preprocessor conditionals â€”
 //! all `#include` directives are returned unconditionally.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::search_paths::IncludeSearchPaths;
+use zccache_core::NormalizedPath;
 
 /// The kind of `#include` directive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IncludeKind {
-    /// `#include "foo.h"` — quoted include.
+    /// `#include "foo.h"` â€” quoted include.
     Quoted,
-    /// `#include <foo.h>` — angle-bracket include.
+    /// `#include <foo.h>` â€” angle-bracket include.
     AngleBracket,
-    /// `#include MACRO` — computed include, cannot resolve by text scanning.
+    /// `#include MACRO` â€” computed include, cannot resolve by text scanning.
     Computed(String),
 }
 
@@ -36,7 +37,7 @@ pub struct IncludeDirective {
 #[derive(Debug, Clone)]
 pub struct ScanResult {
     /// All resolved include paths (absolute, deduplicated).
-    pub resolved: Vec<PathBuf>,
+    pub resolved: Vec<NormalizedPath>,
     /// Include paths that could not be resolved to an existing file.
     pub unresolved: Vec<String>,
     /// True if any `#include MACRO` (computed include) was found.
@@ -122,7 +123,7 @@ pub fn resolve_include(
     directive: &IncludeDirective,
     search: &IncludeSearchPaths,
     including_file_dir: &Path,
-) -> Option<PathBuf> {
+) -> Option<NormalizedPath> {
     match &directive.kind {
         IncludeKind::Quoted => {
             // 1. Directory of the including file.
@@ -187,10 +188,10 @@ pub fn scan_recursive(source: &Path, search: &IncludeSearchPaths) -> ScanResult 
 fn scan_recursive_inner(
     file: &Path,
     search: &IncludeSearchPaths,
-    resolved: &mut Vec<PathBuf>,
+    resolved: &mut Vec<NormalizedPath>,
     unresolved: &mut Vec<String>,
     has_computed: &mut bool,
-    visited: &mut HashSet<PathBuf>,
+    visited: &mut HashSet<NormalizedPath>,
 ) {
     let directives = match scan_includes(file) {
         Ok(d) => d,
@@ -226,7 +227,7 @@ fn scan_recursive_inner(
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────
+// â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Join backslash-continued lines into single logical lines.
 fn join_continuations(source: &str) -> String {
@@ -301,7 +302,7 @@ fn strip_comments(line: &str, in_block_comment: &mut bool) -> String {
             continue;
         }
 
-        // Line comment — stop processing this line.
+        // Line comment â€” stop processing this line.
         if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
             break;
         }
@@ -372,7 +373,7 @@ fn parse_include_from_line(line: &str) -> Option<IncludeDirective> {
         });
     }
 
-    // #include MACRO — computed include.
+    // #include MACRO â€” computed include.
     let macro_name: String = rest
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -389,11 +390,11 @@ fn parse_include_from_line(line: &str) -> Option<IncludeDirective> {
 }
 
 /// Normalize a path to an absolute path (best-effort, no symlink resolution).
-fn normalize(path: &Path) -> PathBuf {
-    try_normalize(path).unwrap_or_else(|| path.to_path_buf())
+fn normalize(path: &Path) -> NormalizedPath {
+    try_normalize(path).unwrap_or_else(|| path.into())
 }
 
-fn try_normalize(path: &Path) -> Option<PathBuf> {
+fn try_normalize(path: &Path) -> Option<NormalizedPath> {
     // Use canonicalize which resolves symlinks and produces an absolute path.
     // On Windows, canonicalize produces \\?\ extended-length paths which must
     // be stripped to match the watcher's path format for journal lookups.
@@ -402,10 +403,10 @@ fn try_normalize(path: &Path) -> Option<PathBuf> {
     {
         let s = p.to_string_lossy();
         if let Some(stripped) = s.strip_prefix(r"\\?\") {
-            return Some(PathBuf::from(stripped));
+            return Some(NormalizedPath::from(stripped));
         }
     }
-    Some(p)
+    Some(p.into())
 }
 
 #[cfg(test)]
@@ -413,7 +414,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    // ── scan_includes_str tests ─────────────────────────────────────
+    // â”€â”€ scan_includes_str tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn basic_quoted_include() {
@@ -582,7 +583,7 @@ mod tests {
         assert_eq!(includes[0].path, "after.h");
     }
 
-    // ── resolve_include tests ────────────────────────────────────────
+    // â”€â”€ resolve_include tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn resolve_quoted_in_file_dir() {
@@ -615,10 +616,10 @@ mod tests {
             line: 1,
         };
         let search = IncludeSearchPaths {
-            iquote: vec![iquote_dir],
+            iquote: vec![iquote_dir.into()],
             ..Default::default()
         };
-        // Not in the including file's dir — should find via iquote.
+        // Not in the including file's dir â€” should find via iquote.
         let other_dir = dir.path().join("other");
         std::fs::create_dir(&other_dir).unwrap();
         let result = resolve_include(&directive, &search, &other_dir);
@@ -640,7 +641,7 @@ mod tests {
             line: 1,
         };
         let search = IncludeSearchPaths {
-            user: vec![inc],
+            user: vec![inc.into()],
             ..Default::default()
         };
         let result = resolve_include(&directive, &search, dir.path());
@@ -661,7 +662,7 @@ mod tests {
             line: 1,
         };
         let search = IncludeSearchPaths {
-            iquote: vec![iquote_dir],
+            iquote: vec![iquote_dir.into()],
             ..Default::default()
         };
         let result = resolve_include(&directive, &search, dir.path());
@@ -711,15 +712,15 @@ mod tests {
             line: 1,
         };
         let search = IncludeSearchPaths {
-            user: vec![user_dir],
-            system: vec![sys_dir],
+            user: vec![user_dir.into()],
+            system: vec![sys_dir.into()],
             ..Default::default()
         };
         let result = resolve_include(&directive, &search, dir.path()).unwrap();
         assert_eq!(result, normalize(&user_header));
     }
 
-    // ── scan_recursive tests ─────────────────────────────────────────
+    // â”€â”€ scan_recursive tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn recursive_scan_finds_transitive_includes() {
@@ -813,7 +814,7 @@ mod tests {
         let search = IncludeSearchPaths::default();
         let result = scan_recursive(&dir.path().join("main.c"), &search);
 
-        // a.h, b.h, common.h — each once.
+        // a.h, b.h, common.h â€” each once.
         assert_eq!(result.resolved.len(), 3);
     }
 
@@ -828,7 +829,7 @@ mod tests {
         std::fs::write(inc.join("detail.h"), "// impl\n").unwrap();
 
         let search = IncludeSearchPaths {
-            user: vec![inc.clone()],
+            user: vec![inc.clone().into()],
             ..Default::default()
         };
         let result = scan_recursive(&dir.path().join("main.c"), &search);
@@ -838,7 +839,7 @@ mod tests {
         assert!(result.resolved.contains(&normalize(&inc.join("detail.h"))));
     }
 
-    // ── Helper function tests ────────────────────────────────────────
+    // â”€â”€ Helper function tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn join_continuations_merges_lines() {

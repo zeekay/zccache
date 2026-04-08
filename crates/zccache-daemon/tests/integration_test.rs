@@ -74,7 +74,7 @@ async fn test_session_start_with_nonexistent_compiler() {
         client
             .send(&Request::SessionStart {
                 client_pid: std::process::id(),
-                working_dir: std::env::current_dir().unwrap(),
+                working_dir: std::env::current_dir().unwrap().into(),
                 log_file: None,
                 track_stats: false,
                 journal_path: None,
@@ -92,7 +92,7 @@ async fn test_session_start_with_nonexistent_compiler() {
             .send(&Request::Compile {
                 session_id: session_id.clone(),
                 args: vec!["-c".to_string(), "dummy.cpp".to_string()],
-                cwd: std::env::current_dir().unwrap(),
+                cwd: std::env::current_dir().unwrap().into(),
                 compiler: "/nonexistent/compiler".to_string().into(),
                 env: None,
             })
@@ -133,7 +133,7 @@ async fn test_session_start_with_clang_toolchain() {
         client
             .send(&Request::SessionStart {
                 client_pid: std::process::id(),
-                working_dir: std::env::current_dir().unwrap(),
+                working_dir: std::env::current_dir().unwrap().into(),
                 log_file: None,
                 track_stats: false,
                 journal_path: None,
@@ -159,7 +159,7 @@ async fn test_session_start_with_clang_toolchain() {
         client
             .send(&Request::SessionStart {
                 client_pid: std::process::id(),
-                working_dir: std::env::current_dir().unwrap(),
+                working_dir: std::env::current_dir().unwrap().into(),
                 log_file: None,
                 track_stats: false,
                 journal_path: None,
@@ -206,7 +206,7 @@ async fn test_full_client_flow() {
         client
             .send(&Request::SessionStart {
                 client_pid: std::process::id(),
-                working_dir: std::env::current_dir().unwrap(),
+                working_dir: std::env::current_dir().unwrap().into(),
                 log_file: None,
                 track_stats: false,
                 journal_path: None,

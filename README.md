@@ -33,6 +33,22 @@
 Inspired by [sccache](https://github.com/mozilla/sccache), but optimized for local-first use
 with aggressive file metadata caching and filesystem watching.
 
+## Quick Install
+
+```bash
+curl -LsSf https://github.com/zackees/zccache/releases/latest/download/install.sh | sh
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/zackees/zccache/releases/latest/download/install.ps1 | iex"
+```
+
+Verify:
+
+```bash
+zccache --version
+```
+
 ## Performance
 
 50 files per benchmark, median of 5 trials. Run it yourself: `./perf`
@@ -111,11 +127,41 @@ The difference comes from **architecture**, not better caching:
 ## Install
 
 ```bash
-pip install zccache
+curl -LsSf https://github.com/zackees/zccache/releases/latest/download/install.sh | sh
 ```
 
-This installs **native Rust binaries** (`zccache` and `zccache-daemon`) directly
-onto your PATH — no Python runtime dependency. Pre-built wheels are available for:
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/zackees/zccache/releases/latest/download/install.ps1 | iex"
+```
+
+This installs the standalone **native Rust binaries** (`zccache`, `zccache-daemon`,
+and `zccache-fp`) directly from GitHub Releases.
+
+Default install locations:
+
+- Linux/macOS user install: `~/.local/bin`
+- Linux/macOS global install: `/usr/local/bin`
+- Windows user install: `%USERPROFILE%\.local\bin`
+- Windows global install: `%ProgramFiles%\zccache\bin`
+
+Global install examples:
+
+```bash
+curl -LsSf https://github.com/zackees/zccache/releases/latest/download/install.sh | sudo sh -s -- --global
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "$env:ZCCACHE_INSTALL_MODE='global'; irm https://github.com/zackees/zccache/releases/latest/download/install.ps1 | iex"
+```
+
+Each GitHub release also publishes standalone per-platform archives:
+
+- Linux: `zccache-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz`, `zccache-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz`
+- macOS: `zccache-vX.Y.Z-x86_64-apple-darwin.tar.gz`, `zccache-vX.Y.Z-aarch64-apple-darwin.tar.gz`
+- Windows: `zccache-vX.Y.Z-x86_64-pc-windows-msvc.zip`, `zccache-vX.Y.Z-aarch64-pc-windows-msvc.zip`
+
+PyPI remains available if you prefer `pip install zccache`; those wheels also install
+the native binaries directly onto your PATH. Pre-built wheels are available for:
 
 | Platform | Architecture |
 |----------|-------------|

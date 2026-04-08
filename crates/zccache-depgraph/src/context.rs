@@ -4,8 +4,10 @@
 //! and maps to an include list. The artifact key incorporates content
 //! hashes of all files for artifact store lookup.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use zccache_core::path::normalize_for_key;
+use zccache_core::NormalizedPath;
 use zccache_hash::ContentHash;
 
 use crate::args::ParsedArgs;
@@ -66,7 +68,7 @@ impl std::fmt::Display for ArtifactKey {
 #[derive(Debug, Clone)]
 pub struct CompileContext {
     /// Absolute path to the source file.
-    pub source_file: PathBuf,
+    pub source_file: NormalizedPath,
     /// Ordered include search paths.
     pub include_search: IncludeSearchPaths,
     /// Sorted defines (-D flags).
@@ -74,8 +76,8 @@ pub struct CompileContext {
     /// Sorted cache-relevant flags (-std, -O, -f, etc.).
     pub flags: Vec<String>,
     /// Force-included files (-include).
-    pub force_includes: Vec<PathBuf>,
-    /// Sorted unknown flags — not recognized by the parser but still
+    pub force_includes: Vec<NormalizedPath>,
+    /// Sorted unknown flags â€” not recognized by the parser but still
     /// affect compilation output, so they must be part of the cache key.
     pub unknown_flags: Vec<String>,
 }
@@ -113,28 +115,33 @@ impl CompileContext {
         hasher.update(b"zccache-context-key-v1\0");
 
         // Source file (absolute path).
-        hasher.update(self.source_file.to_string_lossy().as_bytes());
+        let source_file = normalize_for_key(&self.source_file);
+        hasher.update(source_file.as_bytes());
         hasher.update(b"\0");
 
         // Include dirs in order (order matters for resolution!).
         hasher.update(b"iquote\0");
         for dir in &self.include_search.iquote {
-            hasher.update(dir.to_string_lossy().as_bytes());
+            let dir = normalize_for_key(dir);
+            hasher.update(dir.as_bytes());
             hasher.update(b"\0");
         }
         hasher.update(b"user\0");
         for dir in &self.include_search.user {
-            hasher.update(dir.to_string_lossy().as_bytes());
+            let dir = normalize_for_key(dir);
+            hasher.update(dir.as_bytes());
             hasher.update(b"\0");
         }
         hasher.update(b"system\0");
         for dir in &self.include_search.system {
-            hasher.update(dir.to_string_lossy().as_bytes());
+            let dir = normalize_for_key(dir);
+            hasher.update(dir.as_bytes());
             hasher.update(b"\0");
         }
         hasher.update(b"after\0");
         for dir in &self.include_search.after {
-            hasher.update(dir.to_string_lossy().as_bytes());
+            let dir = normalize_for_key(dir);
+            hasher.update(dir.as_bytes());
             hasher.update(b"\0");
         }
 
@@ -155,11 +162,12 @@ impl CompileContext {
         // Force includes.
         hasher.update(b"force-include\0");
         for fi in &self.force_includes {
-            hasher.update(fi.to_string_lossy().as_bytes());
+            let fi = normalize_for_key(fi);
+            hasher.update(fi.as_bytes());
             hasher.update(b"\0");
         }
 
-        // Unknown flags — not recognized but still affect compilation.
+        // Unknown flags â€” not recognized but still affect compilation.
         hasher.update(b"unknown\0");
         for flag in &self.unknown_flags {
             hasher.update(flag.as_bytes());
@@ -188,7 +196,8 @@ pub fn compute_artifact_key<P: AsRef<Path> + Ord>(
     hasher.update(b"\0");
 
     for (path, hash) in file_hashes.iter() {
-        hasher.update(path.as_ref().to_string_lossy().as_bytes());
+        let path = normalize_for_key(path.as_ref());
+        hasher.update(path.as_bytes());
         hasher.update(b"\0");
         hasher.update(hash.as_bytes());
         hasher.update(b"\0");
@@ -205,7 +214,7 @@ pub fn compute_artifact_key<P: AsRef<Path> + Ord>(
 #[derive(Debug, Clone)]
 pub struct RustcCompileContext {
     /// Absolute path to the source file.
-    pub source_file: PathBuf,
+    pub source_file: NormalizedPath,
     /// `--crate-name` value.
     pub crate_name: Option<String>,
     /// Sorted `--crate-type` values.
@@ -263,7 +272,7 @@ impl RustcCompileContext {
         let mut remap_path_prefixes = args.remap_path_prefixes.clone();
         remap_path_prefixes.sort();
 
-        // Filter CARGO_* env vars — these affect compilation output via env!() macro.
+        // Filter CARGO_* env vars â€” these affect compilation output via env!() macro.
         // Exclude CARGO_MAKEFLAGS (job server, not output-affecting) and
         // CARGO_INCREMENTAL (handled by stripping -C incremental).
         let mut env_vars: Vec<(String, String)> = client_env
@@ -304,7 +313,7 @@ impl RustcCompileContext {
 
         hasher.update(b"zccache-rustc-context-key-v2\0");
 
-        // Compiler binary hash (different rustc versions → different output).
+        // Compiler binary hash (different rustc versions â†’ different output).
         if let Some(ref ch) = self.compiler_hash {
             hasher.update(b"compiler\0");
             hasher.update(ch.as_bytes());
@@ -312,7 +321,8 @@ impl RustcCompileContext {
         }
 
         // Source file (absolute path).
-        hasher.update(self.source_file.to_string_lossy().as_bytes());
+        let source_file = normalize_for_key(&self.source_file);
+        hasher.update(source_file.as_bytes());
         hasher.update(b"\0");
 
         // Crate name.
@@ -378,7 +388,7 @@ impl RustcCompileContext {
             hasher.update(b"\0");
         }
 
-        // Extern crate (name, path) pairs — path included so different
+        // Extern crate (name, path) pairs â€” path included so different
         // --extern a=v1.rlib vs --extern a=v2.rlib get different context keys.
         hasher.update(b"externs\0");
         for (name, path) in &self.extern_crates {
@@ -441,7 +451,8 @@ pub fn compute_rustc_artifact_key<P: AsRef<Path> + Ord>(
 
     // Source + dependency file hashes.
     for (path, hash) in file_hashes.iter() {
-        hasher.update(path.as_ref().to_string_lossy().as_bytes());
+        let path = normalize_for_key(path.as_ref());
+        hasher.update(path.as_bytes());
         hasher.update(b"\0");
         hasher.update(hash.as_bytes());
         hasher.update(b"\0");
@@ -461,15 +472,21 @@ pub fn compute_rustc_artifact_key<P: AsRef<Path> + Ord>(
 
 #[cfg(test)]
 mod tests {
+    use zccache_core::NormalizedPath;
+
     use super::*;
     use crate::args::UserDepFlags;
     use crate::rustc_args::ExternCrate;
+    use zccache_hash::hash_bytes;
 
     fn make_context(source: &str, user_dirs: &[&str], defines: &[&str]) -> CompileContext {
         CompileContext {
-            source_file: PathBuf::from(source),
+            source_file: NormalizedPath::from(source),
             include_search: IncludeSearchPaths {
-                user: user_dirs.iter().map(PathBuf::from).collect(),
+                user: user_dirs
+                    .iter()
+                    .map(|dir| NormalizedPath::from(*dir))
+                    .collect(),
                 ..Default::default()
             },
             defines: {
@@ -519,6 +536,102 @@ mod tests {
         assert_ne!(k1, k2, "include dir order should affect context key");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_context_key_normalizes_equivalent_path_spellings() {
+        let ctx1 = CompileContext {
+            source_file: NormalizedPath::from(r"C:\work\src\main.cpp"),
+            include_search: IncludeSearchPaths {
+                user: vec![NormalizedPath::from(r"C:\work\include")],
+                ..Default::default()
+            },
+            defines: Vec::new(),
+            flags: Vec::new(),
+            force_includes: vec![NormalizedPath::from(r"C:\work\pch\base.h")],
+            unknown_flags: Vec::new(),
+        };
+        let ctx2 = CompileContext {
+            source_file: NormalizedPath::from("c:/work/src/main.cpp"),
+            include_search: IncludeSearchPaths {
+                user: vec![NormalizedPath::from("c:/work/include")],
+                ..Default::default()
+            },
+            defines: Vec::new(),
+            flags: Vec::new(),
+            force_includes: vec![NormalizedPath::from("c:/work/pch/base.h")],
+            unknown_flags: Vec::new(),
+        };
+
+        assert_eq!(ctx1.context_key(), ctx2.context_key());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_artifact_key_normalizes_equivalent_path_spellings() {
+        let ctx = CompileContext {
+            source_file: NormalizedPath::from(r"C:\work\src\main.cpp"),
+            include_search: IncludeSearchPaths::default(),
+            defines: Vec::new(),
+            flags: Vec::new(),
+            force_includes: Vec::new(),
+            unknown_flags: Vec::new(),
+        };
+        let key = ctx.context_key();
+
+        let mut file_hashes_a = vec![
+            (
+                NormalizedPath::from(r"C:\work\include\foo.h"),
+                hash_bytes(b"header"),
+            ),
+            (
+                NormalizedPath::from(r"C:\work\src\main.cpp"),
+                hash_bytes(b"source"),
+            ),
+        ];
+        let mut file_hashes_b = vec![
+            (
+                NormalizedPath::from("c:/work/include/foo.h"),
+                hash_bytes(b"header"),
+            ),
+            (
+                NormalizedPath::from("c:/work/src/main.cpp"),
+                hash_bytes(b"source"),
+            ),
+        ];
+
+        assert_eq!(
+            compute_artifact_key(&key, &mut file_hashes_a),
+            compute_artifact_key(&key, &mut file_hashes_b)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rustc_context_key_normalizes_equivalent_source_path_spellings() {
+        let ctx1 = RustcCompileContext {
+            source_file: NormalizedPath::from(r"C:\work\src\lib.rs"),
+            crate_name: Some("demo".to_string()),
+            crate_types: vec!["rlib".to_string()],
+            edition: Some("2021".to_string()),
+            emit_types: vec!["link".to_string()],
+            cfgs: Vec::new(),
+            check_cfgs: Vec::new(),
+            codegen_flags: Vec::new(),
+            target: None,
+            cap_lints: None,
+            extern_crates: Vec::new(),
+            lint_flags: Vec::new(),
+            unknown_flags: Vec::new(),
+            remap_path_prefixes: Vec::new(),
+            env_vars: Vec::new(),
+            compiler_hash: None,
+        };
+        let mut ctx2 = ctx1.clone();
+        ctx2.source_file = NormalizedPath::from("c:/work/src/lib.rs");
+
+        assert_eq!(ctx1.context_key(), ctx2.context_key());
+    }
+
     #[test]
     fn artifact_key_changes_with_content() {
         let ctx = make_context("/src/a.c", &[], &[]);
@@ -527,8 +640,8 @@ mod tests {
         let hash_a = zccache_hash::hash_bytes(b"content A");
         let hash_b = zccache_hash::hash_bytes(b"content B");
 
-        let ak1 = compute_artifact_key(&ck, &mut [(PathBuf::from("/src/a.c"), hash_a)]);
-        let ak2 = compute_artifact_key(&ck, &mut [(PathBuf::from("/src/a.c"), hash_b)]);
+        let ak1 = compute_artifact_key(&ck, &mut [(NormalizedPath::from("/src/a.c"), hash_a)]);
+        let ak2 = compute_artifact_key(&ck, &mut [(NormalizedPath::from("/src/a.c"), hash_b)]);
         assert_ne!(ak1, ak2);
     }
 
@@ -539,8 +652,8 @@ mod tests {
 
         let hash = zccache_hash::hash_bytes(b"content");
 
-        let ak1 = compute_artifact_key(&ck, &mut [(PathBuf::from("/src/a.c"), hash)]);
-        let ak2 = compute_artifact_key(&ck, &mut [(PathBuf::from("/src/a.c"), hash)]);
+        let ak1 = compute_artifact_key(&ck, &mut [(NormalizedPath::from("/src/a.c"), hash)]);
+        let ak2 = compute_artifact_key(&ck, &mut [(NormalizedPath::from("/src/a.c"), hash)]);
         assert_eq!(ak1, ak2);
     }
 
@@ -554,11 +667,17 @@ mod tests {
 
         let ak1 = compute_artifact_key(
             &ck,
-            &mut [(PathBuf::from("/a.h"), h1), (PathBuf::from("/b.h"), h2)],
+            &mut [
+                (NormalizedPath::from("/a.h"), h1),
+                (NormalizedPath::from("/b.h"), h2),
+            ],
         );
         let ak2 = compute_artifact_key(
             &ck,
-            &mut [(PathBuf::from("/b.h"), h2), (PathBuf::from("/a.h"), h1)],
+            &mut [
+                (NormalizedPath::from("/b.h"), h2),
+                (NormalizedPath::from("/a.h"), h1),
+            ],
         );
         assert_eq!(ak1, ak2, "file order should not affect artifact key");
     }
@@ -575,7 +694,7 @@ mod tests {
     #[test]
     fn from_parsed_args_sorts() {
         let args = ParsedArgs {
-            source_file: PathBuf::from("/src/a.c"),
+            source_file: NormalizedPath::from("/src/a.c"),
             output_file: None,
             include_search: IncludeSearchPaths::default(),
             defines: vec!["ZZZ".into(), "AAA".into()],
@@ -605,7 +724,7 @@ mod tests {
     fn force_include_affects_key() {
         let ctx1 = make_context("/src/a.c", &[], &[]);
         let mut ctx2 = make_context("/src/a.c", &[], &[]);
-        ctx2.force_includes = vec![PathBuf::from("/pch.h")];
+        ctx2.force_includes = vec![NormalizedPath::from("/pch.h")];
         assert_ne!(ctx1.context_key(), ctx2.context_key());
     }
 
@@ -639,11 +758,11 @@ mod tests {
         );
     }
 
-    // ─── RustcCompileContext tests ───────────────────────────────────
+    // â”€â”€â”€ RustcCompileContext tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     fn make_rustc_context(source: &str, edition: &str) -> RustcCompileContext {
         RustcCompileContext {
-            source_file: PathBuf::from(source),
+            source_file: NormalizedPath::from(source),
             crate_name: Some("mylib".to_string()),
             crate_types: vec!["lib".to_string()],
             edition: Some(edition.to_string()),
@@ -753,7 +872,7 @@ mod tests {
     #[test]
     fn rustc_from_parsed_args() {
         let args = RustcParsedArgs {
-            source_file: PathBuf::from("/src/lib.rs"),
+            source_file: NormalizedPath::from("/src/lib.rs"),
             crate_name: Some("mylib".to_string()),
             crate_types: vec!["rlib".to_string(), "lib".to_string()],
             edition: Some("2021".to_string()),
@@ -766,11 +885,11 @@ mod tests {
             externs: vec![
                 ExternCrate {
                     name: "serde".to_string(),
-                    path: PathBuf::from("/deps/libserde.rlib"),
+                    path: NormalizedPath::from("/deps/libserde.rlib"),
                 },
                 ExternCrate {
                     name: "log".to_string(),
-                    path: PathBuf::from("/deps/liblog.rlib"),
+                    path: NormalizedPath::from("/deps/liblog.rlib"),
                 },
             ],
             lint_flags: Vec::new(),
@@ -810,12 +929,12 @@ mod tests {
 
         let ak1 = compute_rustc_artifact_key(
             &ck,
-            &mut [(PathBuf::from("/src/lib.rs"), src_hash)],
+            &mut [(NormalizedPath::from("/src/lib.rs"), src_hash)],
             &mut [("serde".to_string(), ext_hash_a)],
         );
         let ak2 = compute_rustc_artifact_key(
             &ck,
-            &mut [(PathBuf::from("/src/lib.rs"), src_hash)],
+            &mut [(NormalizedPath::from("/src/lib.rs"), src_hash)],
             &mut [("serde".to_string(), ext_hash_b)],
         );
         assert_ne!(
@@ -834,12 +953,12 @@ mod tests {
 
         let ak1 = compute_rustc_artifact_key(
             &ck,
-            &mut [(PathBuf::from("/src/lib.rs"), src_hash)],
+            &mut [(NormalizedPath::from("/src/lib.rs"), src_hash)],
             &mut [("serde".to_string(), ext_hash)],
         );
         let ak2 = compute_rustc_artifact_key(
             &ck,
-            &mut [(PathBuf::from("/src/lib.rs"), src_hash)],
+            &mut [(NormalizedPath::from("/src/lib.rs"), src_hash)],
             &mut [("serde".to_string(), ext_hash)],
         );
         assert_eq!(ak1, ak2);

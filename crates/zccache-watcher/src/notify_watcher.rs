@@ -120,15 +120,15 @@ fn convert_event(ignore: &IgnoreFilter, event: &Event) -> Vec<WatchEvent> {
         }
         if from_ignored {
             // File appeared from ignored area — treat as creation.
-            return vec![WatchEvent::Created(to.clone())];
+            return vec![WatchEvent::Created(to.as_path().into())];
         }
         if to_ignored {
             // File moved to ignored area — treat as removal.
-            return vec![WatchEvent::Removed(from.clone())];
+            return vec![WatchEvent::Removed(from.as_path().into())];
         }
         return vec![WatchEvent::Renamed {
-            from: from.clone(),
-            to: to.clone(),
+            from: from.as_path().into(),
+            to: to.as_path().into(),
         }];
     }
 
@@ -139,20 +139,20 @@ fn convert_event(ignore: &IgnoreFilter, event: &Event) -> Vec<WatchEvent> {
         }
 
         let watch_event = match event.kind {
-            EventKind::Create(_) => WatchEvent::Created(path.clone()),
-            EventKind::Remove(_) => WatchEvent::Removed(path.clone()),
+            EventKind::Create(_) => WatchEvent::Created(path.as_path().into()),
+            EventKind::Remove(_) => WatchEvent::Removed(path.as_path().into()),
             EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::From)) => {
                 // Half of a rename — treat as removal (conservative).
-                WatchEvent::Removed(path.clone())
+                WatchEvent::Removed(path.as_path().into())
             }
             EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::To)) => {
                 // Half of a rename — treat as creation (conservative).
-                WatchEvent::Created(path.clone())
+                WatchEvent::Created(path.as_path().into())
             }
-            EventKind::Modify(_) => WatchEvent::Modified(path.clone()),
+            EventKind::Modify(_) => WatchEvent::Modified(path.as_path().into()),
             EventKind::Access(_) => continue,
             // Any, Other — conservative: treat as modification.
-            _ => WatchEvent::Modified(path.clone()),
+            _ => WatchEvent::Modified(path.as_path().into()),
         };
 
         result.push(watch_event);
@@ -164,7 +164,6 @@ fn convert_event(ignore: &IgnoreFilter, event: &Event) -> Vec<WatchEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn test_filter() -> IgnoreFilter {
         IgnoreFilter::new(vec![".git".to_string(), "target".to_string()])
@@ -175,12 +174,14 @@ mod tests {
         let filter = test_filter();
         let event = Event {
             kind: EventKind::Create(notify::event::CreateKind::File),
-            paths: vec![PathBuf::from("src/main.rs")],
+            paths: vec![Path::new("src/main.rs").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
         assert_eq!(result.len(), 1);
-        assert!(matches!(&result[0], WatchEvent::Created(p) if p == Path::new("src/main.rs")));
+        assert!(
+            matches!(&result[0], WatchEvent::Created(p) if p.as_path() == Path::new("src/main.rs"))
+        );
     }
 
     #[test]
@@ -190,12 +191,14 @@ mod tests {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Content,
             )),
-            paths: vec![PathBuf::from("src/lib.rs")],
+            paths: vec![Path::new("src/lib.rs").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
         assert_eq!(result.len(), 1);
-        assert!(matches!(&result[0], WatchEvent::Modified(p) if p == Path::new("src/lib.rs")));
+        assert!(
+            matches!(&result[0], WatchEvent::Modified(p) if p.as_path() == Path::new("src/lib.rs"))
+        );
     }
 
     #[test]
@@ -203,12 +206,12 @@ mod tests {
         let filter = test_filter();
         let event = Event {
             kind: EventKind::Remove(notify::event::RemoveKind::File),
-            paths: vec![PathBuf::from("old.c")],
+            paths: vec![Path::new("old.c").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
         assert_eq!(result.len(), 1);
-        assert!(matches!(&result[0], WatchEvent::Removed(p) if p == Path::new("old.c")));
+        assert!(matches!(&result[0], WatchEvent::Removed(p) if p.as_path() == Path::new("old.c")));
     }
 
     #[test]
@@ -218,7 +221,7 @@ mod tests {
             kind: EventKind::Modify(notify::event::ModifyKind::Name(
                 notify::event::RenameMode::Both,
             )),
-            paths: vec![PathBuf::from("old.c"), PathBuf::from("new.c")],
+            paths: vec![Path::new("old.c").to_owned(), Path::new("new.c").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
@@ -226,7 +229,7 @@ mod tests {
         assert!(matches!(
             &result[0],
             WatchEvent::Renamed { from, to }
-            if from == Path::new("old.c") && to == Path::new("new.c")
+            if from.as_path() == Path::new("old.c") && to.as_path() == Path::new("new.c")
         ));
     }
 
@@ -237,12 +240,12 @@ mod tests {
             kind: EventKind::Modify(notify::event::ModifyKind::Name(
                 notify::event::RenameMode::From,
             )),
-            paths: vec![PathBuf::from("gone.c")],
+            paths: vec![Path::new("gone.c").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
         assert_eq!(result.len(), 1);
-        assert!(matches!(&result[0], WatchEvent::Removed(p) if p == Path::new("gone.c")));
+        assert!(matches!(&result[0], WatchEvent::Removed(p) if p.as_path() == Path::new("gone.c")));
     }
 
     #[test]
@@ -252,12 +255,14 @@ mod tests {
             kind: EventKind::Modify(notify::event::ModifyKind::Name(
                 notify::event::RenameMode::To,
             )),
-            paths: vec![PathBuf::from("appeared.c")],
+            paths: vec![Path::new("appeared.c").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
         assert_eq!(result.len(), 1);
-        assert!(matches!(&result[0], WatchEvent::Created(p) if p == Path::new("appeared.c")));
+        assert!(
+            matches!(&result[0], WatchEvent::Created(p) if p.as_path() == Path::new("appeared.c"))
+        );
     }
 
     #[test]
@@ -267,7 +272,7 @@ mod tests {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Content,
             )),
-            paths: vec![PathBuf::from("project/.git/index")],
+            paths: vec![Path::new("project/.git/index").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
@@ -282,8 +287,8 @@ mod tests {
                 notify::event::RenameMode::Both,
             )),
             paths: vec![
-                PathBuf::from("project/.git/old"),
-                PathBuf::from("project/.git/new"),
+                Path::new("project/.git/old").to_owned(),
+                Path::new("project/.git/new").to_owned(),
             ],
             attrs: Default::default(),
         };
@@ -300,14 +305,16 @@ mod tests {
                 notify::event::RenameMode::Both,
             )),
             paths: vec![
-                PathBuf::from("project/.git/stash"),
-                PathBuf::from("src/recovered.c"),
+                Path::new("project/.git/stash").to_owned(),
+                Path::new("src/recovered.c").to_owned(),
             ],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
         assert_eq!(result.len(), 1);
-        assert!(matches!(&result[0], WatchEvent::Created(p) if p == Path::new("src/recovered.c")));
+        assert!(
+            matches!(&result[0], WatchEvent::Created(p) if p.as_path() == Path::new("src/recovered.c"))
+        );
     }
 
     #[test]
@@ -319,14 +326,16 @@ mod tests {
                 notify::event::RenameMode::Both,
             )),
             paths: vec![
-                PathBuf::from("src/main.rs"),
-                PathBuf::from("project/.git/stash"),
+                Path::new("src/main.rs").to_owned(),
+                Path::new("project/.git/stash").to_owned(),
             ],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
         assert_eq!(result.len(), 1);
-        assert!(matches!(&result[0], WatchEvent::Removed(p) if p == Path::new("src/main.rs")));
+        assert!(
+            matches!(&result[0], WatchEvent::Removed(p) if p.as_path() == Path::new("src/main.rs"))
+        );
     }
 
     #[test]
@@ -334,7 +343,7 @@ mod tests {
         let filter = test_filter();
         let event = Event {
             kind: EventKind::Access(notify::event::AccessKind::Read),
-            paths: vec![PathBuf::from("src/main.rs")],
+            paths: vec![Path::new("src/main.rs").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
@@ -349,7 +358,7 @@ mod tests {
             kind: EventKind::Modify(notify::event::ModifyKind::Name(
                 notify::event::RenameMode::Both,
             )),
-            paths: vec![PathBuf::from("only_one.c")],
+            paths: vec![Path::new("only_one.c").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
@@ -377,7 +386,7 @@ mod tests {
         let filter = test_filter();
         let event = Event {
             kind: EventKind::Other,
-            paths: vec![PathBuf::from("mystery.c")],
+            paths: vec![Path::new("mystery.c").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
@@ -390,7 +399,7 @@ mod tests {
         let filter = test_filter();
         let event = Event {
             kind: EventKind::Any,
-            paths: vec![PathBuf::from("any.c")],
+            paths: vec![Path::new("any.c").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
@@ -403,7 +412,7 @@ mod tests {
         let filter = test_filter();
         let event = Event {
             kind: EventKind::Remove(notify::event::RemoveKind::Folder),
-            paths: vec![PathBuf::from("src/old_module")],
+            paths: vec![Path::new("src/old_module").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
@@ -416,7 +425,7 @@ mod tests {
         let filter = test_filter();
         let event = Event {
             kind: EventKind::Create(notify::event::CreateKind::Folder),
-            paths: vec![PathBuf::from("src/new_module")],
+            paths: vec![Path::new("src/new_module").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
@@ -431,7 +440,7 @@ mod tests {
             kind: EventKind::Modify(notify::event::ModifyKind::Metadata(
                 notify::event::MetadataKind::Permissions,
             )),
-            paths: vec![PathBuf::from("script.sh")],
+            paths: vec![Path::new("script.sh").to_owned()],
             attrs: Default::default(),
         };
         let result = convert_event(&filter, &event);
@@ -494,7 +503,7 @@ mod tests {
         // Even if a rescan event carries paths, we still treat it as overflow
         // because the semantics are "everything may have changed".
         let mut event = Event::new(EventKind::Other).set_flag(Flag::Rescan);
-        event.paths = vec![PathBuf::from("src/main.rs")];
+        event.paths = vec![Path::new("src/main.rs").to_owned()];
         let result = convert_event(&filter, &event);
         assert_eq!(result.len(), 1);
         assert!(matches!(&result[0], WatchEvent::Overflow));
@@ -508,9 +517,9 @@ mod tests {
                 notify::event::DataChange::Content,
             )),
             paths: vec![
-                PathBuf::from("src/main.rs"),
-                PathBuf::from("target/debug/binary"),
-                PathBuf::from("src/lib.rs"),
+                Path::new("src/main.rs").to_owned(),
+                Path::new("target/debug/binary").to_owned(),
+                Path::new("src/lib.rs").to_owned(),
             ],
             attrs: Default::default(),
         };

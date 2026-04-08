@@ -6,10 +6,11 @@
 //! Run all:    uv run cargo test -p zccache-daemon --test response_file_cache -- --ignored --nocapture
 //! Run single: uv run cargo test -p zccache-daemon --test response_file_cache -- <test_name> --ignored --nocapture
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use zccache_core::NormalizedPath;
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
 
@@ -126,7 +127,7 @@ async fn compile(
 }
 
 struct TestHarness {
-    clang: PathBuf,
+    clang: NormalizedPath,
     tmp: tempfile::TempDir,
     #[expect(dead_code)]
     cache_env: CacheEnvGuard,
@@ -168,11 +169,11 @@ impl TestHarness {
         self.tmp.path().to_string_lossy().into_owned()
     }
 
-    fn path(&self, name: &str) -> PathBuf {
-        self.tmp.path().join(name)
+    fn path(&self, name: &str) -> NormalizedPath {
+        NormalizedPath::new(self.tmp.path().join(name))
     }
 
-    fn write_file(&self, name: &str, content: &str) -> PathBuf {
+    fn write_file(&self, name: &str, content: &str) -> NormalizedPath {
         let p = self.path(name);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).unwrap();

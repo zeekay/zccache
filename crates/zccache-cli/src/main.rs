@@ -23,8 +23,9 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::{Parser, Subcommand};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
+use zccache_core::NormalizedPath;
 
 /// zccache -- fast local compiler cache.
 #[derive(Debug, Parser)]
@@ -114,7 +115,7 @@ enum Commands {
     Fp {
         /// Path to the cache file (e.g., .cache/lint.json).
         #[arg(long)]
-        cache_file: PathBuf,
+        cache_file: String,
 
         /// Cache algorithm: hash or two-layer.
         #[arg(long, default_value = "two-layer")]
@@ -139,7 +140,7 @@ enum FpCommands {
     Check {
         /// Root directory to scan (default: current directory).
         #[arg(long, default_value = ".")]
-        root: PathBuf,
+        root: String,
 
         /// File extensions to include (without dot, e.g., "rs", "cpp").
         /// Cannot be used with --include.
@@ -184,6 +185,18 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "--version",
     "-V",
 ];
+
+fn absolute_path(path: &str) -> NormalizedPath {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.into()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(path)
+            .into()
+    }
+}
 
 /// Convert an i32 exit code to ExitCode without silent truncation.
 /// A bare `exit_code as u8` wraps: 256 → 0 (success), masking failures.
@@ -259,31 +272,19 @@ fn main() -> ExitCode {
         } => {
             let endpoint = resolve_endpoint(endpoint.as_deref());
             let cwd = cwd
-                .map(PathBuf::from)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            let log = log.map(|p| {
-                let path = Path::new(&p);
-                if path.is_absolute() {
-                    PathBuf::from(p)
-                } else {
-                    std::env::current_dir().unwrap_or_default().join(p)
-                }
-            });
+                .map(NormalizedPath::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().into());
+            let log = log.map(|p| absolute_path(&p));
             let journal = journal.map(|p| {
                 if !p.ends_with(".jsonl") {
                     eprintln!("error: --journal path must end in .jsonl");
                     std::process::exit(1);
                 }
-                let path = Path::new(&p);
-                if path.is_absolute() {
-                    PathBuf::from(p)
-                } else {
-                    std::env::current_dir().unwrap_or_default().join(p)
-                }
+                absolute_path(&p)
             });
             run_async(cmd_session_start(
                 &endpoint,
-                &cwd,
+                cwd.as_path(),
                 log.as_deref(),
                 stats,
                 journal,
@@ -316,24 +317,34 @@ fn main() -> ExitCode {
             fp_command,
         } => {
             let endpoint = resolve_endpoint(endpoint.as_deref());
+            let cache_file = absolute_path(&cache_file);
             match fp_command {
                 FpCommands::Check {
                     root,
                     ext,
                     include,
                     exclude,
-                } => run_async(cmd_fp_check(
-                    &endpoint,
-                    &cache_file,
-                    &cache_type,
-                    &root,
-                    &ext,
-                    &include,
-                    &exclude,
-                )),
-                FpCommands::MarkSuccess => run_async(cmd_fp_mark(&endpoint, &cache_file, true)),
-                FpCommands::MarkFailure => run_async(cmd_fp_mark(&endpoint, &cache_file, false)),
-                FpCommands::Invalidate => run_async(cmd_fp_invalidate(&endpoint, &cache_file)),
+                } => {
+                    let root = absolute_path(&root);
+                    run_async(cmd_fp_check(
+                        &endpoint,
+                        cache_file.as_path(),
+                        &cache_type,
+                        root.as_path(),
+                        &ext,
+                        &include,
+                        &exclude,
+                    ))
+                }
+                FpCommands::MarkSuccess => {
+                    run_async(cmd_fp_mark(&endpoint, cache_file.as_path(), true))
+                }
+                FpCommands::MarkFailure => {
+                    run_async(cmd_fp_mark(&endpoint, cache_file.as_path(), false))
+                }
+                FpCommands::Invalidate => {
+                    run_async(cmd_fp_invalidate(&endpoint, cache_file.as_path()))
+                }
             }
         }
     }
@@ -555,7 +566,7 @@ async fn cmd_session_start(
     cwd: &Path,
     log: Option<&Path>,
     track_stats: bool,
-    journal: Option<PathBuf>,
+    journal: Option<NormalizedPath>,
 ) -> ExitCode {
     if let Err(e) = ensure_daemon(endpoint).await {
         eprintln!("cannot start daemon at {endpoint}: {e}");
@@ -573,8 +584,8 @@ async fn cmd_session_start(
     if let Err(e) = conn
         .send(&zccache_protocol::Request::SessionStart {
             client_pid: std::process::id(),
-            working_dir: cwd.to_path_buf(),
-            log_file: log.map(Path::to_path_buf),
+            working_dir: cwd.into(),
+            log_file: log.map(NormalizedPath::from),
             track_stats,
             journal_path: journal,
         })
@@ -847,9 +858,9 @@ async fn cmd_fp_check(
     };
 
     let request = zccache_protocol::Request::FingerprintCheck {
-        cache_file: cache_file.to_path_buf(),
+        cache_file: cache_file.into(),
         cache_type: cache_type.to_string(),
-        root: root.to_path_buf(),
+        root: root.into(),
         extensions: ext.to_vec(),
         include_globs: include.to_vec(),
         exclude: exclude.to_vec(),
@@ -913,11 +924,11 @@ async fn cmd_fp_mark(endpoint: &str, cache_file: &Path, success: bool) -> ExitCo
 
     let request = if success {
         zccache_protocol::Request::FingerprintMarkSuccess {
-            cache_file: cache_file.to_path_buf(),
+            cache_file: cache_file.into(),
         }
     } else {
         zccache_protocol::Request::FingerprintMarkFailure {
-            cache_file: cache_file.to_path_buf(),
+            cache_file: cache_file.into(),
         }
     };
 
@@ -966,7 +977,7 @@ async fn cmd_fp_invalidate(endpoint: &str, cache_file: &Path) -> ExitCode {
     };
 
     let request = zccache_protocol::Request::FingerprintInvalidate {
-        cache_file: cache_file.to_path_buf(),
+        cache_file: cache_file.into(),
     };
 
     if let Err(e) = conn.send(&request).await {
@@ -1078,14 +1089,14 @@ fn run_rustfmt_cached(rustfmt_path: &Path, args: &[String], cwd: &Path) -> ExitC
     // Resolve source files to absolute paths and check cache (parallel)
     use rayon::prelude::*;
 
-    let results: Vec<(PathBuf, bool, Option<zccache_hash::ContentHash>)> = parsed
+    let results: Vec<(NormalizedPath, bool, Option<zccache_hash::ContentHash>)> = parsed
         .source_files
         .par_iter()
         .map(|src| {
             let abs = if src.is_absolute() {
                 src.clone()
             } else {
-                cwd.join(src)
+                cwd.join(src).into()
             };
             let (is_hit, hash) = match zccache_hash::hash_file(&abs) {
                 Ok(content_hash) => {
@@ -1098,8 +1109,8 @@ fn run_rustfmt_cached(rustfmt_path: &Path, args: &[String], cwd: &Path) -> ExitC
         })
         .collect();
 
-    let mut miss_files: Vec<PathBuf> = Vec::new();
-    let mut all_files: Vec<(PathBuf, bool, Option<zccache_hash::ContentHash>)> = Vec::new();
+    let mut miss_files: Vec<NormalizedPath> = Vec::new();
+    let mut all_files: Vec<(NormalizedPath, bool, Option<zccache_hash::ContentHash>)> = Vec::new();
     for (abs, is_hit, hash) in results {
         if !is_hit {
             miss_files.push(abs.clone());
@@ -1164,7 +1175,7 @@ fn run_rustfmt_cached(rustfmt_path: &Path, args: &[String], cwd: &Path) -> ExitC
 fn run_rustfmt_on_files(
     rustfmt_path: &Path,
     original_args: &[String],
-    files: &[PathBuf],
+    files: &[NormalizedPath],
     parsed: &zccache_compiler::parse_rustfmt::ParsedRustfmt,
 ) -> Result<i32, std::io::Error> {
     // Reconstruct args: flags + the miss files (not the original file list)
@@ -1249,7 +1260,7 @@ fn run_wrap(args: &[String]) -> ExitCode {
             &endpoint,
             &wrapped_tool,
             tool_args,
-            cwd,
+            cwd.into(),
             client_env,
         ));
     }
@@ -1265,7 +1276,7 @@ fn run_wrap(args: &[String]) -> ExitCode {
                 &endpoint,
                 &session_id,
                 tool_args,
-                cwd,
+                cwd.into(),
                 wrapped_tool,
                 client_env,
             ))
@@ -1276,7 +1287,7 @@ fn run_wrap(args: &[String]) -> ExitCode {
                 &endpoint,
                 &wrapped_tool,
                 tool_args,
-                cwd,
+                cwd.into(),
                 client_env,
             ))
         }
@@ -1285,19 +1296,19 @@ fn run_wrap(args: &[String]) -> ExitCode {
 
 /// Resolve a compiler name/path to an absolute path.
 /// Normalizes MSYS paths on Windows, then searches PATH if not already absolute.
-fn resolve_compiler_path(compiler: &str) -> PathBuf {
+fn resolve_compiler_path(compiler: &str) -> NormalizedPath {
     let normalized = zccache_core::path::normalize_msys_path(compiler);
     let path = Path::new(&normalized);
 
     // Already absolute — return as-is.
     if path.is_absolute() {
-        return PathBuf::from(normalized);
+        return normalized.into();
     }
 
     // Search PATH for the compiler.
     match which_on_path(&normalized) {
         Some(abs) => abs,
-        None => PathBuf::from(normalized), // Let the daemon report the error.
+        None => normalized.into(), // Let the daemon report the error.
     }
 }
 
@@ -1305,8 +1316,8 @@ async fn cmd_compile(
     endpoint: &str,
     session_id: &str,
     args: Vec<String>,
-    cwd: PathBuf,
-    compiler: PathBuf,
+    cwd: NormalizedPath,
+    compiler: NormalizedPath,
     client_env: Vec<(String, String)>,
 ) -> ExitCode {
     let mut conn = match connect(endpoint).await {
@@ -1372,7 +1383,7 @@ async fn cmd_compile_ephemeral(
     endpoint: &str,
     compiler: &Path,
     args: Vec<String>,
-    cwd: PathBuf,
+    cwd: NormalizedPath,
     client_env: Vec<(String, String)>,
 ) -> ExitCode {
     // Ensure daemon is running and version-compatible.
@@ -1392,7 +1403,7 @@ async fn cmd_compile_ephemeral(
         .send(&zccache_protocol::Request::CompileEphemeral {
             client_pid: std::process::id(),
             working_dir: cwd.clone(),
-            compiler: compiler.to_path_buf(),
+            compiler: compiler.into(),
             args,
             cwd,
             env: Some(client_env),
@@ -1442,7 +1453,7 @@ async fn cmd_link_ephemeral(
     endpoint: &str,
     tool: &Path,
     args: Vec<String>,
-    cwd: PathBuf,
+    cwd: NormalizedPath,
     client_env: Vec<(String, String)>,
 ) -> ExitCode {
     if let Err(e) = ensure_daemon(endpoint).await {
@@ -1460,7 +1471,7 @@ async fn cmd_link_ephemeral(
     if let Err(e) = conn
         .send(&zccache_protocol::Request::LinkEphemeral {
             client_pid: std::process::id(),
-            tool: tool.to_path_buf(),
+            tool: tool.into(),
             args,
             cwd,
             env: Some(client_env),
@@ -1658,7 +1669,7 @@ async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
 }
 
 /// Find the daemon binary. Looks next to the CLI binary first, then on PATH.
-fn find_daemon_binary() -> Option<std::path::PathBuf> {
+fn find_daemon_binary() -> Option<NormalizedPath> {
     let name = if cfg!(windows) {
         "zccache-daemon.exe"
     } else {
@@ -1670,7 +1681,7 @@ fn find_daemon_binary() -> Option<std::path::PathBuf> {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join(name);
             if candidate.exists() {
-                return Some(candidate);
+                return Some(candidate.into());
             }
         }
     }
@@ -1681,19 +1692,19 @@ fn find_daemon_binary() -> Option<std::path::PathBuf> {
 
 /// Simple PATH lookup (no external crate needed).
 /// On Windows, also tries appending `.exe` if the name has no extension.
-fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
+fn which_on_path(name: &str) -> Option<NormalizedPath> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(name);
         if candidate.is_file() {
-            return Some(candidate);
+            return Some(candidate.into());
         }
         // On Windows, try with .exe suffix
         #[cfg(windows)]
         if std::path::Path::new(name).extension().is_none() {
             let with_exe = dir.join(format!("{name}.exe"));
             if with_exe.is_file() {
-                return Some(with_exe);
+                return Some(with_exe.into());
             }
         }
     }

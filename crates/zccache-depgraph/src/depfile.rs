@@ -11,11 +11,12 @@
 //! a working directory, excludes the source file itself, and deduplicates.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::args::UserDepFlags;
 use crate::scanner::ScanResult;
+use zccache_core::NormalizedPath;
 
 /// Errors that can occur while parsing a `.d` file.
 #[derive(Debug)]
@@ -119,20 +120,20 @@ pub fn parse_depfile_path(
     parse_depfile(&content, source, cwd)
 }
 
-// ── Depfile Strategy ────────────────────────────────────────────────
+// â”€â”€ Depfile Strategy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// How to obtain the depfile for a compilation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DepfileStrategy {
-    /// We injected `-MD -MF <path>` — read and clean up after compilation.
-    Injected { path: PathBuf },
-    /// User already had `-MF <path>` — read it (don't delete).
-    UserSpecified { path: PathBuf },
-    /// User had `-MD` but no `-MF` — derive path from output stem.
-    UserDefault { path: PathBuf },
-    /// MSVC `/showIncludes` — parse stderr after compilation.
+    /// We injected `-MD -MF <path>` â€” read and clean up after compilation.
+    Injected { path: NormalizedPath },
+    /// User already had `-MF <path>` â€” read it (don't delete).
+    UserSpecified { path: NormalizedPath },
+    /// User had `-MD` but no `-MF` â€” derive path from output stem.
+    UserDefault { path: NormalizedPath },
+    /// MSVC `/showIncludes` â€” parse stderr after compilation.
     ShowIncludes,
-    /// Compiler doesn't support depfiles — use fallback scanner.
+    /// Compiler doesn't support depfiles â€” use fallback scanner.
     Unsupported,
 }
 
@@ -167,7 +168,12 @@ pub fn prepare_depfile(
     // User has -MD/-MMD but no -MF: derive from output file stem.
     if dep_flags.has_md {
         let d_path = output_file.with_extension("d");
-        return (Vec::new(), DepfileStrategy::UserDefault { path: d_path });
+        return (
+            Vec::new(),
+            DepfileStrategy::UserDefault {
+                path: d_path.into(),
+            },
+        );
     }
 
     // No user dep flags: inject -MD -MF <tmpfile>.
@@ -184,6 +190,7 @@ pub fn prepare_depfile(
         .and_then(|s| s.to_str())
         .unwrap_or("depfile");
     let tmp_path = tmpdir.join(format!("{stem}_{}_{unique}.d", std::process::id()));
+    let tmp_path: NormalizedPath = tmp_path.into();
     let extra_args = vec![
         "-MD".to_string(),
         "-MF".to_string(),
@@ -192,7 +199,7 @@ pub fn prepare_depfile(
     (extra_args, DepfileStrategy::Injected { path: tmp_path })
 }
 
-// ── Internal helpers ─────────────────────────────────────────────────
+// â”€â”€ Internal helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Join backslash-continued lines: replace `\<newline>` sequences with a
 /// single space so that the entire depfile becomes one logical line.
@@ -260,7 +267,7 @@ fn find_separator_colon(line: &str) -> Result<usize, DepfileError> {
 }
 
 /// Split the dependency string on unescaped whitespace, then unescape each
-/// token (`\ ` → ` `, `\#` → `#`).
+/// token (`\ ` â†’ ` `, `\#` â†’ `#`).
 fn split_and_unescape(deps: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -304,7 +311,7 @@ fn split_and_unescape(deps: &str) -> Vec<String> {
 /// On Windows, `std::fs::canonicalize` produces `\\?\` extended-length paths.
 /// These must be stripped so paths match the format used by the file watcher
 /// (which also strips `\\?\`), ensuring journal/metadata lookups work correctly.
-pub(crate) fn canonicalize_path(path: &Path, cwd: &Path) -> PathBuf {
+pub(crate) fn canonicalize_path(path: &Path, cwd: &Path) -> NormalizedPath {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| {
         if path.is_absolute() {
             path.to_path_buf()
@@ -312,17 +319,17 @@ pub(crate) fn canonicalize_path(path: &Path, cwd: &Path) -> PathBuf {
             cwd.join(path)
         }
     });
-    strip_win_prefix(canonical)
+    strip_win_prefix(canonical.into())
 }
 
 /// Strip the `\\?\` extended-length prefix on Windows.
 /// No-op on other platforms.
-pub(crate) fn strip_win_prefix(path: PathBuf) -> PathBuf {
+pub(crate) fn strip_win_prefix(path: NormalizedPath) -> NormalizedPath {
     #[cfg(windows)]
     {
         let s = path.to_string_lossy();
         if let Some(stripped) = s.strip_prefix(r"\\?\") {
-            return PathBuf::from(stripped);
+            return NormalizedPath::from(stripped);
         }
     }
     path
@@ -330,25 +337,31 @@ pub(crate) fn strip_win_prefix(path: PathBuf) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use zccache_core::NormalizedPath;
+
     use super::*;
     use tempfile::TempDir;
 
     /// Helper: create a file with empty content inside a temp dir.
-    fn touch(dir: &Path, name: &str) -> PathBuf {
+    fn touch(dir: &Path, name: &str) -> NormalizedPath {
         let p = dir.join(name);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(&p, "").unwrap();
-        p
+        p.into()
     }
 
     /// Helper: canonicalize a path (or return it unchanged), stripping \\?\ on Windows.
-    fn canon(p: &Path) -> PathBuf {
-        strip_win_prefix(std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
+    fn canon(p: &Path) -> NormalizedPath {
+        strip_win_prefix(
+            std::fs::canonicalize(p)
+                .unwrap_or_else(|_| p.to_path_buf())
+                .into(),
+        )
     }
 
-    // ── 1. parse_single_line ─────────────────────────────────────────
+    // â”€â”€ 1. parse_single_line â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn parse_single_line() {
@@ -366,7 +379,7 @@ mod tests {
         assert!(!result.has_computed);
     }
 
-    // ── 2. parse_continuations ───────────────────────────────────────
+    // â”€â”€ 2. parse_continuations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn parse_continuations() {
@@ -384,7 +397,7 @@ mod tests {
         assert!(result.resolved.contains(&canon(&baz_h)));
     }
 
-    // ── 3. parse_escaped_spaces ──────────────────────────────────────
+    // â”€â”€ 3. parse_escaped_spaces â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn parse_escaped_spaces() {
@@ -408,7 +421,7 @@ mod tests {
         );
     }
 
-    // ── 4. parse_multiple_targets ────────────────────────────────────
+    // â”€â”€ 4. parse_multiple_targets â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn parse_multiple_targets() {
@@ -425,7 +438,7 @@ mod tests {
         assert_eq!(result.resolved[0], canon(&bar_h));
     }
 
-    // ── 5. parse_empty_deps ──────────────────────────────────────────
+    // â”€â”€ 5. parse_empty_deps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn parse_empty_deps() {
@@ -433,14 +446,14 @@ mod tests {
         let cwd = dir.path();
         let source = touch(cwd, "foo.c");
 
-        // Source is the only dependency — it gets excluded.
+        // Source is the only dependency â€” it gets excluded.
         let content = "foo.o: foo.c";
         let result = parse_depfile(content, &source, cwd).unwrap();
 
         assert!(result.resolved.is_empty());
     }
 
-    // ── 6. parse_relative_paths_resolved ─────────────────────────────
+    // â”€â”€ 6. parse_relative_paths_resolved â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn parse_relative_paths_resolved() {
@@ -457,7 +470,7 @@ mod tests {
         assert_eq!(result.resolved[0], canon(&header));
     }
 
-    // ── 7. parse_source_excluded ─────────────────────────────────────
+    // â”€â”€ 7. parse_source_excluded â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn parse_source_excluded() {
@@ -477,7 +490,7 @@ mod tests {
         assert!(!result.resolved.contains(&canon(&source)));
     }
 
-    // ── 8. parse_deduplicates ────────────────────────────────────────
+    // â”€â”€ 8. parse_deduplicates â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn parse_deduplicates() {
@@ -486,7 +499,7 @@ mod tests {
         let source = touch(cwd, "foo.c");
         let bar_h = touch(cwd, "bar.h");
 
-        // bar.h appears twice — should be deduplicated.
+        // bar.h appears twice â€” should be deduplicated.
         let content = "foo.o: foo.c bar.h bar.h";
         let result = parse_depfile(content, &source, cwd).unwrap();
 
@@ -494,7 +507,7 @@ mod tests {
         assert_eq!(result.resolved[0], canon(&bar_h));
     }
 
-    // ── 9. parse_windows_drive_letters ───────────────────────────────
+    // â”€â”€ 9. parse_windows_drive_letters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     #[cfg(windows)]
@@ -540,7 +553,7 @@ mod tests {
         );
     }
 
-    // ── 10. parse_empty_content_errors ───────────────────────────────
+    // â”€â”€ 10. parse_empty_content_errors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn parse_empty_content_errors() {
@@ -554,7 +567,7 @@ mod tests {
         }
     }
 
-    // ── 11. parse_real_gcc_output ────────────────────────────────────
+    // â”€â”€ 11. parse_real_gcc_output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn parse_real_gcc_output() {
@@ -583,7 +596,7 @@ mod tests {
         assert!(result.unresolved.is_empty());
     }
 
-    // ── 12. parse_real_clang_output ──────────────────────────────────
+    // â”€â”€ 12. parse_real_clang_output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn parse_real_clang_output() {
@@ -613,7 +626,7 @@ mod tests {
         assert!(!result.has_computed);
     }
 
-    // ── Additional edge cases ────────────────────────────────────────
+    // â”€â”€ Additional edge cases â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn whitespace_only_is_malformed() {
@@ -696,7 +709,7 @@ mod tests {
         assert!(msg.contains("bad content"));
     }
 
-    // ── Unit tests for internal helpers ──────────────────────────────
+    // â”€â”€ Unit tests for internal helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn join_continuations_replaces_with_space() {
@@ -743,7 +756,7 @@ mod tests {
         assert_eq!(tokens, vec!["file#1.h"]);
     }
 
-    // ── Strategy tests ──────────────────────────────────────────────
+    // â”€â”€ Strategy tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn strategy_unsupported() {
@@ -758,7 +771,7 @@ mod tests {
     fn strategy_user_mf() {
         let dep_flags = UserDepFlags {
             has_md: true,
-            mf_path: Some(PathBuf::from("/build/deps.d")),
+            mf_path: Some(NormalizedPath::from("/build/deps.d")),
         };
         let (args, strategy) =
             prepare_depfile(true, &dep_flags, Path::new("foo.o"), Path::new("/tmp"));
@@ -766,7 +779,7 @@ mod tests {
         assert_eq!(
             strategy,
             DepfileStrategy::UserSpecified {
-                path: PathBuf::from("/build/deps.d")
+                path: NormalizedPath::from("/build/deps.d")
             }
         );
     }
@@ -783,7 +796,7 @@ mod tests {
         assert_eq!(
             strategy,
             DepfileStrategy::UserDefault {
-                path: PathBuf::from("foo.d")
+                path: NormalizedPath::from("foo.d")
             }
         );
     }

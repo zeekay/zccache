@@ -7,7 +7,7 @@
 
 use crate::clock::{ChangeJournal, Clock};
 use crate::metadata::MetadataCache;
-use std::path::{Path, PathBuf};
+use zccache_core::NormalizedPath;
 use zccache_core::Result;
 use zccache_hash::ContentHash;
 
@@ -71,7 +71,7 @@ impl CacheSystem {
     /// # Errors
     ///
     /// Returns an error if the file cannot be read.
-    pub fn lookup_since(&self, path: &Path, since_clock: Clock) -> Result<ClockLookup> {
+    pub fn lookup_since(&self, path: &NormalizedPath, since_clock: Clock) -> Result<ClockLookup> {
         let clock = self.journal.current_clock();
 
         // Fast path: journal says no changes AND stat confirms mtime+size match.
@@ -84,7 +84,7 @@ impl CacheSystem {
         }
 
         // Slow path: stat-verify and hash via MetadataCache.
-        let hash = self.metadata.lookup(path)?;
+        let hash = self.metadata.lookup(path.as_path())?;
         Ok(ClockLookup {
             hash,
             clock: self.journal.current_clock(),
@@ -97,7 +97,7 @@ impl CacheSystem {
     /// for each affected path. Called by the settle buffer after coalescing.
     ///
     /// Returns the new clock value.
-    pub fn apply_changes(&self, changed_paths: Vec<PathBuf>) -> Clock {
+    pub fn apply_changes(&self, changed_paths: Vec<NormalizedPath>) -> Clock {
         // Downgrade confidence for each changed path.
         for path in &changed_paths {
             self.metadata.downgrade(path);
@@ -113,8 +113,8 @@ impl CacheSystem {
     /// Modified files are downgraded. Advances the clock.
     pub fn apply_changes_with_removals(
         &self,
-        changed: Vec<PathBuf>,
-        removed: Vec<PathBuf>,
+        changed: Vec<NormalizedPath>,
+        removed: Vec<NormalizedPath>,
     ) -> Clock {
         for path in &changed {
             self.metadata.downgrade(path);
@@ -174,7 +174,8 @@ impl CacheSystem {
 
     /// Remove journal `last_change` entries not in the metadata cache.
     fn cleanup_journal(&self) -> usize {
-        let live: std::collections::HashSet<PathBuf> = self.metadata.paths().into_iter().collect();
+        let live: std::collections::HashSet<NormalizedPath> =
+            self.metadata.paths().into_iter().collect();
         self.journal.retain_paths(&live)
     }
 
@@ -184,7 +185,7 @@ impl CacheSystem {
     /// This enables the zero-syscall fast path in `lookup_since` for files
     /// that the watcher hasn't reported yet. Call after scanning includes
     /// on a cache miss so headers get the fast path on subsequent hits.
-    pub fn register_tracked(&self, paths: &[PathBuf]) {
+    pub fn register_tracked(&self, paths: &[NormalizedPath]) {
         for path in paths {
             self.journal.register(path.clone());
         }
@@ -206,10 +207,10 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    fn create_file(dir: &TempDir, name: &str, content: &str) -> PathBuf {
+    fn create_file(dir: &TempDir, name: &str, content: &str) -> NormalizedPath {
         let path = dir.path().join(name);
         fs::write(&path, content).expect("failed to create test file");
-        path
+        path.into()
     }
 
     fn sleep_for_mtime() {
@@ -232,7 +233,7 @@ mod tests {
     #[test]
     fn lookup_since_nonexistent_file_returns_error() {
         let cache = CacheSystem::new();
-        let result = cache.lookup_since(Path::new("/no/such/file.c"), Clock::ZERO);
+        let result = cache.lookup_since(&NormalizedPath::from("/no/such/file.c"), Clock::ZERO);
         assert!(result.is_err());
     }
 

@@ -16,7 +16,7 @@ pub mod notify_watcher;
 pub mod recovery;
 pub mod settle;
 
-use std::path::PathBuf;
+use zccache_core::NormalizedPath;
 
 pub use ignore::IgnoreFilter;
 pub use notify_watcher::NotifyWatcher;
@@ -27,13 +27,16 @@ pub use settle::{SettleBuffer, SettledEvent};
 #[derive(Debug, Clone)]
 pub enum WatchEvent {
     /// A file was modified.
-    Modified(PathBuf),
+    Modified(NormalizedPath),
     /// A file was created.
-    Created(PathBuf),
+    Created(NormalizedPath),
     /// A file was removed.
-    Removed(PathBuf),
+    Removed(NormalizedPath),
     /// A file was renamed (from, to).
-    Renamed { from: PathBuf, to: PathBuf },
+    Renamed {
+        from: NormalizedPath,
+        to: NormalizedPath,
+    },
     /// The watcher's event buffer overflowed. All watched paths
     /// should be considered stale.
     Overflow,

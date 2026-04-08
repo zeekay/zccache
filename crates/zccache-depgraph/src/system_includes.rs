@@ -13,7 +13,9 @@
 //! only handles parsing the output and caching results.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use zccache_core::NormalizedPath;
 
 /// Parse compiler `-v -E` output to extract system include paths.
 ///
@@ -24,7 +26,7 @@ use std::path::{Path, PathBuf};
 /// Lines starting with ` (framework directory)` are included but the
 /// suffix is stripped.
 #[must_use]
-pub fn parse_system_include_output(output: &str) -> Vec<PathBuf> {
+pub fn parse_system_include_output(output: &str) -> Vec<NormalizedPath> {
     let mut in_section = false;
     let mut paths = Vec::new();
 
@@ -49,7 +51,7 @@ pub fn parse_system_include_output(output: &str) -> Vec<PathBuf> {
             };
 
             if !path_str.is_empty() {
-                paths.push(PathBuf::from(path_str));
+                paths.push(path_str.into());
             }
         }
     }
@@ -77,7 +79,7 @@ pub fn discovery_args() -> Vec<&'static str> {
 /// across sessions.
 #[derive(Debug, Default)]
 pub struct SystemIncludeCache {
-    cache: HashMap<PathBuf, Vec<PathBuf>>,
+    cache: HashMap<NormalizedPath, Vec<NormalizedPath>>,
 }
 
 impl SystemIncludeCache {
@@ -89,12 +91,13 @@ impl SystemIncludeCache {
 
     /// Look up cached system include paths for a compiler.
     #[must_use]
-    pub fn get(&self, compiler: &Path) -> Option<&[PathBuf]> {
-        self.cache.get(compiler).map(Vec::as_slice)
+    pub fn get(&self, compiler: &Path) -> Option<&[NormalizedPath]> {
+        let compiler = NormalizedPath::new(compiler);
+        self.cache.get(&compiler).map(Vec::as_slice)
     }
 
     /// Store discovered system include paths for a compiler.
-    pub fn insert(&mut self, compiler: PathBuf, paths: Vec<PathBuf>) {
+    pub fn insert(&mut self, compiler: NormalizedPath, paths: Vec<NormalizedPath>) {
         self.cache.insert(compiler, paths);
     }
 
@@ -102,15 +105,16 @@ impl SystemIncludeCache {
     ///
     /// The closure receives the compiler path and should execute the
     /// discovery command and return parsed paths.
-    pub fn get_or_discover<F>(&mut self, compiler: &Path, discover: F) -> &[PathBuf]
+    pub fn get_or_discover<F>(&mut self, compiler: &Path, discover: F) -> &[NormalizedPath]
     where
-        F: FnOnce(&Path) -> Vec<PathBuf>,
+        F: FnOnce(&Path) -> Vec<NormalizedPath>,
     {
-        if !self.cache.contains_key(compiler) {
+        let compiler_key = NormalizedPath::new(compiler);
+        if !self.cache.contains_key(&compiler_key) {
             let paths = discover(compiler);
-            self.cache.insert(compiler.to_path_buf(), paths);
+            self.cache.insert(compiler_key.clone(), paths);
         }
-        self.cache.get(compiler).map(Vec::as_slice).unwrap()
+        self.cache.get(&compiler_key).map(Vec::as_slice).unwrap()
     }
 
     /// Remove all cached entries.
@@ -154,10 +158,10 @@ End of search list.
         assert_eq!(
             paths,
             vec![
-                PathBuf::from("/usr/lib/gcc/x86_64-linux-gnu/11/include"),
-                PathBuf::from("/usr/local/include"),
-                PathBuf::from("/usr/include/x86_64-linux-gnu"),
-                PathBuf::from("/usr/include"),
+                NormalizedPath::from("/usr/lib/gcc/x86_64-linux-gnu/11/include"),
+                NormalizedPath::from("/usr/local/include"),
+                NormalizedPath::from("/usr/include/x86_64-linux-gnu"),
+                NormalizedPath::from("/usr/include"),
             ]
         );
     }
@@ -178,9 +182,9 @@ End of search list.
         assert_eq!(
             paths,
             vec![
-                PathBuf::from("/usr/lib/clang/14.0.0/include"),
-                PathBuf::from("/usr/local/include"),
-                PathBuf::from("/usr/include"),
+                NormalizedPath::from("/usr/lib/clang/14.0.0/include"),
+                NormalizedPath::from("/usr/local/include"),
+                NormalizedPath::from("/usr/include"),
             ]
         );
     }
@@ -200,10 +204,12 @@ End of search list.
         assert_eq!(
             paths,
             vec![
-                PathBuf::from("/usr/local/include"),
-                PathBuf::from("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include"),
-                PathBuf::from(
-                    "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
+                NormalizedPath::from("/usr/local/include"),
+                NormalizedPath::from(
+                    "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include",
+                ),
+                NormalizedPath::from(
+                    "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
                 ),
             ]
         );
@@ -232,7 +238,7 @@ End of search list.
 End of search list.
 "#;
         let paths = parse_system_include_output(output);
-        assert_eq!(paths, vec![PathBuf::from("/usr/include")]);
+        assert_eq!(paths, vec![NormalizedPath::from("/usr/include")]);
     }
 
     #[test]
@@ -245,11 +251,11 @@ End of search list.
     fn cache_insert_and_get() {
         let mut cache = SystemIncludeCache::new();
         cache.insert(
-            PathBuf::from("/usr/bin/gcc"),
-            vec![PathBuf::from("/usr/include")],
+            "/usr/bin/gcc".into(),
+            vec![NormalizedPath::from("/usr/include")],
         );
         let paths = cache.get(Path::new("/usr/bin/gcc")).unwrap();
-        assert_eq!(paths, &[PathBuf::from("/usr/include")]);
+        assert_eq!(paths, &[NormalizedPath::from("/usr/include")]);
     }
 
     #[test]
@@ -260,12 +266,12 @@ End of search list.
         // First call should invoke the closure.
         let paths = cache.get_or_discover(Path::new("/usr/bin/g++"), |_| {
             call_count += 1;
-            vec![PathBuf::from("/usr/include")]
+            vec![NormalizedPath::from("/usr/include")]
         });
-        assert_eq!(paths, &[PathBuf::from("/usr/include")]);
+        assert_eq!(paths, &[NormalizedPath::from("/usr/include")]);
         assert_eq!(call_count, 1);
 
-        // Second call should use cache — but we can't capture the same
+        // Second call should use cache â€” but we can't capture the same
         // mutable reference, so verify via len.
         assert_eq!(cache.len(), 1);
         assert!(cache.get(Path::new("/usr/bin/g++")).is_some());
@@ -275,12 +281,12 @@ End of search list.
     fn cache_different_compilers() {
         let mut cache = SystemIncludeCache::new();
         cache.insert(
-            PathBuf::from("/usr/bin/gcc"),
-            vec![PathBuf::from("/gcc/include")],
+            "/usr/bin/gcc".into(),
+            vec![NormalizedPath::from("/gcc/include")],
         );
         cache.insert(
-            PathBuf::from("/usr/bin/clang"),
-            vec![PathBuf::from("/clang/include")],
+            "/usr/bin/clang".into(),
+            vec![NormalizedPath::from("/clang/include")],
         );
         assert_eq!(cache.len(), 2);
         assert_ne!(

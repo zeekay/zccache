@@ -6,6 +6,7 @@
 use crate::metadata::{Confidence, FileMetadata, MetadataCache};
 use std::path::Path;
 use std::time::Instant;
+use zccache_core::NormalizedPath;
 use zccache_core::Result;
 use zccache_hash::ContentHash;
 
@@ -50,9 +51,12 @@ impl MetadataCache {
     /// Returns `Gone` if the file no longer exists.
     /// Returns `Err` if the path is not in the cache (use `stat_file` instead).
     pub fn verify(&self, path: &Path) -> Result<VerifyResult> {
-        let cached = self.get(path).ok_or_else(|| zccache_core::Error::Cache {
-            message: format!("path not in cache: {}", path.display()),
-        })?;
+        let normalized = NormalizedPath::from(path);
+        let cached = self
+            .get(&normalized)
+            .ok_or_else(|| zccache_core::Error::Cache {
+                message: format!("path not in cache: {}", path.display()),
+            })?;
 
         let fresh = match Self::stat_file(path) {
             Ok(m) => m,
@@ -83,7 +87,8 @@ impl MetadataCache {
     ///
     /// Returns an error if the file cannot be read.
     pub fn lookup(&self, path: &Path) -> Result<ContentHash> {
-        let cached = self.get(path);
+        let normalized = NormalizedPath::from(path);
+        let cached = self.get(&normalized);
 
         // Cache miss → stat, hash, insert.
         let entry = match cached {
@@ -96,8 +101,8 @@ impl MetadataCache {
         let fresh = match Self::stat_file(path) {
             Ok(m) => m,
             Err(zccache_core::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.remove(path);
-                return Err(zccache_core::Error::FileNotFound(path.to_path_buf()));
+                self.remove(&normalized);
+                return Err(zccache_core::Error::FileNotFound(path.into()));
             }
             Err(e) => return Err(e),
         };
@@ -110,7 +115,7 @@ impl MetadataCache {
                     // Metadata matches → promote to High, reuse cached hash if present.
                     if let Some(hash_bytes) = entry.content_hash {
                         self.insert(
-                            path.to_path_buf(),
+                            path.into(),
                             FileMetadata {
                                 confidence: Confidence::High,
                                 last_verified: Instant::now(),
@@ -145,7 +150,7 @@ impl MetadataCache {
                 let post = Self::stat_file(path)?;
                 if pre.mtime == post.mtime && pre.size == post.size {
                     self.insert(
-                        path.to_path_buf(),
+                        path.into(),
                         FileMetadata {
                             content_hash: Some(*h.as_bytes()),
                             ..post
@@ -157,7 +162,7 @@ impl MetadataCache {
             // Still unstable after retries — return last hash but at Low confidence.
             let meta = Self::stat_file(path)?;
             self.insert(
-                path.to_path_buf(),
+                path.into(),
                 FileMetadata {
                     confidence: Confidence::Low,
                     content_hash: Some(*hash.as_bytes()),
@@ -168,7 +173,7 @@ impl MetadataCache {
         }
 
         self.insert(
-            path.to_path_buf(),
+            path.into(),
             FileMetadata {
                 content_hash: Some(*hash.as_bytes()),
                 ..post_stat
@@ -183,16 +188,16 @@ mod tests {
     use super::*;
     use crate::Confidence;
     use std::fs;
-    use std::path::PathBuf;
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+    use zccache_core::NormalizedPath;
 
     /// Helper: create a file with given content, return its path.
-    fn create_file(dir: &TempDir, name: &str, content: &str) -> PathBuf {
+    fn create_file(dir: &TempDir, name: &str, content: &str) -> NormalizedPath {
         let path = dir.path().join(name);
         fs::write(&path, content).expect("failed to create test file");
-        path
+        path.into()
     }
 
     /// Helper: sleep enough for mtime to differ.

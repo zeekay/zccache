@@ -3,7 +3,8 @@
 //! Provides helpers for integration tests, including temp directories,
 //! daemon lifecycle management, and test fixtures.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use zccache_core::NormalizedPath;
 
 // ─── Tool discovery ─────────────────────────────────────────────────────────
 
@@ -22,7 +23,7 @@ pub fn ensure_clang_tool_chain_on_path() {
                 // Prepend to PATH
                 let path_var = std::env::var_os("PATH").unwrap_or_default();
                 let mut paths = vec![bin_dir];
-                paths.extend(std::env::split_paths(&path_var));
+                paths.extend(std::env::split_paths(&path_var).map(Into::into));
                 let new_path = std::env::join_paths(paths).unwrap();
                 std::env::set_var("PATH", &new_path);
             }
@@ -31,7 +32,7 @@ pub fn ensure_clang_tool_chain_on_path() {
 }
 
 /// Returns the clang-tool-chain bin directory for the current platform, if it exists.
-fn clang_tool_chain_bin_dir() -> Option<PathBuf> {
+fn clang_tool_chain_bin_dir() -> Option<NormalizedPath> {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .ok()?;
@@ -65,7 +66,7 @@ fn clang_tool_chain_bin_dir() -> Option<PathBuf> {
         )
     };
 
-    let dir = PathBuf::from(home)
+    let dir = NormalizedPath::new(home)
         .join(".clang-tool-chain")
         .join("clang")
         .join(platform)
@@ -83,19 +84,19 @@ fn clang_tool_chain_bin_dir() -> Option<PathBuf> {
 ///
 /// Call [`ensure_clang_tool_chain_on_path`] first to make clang-tool-chain
 /// binaries discoverable.
-pub fn find_on_path(name: &str) -> Option<PathBuf> {
+pub fn find_on_path(name: &str) -> Option<NormalizedPath> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(name);
         if candidate.is_file() {
-            return Some(candidate);
+            return Some(candidate.into());
         }
         // On Windows, also try with .exe suffix
         #[cfg(windows)]
         if std::path::Path::new(name).extension().is_none() {
             let with_exe = dir.join(format!("{name}.exe"));
             if with_exe.is_file() {
-                return Some(with_exe);
+                return Some(with_exe.into());
             }
         }
     }
@@ -105,13 +106,13 @@ pub fn find_on_path(name: &str) -> Option<PathBuf> {
 /// Find clang++ via clang-tool-chain + PATH. Convenience wrapper.
 ///
 /// Ensures clang-tool-chain is on PATH, then searches for `clang++`.
-pub fn find_clang() -> Option<PathBuf> {
+pub fn find_clang() -> Option<NormalizedPath> {
     ensure_clang_tool_chain_on_path();
     find_on_path("clang++")
 }
 
 /// Find `rustc` on PATH.
-pub fn find_rustc() -> Option<PathBuf> {
+pub fn find_rustc() -> Option<NormalizedPath> {
     find_on_path("rustc")
 }
 
@@ -239,7 +240,7 @@ impl TestProject {
     ///
     /// Creates `include/`, `src/`, and `obj/` directories.
     /// Returns the list of (source_path, object_path) compilation units.
-    pub fn generate(&self, root: &Path) -> Vec<(PathBuf, PathBuf)> {
+    pub fn generate(&self, root: &Path) -> Vec<(NormalizedPath, NormalizedPath)> {
         let incdir = root.join("include");
         let srcdir = root.join("src");
         let objdir = root.join("obj");
@@ -254,8 +255,8 @@ impl TestProject {
         (0..self.source_count)
             .map(|i| {
                 (
-                    srcdir.join(format!("unit_{i:04}.cpp")),
-                    objdir.join(format!("unit_{i:04}.o")),
+                    srcdir.join(format!("unit_{i:04}.cpp")).into(),
+                    objdir.join(format!("unit_{i:04}.o")).into(),
                 )
             })
             .collect()
@@ -320,7 +321,7 @@ static_library('testlib', sources, include_directories: inc)
         std::fs::write(root.join("meson.build"), meson_build).unwrap();
 
         MesonProject {
-            source_dir: root.to_path_buf(),
+            source_dir: root.to_path_buf().into(),
             source_count: self.source_count,
         }
     }
@@ -545,7 +546,7 @@ int entry_{index}() {{
 /// A generated meson project with methods to run meson setup and ninja builds.
 pub struct MesonProject {
     /// Root directory containing `meson.build` and source files.
-    pub source_dir: PathBuf,
+    pub source_dir: NormalizedPath,
     /// Number of source files in the project.
     pub source_count: usize,
 }

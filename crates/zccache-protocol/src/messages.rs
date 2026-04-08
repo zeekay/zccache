@@ -1,8 +1,8 @@
 //! Protocol message definitions.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::Arc;
+use zccache_core::NormalizedPath;
 
 /// A request from client to daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,13 +30,13 @@ pub enum Request {
         /// Client process ID.
         client_pid: u32,
         /// Client working directory.
-        working_dir: PathBuf,
+        working_dir: NormalizedPath,
         /// Optional path to a log file for this session.
-        log_file: Option<PathBuf>,
+        log_file: Option<NormalizedPath>,
         /// Whether to track per-session statistics.
         track_stats: bool,
         /// Path for per-session JSONL compile journal (must end in .jsonl).
-        journal_path: Option<PathBuf>,
+        journal_path: Option<NormalizedPath>,
     },
     /// Compile a source file within an existing session.
     Compile {
@@ -45,9 +45,9 @@ pub enum Request {
         /// Compiler arguments (e.g., ["-c", "hello.cpp", "-o", "hello.o"]).
         args: Vec<String>,
         /// Working directory for the compilation.
-        cwd: PathBuf,
+        cwd: NormalizedPath,
         /// Path to the compiler executable (required).
-        compiler: PathBuf,
+        compiler: NormalizedPath,
         /// Client environment variables to pass to the compiler process.
         /// If `None`, the daemon's own environment is inherited (backward compat).
         /// If `Some`, the compiler process uses exactly these env vars.
@@ -67,13 +67,13 @@ pub enum Request {
         /// Client process ID.
         client_pid: u32,
         /// Client working directory.
-        working_dir: PathBuf,
+        working_dir: NormalizedPath,
         /// Path to the compiler executable.
-        compiler: PathBuf,
+        compiler: NormalizedPath,
         /// Compiler arguments (e.g., ["-c", "hello.cpp", "-o", "hello.o"]).
         args: Vec<String>,
         /// Working directory for the compilation.
-        cwd: PathBuf,
+        cwd: NormalizedPath,
         /// Client environment variables to pass to the compiler process.
         env: Option<Vec<(String, String)>>,
     },
@@ -83,11 +83,11 @@ pub enum Request {
         /// Client process ID.
         client_pid: u32,
         /// Path to the linker/archiver tool (ar, ld, lib.exe, link.exe, etc.).
-        tool: PathBuf,
+        tool: NormalizedPath,
         /// Tool arguments (e.g., ["rcs", "libfoo.a", "a.o", "b.o"]).
         args: Vec<String>,
         /// Working directory for the link operation.
-        cwd: PathBuf,
+        cwd: NormalizedPath,
         /// Client environment variables.
         env: Option<Vec<(String, String)>>,
     },
@@ -101,11 +101,11 @@ pub enum Request {
     /// NOTE: Appended at end to preserve bincode variant indices.
     FingerprintCheck {
         /// Path to the cache file (e.g., .cache/lint.json).
-        cache_file: PathBuf,
+        cache_file: NormalizedPath,
         /// Cache algorithm: "hash" or "two-layer".
         cache_type: String,
         /// Root directory to scan.
-        root: PathBuf,
+        root: NormalizedPath,
         /// File extensions to include (without dot, e.g., "rs", "cpp").
         /// Empty = all files. Conflicts with `include_globs`.
         extensions: Vec<String>,
@@ -118,17 +118,17 @@ pub enum Request {
     /// Mark the previous fingerprint check as successful.
     FingerprintMarkSuccess {
         /// Path to the cache file.
-        cache_file: PathBuf,
+        cache_file: NormalizedPath,
     },
     /// Mark the previous fingerprint check as failed.
     FingerprintMarkFailure {
         /// Path to the cache file.
-        cache_file: PathBuf,
+        cache_file: NormalizedPath,
     },
     /// Invalidate a fingerprint cache (delete all state).
     FingerprintInvalidate {
         /// Path to the cache file.
-        cache_file: PathBuf,
+        cache_file: NormalizedPath,
     },
 }
 
@@ -150,7 +150,7 @@ pub enum Response {
         /// Assigned session ID (UUID string).
         session_id: String,
         /// Path to the per-session JSONL journal file (if journal was requested).
-        journal_path: Option<PathBuf>,
+        journal_path: Option<NormalizedPath>,
     },
     /// Result of a compilation request.
     CompileResult {
@@ -259,7 +259,7 @@ pub struct DaemonStatus {
     /// Currently active sessions.
     pub sessions_active: u64,
     /// Path to the cache directory.
-    pub cache_dir: PathBuf,
+    pub cache_dir: NormalizedPath,
     /// On-disk depgraph snapshot format version.
     pub dep_graph_version: u32,
     /// Size of the depgraph snapshot file on disk (0 = not persisted).
@@ -403,7 +403,7 @@ mod tests {
             dep_graph_files: 4201,
             sessions_total: 41,
             sessions_active: 3,
-            cache_dir: PathBuf::from("/home/user/.zccache"),
+            cache_dir: "/home/user/.zccache".into(),
             dep_graph_version: 1,
             dep_graph_disk_size: 2_500_000,
         };
@@ -414,7 +414,7 @@ mod tests {
     fn session_start_with_track_stats_roundtrip() {
         let req = Request::SessionStart {
             client_pid: 1234,
-            working_dir: PathBuf::from("/home/user/project"),
+            working_dir: "/home/user/project".into(),
             log_file: None,
             track_stats: true,
             journal_path: None,
@@ -423,7 +423,7 @@ mod tests {
 
         let req_no_stats = Request::SessionStart {
             client_pid: 1234,
-            working_dir: PathBuf::from("/home/user/project"),
+            working_dir: "/home/user/project".into(),
             log_file: None,
             track_stats: false,
             journal_path: None,
@@ -435,16 +435,16 @@ mod tests {
     fn session_start_with_journal_path_roundtrip() {
         let req = Request::SessionStart {
             client_pid: 5678,
-            working_dir: PathBuf::from("/home/user/project"),
+            working_dir: "/home/user/project".into(),
             log_file: None,
             track_stats: false,
-            journal_path: Some(PathBuf::from("/tmp/build.jsonl")),
+            journal_path: Some("/tmp/build.jsonl".into()),
         };
         roundtrip(&req);
 
         let req_no_journal = Request::SessionStart {
             client_pid: 5678,
-            working_dir: PathBuf::from("/home/user/project"),
+            working_dir: "/home/user/project".into(),
             log_file: None,
             track_stats: false,
             journal_path: None,
@@ -456,9 +456,7 @@ mod tests {
     fn session_started_with_journal_path_roundtrip() {
         let resp = Response::SessionStarted {
             session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
-            journal_path: Some(PathBuf::from(
-                "/home/user/.zccache/logs/sessions/test.jsonl",
-            )),
+            journal_path: Some("/home/user/.zccache/logs/sessions/test.jsonl".into()),
         };
         roundtrip(&resp);
 
@@ -509,19 +507,19 @@ mod tests {
     fn compile_ephemeral_roundtrip() {
         roundtrip(&Request::CompileEphemeral {
             client_pid: 9876,
-            working_dir: PathBuf::from("/home/user/project"),
-            compiler: PathBuf::from("/usr/bin/clang++"),
+            working_dir: "/home/user/project".into(),
+            compiler: "/usr/bin/clang++".into(),
             args: vec!["-c".into(), "main.cpp".into(), "-o".into(), "main.o".into()],
-            cwd: PathBuf::from("/home/user/project/build"),
+            cwd: "/home/user/project/build".into(),
             env: Some(vec![("PATH".into(), "/usr/bin".into())]),
         });
         // Also test with env = None
         roundtrip(&Request::CompileEphemeral {
             client_pid: 1,
-            working_dir: PathBuf::from("."),
-            compiler: PathBuf::from("gcc"),
+            working_dir: ".".into(),
+            compiler: "gcc".into(),
             args: vec![],
-            cwd: PathBuf::from("."),
+            cwd: ".".into(),
             env: None,
         });
     }
@@ -530,16 +528,16 @@ mod tests {
     fn link_ephemeral_roundtrip() {
         roundtrip(&Request::LinkEphemeral {
             client_pid: 5555,
-            tool: PathBuf::from("/usr/bin/ar"),
+            tool: "/usr/bin/ar".into(),
             args: vec!["rcs".into(), "libfoo.a".into(), "a.o".into(), "b.o".into()],
-            cwd: PathBuf::from("/home/user/project/build"),
+            cwd: "/home/user/project/build".into(),
             env: Some(vec![("PATH".into(), "/usr/bin".into())]),
         });
         roundtrip(&Request::LinkEphemeral {
             client_pid: 1,
-            tool: PathBuf::from("lib.exe"),
+            tool: "lib.exe".into(),
             args: vec!["/OUT:foo.lib".into(), "a.obj".into()],
-            cwd: PathBuf::from("."),
+            cwd: ".".into(),
             env: None,
         });
     }
@@ -598,8 +596,8 @@ mod tests {
         roundtrip(&Request::Compile {
             session_id: "550e8400-e29b-41d4-a716-446655440000".into(),
             args: vec!["-c".into(), "foo.c".into()],
-            cwd: PathBuf::from("/tmp"),
-            compiler: PathBuf::from("/usr/bin/gcc"),
+            cwd: "/tmp".into(),
+            compiler: "/usr/bin/gcc".into(),
             env: None,
         });
     }
@@ -641,7 +639,7 @@ mod tests {
             dep_graph_files: 0,
             sessions_total: 0,
             sessions_active: 0,
-            cache_dir: PathBuf::new(),
+            cache_dir: "".into(),
             dep_graph_version: 0,
             dep_graph_disk_size: 0,
         };
@@ -656,17 +654,17 @@ mod tests {
     #[test]
     fn fingerprint_check_roundtrip() {
         roundtrip(&Request::FingerprintCheck {
-            cache_file: PathBuf::from("/tmp/lint.json"),
+            cache_file: "/tmp/lint.json".into(),
             cache_type: "two-layer".into(),
-            root: PathBuf::from("/home/user/project/src"),
+            root: "/home/user/project/src".into(),
             extensions: vec!["rs".into(), "toml".into()],
             include_globs: vec![],
             exclude: vec![".git".into(), "target".into()],
         });
         roundtrip(&Request::FingerprintCheck {
-            cache_file: PathBuf::from("cache.json"),
+            cache_file: "cache.json".into(),
             cache_type: "hash".into(),
-            root: PathBuf::from("."),
+            root: ".".into(),
             extensions: vec![],
             include_globs: vec!["**/*.cpp".into(), "**/*.h".into()],
             exclude: vec![],
@@ -676,21 +674,21 @@ mod tests {
     #[test]
     fn fingerprint_mark_success_roundtrip() {
         roundtrip(&Request::FingerprintMarkSuccess {
-            cache_file: PathBuf::from("/tmp/lint.json"),
+            cache_file: "/tmp/lint.json".into(),
         });
     }
 
     #[test]
     fn fingerprint_mark_failure_roundtrip() {
         roundtrip(&Request::FingerprintMarkFailure {
-            cache_file: PathBuf::from("/tmp/lint.json"),
+            cache_file: "/tmp/lint.json".into(),
         });
     }
 
     #[test]
     fn fingerprint_invalidate_roundtrip() {
         roundtrip(&Request::FingerprintInvalidate {
-            cache_file: PathBuf::from("/tmp/lint.json"),
+            cache_file: "/tmp/lint.json".into(),
         });
     }
 

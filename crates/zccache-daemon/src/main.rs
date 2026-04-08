@@ -12,6 +12,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::Parser;
+use zccache_core::NormalizedPath;
 
 /// zccache daemon -- local compiler cache service.
 #[derive(Debug, Parser)]
@@ -19,7 +20,7 @@ use clap::Parser;
 struct Args {
     /// Path to configuration file.
     #[arg(long)]
-    config: Option<std::path::PathBuf>,
+    config: Option<NormalizedPath>,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]

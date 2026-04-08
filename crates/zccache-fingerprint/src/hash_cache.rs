@@ -1,4 +1,5 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use zccache_core::NormalizedPath;
 
 use rayon::prelude::*;
 
@@ -45,13 +46,15 @@ pub fn compute_aggregate_hash(files: &[ScannedFile]) -> Result<String> {
 /// tests" or "rebuild everything"). Cheaper than `TwoLayerCache` when you only
 /// need a single yes/no answer.
 pub struct HashCache {
-    cache_file: PathBuf,
+    cache_file: NormalizedPath,
 }
 
 impl HashCache {
     /// Create a new cache backed by the given file path.
-    pub fn new(cache_file: PathBuf) -> Self {
-        Self { cache_file }
+    pub fn new(cache_file: impl Into<NormalizedPath>) -> Self {
+        Self {
+            cache_file: cache_file.into(),
+        }
     }
 
     /// Check whether the operation needs to run.
