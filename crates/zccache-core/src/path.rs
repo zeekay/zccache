@@ -250,7 +250,7 @@ pub fn normalize_for_key(path: &Path) -> String {
 
     #[cfg(target_os = "macos")]
     {
-        return normalized.to_string_lossy().to_lowercase();
+        normalized.to_string_lossy().to_lowercase()
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
