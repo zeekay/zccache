@@ -207,25 +207,59 @@ static RSP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// compiler from misinterpreting them. Inside quotes, `"` and `\` are
 /// backslash-escaped.
 #[cfg(any(windows, test))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn format_rsp_content(args: &[String]) -> String {
     let estimated_len: usize = args.iter().map(|a| a.len() + 3).sum();
     let mut content = String::with_capacity(estimated_len);
     for arg in args {
-        if arg.contains(' ') || arg.contains('"') || arg.starts_with('@') {
-            content.push('"');
-            for ch in arg.chars() {
-                if ch == '"' || ch == '\\' {
-                    content.push('\\');
-                }
-                content.push(ch);
-            }
-            content.push('"');
-        } else {
-            content.push_str(arg);
-        }
+        content.push_str(&format_rsp_argument(arg).expect("argument should be representable"));
         content.push('\n');
     }
     content
+}
+
+#[cfg(any(windows, test))]
+fn format_rsp_content_if_safe(args: &[String]) -> Option<String> {
+    let estimated_len: usize = args.iter().map(|a| a.len() + 3).sum();
+    let mut content = String::with_capacity(estimated_len);
+    for arg in args {
+        content.push_str(&format_rsp_argument(arg)?);
+        content.push('\n');
+    }
+    Some(content)
+}
+
+#[cfg(any(windows, test))]
+fn format_rsp_argument(arg: &str) -> Option<String> {
+    if arg.is_empty() {
+        return Some("''".to_string());
+    }
+
+    let needs_quoting = arg.contains(char::is_whitespace)
+        || arg.contains('"')
+        || arg.contains('\'')
+        || arg.starts_with('@');
+
+    if !needs_quoting {
+        return Some(arg.to_string());
+    }
+
+    // GCC/Clang response files on Windows treat single quotes literally.
+    // Prefer them when possible so we preserve backslashes and embedded
+    // double quotes exactly as they appeared in the original argv.
+    if !arg.contains('\'') {
+        return Some(format!("'{arg}'"));
+    }
+
+    // Double-quoted response file args are only safe when the argument
+    // contains no backslashes, since our parser/compiler model would treat
+    // backslashes as escapes and change Windows path semantics.
+    if !arg.contains('\\') {
+        let escaped = arg.replace('"', "\\\"");
+        return Some(format!("\"{escaped}\""));
+    }
+
+    None
 }
 
 /// If the total length of `args` exceeds the Windows command-line limit, write
@@ -246,7 +280,10 @@ pub fn write_response_file_if_needed(
 
     let id = RSP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let rsp_path = tmp_dir.join(format!("zccache_{}_{}.rsp", std::process::id(), id));
-    std::fs::write(&rsp_path, format_rsp_content(args))?;
+    let Some(content) = format_rsp_content_if_safe(args) else {
+        return Ok(None);
+    };
+    std::fs::write(&rsp_path, content)?;
 
     Ok(Some(TempResponseFile { path: rsp_path }))
 }
@@ -732,21 +769,21 @@ mod tests {
     fn format_rsp_quotes_spaces() {
         let args = s(&["-I/path with spaces/include", "-c"]);
         let content = format_rsp_content(&args);
-        assert_eq!(content, "\"-I/path with spaces/include\"\n-c\n");
+        assert_eq!(content, "'-I/path with spaces/include'\n-c\n");
     }
 
     #[test]
     fn format_rsp_escapes_quotes() {
         let args = s(&[r#"-DMSG="hello""#]);
         let content = format_rsp_content(&args);
-        assert_eq!(content, "\"-DMSG=\\\"hello\\\"\"\n");
+        assert_eq!(content, "'-DMSG=\"hello\"'\n");
     }
 
     #[test]
     fn format_rsp_escapes_backslash_in_quoted() {
         let args = s(&[r"-IC:\path with spaces\include"]);
         let content = format_rsp_content(&args);
-        assert_eq!(content, "\"-IC:\\\\path with spaces\\\\include\"\n");
+        assert_eq!(content, "'-IC:\\path with spaces\\include'\n");
     }
 
     #[test]
@@ -755,7 +792,7 @@ mod tests {
         // from interpreting them as nested response file references.
         let args = s(&["@rpath/lib", "-c"]);
         let content = format_rsp_content(&args);
-        assert_eq!(content, "\"@rpath/lib\"\n-c\n");
+        assert_eq!(content, "'@rpath/lib'\n-c\n");
     }
 
     #[test]
@@ -773,6 +810,26 @@ mod tests {
         let content = format_rsp_content(&args);
         let parsed = parse_response_file_content(&content);
         assert_eq!(parsed, args);
+    }
+
+    #[test]
+    fn format_rsp_declines_unsafe_single_quote_with_backslash() {
+        let args = s(&[r"C:\path with spaces\o'hare"]);
+        assert!(format_rsp_content_if_safe(&args).is_none());
+    }
+
+    #[test]
+    fn format_rsp_prefers_single_quotes_for_windows_gcc_shapes() {
+        let args = s(&[
+            r#"-DVALUE="C:\Program Files\SDK\include""#,
+            r"C:\work tree\main.c",
+        ]);
+        let content = format_rsp_content_if_safe(&args).unwrap();
+        assert_eq!(
+            content,
+            "'-DVALUE=\"C:\\Program Files\\SDK\\include\"'\n'C:\\work tree\\main.c'\n"
+        );
+        assert_eq!(parse_response_file_content(&content), args);
     }
 
     #[test]

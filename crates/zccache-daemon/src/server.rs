@@ -54,6 +54,18 @@ pub(crate) struct FastHitEntry {
 const FAST_HIT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone)]
+struct RspDependency {
+    path: PathBuf,
+    hash: ContentHash,
+}
+
+#[derive(Clone)]
+struct RspCacheEntry {
+    expanded: Vec<String>,
+    dependencies: Vec<RspDependency>,
+}
+
+#[derive(Clone)]
 /// Cached compilation artifact with lazy payload loading.
 ///
 /// Metadata (output names, sizes, stdout, stderr, exit code) is always in
@@ -239,10 +251,10 @@ struct SharedState {
     /// Whether the file watcher is active. Fast-hit cache is only used when
     /// the watcher is running, since we rely on it for change detection.
     watcher_active: AtomicBool,
-    /// Response file expansion cache: resolved_path → expanded args.
-    /// Avoids re-reading and re-parsing @file references on every request.
-    /// Response files are static during a build, so no invalidation needed.
-    rsp_cache: DashMap<PathBuf, Vec<String>>,
+    /// Response file expansion cache keyed by canonical root path.
+    /// Each entry carries the transitive response-file hashes required to
+    /// validate freshness before reusing the cached expansion.
+    rsp_cache: DashMap<PathBuf, RspCacheEntry>,
     /// Request-level fast path cache: hash(compiler, args, cwd) → pre-computed context.
     /// When the same compile request is seen again and the fast-hit cache still
     /// holds a valid entry, this allows skipping ALL heavy work: system include
@@ -2162,22 +2174,11 @@ fn expand_args_cached(state: &SharedState, args: &[String], cwd: &Path) -> Vec<S
                 cwd.join(filename)
             };
 
-            if let Some(cached) = state.rsp_cache.get(&resolved) {
-                result.extend(cached.value().iter().cloned());
-            } else {
-                // Expand this single @file and cache the result
-                match zccache_compiler::response_file::expand_response_files_in(
-                    std::slice::from_ref(arg),
-                    cwd,
-                ) {
-                    Ok(expanded) => {
-                        state.rsp_cache.insert(resolved, expanded.clone());
-                        result.extend(expanded);
-                    }
-                    Err(e) => {
-                        tracing::debug!("response file expansion failed: {e}, passing raw arg");
-                        result.push(arg.clone());
-                    }
+            match expand_rsp_arg_cached(state, &resolved) {
+                Ok(expanded) => result.extend(expanded),
+                Err(e) => {
+                    tracing::debug!("response file expansion failed: {e}, passing raw arg");
+                    result.push(arg.clone());
                 }
             }
         } else {
@@ -2185,6 +2186,112 @@ fn expand_args_cached(state: &SharedState, args: &[String], cwd: &Path) -> Vec<S
         }
     }
     result
+}
+
+fn expand_rsp_arg_cached(state: &SharedState, resolved: &Path) -> Result<Vec<String>, String> {
+    let canonical = resolved
+        .canonicalize()
+        .map_err(|e| format!("failed to read response file '{}': {e}", resolved.display()))?;
+
+    if let Some(cached) = state.rsp_cache.get(&canonical) {
+        let fresh = cached
+            .dependencies
+            .iter()
+            .all(|dep| hash_file_via_cache(state, &dep.path) == Some(dep.hash));
+        if fresh {
+            return Ok(cached.expanded.clone());
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut dependencies = Vec::new();
+    let expanded = expand_rsp_recursive(state, &canonical, &mut seen, &mut dependencies, 0)
+        .map_err(|e| e.to_string())?;
+    state.rsp_cache.insert(
+        canonical,
+        RspCacheEntry {
+            expanded: expanded.clone(),
+            dependencies,
+        },
+    );
+    Ok(expanded)
+}
+
+fn expand_rsp_recursive(
+    state: &SharedState,
+    path: &Path,
+    seen: &mut HashSet<PathBuf>,
+    dependencies: &mut Vec<RspDependency>,
+    depth: usize,
+) -> Result<Vec<String>, zccache_compiler::response_file::ResponseFileError> {
+    use zccache_compiler::response_file::{parse_response_file_content, ResponseFileError};
+
+    const MAX_RSP_DEPTH: usize = 10;
+
+    if depth >= MAX_RSP_DEPTH {
+        return Err(ResponseFileError::TooDeep {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| ResponseFileError::ReadError {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+
+    if !seen.insert(canonical.clone()) {
+        return Err(ResponseFileError::CircularReference {
+            path: canonical.clone(),
+        });
+    }
+
+    let content_hash =
+        hash_file_via_cache(state, &canonical).ok_or_else(|| ResponseFileError::ReadError {
+            path: canonical.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "failed to hash response file",
+            ),
+        })?;
+    dependencies.push(RspDependency {
+        path: canonical.clone(),
+        hash: content_hash,
+    });
+
+    let content =
+        std::fs::read_to_string(&canonical).map_err(|e| ResponseFileError::ReadError {
+            path: canonical.clone(),
+            source: e,
+        })?;
+    let base_dir = canonical.parent().unwrap_or_else(|| Path::new("."));
+    let mut expanded = Vec::new();
+    for child in parse_response_file_content(&content) {
+        if let Some(filename) = child.strip_prefix('@') {
+            if filename.is_empty() {
+                expanded.push(child);
+                continue;
+            }
+            let child_path = if Path::new(filename).is_absolute() {
+                PathBuf::from(filename)
+            } else {
+                base_dir.join(filename)
+            };
+            expanded.extend(expand_rsp_recursive(
+                state,
+                &child_path,
+                seen,
+                dependencies,
+                depth + 1,
+            )?);
+        } else {
+            expanded.push(child);
+        }
+    }
+
+    seen.remove(&canonical);
+    Ok(expanded)
 }
 
 /// Check if all files in a context's dependency list are unchanged since
@@ -2215,6 +2322,8 @@ fn context_files_fresh(
 ///
 /// Streams bytes directly into blake3 without intermediate buffer allocation.
 /// Zero-alloc: ~100ns for 10 args, ~500ns for 300 args.
+/// Callers should pass the fully expanded argv so response-file content
+/// changes also invalidate the request-level fast path.
 fn request_fingerprint(compiler: &Path, args: &[String], cwd: &Path) -> ContentHash {
     let mut h = zccache_hash::StreamHasher::new();
     h.update(b"zccache-request-v1\0");
@@ -2247,6 +2356,9 @@ async fn handle_compile(
             };
         }
     };
+    // Expand response files before request-level caching so `@file` mutations
+    // can't reuse stale fast-hit entries keyed only by raw argv.
+    let expanded_args = expand_args_cached(state, args, cwd);
 
     // ── Ultra-fast request-level cache ────────────────────────────────
     // If we've seen this exact (compiler, args, cwd) before AND the fast-hit
@@ -2254,7 +2366,7 @@ async fn handle_compile(
     // discovery, watch_directories, response file expansion, arg parsing,
     // context building, and dep_graph registration.
     if state.watcher_active.load(Ordering::Acquire) {
-        let request_fp = request_fingerprint(compiler_path, args, cwd);
+        let request_fp = request_fingerprint(compiler_path, &expanded_args, cwd);
         if let Some(req_entry) = state.request_cache.get(&request_fp) {
             if let Some(fh_entry) = state.fast_hit_cache.get(&req_entry.context_key) {
                 if fh_entry.cached_at.elapsed() < FAST_HIT_MAX_AGE
@@ -2362,7 +2474,6 @@ async fn handle_compile(
 
     // ── Phase: expand response files + parse args ─────────────────────
     let t0 = std::time::Instant::now();
-    let expanded_args = expand_args_cached(state, args, cwd);
     let compiler_str = compiler.to_str().unwrap_or("");
     let parsed = zccache_compiler::parse_invocation(compiler_str, &expanded_args);
     let compilation = match parsed {
@@ -2512,8 +2623,7 @@ async fn handle_compile(
                             );
                             let bookkeeping_ns = t7.elapsed().as_nanos() as u64;
 
-                            // Populate request-level cache for ultra-fast path
-                            let rfp = request_fingerprint(compiler_path, args, cwd);
+                            let rfp = request_fingerprint(compiler_path, &expanded_args, cwd);
                             state.request_cache.insert(
                                 rfp,
                                 RequestCacheEntry {
@@ -2766,8 +2876,7 @@ async fn handle_compile(
                             },
                         );
 
-                        // Populate request-level cache for ultra-fast path
-                        let rfp = request_fingerprint(compiler_path, args, cwd);
+                        let rfp = request_fingerprint(compiler_path, &expanded_args, cwd);
                         state.request_cache.insert(
                             rfp,
                             RequestCacheEntry {

@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 
 /// Builder for constructing a deterministic cache key.
 ///
-/// Fields are sorted and hashed in a deterministic order to ensure
-/// the same inputs always produce the same cache key.
+/// Environment and dependency maps are sorted for determinism, while
+/// compile arguments are hashed in their original argv order because
+/// compilers can treat argument ordering as significant.
 #[derive(Debug, Default)]
 pub struct CacheKeyBuilder {
     compiler_id: Option<ContentHash>,
@@ -76,10 +77,9 @@ impl CacheKeyBuilder {
         let compiler = self.compiler_id.expect("compiler hash is required");
         hasher.update(compiler.as_bytes());
 
-        // Arguments (sorted for determinism)
-        let mut sorted_args = self.arguments;
-        sorted_args.sort();
-        for arg in &sorted_args {
+        // Arguments — preserve original argv order because compile flag order
+        // can affect semantics (for example, repeated flags where the last wins).
+        for arg in &self.arguments {
             hasher.update(arg.as_bytes());
             hasher.update(b"\0");
         }
@@ -149,5 +149,49 @@ mod tests {
             .build();
 
         assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn argument_order_is_preserved_in_key() {
+        let compiler = hash_bytes(b"gcc-12");
+        let source = hash_bytes(b"int main() {}");
+
+        let k1 = CacheKeyBuilder::new()
+            .compiler(compiler)
+            .source(source)
+            .arg("-include")
+            .arg("a.h")
+            .build();
+
+        let k2 = CacheKeyBuilder::new()
+            .compiler(compiler)
+            .source(source)
+            .arg("-include")
+            .arg("a.h")
+            .build();
+
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn different_argument_order_produces_different_key() {
+        let compiler = hash_bytes(b"gcc-12");
+        let source = hash_bytes(b"int main() {}");
+
+        let k1 = CacheKeyBuilder::new()
+            .compiler(compiler)
+            .source(source)
+            .arg("-DNAME=first")
+            .arg("-DNAME=second")
+            .build();
+
+        let k2 = CacheKeyBuilder::new()
+            .compiler(compiler)
+            .source(source)
+            .arg("-DNAME=second")
+            .arg("-DNAME=first")
+            .build();
+
+        assert_ne!(k1, k2, "swapping compile arg order must change the key");
     }
 }

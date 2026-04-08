@@ -7,7 +7,7 @@
 //! Run single: uv run cargo test -p zccache-daemon --test response_file_cache -- <test_name> --ignored --nocapture
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use zccache_daemon::DaemonServer;
@@ -30,6 +30,50 @@ async fn start_daemon() -> (String, JoinHandle<()>, Arc<Notify>) {
         server.run(0).await.unwrap();
     });
     (endpoint, handle, shutdown)
+}
+
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct CacheEnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    old_home: Option<String>,
+    old_userprofile: Option<String>,
+}
+
+impl CacheEnvGuard {
+    fn new(home: &Path) -> Self {
+        let lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let old_home = std::env::var("HOME").ok();
+        let old_userprofile = std::env::var("USERPROFILE").ok();
+        let home = home.to_string_lossy().into_owned();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+        }
+        Self {
+            _lock: lock,
+            old_home,
+            old_userprofile,
+        }
+    }
+}
+
+impl Drop for CacheEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.old_userprofile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
 }
 
 async fn start_session(
@@ -85,6 +129,8 @@ struct TestHarness {
     clang: PathBuf,
     tmp: tempfile::TempDir,
     #[expect(dead_code)]
+    cache_env: CacheEnvGuard,
+    #[expect(dead_code)]
     endpoint: String,
     server_handle: JoinHandle<()>,
     shutdown: Arc<Notify>,
@@ -96,6 +142,9 @@ impl TestHarness {
     async fn new() -> Option<Self> {
         let clang = zccache_test_support::find_clang()?;
         let tmp = tempfile::tempdir().unwrap();
+        let cache_home = tmp.path().join("home");
+        std::fs::create_dir_all(&cache_home).unwrap();
+        let cache_env = CacheEnvGuard::new(&cache_home);
         let log = tmp.path().join("log.txt");
         let cwd = tmp.path().to_string_lossy().into_owned();
 
@@ -106,6 +155,7 @@ impl TestHarness {
         Some(Self {
             clang,
             tmp,
+            cache_env,
             endpoint,
             server_handle,
             shutdown,
@@ -141,6 +191,14 @@ impl TestHarness {
         self.shutdown.notify_one();
         self.server_handle.await.unwrap();
     }
+}
+
+#[cfg(windows)]
+fn padded_rsp_args(mut args: Vec<String>) -> Vec<String> {
+    while args.iter().map(|a| a.len() + 3).sum::<usize>() < 31_000 {
+        args.push(format!("-D_FILLER_{}={}", args.len(), "X".repeat(128)));
+    }
+    args
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -559,6 +617,85 @@ async fn rsp_with_quoted_args() {
         .await;
     assert_eq!(exit, 0);
     assert!(cached, "same quoted rsp must hit");
+
+    h.shutdown().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore] // integration: spawns clang and exercises Windows spill path
+async fn daemon_spill_rsp_preserves_compile_success() {
+    let mut h = match TestHarness::new().await {
+        Some(h) => h,
+        None => return,
+    };
+
+    h.write_file("src.c", "int f(void) { return 0; }\n");
+
+    let mut rsp_args = vec![
+        "-c".to_string(),
+        "src.c".to_string(),
+        "-o".to_string(),
+        "src.o".to_string(),
+        "-Wall".to_string(),
+    ];
+    rsp_args = padded_rsp_args(rsp_args);
+    h.write_file("spill.rsp", &rsp_args.join("\n"));
+
+    let (exit, cached) = h.compile_with_args(&["@spill.rsp"]).await;
+    assert_eq!(exit, 0);
+    assert!(!cached);
+
+    std::fs::remove_file(h.path("src.o")).unwrap();
+    let (exit, cached) = h.compile_with_args(&["@spill.rsp"]).await;
+    assert_eq!(exit, 0);
+    assert!(cached, "second compile should hit through spilled rsp");
+
+    h.shutdown().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore] // integration: spawns clang and exercises Windows spill path
+async fn daemon_spill_rsp_preserves_fbuild_style_args() {
+    let mut h = match TestHarness::new().await {
+        Some(h) => h,
+        None => return,
+    };
+
+    h.write_file("inc/config.h", "#define CFG_VALUE 7\n");
+    h.write_file(
+        "src.c",
+        "#include \"config.h\"\nconst char *msg(void) { return MESSAGE; }\nint f(void) { return CFG_VALUE; }\n",
+    );
+    h.write_file(
+        "defines.rsp",
+        "'-DMESSAGE=\"C:\\Program Files\\Vendor SDK\"'\n",
+    );
+    h.write_file("includes.rsp", "'-Iinc'\n");
+
+    let mut outer_args = vec![
+        "-c".to_string(),
+        "src.c".to_string(),
+        "-o".to_string(),
+        "src.o".to_string(),
+        "@defines.rsp".to_string(),
+        "@includes.rsp".to_string(),
+    ];
+    outer_args = padded_rsp_args(outer_args);
+    h.write_file("outer.rsp", &outer_args.join("\n"));
+
+    let (exit, cached) = h.compile_with_args(&["@outer.rsp"]).await;
+    assert_eq!(exit, 0);
+    assert!(!cached);
+
+    std::fs::remove_file(h.path("src.o")).unwrap();
+    let (exit, cached) = h.compile_with_args(&["@outer.rsp"]).await;
+    assert_eq!(exit, 0);
+    assert!(
+        cached,
+        "second compile should hit for fbuild-style spilled rsp"
+    );
 
     h.shutdown().await;
 }

@@ -18,8 +18,20 @@ use zccache_compiler::response_file::{
     expand_response_files, parse_response_file_content, ResponseFileError,
 };
 
+#[cfg(windows)]
+use zccache_compiler::response_file::write_response_file_if_needed;
+
 fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| x.to_string()).collect()
+}
+
+#[cfg(windows)]
+fn force_spill_args_owned(seed: Vec<String>) -> Vec<String> {
+    let mut args = seed;
+    while args.iter().map(|a| a.len() + 3).sum::<usize>() < 31_000 {
+        args.push(format!("-D_FILLER_{}={}", args.len(), "X".repeat(128)));
+    }
+    args
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1374,4 +1386,59 @@ fn regression_bare_at_then_real_at() {
     let args = s(&["@", &format!("@{}", path.display())]);
     let result = expand_response_files(&args).unwrap();
     assert_eq!(result, s(&["@", "-DREAL"]));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_fbuild_shape_roundtrips_through_spill_rsp() {
+    let dir = tempfile::tempdir().unwrap();
+    let includes = dir.path().join("includes.rsp");
+    std::fs::write(
+        &includes,
+        "'-IC:\\SDK\\Include'\n'-IC:\\Project Root\\Generated Headers'\n",
+    )
+    .unwrap();
+
+    let args = force_spill_args_owned(vec![
+        "-c".to_string(),
+        r"C:\Project Root\src\main.c".to_string(),
+        "-o".to_string(),
+        r"C:\Project Root\build\main.o".to_string(),
+        r#"-DVERSION="1.2.3""#.to_string(),
+        r#"-DPKG_PATH="C:\Program Files\Vendor SDK\include""#.to_string(),
+        format!("@{}", includes.display()),
+    ]);
+
+    let rsp = write_response_file_if_needed(&args, dir.path())
+        .unwrap()
+        .expect("spill rsp should be written");
+    let written = std::fs::read_to_string(&rsp.path).unwrap();
+    let reparsed = parse_response_file_content(&written);
+
+    assert_eq!(reparsed, args);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_fbuild_shape_preserves_expanded_argv_semantics() {
+    let original = s(&[
+        "-c",
+        r"C:\Project Root\src\main.c",
+        "-o",
+        r"C:\Project Root\build\main.o",
+        r#"-DVERSION="1.2.3""#,
+        r#"-DPKG_PATH="C:\Program Files\Vendor SDK\include""#,
+        r"-IC:\SDK\Include",
+        r"-IC:\Project Root\Generated Headers",
+    ]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let args = force_spill_args_owned(original.clone());
+    let rsp = write_response_file_if_needed(&args, dir.path())
+        .unwrap()
+        .expect("spill rsp should be written");
+    let written = std::fs::read_to_string(&rsp.path).unwrap();
+    let reparsed = parse_response_file_content(&written);
+
+    assert_eq!(reparsed[..original.len()], original);
 }
