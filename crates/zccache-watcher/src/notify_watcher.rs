@@ -80,6 +80,20 @@ impl NotifyWatcher {
         Ok(())
     }
 
+    /// Start watching a directory recursively.
+    ///
+    /// This is intended for library consumers that want a single root watch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be watched.
+    pub fn watch_recursive(&mut self, path: &Path) -> zccache_core::Result<()> {
+        self.watcher
+            .watch(path, RecursiveMode::Recursive)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(())
+    }
+
     /// Stop watching a directory.
     ///
     /// # Errors

@@ -176,16 +176,7 @@ fn make_fake_windows_archive(root: &Path, target: &str) -> NormalizedPath {
     fs::write(archive_root.join("README.md"), "test archive\r\n").expect("write readme");
 
     let archive = asset_dir.join(format!("zccache-{tag}-{target}.zip"));
-    let command = format!(
-        "Compress-Archive -Path '{}' -DestinationPath '{}' -Force",
-        archive_root.display(),
-        archive.display()
-    );
-    let status = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &command])
-        .status()
-        .expect("run Compress-Archive");
-    assert!(status.success(), "Compress-Archive failed with {status}");
+    write_zip_archive(&archive, &asset_dir, &archive_root);
     NormalizedPath::new(archive)
 }
 
@@ -203,6 +194,66 @@ fn write_windows_binary(path: &Path, name: &str) {
         .status()
         .expect("run Add-Type");
     assert!(status.success(), "Add-Type failed with {status}");
+}
+
+#[cfg(windows)]
+fn write_zip_archive(archive: &Path, base_dir: &Path, root_dir: &Path) {
+    use std::fs::File;
+
+    use zip::write::SimpleFileOptions;
+    use zip::CompressionMethod;
+    use zip::ZipWriter;
+
+    if archive.exists() {
+        fs::remove_file(archive).expect("remove existing archive");
+    }
+
+    let file = File::create(archive).expect("create zip archive");
+    let mut zip = ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    add_directory_to_zip(&mut zip, base_dir, root_dir, options);
+    zip.finish().expect("finish zip archive");
+}
+
+#[cfg(windows)]
+fn add_directory_to_zip(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    base_dir: &Path,
+    dir: &Path,
+    options: zip::write::SimpleFileOptions,
+) {
+    let dir_name = dir
+        .strip_prefix(base_dir)
+        .expect("directory inside base")
+        .to_string_lossy()
+        .replace('\\', "/");
+    zip.add_directory(format!("{dir_name}/"), options)
+        .expect("add zip directory");
+
+    let mut entries = fs::read_dir(dir)
+        .expect("read zip source dir")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect zip source dir");
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            add_directory_to_zip(zip, base_dir, &path, options);
+            continue;
+        }
+
+        let name = path
+            .strip_prefix(base_dir)
+            .expect("file inside base")
+            .to_string_lossy()
+            .replace('\\', "/");
+        zip.start_file(name, options).expect("start zip file");
+
+        let bytes = fs::read(&path).expect("read zip file bytes");
+        zip.write_all(&bytes).expect("write zip file bytes");
+    }
 }
 
 #[cfg(unix)]

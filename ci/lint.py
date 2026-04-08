@@ -29,6 +29,47 @@ def run_cmd(cmd):
     )
 
 
+def run_cmd_capture(cmd):
+    """Run a command rooted at the project directory and capture output."""
+    return subprocess.run(
+        cmd,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(SCRIPT_DIR),
+        env=clean_env(),
+        capture_output=True,
+    )
+
+
+def ensure_windows_dylint_aliases():
+    """Create cargo-dylint's expected `name@toolchain.dll` aliases on Windows."""
+    if os.name != "nt":
+        return False
+
+    libraries_root = SCRIPT_DIR / "target" / "dylint" / "libraries"
+    if not libraries_root.is_dir():
+        return False
+
+    created = False
+    for toolchain_dir in libraries_root.iterdir():
+        if not toolchain_dir.is_dir():
+            continue
+        release_dir = toolchain_dir / "release"
+        if not release_dir.is_dir():
+            continue
+        suffix = f"@{toolchain_dir.name}.dll"
+        for dll in release_dir.glob("*.dll"):
+            if "@" in dll.stem:
+                continue
+            alias = dll.with_name(f"{dll.stem}{suffix}")
+            if alias.exists():
+                continue
+            alias.write_bytes(dll.read_bytes())
+            created = True
+    return created
+
+
 def detect_crate(file_path):
     """Extract crate name from a file path under crates/."""
     normalized = file_path.replace("\\", "/")
@@ -100,11 +141,18 @@ def lint_workspace():
         )
         return 1
 
-    result = run_cmd([
+    result = run_cmd_capture([
         "cargo", "dylint", "--all", "--workspace",
     ])
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
     if result.returncode != 0:
-        return result.returncode
+        if ensure_windows_dylint_aliases():
+            result = run_cmd([
+                "cargo", "dylint", "--all", "--workspace",
+            ])
+        if result.returncode != 0:
+            return result.returncode
 
     env = clean_env()
     env["RUSTDOCFLAGS"] = "-D warnings"

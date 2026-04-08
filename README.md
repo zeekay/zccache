@@ -458,7 +458,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full system design.
 | `zccache-hash` | blake3 hashing and cache key computation |
 | `zccache-fscache` | In-memory file metadata cache |
 | `zccache-artifact` | Disk-backed artifact store with redb index |
-| `zccache-watcher` | File watcher abstraction (notify backend) |
+| `zccache-watcher` | File watcher subsystem: daemon `notify` pipeline plus Rust-backed Python watcher bindings |
 | `zccache-compiler` | Compiler detection and argument parsing |
 | `zccache-test-support` | Test utilities and fixtures |
 
@@ -479,6 +479,138 @@ cargo test --workspace
 - [Architecture](docs/ARCHITECTURE.md)
 - [Design Decisions](docs/DESIGN_DECISIONS.md)
 - [Roadmap](docs/ROADMAP.md)
+
+## Watcher APIs
+
+zccache exposes watcher-related APIs in three different places, depending on
+how you want to consume change detection:
+
+- CLI: `zccache fp ...` for daemon-backed fingerprint checks in scripts and CI
+- Python: `zccache.watcher` for cross-platform library-style file watching
+- Rust: `zccache-watcher` for the daemon-facing watcher pipeline primitives
+
+### CLI API
+
+The CLI watcher entrypoint is the fingerprint API. It answers "should I rerun?"
+by consulting the daemon's in-memory watch state and cached file fingerprints.
+
+```bash
+zccache fp --cache-file .cache/headers.json check \
+  --root . \
+  --include '**/*.cpp' \
+  --include '**/*.h' \
+  --exclude build \
+  --exclude .git
+```
+
+Exit codes:
+
+- `0`: files changed, run the expensive step
+- `1`: no changes detected, skip the step
+
+After a successful or failed run, update the daemon's watch state:
+
+```bash
+zccache fp --cache-file .cache/headers.json mark-success
+zccache fp --cache-file .cache/headers.json mark-failure
+zccache fp --cache-file .cache/headers.json invalidate
+```
+
+The fingerprint API is the best fit for shell scripts, CI jobs, and build
+steps that only need a yes/no change answer rather than a stream of file events.
+
+### Python API
+
+The repository also exposes `zccache.watcher` for robust cross-platform file
+watching from Python. The public API is polling- and callback-friendly, while
+the backend runs the filesystem scan loop in Rust and only crosses into Python
+when delivering events.
+
+```python
+from zccache.watcher import watch_files
+
+watcher = watch_files(
+    ".",
+    include_folders=["src", "include"],
+    include_globs=["src/**/*.cpp", "include/**/*.h"],
+    excluded_patterns=["build", "dist/**", ".git"],
+    debounce_seconds=0.2,
+    poll_interval=0.1,
+)
+
+event = watcher.poll(timeout=1.0)
+if event is not None:
+    print(event.paths)
+
+watcher.stop()
+```
+
+For explicit lifecycle control, use the class API:
+
+```python
+from zccache.watcher import FileWatcher
+
+watcher = FileWatcher(".", include_globs=["**/*.cpp"], autostart=False)
+watcher.start()
+event = watcher.poll(timeout=1.0)
+watcher.stop()
+watcher.resume()
+watcher.stop()
+```
+
+Python watcher features:
+
+- `include_folders` to narrow the scan roots
+- `include_globs` to include only matching files
+- `excluded_patterns` to skip directories or files
+- `debounce_seconds` to coalesce bursts of edits
+- optional `notification_predicate` applied at Python delivery time
+- callback API plus polling API
+- explicit `start()`, `stop()`, `resume()`, and context-manager support
+
+Compatibility wrappers used by `fastled-wasm` are also available:
+
+- `FileWatcherProcess`
+- `DebouncedFileWatcherProcess`
+- `watch_files`
+- `FileWatcher`
+
+See [crates/zccache-watcher/README.md](crates/zccache-watcher/README.md) for the
+full Python watcher surface.
+
+### Rust API
+
+For Rust consumers, the public watcher crate is [`zccache-watcher`](crates/zccache-watcher/README.md).
+It now exposes both the daemon-facing watcher pipeline and a library-style
+polling watcher API:
+
+- `PollingWatcherConfig`
+- `PollingWatcher`
+- `PollWatchBatch`
+- `PollWatchObserver`
+
+- `IgnoreFilter` for directory-name-based filtering
+- `NotifyWatcher` for `notify`-backed OS watch registration
+- `SettleBuffer` and `SettledEvent` for burst coalescing
+- `OverflowRecovery` for overflow-driven rescan scheduling
+- `WatchEvent` and `WatcherConfig` for event/config plumbing
+
+Example:
+
+```rust
+use std::time::Duration;
+use zccache_watcher::{PollingWatcher, PollingWatcherConfig};
+
+let mut config = PollingWatcherConfig::new(".");
+config.include_globs = vec!["**/*.cpp".to_string()];
+config.poll_interval = Duration::from_millis(50);
+config.debounce = Duration::from_millis(50);
+
+let watcher = PollingWatcher::new(config)?;
+watcher.start()?;
+let batch = watcher.poll_timeout(Duration::from_secs(1))?;
+watcher.stop()?;
+```
 
 ## License
 
