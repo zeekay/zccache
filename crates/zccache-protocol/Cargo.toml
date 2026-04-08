@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "IPC message protocol for zccache"
 
 
 [dependencies]
@@ -11,4 +14,4 @@ serde = { workspace = true }
 bincode = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
-zccache-core = { path = "../zccache-core" }
+zccache-core = { workspace = true }

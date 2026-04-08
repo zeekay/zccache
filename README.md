@@ -3,6 +3,11 @@
 [![Linux](https://github.com/zackees/zccache/actions/workflows/ci-linux.yml/badge.svg)](https://github.com/zackees/zccache/actions/workflows/ci-linux.yml)
 [![macOS](https://github.com/zackees/zccache/actions/workflows/ci-macos.yml/badge.svg)](https://github.com/zackees/zccache/actions/workflows/ci-macos.yml)
 [![Windows](https://github.com/zackees/zccache/actions/workflows/ci-windows.yml/badge.svg)](https://github.com/zackees/zccache/actions/workflows/ci-windows.yml)
+[![PyPI](https://img.shields.io/pypi/v/zccache)](https://pypi.org/project/zccache/)
+[![crates.io: zccache-core](https://img.shields.io/crates/v/zccache-core)](https://crates.io/crates/zccache-core)
+[![crates.io: zccache-cli](https://img.shields.io/crates/v/zccache-cli)](https://crates.io/crates/zccache-cli)
+[![crates.io: zccache-daemon](https://img.shields.io/crates/v/zccache-daemon)](https://crates.io/crates/zccache-daemon)
+[![Rust Workspace Version](https://img.shields.io/badge/rust%20workspace-1.1.18-orange)](https://crates.io/search?q=zccache)
 
 ![C/C++](https://img.shields.io/badge/C%2FC%2B%2B-555?logo=c%2B%2B&logoColor=white)
 [![clang](https://img.shields.io/badge/clang-supported-brightgreen?logo=llvm)](https://clang.llvm.org/)
@@ -124,16 +129,43 @@ Verify the install:
 zccache --version
 ```
 
+Rust crates are also published on crates.io. The main installable/runtime crates are:
+
+- `zccache-cli`
+- `zccache-daemon`
+- `zccache-core`
+- `zccache-hash`
+- `zccache-protocol`
+- `zccache-fscache`
+- `zccache-artifact`
+
 Use it as a drop-in replacement for sccache — just substitute `zccache`:
 
-### Rust / Cargo integration
+### Integration Summary
 
 ```bash
-# cargo build (cached)
 RUSTC_WRAPPER=zccache cargo build
+export CC="zccache clang"
+export CXX="zccache clang++"
+```
 
-# cargo check (cached)
+- Rust: set `RUSTC_WRAPPER=zccache` or add `rustc-wrapper = "zccache"` to `.cargo/config.toml`.
+- Bash: export `RUSTC_WRAPPER`, `CC`, and `CXX` once in your shell or CI environment.
+- Python: pass `RUSTC_WRAPPER`, `CC`, and `CXX` through `subprocess` env when invoking `cargo` or `clang`.
+- First commands to check: `zccache --version`, `zccache start`, `zccache status`.
+
+<details>
+<summary>Rust zccache integration</summary>
+
+Use `zccache` as Cargo's compiler wrapper:
+
+```bash
+# one-off invocation
+RUSTC_WRAPPER=zccache cargo build
 RUSTC_WRAPPER=zccache cargo check
+
+# optional: start the daemon explicitly
+zccache start
 ```
 
 Add to `.cargo/config.toml` for automatic use:
@@ -143,10 +175,108 @@ Add to `.cargo/config.toml` for automatic use:
 rustc-wrapper = "zccache"
 ```
 
-Supports `--emit=metadata` (cargo check), `--emit=dep-info,metadata,link` (cargo build),
-extern crate content hashing (dependency changes cause cache misses), and all
-cacheable crate types (`lib`, `rlib`, `staticlib`). Proc-macro and binary crates
-are passed through without caching (same as sccache).
+Recommended project-local config:
+
+```toml
+[build]
+rustc-wrapper = "zccache"
+
+[env]
+ZCCACHE_DIR = { value = "/tmp/.zccache", force = false }
+```
+
+Supports `--emit=metadata` (`cargo check`), `--emit=dep-info,metadata,link` (`cargo build`),
+extern crate content hashing, and cacheable crate types such as `lib`, `rlib`,
+and `staticlib`. Proc-macro and binary crates are passed through without caching,
+matching the usual `sccache` behavior.
+
+Useful Rust workflow commands:
+
+```bash
+# inspect status
+zccache status
+
+# clear local cache
+zccache clear
+
+# validate wrapper is active
+RUSTC_WRAPPER=zccache cargo clean
+RUSTC_WRAPPER=zccache cargo check
+zccache status
+```
+
+</details>
+
+<details>
+<summary>Bash integration</summary>
+
+For shell-driven builds, export the wrapper once in your session or CI step:
+
+```bash
+export RUSTC_WRAPPER=zccache
+export CC="zccache clang"
+export CXX="zccache clang++"
+
+zccache start
+cargo build
+ninja
+```
+
+If you want this active in interactive shells, add it to `~/.bashrc`:
+
+```bash
+export RUSTC_WRAPPER=zccache
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+For per-build stats in Bash:
+
+```bash
+eval "$(zccache session-start --stats)"
+cargo build
+zccache session-end "$ZCCACHE_SESSION_ID"
+```
+
+</details>
+
+<details>
+<summary>Python integration</summary>
+
+Python projects can use `zccache` when invoking Rust or C/C++ toolchains through
+`subprocess`, build backends, or extension-module builds.
+
+```python
+import os
+import subprocess
+
+env = os.environ.copy()
+env["RUSTC_WRAPPER"] = "zccache"
+env["CC"] = "zccache clang"
+env["CXX"] = "zccache clang++"
+
+subprocess.run(["cargo", "build", "--release"], check=True, env=env)
+```
+
+This is useful for:
+
+- `setuptools-rust`
+- `maturin`
+- `scikit-build-core`
+- custom Python build/test harnesses that shell out to `cargo`, `clang`, or `clang++`
+
+Example with `maturin`:
+
+```bash
+RUSTC_WRAPPER=zccache maturin build
+```
+
+Example with Python driving `cargo check`:
+
+```python
+subprocess.run(["cargo", "check"], check=True, env=env)
+```
+
+</details>
 
 ### C/C++ build system integration (ninja, meson, cmake, make)
 

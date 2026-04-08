@@ -4,11 +4,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Dependency graph tracking for zccache cache invalidation"
 
 
 [dependencies]
-zccache-core = { path = "../zccache-core" }
-zccache-hash = { path = "../zccache-hash" }
+zccache-core = { workspace = true }
+zccache-hash = { workspace = true }
 blake3 = { workspace = true }
 dashmap = { workspace = true }
 rayon = { workspace = true }

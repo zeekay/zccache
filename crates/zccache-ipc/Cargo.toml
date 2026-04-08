@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "IPC transport layer for zccache"
 
 
 [dependencies]
@@ -12,5 +15,5 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
-zccache-protocol = { path = "../zccache-protocol" }
-zccache-core = { path = "../zccache-core" }
+zccache-protocol = { workspace = true }
+zccache-core = { workspace = true }

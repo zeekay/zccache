@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Filesystem metadata cache for zccache"
 
 
 [dependencies]
@@ -11,8 +14,8 @@ dashmap = { workspace = true }
 rayon = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
-zccache-core = { path = "../zccache-core" }
-zccache-hash = { path = "../zccache-hash" }
+zccache-core = { workspace = true }
+zccache-hash = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

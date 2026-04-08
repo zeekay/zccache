@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Filesystem watching subsystem for zccache"
 
 
 [dependencies]
@@ -11,9 +14,9 @@ notify = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-zccache-core = { path = "../zccache-core" }
-zccache-fscache = { path = "../zccache-fscache" }
+zccache-core = { workspace = true }
+zccache-fscache = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-zccache-hash = { path = "../zccache-hash" }
+zccache-hash = { workspace = true }

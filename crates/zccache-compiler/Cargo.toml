@@ -4,13 +4,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Compiler detection and argument parsing for zccache"
 
 
 [dependencies]
 tracing = { workspace = true }
 thiserror = { workspace = true }
-zccache-core = { path = "../zccache-core" }
-zccache-hash = { path = "../zccache-hash" }
+zccache-core = { workspace = true }
+zccache-hash = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

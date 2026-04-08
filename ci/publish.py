@@ -3,18 +3,21 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Build and publish zccache to PyPI.
+"""Build and publish zccache to PyPI and crates.io.
 
 Zero-argument release pipeline:
-  1. Pre-check: fail fast if version already exists on PyPI
+  1. Pre-check: fail fast if version already exists on PyPI or crates.io
   2. Trigger GitHub Actions to build native binaries for all platforms
   3. Wait for builds to complete, download artifacts
   4. Assemble platform-specific wheels (native binaries, no Python runtime)
   5. Upload to PyPI
+  6. Dry-run and publish Rust crates to crates.io in dependency order
 
 Usage:
-    ./publish              # full pipeline
-    ./publish --dry-run    # everything except upload
+    ./publish                  # publish PyPI and crates.io
+    ./publish --dry-run        # build and verify publishability without uploading
+    ./publish --skip-pypi      # publish only Rust crates
+    ./publish --skip-rust      # publish only PyPI wheels
 """
 
 from __future__ import annotations
@@ -42,6 +45,21 @@ ROOT = Path(__file__).resolve().parent.parent
 DIST_DIR = ROOT / "dist"
 WHEEL_DIR = DIST_DIR / "wheels"
 WORKFLOW_FILE = "build.yml"
+RUST_PUBLISH_ORDER = [
+    "zccache-core",
+    "zccache-hash",
+    "zccache-protocol",
+    "zccache-fscache",
+    "zccache-artifact",
+    "zccache-depgraph",
+    "zccache-compiler",
+    "zccache-ipc",
+    "zccache-watcher",
+    "zccache-fingerprint",
+    "zccache-test-support",
+    "zccache-cli",
+    "zccache-daemon",
+]
 
 # GitHub artifact name -> dist/ subdir
 ARTIFACT_MAP: dict[str, str] = {
@@ -105,6 +123,12 @@ def read_project_meta() -> tuple[str, str, str, str, str]:
         proj.get("requires-python", ">=3.9"),
         readme,
     )
+
+
+def read_workspace_version() -> str:
+    with open(ROOT / "Cargo.toml", "rb") as f:
+        data = tomllib.load(f)
+    return data["workspace"]["package"]["version"]
 
 
 def download_failed_logs(repo: str, run_id: int) -> list[Path]:
@@ -232,6 +256,39 @@ def check_pypi_version(name: str, version: str) -> None:
             log(f"  WARNING: PyPI check failed (HTTP {e.code}), continuing anyway")
     except (urllib.error.URLError, TimeoutError):
         log("  WARNING: Could not reach PyPI, continuing anyway")
+
+
+def crate_version_exists(name: str, version: str) -> bool:
+    url = f"https://crates.io/api/v1/crates/{name}/{version}"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            json.loads(resp.read())
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
+
+
+def check_crates_versions(version: str) -> None:
+    log(f"\n=== Step 1b: Pre-check crates.io for Rust crates {version} ===")
+    existing: list[str] = []
+    for crate in RUST_PUBLISH_ORDER:
+        try:
+            if crate_version_exists(crate, version):
+                existing.append(crate)
+                log(f"  EXISTS: {crate} {version}")
+            else:
+                log(f"  OK: {crate} {version} is available")
+        except (urllib.error.URLError, TimeoutError) as e:
+            log(f"  WARNING: Could not reach crates.io for {crate}: {e}")
+
+    if existing:
+        log("  ERROR: These crates already exist on crates.io:")
+        for crate in existing:
+            log(f"    - {crate} {version}")
+        log("  Bump the workspace version in Cargo.toml before publishing.")
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -534,67 +591,137 @@ def verify_pypi_wheels(name: str, version: str, expected_wheels: list[Path]) -> 
     sys.exit(1)
 
 
+def verify_rust_crates_locally() -> None:
+    log("\n=== Step 7: Verify Rust crates locally ===")
+    for crate in RUST_PUBLISH_ORDER:
+        run(["cargo", "check", "--all-targets", "-p", crate], cwd=ROOT)
+
+
+def verify_crate_visible(crate: str, version: str) -> None:
+    url = f"https://crates.io/api/v1/crates/{crate}/{version}"
+    timeout = 300
+    interval = 10
+    start = time.time()
+
+    while time.time() - start < timeout:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read())
+            crate_data = data.get("version") or {}
+            if crate_data.get("num") == version:
+                elapsed = int(time.time() - start)
+                log(f"  Verified {crate} {version} on crates.io ({elapsed}s)")
+                return
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+            elapsed = int(time.time() - start)
+            log(f"  [{elapsed}s] Waiting for {crate} {version} on crates.io ({e})")
+            time.sleep(interval)
+            continue
+
+        elapsed = int(time.time() - start)
+        log(f"  [{elapsed}s] Waiting for {crate} {version} on crates.io")
+        time.sleep(interval)
+
+    log(f"  ERROR: Timed out waiting for {crate} {version} to appear on crates.io")
+    log(f"  Check https://crates.io/crates/{crate}")
+    sys.exit(1)
+
+
+def publish_rust_crates(version: str, dry_run: bool) -> None:
+    if dry_run:
+        verify_rust_crates_locally()
+        log("\n=== Step 8: Upload Rust crates (skipped - dry run) ===")
+        for crate in RUST_PUBLISH_ORDER:
+            log(f"  {crate} {version}")
+        return
+
+    verify_rust_crates_locally()
+    log("\n=== Step 8: Publish Rust crates to crates.io ===")
+    for crate in RUST_PUBLISH_ORDER:
+        run(["cargo", "publish", "--allow-dirty", "-p", crate], cwd=ROOT)
+        verify_crate_visible(crate, version)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build and publish zccache to PyPI")
+    parser = argparse.ArgumentParser(description="Build and publish zccache to PyPI and crates.io")
     parser.add_argument("--dry-run", action="store_true", help="Build wheels but do not upload.")
+    parser.add_argument("--skip-pypi", action="store_true", help="Skip the PyPI release flow.")
+    parser.add_argument("--skip-rust", action="store_true", help="Skip the crates.io release flow.")
     args = parser.parse_args()
 
-    # Verify prerequisites
-    try:
-        run_capture(["gh", "--version"])
-    except FileNotFoundError:
-        log("ERROR: 'gh' (GitHub CLI) is not installed.")
+    run_pypi = not args.skip_pypi
+    run_rust = not args.skip_rust
+    if not run_pypi and not run_rust:
+        log("ERROR: Nothing to do. Remove one of --skip-pypi / --skip-rust.")
         sys.exit(1)
 
+    if run_pypi:
+        try:
+            run_capture(["gh", "--version"])
+        except FileNotFoundError:
+            log("ERROR: 'gh' (GitHub CLI) is not installed.")
+            sys.exit(1)
+
     name, version, summary, requires_python, readme = read_project_meta()
-    repo = detect_repo()
-    log(f"Publishing {name} {version} from {repo}")
+    workspace_version = read_workspace_version()
+    if workspace_version != version:
+        log(f"ERROR: pyproject.toml version ({version}) does not match Cargo.toml version ({workspace_version}).")
+        sys.exit(1)
+
+    repo = detect_repo() if run_pypi else ""
+    targets: list[str] = []
+    if run_pypi:
+        targets.append("PyPI")
+    if run_rust:
+        targets.append("crates.io")
+    log(f"Publishing {name} {version} to {', '.join(targets)}")
 
     if not args.dry_run:
-        # Step 0: Fail fast if repo has uncommitted or unpushed changes.
-        # GH Actions builds from the remote branch, so local-only changes
-        # produce binaries with stale version strings baked in.
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        if dirty:
-            log(f"ERROR: Working tree is dirty. Commit and push before publishing.\n{dirty}")
-            sys.exit(1)
+        if run_pypi:
+            # GH Actions builds from the remote branch, so local-only changes
+            # produce binaries with stale version strings baked in.
+            dirty = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if dirty:
+                log(f"ERROR: Working tree is dirty. Commit and push before publishing PyPI artifacts.\n{dirty}")
+                sys.exit(1)
 
-        local_sha = run_capture(["git", "rev-parse", "HEAD"])
-        remote_sha = run_capture(["git", "rev-parse", "@{u}"])
-        if local_sha != remote_sha:
-            log(f"ERROR: Local HEAD ({local_sha[:12]}) differs from remote ({remote_sha[:12]}). Push before publishing.")
-            sys.exit(1)
+            local_sha = run_capture(["git", "rev-parse", "HEAD"])
+            remote_sha = run_capture(["git", "rev-parse", "@{u}"])
+            if local_sha != remote_sha:
+                log(f"ERROR: Local HEAD ({local_sha[:12]}) differs from remote ({remote_sha[:12]}). Push before publishing PyPI artifacts.")
+                sys.exit(1)
 
-        # Step 1: Fail fast if version exists
-        check_pypi_version(name, version)
+            check_pypi_version(name, version)
 
-    # Step 2: Build native binaries on all platforms
-    run_id = trigger_and_wait(repo)
+        if run_rust:
+            check_crates_versions(version)
 
-    # Step 3: Download artifacts
-    download_artifacts(repo, run_id)
+    if run_pypi:
+        run_id = trigger_and_wait(repo)
+        download_artifacts(repo, run_id)
+        wheels = build_all_wheels(name, version, summary, requires_python, readme)
 
-    # Step 4: Build platform wheels
-    wheels = build_all_wheels(name, version, summary, requires_python, readme)
+        # Step 5: Upload
+        if args.dry_run:
+            log("\n=== Step 5: Upload (skipped - dry run) ===")
+            for w in wheels:
+                log(f"  {w.name}")
+        else:
+            upload_wheels(wheels, name, version)
+            # Step 6: Verify all wheels are visible on PyPI (CDN propagation)
+            verify_pypi_wheels(name, version, wheels)
 
-    # Step 5: Upload
-    if args.dry_run:
-        log("\n=== Step 5: Upload (skipped — dry run) ===")
-        for w in wheels:
-            log(f"  {w.name}")
-    else:
-        upload_wheels(wheels, name, version)
-        # Step 6: Verify all wheels are visible on PyPI (CDN propagation)
-        verify_pypi_wheels(name, version, wheels)
+    if run_rust:
+        publish_rust_crates(version, args.dry_run)
 
     log("\n=== Done ===")
 

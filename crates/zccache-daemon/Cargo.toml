@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Background daemon for the zccache compiler cache"
 
 
 [lib]
@@ -24,16 +27,16 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
-zccache-core = { path = "../zccache-core" }
-zccache-protocol = { path = "../zccache-protocol" }
-zccache-ipc = { path = "../zccache-ipc" }
-zccache-fscache = { path = "../zccache-fscache" }
-zccache-artifact = { path = "../zccache-artifact" }
-zccache-watcher = { path = "../zccache-watcher" }
-zccache-hash = { path = "../zccache-hash" }
-zccache-compiler = { path = "../zccache-compiler" }
-zccache-depgraph = { path = "../zccache-depgraph" }
-zccache-fingerprint = { path = "../zccache-fingerprint" }
+zccache-core = { workspace = true }
+zccache-protocol = { workspace = true }
+zccache-ipc = { workspace = true }
+zccache-fscache = { workspace = true }
+zccache-artifact = { workspace = true }
+zccache-watcher = { workspace = true }
+zccache-hash = { workspace = true }
+zccache-compiler = { workspace = true }
+zccache-depgraph = { workspace = true }
+zccache-fingerprint = { workspace = true }
 dashmap = { workspace = true }
 rayon = { workspace = true }
 bincode = { workspace = true }
@@ -45,5 +48,5 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 tempfile = { workspace = true }
-zccache-cli = { path = "../zccache-cli" }
-zccache-test-support = { path = "../zccache-test-support" }
+zccache-cli = { workspace = true }
+zccache-test-support = { workspace = true }

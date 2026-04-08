@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "File fingerprinting engine and CLI for zccache"
 
 
 [lib]
@@ -26,7 +29,7 @@ python = ["dep:pyo3"]
 
 [dependencies]
 clap = { workspace = true }
-zccache-hash = { path = "../zccache-hash" }
+zccache-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"
 thiserror = { workspace = true }

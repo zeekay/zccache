@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "CI tools for zccache (stop hook with process/thread dumping)"
+publish = false
 
 [dependencies]
 md5 = "0.7"
