@@ -17,9 +17,9 @@ inputs:
     required: false
     default: "false"
   python_version:
-    description: Python version to install when include_python is enabled.
+    description: Python version to install for packaging and optional Python extension builds.
     required: false
-    default: ""
+    default: "3.13"
   linker:
     description: Optional linker executable for cross-compilation.
     required: false
@@ -52,7 +52,6 @@ runs:
         echo "standalone_dir=${{ github.workspace }}/standalone" >> "$GITHUB_OUTPUT"
 
     - name: Setup Python
-      if: inputs.include_python == 'true'
       uses: actions/setup-python@v5
       with:
         python-version: ${{ inputs.python_version }}
