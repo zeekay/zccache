@@ -19,7 +19,7 @@ members = [
 exclude = ["dylints/ban_std_pathbuf"]
 
 [workspace.package]
-version = "1.1.19"
+version = "1.1.20"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
@@ -46,19 +46,19 @@ bytes = "1"
 rkyv = { version = "0.7", features = ["validation"] }
 tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 mimalloc = "0.1"
-zccache-core = { version = "=1.1.19", path = "crates/zccache-core" }
-zccache-hash = { version = "=1.1.19", path = "crates/zccache-hash" }
-zccache-protocol = { version = "=1.1.19", path = "crates/zccache-protocol" }
-zccache-fscache = { version = "=1.1.19", path = "crates/zccache-fscache" }
-zccache-artifact = { version = "=1.1.19", path = "crates/zccache-artifact" }
-zccache-depgraph = { version = "=1.1.19", path = "crates/zccache-depgraph" }
-zccache-watcher = { version = "=1.1.19", path = "crates/zccache-watcher" }
-zccache-compiler = { version = "=1.1.19", path = "crates/zccache-compiler" }
-zccache-ipc = { version = "=1.1.19", path = "crates/zccache-ipc" }
-zccache-daemon = { version = "=1.1.19", path = "crates/zccache-daemon" }
-zccache-cli = { version = "=1.1.19", path = "crates/zccache-cli" }
-zccache-test-support = { version = "=1.1.19", path = "crates/zccache-test-support" }
-zccache-fingerprint = { version = "=1.1.19", path = "crates/zccache-fingerprint" }
+zccache-core = { version = "=1.1.20", path = "crates/zccache-core" }
+zccache-hash = { version = "=1.1.20", path = "crates/zccache-hash" }
+zccache-protocol = { version = "=1.1.20", path = "crates/zccache-protocol" }
+zccache-fscache = { version = "=1.1.20", path = "crates/zccache-fscache" }
+zccache-artifact = { version = "=1.1.20", path = "crates/zccache-artifact" }
+zccache-depgraph = { version = "=1.1.20", path = "crates/zccache-depgraph" }
+zccache-watcher = { version = "=1.1.20", path = "crates/zccache-watcher" }
+zccache-compiler = { version = "=1.1.20", path = "crates/zccache-compiler" }
+zccache-ipc = { version = "=1.1.20", path = "crates/zccache-ipc" }
+zccache-daemon = { version = "=1.1.20", path = "crates/zccache-daemon" }
+zccache-cli = { version = "=1.1.20", path = "crates/zccache-cli" }
+zccache-test-support = { version = "=1.1.20", path = "crates/zccache-test-support" }
+zccache-fingerprint = { version = "=1.1.20", path = "crates/zccache-fingerprint" }
 
 # Vendored notify with fixes for Windows ReadDirectoryChangesW:
 # 1. Detect buffer overflow (bytes_written == 0) and report as error
