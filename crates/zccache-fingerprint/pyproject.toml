@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "zccache-fingerprint"
-version = "1.1.20"
+version = "1.2.0"
 description = "Fast file fingerprinting backed by blake3"
 requires-python = ">=3.9"
 license = "MIT OR Apache-2.0"
