@@ -231,31 +231,107 @@ def record_hash(data: bytes) -> str:
     return "sha256=" + base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
+def list_run_artifacts(repo: str, run_id: int) -> list[str]:
+    """Return artifact names produced by a workflow run."""
+    try:
+        raw = run_capture([
+            "gh",
+            "api",
+            f"repos/{repo}/actions/runs/{run_id}/artifacts",
+        ])
+        data = json.loads(raw)
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return []
+    return [artifact.get("name", "") for artifact in data.get("artifacts", [])]
+
+
+def find_existing_build_run(repo: str, head_sha: str) -> int | None:
+    """Return a successful build workflow run for this commit if artifacts are complete."""
+    try:
+        raw = run_capture([
+            "gh",
+            "run",
+            "list",
+            "--repo",
+            repo,
+            "--workflow",
+            WORKFLOW_FILE,
+            "--commit",
+            head_sha,
+            "--limit",
+            "20",
+            "--json",
+            "databaseId,status,conclusion,headSha",
+        ])
+        runs = json.loads(raw)
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return None
+
+    expected = set(ARTIFACT_MAP)
+    for run_info in runs:
+        if run_info.get("headSha") != head_sha:
+            continue
+        if run_info.get("status") != "completed" or run_info.get("conclusion") != "success":
+            continue
+        run_id = run_info["databaseId"]
+        artifacts = set(list_run_artifacts(repo, run_id))
+        if expected.issubset(artifacts):
+            log(f"  Reusing successful build run {run_id} for {head_sha[:12]}")
+            return run_id
+        missing = sorted(expected - artifacts)
+        log(f"  Run {run_id} is missing artifacts: {', '.join(missing)}")
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Step 1: PyPI version pre-check
 # ---------------------------------------------------------------------------
 
 
-def check_pypi_version(name: str, version: str) -> None:
-    """Fail fast if this version already exists on PyPI."""
-    log(f"\n=== Step 1: Pre-check PyPI for {name} {version} ===")
+def get_pypi_release_filenames(name: str, version: str) -> set[str] | None:
+    """Return PyPI filenames for an existing version, or None if the version is absent."""
     url = f"https://pypi.org/pypi/{name}/json"
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
             data = json.loads(resp.read())
+        release = data.get("releases", {}).get(version)
+        if release is None:
+            return None
+        return {file["filename"] for file in release}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def check_pypi_version(name: str, version: str) -> set[str]:
+    """Report existing PyPI state and return any already-published filenames."""
+    log(f"\n=== Step 1: Pre-check PyPI for {name} {version} ===")
+    try:
+        url = f"https://pypi.org/pypi/{name}/json"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
         existing = set(data.get("releases", {}).keys())
-        if version in existing:
-            log(f"  ERROR: {name} {version} already exists on PyPI.")
-            log("  Bump the version in pyproject.toml before publishing.")
-            sys.exit(1)
+        release_files = get_pypi_release_filenames(name, version)
+        if release_files is not None:
+            log(
+                f"  {name} {version} already exists on PyPI with {len(release_files)} "
+                "file(s); missing files will be uploaded"
+            )
+            return release_files
         log(f"  {name} {version} is available (existing: {', '.join(sorted(existing)) or 'none'})")
+        return set()
     except urllib.error.HTTPError as e:
         if e.code == 404:
             log(f"  {name} not yet on PyPI (first publish)")
+            return set()
         else:
             log(f"  WARNING: PyPI check failed (HTTP {e.code}), continuing anyway")
+            return set()
     except (urllib.error.URLError, TimeoutError):
         log("  WARNING: Could not reach PyPI, continuing anyway")
+        return set()
 
 
 def crate_version_exists(name: str, version: str) -> bool:
@@ -297,12 +373,16 @@ def check_crates_versions(version: str) -> None:
 
 
 def trigger_and_wait(repo: str) -> int:
-    """Trigger build workflow on HEAD, wait for completion, return run ID."""
+    """Reuse an existing successful build for HEAD, or trigger one and wait."""
     log(f"\n=== Step 2: Build native binaries ({repo}) ===")
 
     head_sha = run_capture(["git", "rev-parse", "HEAD"])
     branch = run_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
     log(f"  Branch: {branch} ({head_sha[:12]})")
+
+    existing_run = find_existing_build_run(repo, head_sha)
+    if existing_run is not None:
+        return existing_run
 
     # Snapshot existing runs to detect the new one
     existing_raw = run_capture(
@@ -694,6 +774,7 @@ def main() -> None:
 
     repo = detect_repo() if run_pypi else ""
     targets: list[str] = []
+    existing_pypi_files: set[str] = set()
     if run_pypi:
         targets.append("PyPI")
     if run_rust:
@@ -719,7 +800,7 @@ def main() -> None:
                 log(f"ERROR: Local HEAD ({local_sha[:12]}) differs from remote ({remote_sha[:12]}). Push before publishing PyPI artifacts.")
                 sys.exit(1)
 
-            check_pypi_version(name, version)
+            existing_pypi_files = check_pypi_version(name, version)
 
         if run_rust:
             check_crates_versions(version)
@@ -728,6 +809,7 @@ def main() -> None:
         run_id = trigger_and_wait(repo)
         download_artifacts(repo, run_id)
         wheels = build_all_wheels(name, version, summary, requires_python, readme)
+        wheels_to_upload = [wheel for wheel in wheels if wheel.name not in existing_pypi_files]
 
         # Step 5: Upload
         if args.dry_run:
@@ -735,7 +817,12 @@ def main() -> None:
             for w in wheels:
                 log(f"  {w.name}")
         else:
-            upload_wheels(wheels, name, version)
+            if wheels_to_upload:
+                log(f"  Uploading {len(wheels_to_upload)}/{len(wheels)} wheel(s) missing from PyPI")
+                upload_wheels(wheels_to_upload, name, version)
+            else:
+                log("\n=== Step 5: Upload ===")
+                log("  All expected wheels are already present on PyPI")
             # Step 6: Verify all wheels are visible on PyPI (CDN propagation)
             verify_pypi_wheels(name, version, wheels)
 
