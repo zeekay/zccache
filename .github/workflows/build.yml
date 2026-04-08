@@ -13,7 +13,6 @@ env:
   RUSTFLAGS: "-D warnings"
   CARGO_HOME: ${{ github.workspace }}/.cargo
   RUSTUP_HOME: ${{ github.workspace }}/.rustup
-  PYO3_PYTHON: python
 
 jobs:
   build:
@@ -66,128 +65,27 @@ jobs:
         with:
           ref: ${{ github.event.inputs.ref || github.sha }}
 
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/build-target
+        id: build_target
         with:
-          python-version: "3.13"
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.85.1
-          components: rustfmt,clippy
-          targets: ${{ matrix.target }}
-
-      - name: Activate repo-local Rust toolchain
-        shell: bash
-        run: echo "${{ github.workspace }}/.cargo/bin" >> "$GITHUB_PATH"
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      # Linux musl native (x86_64)
-      - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
-      # Linux musl aarch64 cross-compilation toolchain (from GitHub-hosted mirror;
-      # musl.cc blocks GitHub Actions IPs: github.com/orgs/community/discussions/27906)
-      - name: Install musl cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          curl -fsSL -o aarch64-unknown-linux-musl.tar.xz \
-            https://github.com/cross-tools/musl-cross/releases/download/20250929/aarch64-unknown-linux-musl.tar.xz
-          tar xJf aarch64-unknown-linux-musl.tar.xz
-          echo "$PWD/aarch64-unknown-linux-musl/bin" >> $GITHUB_PATH
-
-      # Linux GNU aarch64 cross-compilation toolchain
-      - name: Install GNU cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      # Set cross-compilation linker via target-specific env var
-      - name: Configure cross-compilation linker
-        if: matrix.linker
-        shell: bash
-        run: |
-          TARGET_UPPER=$(echo "${{ matrix.target }}" | tr '[:lower:]-' '[:upper:]_')
-          echo "CARGO_TARGET_${TARGET_UPPER}_LINKER=${{ matrix.linker }}" >> $GITHUB_ENV
-
-      - name: Build release binaries
-        run: |
-          cargo build --release --target ${{ matrix.target }} -p zccache-cli
-          cargo build --release --target ${{ matrix.target }} -p zccache-daemon
-          cargo build --release --target ${{ matrix.target }} -p zccache-fingerprint
-          cargo build --release --target ${{ matrix.target }} -p zccache-cli --features python
-          cargo build --release --target ${{ matrix.target }} -p zccache-watcher --features python
-          cargo build --release --target ${{ matrix.target }} -p zccache-fingerprint --features python
-
-      - name: Stage artifacts
-        shell: bash
-        run: |
-          mkdir -p staging
-          mkdir -p staging/python/zccache/fingerprint
-          mkdir -p staging/python/zccache/watcher
-          cp target/${{ matrix.target }}/release/zccache${{ matrix.binary_ext }} staging/
-          cp target/${{ matrix.target }}/release/zccache-daemon${{ matrix.binary_ext }} staging/
-          cp target/${{ matrix.target }}/release/zccache-fp${{ matrix.binary_ext }} staging/
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp target/${{ matrix.target }}/release/zccache_cli.dll staging/python/zccache/_native.pyd
-            cp target/${{ matrix.target }}/release/zccache_fingerprint.dll staging/python/zccache/fingerprint/_native.pyd
-            cp target/${{ matrix.target }}/release/zccache_watcher.dll staging/python/zccache/watcher/_native.pyd
-          elif [[ "${{ matrix.target }}" == *apple-darwin ]]; then
-            cp target/${{ matrix.target }}/release/libzccache_cli.dylib staging/python/zccache/_native.so
-            cp target/${{ matrix.target }}/release/libzccache_fingerprint.dylib staging/python/zccache/fingerprint/_native.so
-            cp target/${{ matrix.target }}/release/libzccache_watcher.dylib staging/python/zccache/watcher/_native.so
-          else
-            cp target/${{ matrix.target }}/release/libzccache_cli.so staging/python/zccache/_native.so
-            cp target/${{ matrix.target }}/release/libzccache_fingerprint.so staging/python/zccache/fingerprint/_native.so
-            cp target/${{ matrix.target }}/release/libzccache_watcher.so staging/python/zccache/watcher/_native.so
-          fi
-          # Strip binaries (reduces size significantly)
-          STRIP="${{ matrix.strip }}"
-          if [ -z "$STRIP" ]; then
-            STRIP="strip"
-          fi
-          if command -v "$STRIP" &> /dev/null; then
-            $STRIP staging/zccache${{ matrix.binary_ext }} || true
-            $STRIP staging/zccache-daemon${{ matrix.binary_ext }} || true
-            $STRIP staging/zccache-fp${{ matrix.binary_ext }} || true
-            $STRIP staging/python/zccache/_native.* || true
-            $STRIP staging/python/zccache/fingerprint/_native.* || true
-            $STRIP staging/python/zccache/watcher/_native.* || true
-          fi
-
-      - name: Package standalone release archive
-        shell: bash
-        run: |
-          VERSION=$(python - <<'PY'
-          import tomllib
-          from pathlib import Path
-          with open(Path("Cargo.toml"), "rb") as f:
-              print(tomllib.load(f)["workspace"]["package"]["version"])
-          PY
-          )
-          python ci/package_release.py \
-            --version "$VERSION" \
-            --target "${{ matrix.target }}" \
-            --binary-ext "${{ matrix.binary_ext }}" \
-            --input-dir staging \
-            --output-dir standalone
+          target: ${{ matrix.target }}
+          binary_ext: ${{ matrix.binary_ext }}
+          cache_key: ${{ matrix.target }}
+          include_python: "true"
+          python_version: "3.13"
+          linker: ${{ matrix.linker || '' }}
+          strip: ${{ matrix.strip || '' }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.target }}
-          path: staging/
+          path: ${{ steps.build_target.outputs.staging_dir }}/
           if-no-files-found: error
 
       - name: Upload standalone archive
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
-          path: standalone/
+          path: ${{ steps.build_target.outputs.standalone_dir }}/
           if-no-files-found: error

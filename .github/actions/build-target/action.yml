@@ -1,0 +1,184 @@
+name: Build target artifacts
+description: Build zccache binaries for a single target and stage release artifacts.
+
+inputs:
+  target:
+    description: Rust target triple to build.
+    required: true
+  binary_ext:
+    description: Executable suffix for the target, for example .exe.
+    required: false
+    default: ""
+  cache_key:
+    description: Cache key suffix for Swatinem/rust-cache.
+    required: true
+  include_python:
+    description: Build and stage Python extension artifacts.
+    required: false
+    default: "false"
+  python_version:
+    description: Python version to install when include_python is enabled.
+    required: false
+    default: ""
+  linker:
+    description: Optional linker executable for cross-compilation.
+    required: false
+    default: ""
+  strip:
+    description: Optional strip executable for the target.
+    required: false
+    default: ""
+  version:
+    description: Optional version string for standalone archive naming.
+    required: false
+    default: ""
+
+outputs:
+  staging_dir:
+    description: Directory containing staged binaries and optional Python artifacts.
+    value: ${{ steps.paths.outputs.staging_dir }}
+  standalone_dir:
+    description: Directory containing packaged standalone archives.
+    value: ${{ steps.paths.outputs.standalone_dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set output paths
+      id: paths
+      shell: bash
+      run: |
+        echo "staging_dir=${{ github.workspace }}/staging" >> "$GITHUB_OUTPUT"
+        echo "standalone_dir=${{ github.workspace }}/standalone" >> "$GITHUB_OUTPUT"
+
+    - name: Setup Python
+      if: inputs.include_python == 'true'
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: 1.85.1
+        components: rustfmt,clippy
+        targets: ${{ inputs.target }}
+
+    - name: Activate repo-local Rust toolchain
+      shell: bash
+      run: echo "${{ github.workspace }}/.cargo/bin" >> "$GITHUB_PATH"
+
+    - name: Ensure target stdlib is installed
+      shell: bash
+      run: rustup target add ${{ inputs.target }}
+
+    - name: Restore Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache_key }}
+
+    - name: Install musl tools
+      if: inputs.target == 'x86_64-unknown-linux-musl'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools
+
+    - name: Install musl cross-compilation tools
+      if: inputs.target == 'aarch64-unknown-linux-musl'
+      shell: bash
+      run: |
+        curl -fsSL -o aarch64-unknown-linux-musl.tar.xz \
+          https://github.com/cross-tools/musl-cross/releases/download/20250929/aarch64-unknown-linux-musl.tar.xz
+        tar xJf aarch64-unknown-linux-musl.tar.xz
+        echo "$PWD/aarch64-unknown-linux-musl/bin" >> "$GITHUB_PATH"
+
+    - name: Install GNU cross-compilation tools
+      if: inputs.target == 'aarch64-unknown-linux-gnu'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-aarch64-linux-gnu
+
+    - name: Configure cross-compilation linker
+      if: inputs.linker != ''
+      shell: bash
+      run: |
+        TARGET_UPPER=$(echo "${{ inputs.target }}" | tr '[:lower:]-' '[:upper:]_')
+        echo "CARGO_TARGET_${TARGET_UPPER}_LINKER=${{ inputs.linker }}" >> "$GITHUB_ENV"
+
+    - name: Build release binaries
+      shell: bash
+      env:
+        PYO3_PYTHON: python
+      run: |
+        cargo build --release --target ${{ inputs.target }} -p zccache-cli
+        cargo build --release --target ${{ inputs.target }} -p zccache-daemon
+        cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint
+        if [ "${{ inputs.include_python }}" = "true" ]; then
+          cargo build --release --target ${{ inputs.target }} -p zccache-cli --features python
+          cargo build --release --target ${{ inputs.target }} -p zccache-watcher --features python
+          cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint --features python
+        fi
+
+    - name: Stage artifacts
+      shell: bash
+      run: |
+        rm -rf staging standalone
+        mkdir -p staging
+        cp target/${{ inputs.target }}/release/zccache${{ inputs.binary_ext }} staging/
+        cp target/${{ inputs.target }}/release/zccache-daemon${{ inputs.binary_ext }} staging/
+        cp target/${{ inputs.target }}/release/zccache-fp${{ inputs.binary_ext }} staging/
+
+        if [ "${{ inputs.include_python }}" = "true" ]; then
+          mkdir -p staging/python/zccache/fingerprint
+          mkdir -p staging/python/zccache/watcher
+          if [[ "${{ inputs.target }}" == *pc-windows-msvc ]]; then
+            cp target/${{ inputs.target }}/release/zccache_cli.dll staging/python/zccache/_native.pyd
+            cp target/${{ inputs.target }}/release/zccache_fingerprint.dll staging/python/zccache/fingerprint/_native.pyd
+            cp target/${{ inputs.target }}/release/zccache_watcher.dll staging/python/zccache/watcher/_native.pyd
+          elif [[ "${{ inputs.target }}" == *apple-darwin ]]; then
+            cp target/${{ inputs.target }}/release/libzccache_cli.dylib staging/python/zccache/_native.so
+            cp target/${{ inputs.target }}/release/libzccache_fingerprint.dylib staging/python/zccache/fingerprint/_native.so
+            cp target/${{ inputs.target }}/release/libzccache_watcher.dylib staging/python/zccache/watcher/_native.so
+          else
+            cp target/${{ inputs.target }}/release/libzccache_cli.so staging/python/zccache/_native.so
+            cp target/${{ inputs.target }}/release/libzccache_fingerprint.so staging/python/zccache/fingerprint/_native.so
+            cp target/${{ inputs.target }}/release/libzccache_watcher.so staging/python/zccache/watcher/_native.so
+          fi
+        fi
+
+        STRIP="${{ inputs.strip }}"
+        if [ -z "$STRIP" ]; then
+          STRIP="strip"
+        fi
+        if command -v "$STRIP" &> /dev/null; then
+          $STRIP staging/zccache${{ inputs.binary_ext }} || true
+          $STRIP staging/zccache-daemon${{ inputs.binary_ext }} || true
+          $STRIP staging/zccache-fp${{ inputs.binary_ext }} || true
+          if [ "${{ inputs.include_python }}" = "true" ]; then
+            $STRIP staging/python/zccache/_native.* || true
+            $STRIP staging/python/zccache/fingerprint/_native.* || true
+            $STRIP staging/python/zccache/watcher/_native.* || true
+          fi
+        fi
+
+    - name: Package standalone archive
+      shell: bash
+      run: |
+        VERSION="${{ inputs.version }}"
+        if [ -z "$VERSION" ]; then
+          VERSION=$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          with open(Path("Cargo.toml"), "rb") as f:
+              print(tomllib.load(f)["workspace"]["package"]["version"])
+          PY
+          )
+        fi
+        python ci/package_release.py \
+          --version "$VERSION" \
+          --target "${{ inputs.target }}" \
+          --binary-ext "${{ inputs.binary_ext }}" \
+          --input-dir staging \
+          --output-dir standalone
