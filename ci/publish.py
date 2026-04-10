@@ -29,6 +29,7 @@ import hashlib
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import stat
@@ -80,6 +81,48 @@ PLATFORMS: dict[str, list[str]] = {
     "macos-aarch64": ["macosx_11_0_arm64"],
     "windows-x86_64": ["win_amd64"],
     "windows-arm64": ["win_arm64"],
+}
+
+REQUIRED_PLATFORM_FILES: dict[str, tuple[str, ...]] = {
+    "linux-x86_64-gnu": ("zccache", "zccache-daemon", "zccache-fp"),
+    "linux-aarch64-gnu": ("zccache", "zccache-daemon", "zccache-fp"),
+    "macos-x86_64": ("zccache", "zccache-daemon", "zccache-fp"),
+    "macos-aarch64": ("zccache", "zccache-daemon", "zccache-fp"),
+    "windows-x86_64": ("zccache.exe", "zccache-daemon.exe", "zccache-fp.exe"),
+    "windows-arm64": ("zccache.exe", "zccache-daemon.exe", "zccache-fp.exe"),
+}
+
+REQUIRED_NATIVE_FILES: dict[str, tuple[str, ...]] = {
+    "linux-x86_64-gnu": (
+        "python/zccache/_native.so",
+        "python/zccache/fingerprint/_native.so",
+        "python/zccache/watcher/_native.so",
+    ),
+    "linux-aarch64-gnu": (
+        "python/zccache/_native.so",
+        "python/zccache/fingerprint/_native.so",
+        "python/zccache/watcher/_native.so",
+    ),
+    "macos-x86_64": (
+        "python/zccache/_native.so",
+        "python/zccache/fingerprint/_native.so",
+        "python/zccache/watcher/_native.so",
+    ),
+    "macos-aarch64": (
+        "python/zccache/_native.so",
+        "python/zccache/fingerprint/_native.so",
+        "python/zccache/watcher/_native.so",
+    ),
+    "windows-x86_64": (
+        "python/zccache/_native.pyd",
+        "python/zccache/fingerprint/_native.pyd",
+        "python/zccache/watcher/_native.pyd",
+    ),
+    "windows-arm64": (
+        "python/zccache/_native.pyd",
+        "python/zccache/fingerprint/_native.pyd",
+        "python/zccache/watcher/_native.pyd",
+    ),
 }
 
 IGNORED_PUBLISH_STATUS_PATTERNS = (
@@ -296,6 +339,132 @@ def record_hash(data: bytes) -> str:
     return "sha256=" + base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
+def write_dist_manifest(repo: str, run_id: int | None, head_sha: str, version: str) -> None:
+    manifest = {
+        "repo": repo,
+        "run_id": run_id,
+        "head_sha": head_sha,
+        "version": version,
+        "platforms": {
+            subdir: {
+                "wheel_plats": PLATFORMS[subdir],
+                "files": sorted(
+                    str(path.relative_to(DIST_DIR)).replace("\\", "/")
+                    for path in (DIST_DIR / subdir).rglob("*")
+                    if path.is_file()
+                ),
+            }
+            for subdir in PLATFORMS
+            if (DIST_DIR / subdir).exists()
+        },
+    }
+    manifest_path = DIST_DIR / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def read_dist_manifest() -> dict[str, Any] | None:
+    manifest_path = DIST_DIR / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def missing_local_dist_files() -> list[str]:
+    missing: list[str] = []
+    for subdir, filenames in REQUIRED_PLATFORM_FILES.items():
+        base_dir = DIST_DIR / subdir
+        for filename in filenames:
+            candidate = base_dir / filename
+            if not candidate.is_file() or candidate.stat().st_size == 0:
+                missing.append(str(candidate.relative_to(DIST_DIR)).replace("\\", "/"))
+        for relpath in REQUIRED_NATIVE_FILES[subdir]:
+            candidate = DIST_DIR / subdir / relpath
+            if not candidate.is_file() or candidate.stat().st_size == 0:
+                missing.append(str(candidate.relative_to(DIST_DIR)).replace("\\", "/"))
+    return missing
+
+
+def detect_host_platform_subdir() -> str | None:
+    machine = platform.machine().lower()
+    if sys.platform == "win32":
+        if machine in {"amd64", "x86_64"}:
+            return "windows-x86_64"
+        if machine in {"arm64", "aarch64"}:
+            return "windows-arm64"
+        return None
+    if sys.platform == "darwin":
+        if machine in {"x86_64", "amd64"}:
+            return "macos-x86_64"
+        if machine in {"arm64", "aarch64"}:
+            return "macos-aarch64"
+        return None
+    if sys.platform.startswith("linux"):
+        if machine in {"x86_64", "amd64"}:
+            return "linux-x86_64-gnu"
+        if machine in {"arm64", "aarch64"}:
+            return "linux-aarch64-gnu"
+    return None
+
+
+def host_binaries_match_version(expected_version: str) -> bool:
+    host_subdir = detect_host_platform_subdir()
+    if host_subdir is None:
+        return False
+
+    bin_dir = DIST_DIR / host_subdir
+    required = REQUIRED_PLATFORM_FILES.get(host_subdir, ())
+    if not required:
+        return False
+
+    for filename in required:
+        binary = bin_dir / filename
+        if not binary.is_file() or binary.stat().st_size == 0:
+            return False
+        try:
+            output = run_capture([str(binary), "--version"])
+        except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+            return False
+        if not output.endswith(f" {expected_version}"):
+            return False
+    return True
+
+
+def should_reuse_local_dist(repo: str, head_sha: str, version: str) -> bool:
+    if not DIST_DIR.exists():
+        return False
+
+    missing = missing_local_dist_files()
+    if missing:
+        preview = ", ".join(missing[:6])
+        if len(missing) > 6:
+            preview += ", ..."
+        log(f"  Local dist/ is incomplete: {preview}")
+        return False
+
+    manifest = read_dist_manifest()
+    if manifest is not None:
+        manifest_repo = manifest.get("repo")
+        manifest_sha = manifest.get("head_sha")
+        manifest_version = manifest.get("version")
+        if manifest_repo == repo and manifest_sha == head_sha and manifest_version == version:
+            log("  Reusing local dist/ (manifest matches repo, commit, and version)")
+            return True
+        log(
+            "  Local dist/ manifest does not match current release "
+            f"(repo={manifest_repo!r}, sha={manifest_sha!r}, version={manifest_version!r})"
+        )
+
+    if host_binaries_match_version(version):
+        log("  Reusing local dist/ (host binaries report the expected version)")
+        return True
+
+    log("  Local dist/ could not be validated for this release")
+    return False
+
+
 def list_run_artifacts(repo: str, run_id: int) -> list[str]:
     """Return artifact names produced by a workflow run."""
     try:
@@ -437,13 +606,16 @@ def check_crates_versions(version: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def trigger_and_wait(repo: str) -> int:
-    """Reuse an existing successful build for HEAD, or trigger one and wait."""
+def trigger_and_wait(repo: str, version: str) -> int | None:
+    """Reuse local dist/, or a successful build for HEAD, or trigger one and wait."""
     log(f"\n=== Step 2: Build native binaries ({repo}) ===")
 
     head_sha = run_capture(["git", "rev-parse", "HEAD"])
     branch = run_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
     log(f"  Branch: {branch} ({head_sha[:12]})")
+
+    if should_reuse_local_dist(repo, head_sha, version):
+        return None
 
     existing_run = find_existing_build_run(repo, head_sha)
     if existing_run is not None:
@@ -546,7 +718,7 @@ def trigger_and_wait(repo: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def download_artifacts(repo: str, run_id: int) -> None:
+def download_artifacts(repo: str, run_id: int, head_sha: str, version: str) -> None:
     """Download build artifacts and organize into dist/."""
     log(f"\n=== Step 3: Download artifacts from run {run_id} ===")
 
@@ -595,6 +767,8 @@ def download_artifacts(repo: str, run_id: int) -> None:
         log(f"  ERROR: Missing artifacts for: {', '.join(missing)}")
         log("  All platforms must build successfully before publishing.")
         sys.exit(1)
+
+    write_dist_manifest(repo, run_id, head_sha, version)
 
 
 # ---------------------------------------------------------------------------
@@ -933,8 +1107,12 @@ def main() -> None:
             check_crates_versions(version)
 
     if run_pypi:
-        run_id = trigger_and_wait(repo)
-        download_artifacts(repo, run_id)
+        head_sha = run_capture(["git", "rev-parse", "HEAD"])
+        run_id = trigger_and_wait(repo, version)
+        if run_id is not None:
+            download_artifacts(repo, run_id, head_sha, version)
+        else:
+            write_dist_manifest(repo, None, head_sha, version)
         wheels = build_all_wheels(name, version, summary, requires_python, readme)
         wheels_to_upload = [wheel for wheel in wheels if wheel.name not in existing_pypi_files]
 
