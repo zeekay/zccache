@@ -12,7 +12,8 @@ use zccache_download::{
 use zccache_download_protocol::{Request, Response};
 
 pub use artifact::{
-    ArchiveFormat, FetchRequest, FetchResult, FetchState, FetchStateKind, FetchStatus, WaitMode,
+    ArchiveFormat, DownloadSource, FetchRequest, FetchResult, FetchState, FetchStateKind,
+    FetchStatus, WaitMode,
 };
 
 #[cfg(unix)]

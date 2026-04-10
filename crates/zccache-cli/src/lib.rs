@@ -7,7 +7,8 @@ use zccache_core::NormalizedPath;
 mod python;
 
 pub use zccache_download_client::{
-    ArchiveFormat, FetchRequest, FetchResult, FetchState, FetchStateKind, FetchStatus, WaitMode,
+    ArchiveFormat, DownloadSource, FetchRequest, FetchResult, FetchState, FetchStateKind,
+    FetchStatus, WaitMode,
 };
 
 #[derive(Debug, Clone)]
@@ -33,12 +34,13 @@ pub struct InoConvertResult {
 
 #[derive(Debug, Clone)]
 pub struct DownloadParams {
-    pub url: String,
+    pub source: DownloadSource,
     pub archive_path: Option<std::path::PathBuf>,
     pub unarchive_path: Option<std::path::PathBuf>,
     pub expected_sha256: Option<String>,
     pub archive_format: ArchiveFormat,
-    pub multipart_parts: Option<usize>,
+    pub max_connections: Option<usize>,
+    pub min_segment_size: Option<u64>,
     pub wait_mode: WaitMode,
     pub dry_run: bool,
     pub force: bool,
@@ -46,14 +48,15 @@ pub struct DownloadParams {
 
 impl DownloadParams {
     #[must_use]
-    pub fn new(url: impl Into<String>) -> Self {
+    pub fn new(source: impl Into<DownloadSource>) -> Self {
         Self {
-            url: url.into(),
+            source: source.into(),
             archive_path: None,
             unarchive_path: None,
             expected_sha256: None,
             archive_format: ArchiveFormat::Auto,
-            multipart_parts: None,
+            max_connections: None,
+            min_segment_size: None,
             wait_mode: WaitMode::Block,
             dry_run: false,
             force: false,
@@ -155,8 +158,11 @@ fn resolve_endpoint(explicit: Option<&str>) -> String {
     zccache_ipc::default_endpoint()
 }
 
-pub fn infer_download_archive_path(url: &str, archive_format: ArchiveFormat) -> std::path::PathBuf {
-    let file_name = infer_download_file_name(url, archive_format);
+pub fn infer_download_archive_path(
+    source: &DownloadSource,
+    archive_format: ArchiveFormat,
+) -> std::path::PathBuf {
+    let file_name = infer_download_file_name(source, archive_format);
     zccache_core::config::default_cache_dir()
         .join("downloads")
         .join("artifacts")
@@ -168,17 +174,17 @@ pub fn infer_download_archive_path(url: &str, archive_format: ArchiveFormat) -> 
 pub fn build_download_request(params: DownloadParams) -> FetchRequest {
     let archive_path = params
         .archive_path
-        .unwrap_or_else(|| infer_download_archive_path(&params.url, params.archive_format));
-    let mut request = FetchRequest::new(params.url, archive_path);
+        .unwrap_or_else(|| infer_download_archive_path(&params.source, params.archive_format));
+    let mut request = FetchRequest::new(params.source, archive_path);
     request.destination_path_expanded = params.unarchive_path;
     request.expected_sha256 = params.expected_sha256;
     request.archive_format = params.archive_format;
-    request.multipart_parts = params.multipart_parts;
     request.wait_mode = params.wait_mode;
     request.dry_run = params.dry_run;
     request.force = params.force;
     request.download_options.force = params.force;
-    request.download_options.max_connections = params.multipart_parts;
+    request.download_options.max_connections = params.max_connections;
+    request.download_options.min_segment_size = params.min_segment_size;
     request
 }
 
@@ -200,22 +206,80 @@ pub fn client_download_exists(
     client.exists(&request)
 }
 
-fn infer_download_file_name(url: &str, archive_format: ArchiveFormat) -> String {
-    let base = url
-        .split(['?', '#'])
-        .next()
-        .and_then(|value| value.rsplit('/').next())
-        .filter(|value| !value.is_empty())
-        .map(sanitize_download_file_name)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "download".to_string());
-    let hash = blake3::hash(url.as_bytes()).to_hex().to_string();
+fn infer_download_file_name(source: &DownloadSource, archive_format: ArchiveFormat) -> String {
+    let base = infer_source_file_name(source);
+    let hash = blake3::hash(download_source_key(source).as_bytes())
+        .to_hex()
+        .to_string();
     let suffix = archive_suffix(archive_format);
 
     if base.contains('.') || suffix.is_empty() {
         format!("{hash}-{base}")
     } else {
         format!("{hash}-{base}{suffix}")
+    }
+}
+
+fn infer_source_file_name(source: &DownloadSource) -> String {
+    match source {
+        DownloadSource::Url(url) => {
+            infer_url_file_name(url).unwrap_or_else(|| "download".to_string())
+        }
+        DownloadSource::MultipartUrls(urls) => infer_multipart_file_name(urls),
+    }
+}
+
+fn infer_url_file_name(url: &str) -> Option<String> {
+    url.split(['?', '#'])
+        .next()
+        .and_then(|value| value.rsplit('/').next())
+        .filter(|value| !value.is_empty())
+        .map(sanitize_download_file_name)
+        .filter(|value| !value.is_empty())
+}
+
+fn infer_multipart_file_name(urls: &[String]) -> String {
+    let base = urls
+        .first()
+        .and_then(|url| infer_url_file_name(url))
+        .map(|name| strip_part_suffix(&name).to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "multipart-download".to_string());
+    if base.contains('.') {
+        base
+    } else {
+        "multipart-download".to_string()
+    }
+}
+
+fn strip_part_suffix(value: &str) -> &str {
+    if let Some((base, suffix)) = value.rsplit_once(".part-") {
+        if !base.is_empty() && !suffix.is_empty() {
+            return base;
+        }
+    }
+    if let Some((base, suffix)) = value.rsplit_once(".part_") {
+        if !base.is_empty() && !suffix.is_empty() {
+            return base;
+        }
+    }
+    if let Some(index) = value.rfind(".part") {
+        let suffix = &value[index + ".part".len()..];
+        if !suffix.is_empty()
+            && suffix
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        {
+            return &value[..index];
+        }
+    }
+    value
+}
+
+fn download_source_key(source: &DownloadSource) -> String {
+    match source {
+        DownloadSource::Url(url) => url.clone(),
+        DownloadSource::MultipartUrls(urls) => urls.join("\n"),
     }
 }
 
@@ -735,7 +799,7 @@ mod tests {
     #[test]
     fn infer_download_path_keeps_url_filename() {
         let path = infer_download_archive_path(
-            "https://example.com/releases/toolchain.tar.gz?download=1",
+            &DownloadSource::Url("https://example.com/releases/toolchain.tar.gz?download=1".into()),
             ArchiveFormat::Auto,
         );
         let file_name = path.file_name().unwrap().to_string_lossy();
@@ -744,7 +808,10 @@ mod tests {
 
     #[test]
     fn infer_download_path_uses_archive_format_suffix_when_needed() {
-        let path = infer_download_archive_path("https://example.com/download", ArchiveFormat::Zip);
+        let path = infer_download_archive_path(
+            &DownloadSource::Url("https://example.com/download".into()),
+            ArchiveFormat::Zip,
+        );
         let file_name = path.file_name().unwrap().to_string_lossy();
         assert!(file_name.ends_with(".zip"));
     }
@@ -758,5 +825,18 @@ mod tests {
             .unwrap()
             .to_string_lossy();
         assert!(file_name.ends_with("-file.zip"));
+    }
+
+    #[test]
+    fn infer_download_path_strips_multipart_suffix_from_first_part() {
+        let path = infer_download_archive_path(
+            &DownloadSource::MultipartUrls(vec![
+                "https://example.com/toolchain.tar.zst.part-aa".into(),
+                "https://example.com/toolchain.tar.zst.part-ab".into(),
+            ]),
+            ArchiveFormat::Auto,
+        );
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        assert!(file_name.ends_with("-toolchain.tar.zst"));
     }
 }

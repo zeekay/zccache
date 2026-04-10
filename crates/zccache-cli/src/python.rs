@@ -2,16 +2,29 @@ use std::path::PathBuf;
 
 use pyo3::exceptions::{PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
+use pyo3::types::PyAny;
 
 use crate::{
     build_download_request, client_download, client_download_exists, client_session_end,
     client_session_start, client_session_stats, client_start, client_status, client_stop,
     fingerprint_check, fingerprint_invalidate, fingerprint_mark_failure, fingerprint_mark_success,
-    run_ino_convert_cached, DownloadParams, InoConvertOptions, WaitMode,
+    run_ino_convert_cached, DownloadParams, DownloadSource, InoConvertOptions, WaitMode,
 };
 
 fn runtime_to_py_err(message: String) -> PyErr {
     PyErr::new::<PyRuntimeError, _>(message)
+}
+
+fn parse_download_source(source: &Bound<'_, PyAny>) -> PyResult<DownloadSource> {
+    if let Ok(url) = source.extract::<String>() {
+        return Ok(DownloadSource::Url(url));
+    }
+    if let Ok(urls) = source.extract::<Vec<String>>() {
+        return Ok(DownloadSource::MultipartUrls(urls));
+    }
+    Err(PyErr::new::<PyRuntimeError, _>(
+        "source must be a URL string or a list of URL strings",
+    ))
 }
 
 #[pyclass(module = "zccache._native")]
@@ -421,35 +434,39 @@ impl NativeDownloadApi {
     }
 
     #[pyo3(signature = (
-        source_url,
+        source,
         destination=None,
         expanded=None,
         expected_sha256=None,
         archive_format="auto".to_string(),
-        multipart_parts=None,
+        max_connections=None,
+        min_segment_size=None,
         blocking=true,
         dry_run=false,
         force=false
     ))]
     fn fetch(
         &self,
-        source_url: String,
+        source: &Bound<'_, PyAny>,
         destination: Option<String>,
         expanded: Option<String>,
         expected_sha256: Option<String>,
         archive_format: String,
-        multipart_parts: Option<usize>,
+        max_connections: Option<usize>,
+        min_segment_size: Option<u64>,
         blocking: bool,
         dry_run: bool,
         force: bool,
     ) -> PyResult<NativeFetchResult> {
+        let source = parse_download_source(source)?;
         let request = build_download_request(DownloadParams {
-            url: source_url,
+            source,
             archive_path: destination.map(PathBuf::from),
             unarchive_path: expanded.map(PathBuf::from),
             expected_sha256,
             archive_format: parse_archive_format(&archive_format),
-            multipart_parts,
+            max_connections,
+            min_segment_size,
             wait_mode: if blocking {
                 WaitMode::Block
             } else {
@@ -465,7 +482,7 @@ impl NativeDownloadApi {
     }
 
     #[pyo3(signature = (
-        source_url,
+        source,
         destination=None,
         expanded=None,
         expected_sha256=None,
@@ -473,19 +490,21 @@ impl NativeDownloadApi {
     ))]
     fn exists(
         &self,
-        source_url: String,
+        source: &Bound<'_, PyAny>,
         destination: Option<String>,
         expanded: Option<String>,
         expected_sha256: Option<String>,
         archive_format: String,
     ) -> PyResult<NativeFetchState> {
+        let source = parse_download_source(source)?;
         let request = build_download_request(DownloadParams {
-            url: source_url,
+            source,
             archive_path: destination.map(PathBuf::from),
             unarchive_path: expanded.map(PathBuf::from),
             expected_sha256,
             archive_format: parse_archive_format(&archive_format),
-            multipart_parts: None,
+            max_connections: None,
+            min_segment_size: None,
             wait_mode: WaitMode::Block,
             dry_run: false,
             force: false,
@@ -525,35 +544,39 @@ impl NativeClient {
     }
 
     #[pyo3(signature = (
-        source_url,
+        source,
         destination=None,
         expanded=None,
         expected_sha256=None,
-        multipart_parts=None,
+        max_connections=None,
+        min_segment_size=None,
         blocking=true,
         dry_run=false,
         force=false
     ))]
     fn download(
         &self,
-        source_url: String,
+        source: &Bound<'_, PyAny>,
         destination: Option<String>,
         expanded: Option<String>,
         expected_sha256: Option<String>,
-        multipart_parts: Option<usize>,
+        max_connections: Option<usize>,
+        min_segment_size: Option<u64>,
         blocking: bool,
         dry_run: bool,
         force: bool,
     ) -> PyResult<NativeFetchResult> {
+        let source = parse_download_source(source)?;
         client_download(
             self.endpoint.as_deref(),
             DownloadParams {
-                url: source_url,
+                source,
                 archive_path: destination.map(PathBuf::from),
                 unarchive_path: expanded.map(PathBuf::from),
                 expected_sha256,
                 archive_format: zccache_download_client::ArchiveFormat::Auto,
-                multipart_parts,
+                max_connections,
+                min_segment_size,
                 wait_mode: if blocking {
                     WaitMode::Block
                 } else {
@@ -568,27 +591,29 @@ impl NativeClient {
     }
 
     #[pyo3(signature = (
-        source_url,
+        source,
         destination=None,
         expanded=None,
         expected_sha256=None
     ))]
     fn download_exists(
         &self,
-        source_url: String,
+        source: &Bound<'_, PyAny>,
         destination: Option<String>,
         expanded: Option<String>,
         expected_sha256: Option<String>,
     ) -> PyResult<NativeFetchState> {
+        let source = parse_download_source(source)?;
         client_download_exists(
             self.endpoint.as_deref(),
             DownloadParams {
-                url: source_url,
+                source,
                 archive_path: destination.map(PathBuf::from),
                 unarchive_path: expanded.map(PathBuf::from),
                 expected_sha256,
                 archive_format: zccache_download_client::ArchiveFormat::Auto,
-                multipart_parts: None,
+                max_connections: None,
+                min_segment_size: None,
                 wait_mode: WaitMode::Block,
                 dry_run: false,
                 force: false,

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Union
 
 from zccache._native import NativeDownloadApi
+
+DownloadSource = Union[str, list[str]]
 
 
 @dataclass(frozen=True)
@@ -158,12 +161,13 @@ class DownloadApi:
     def download(
         self,
         *,
-        source_url: str,
+        source: DownloadSource,
         destination: str | Path | None = None,
         expanded: str | Path | None = None,
         expected_sha256: str | None = None,
         archive_format: str = "auto",
-        multipart_parts: int | None = None,
+        max_connections: int | None = None,
+        min_segment_size: int | None = None,
         blocking: bool = True,
         dry_run: bool = False,
         force: bool = False,
@@ -173,12 +177,13 @@ class DownloadApi:
         )
         return _coerce_fetch_result(
             self._native.fetch(
-                source_url,
+                source,
                 destination_path,
                 None if expanded is None else str(Path(expanded)),
                 expected_sha256,
                 archive_format,
-                multipart_parts,
+                max_connections,
+                min_segment_size,
                 blocking,
                 dry_run,
                 force,
@@ -188,23 +193,25 @@ class DownloadApi:
     def fetch(
         self,
         *,
-        source_url: str,
+        source: DownloadSource,
         destination: str | Path | None = None,
         expanded: str | Path | None = None,
         expected_sha256: str | None = None,
         archive_format: str = "auto",
-        multipart_parts: int | None = None,
+        max_connections: int | None = None,
+        min_segment_size: int | None = None,
         blocking: bool = True,
         dry_run: bool = False,
         force: bool = False,
     ) -> FetchResult:
         return self.download(
-            source_url=source_url,
+            source=source,
             destination=destination,
             expanded=expanded,
             expected_sha256=expected_sha256,
             archive_format=archive_format,
-            multipart_parts=multipart_parts,
+            max_connections=max_connections,
+            min_segment_size=min_segment_size,
             blocking=blocking,
             dry_run=dry_run,
             force=force,
@@ -213,7 +220,7 @@ class DownloadApi:
     def exists(
         self,
         *,
-        source_url: str,
+        source: DownloadSource,
         destination: str | Path | None = None,
         expanded: str | Path | None = None,
         expected_sha256: str | None = None,
@@ -221,7 +228,7 @@ class DownloadApi:
     ) -> FetchState:
         return _coerce_fetch_state(
             self._native.exists(
-                source_url,
+                source,
                 None if destination is None else str(Path(destination)),
                 None if expanded is None else str(Path(expanded)),
                 expected_sha256,

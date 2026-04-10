@@ -3581,6 +3581,7 @@ dependencies = [
  "flate2",
  "fs2",
  "lzma-rs",
+ "reqwest",
  "ruzstd",
  "serde",
  "serde_json",

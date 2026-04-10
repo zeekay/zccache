@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use zccache_download::DownloadOptions;
 use zccache_download_client::{
-    is_terminal, ArchiveFormat, DownloadClient, FetchRequest, FetchResult, FetchState, WaitMode,
+    is_terminal, ArchiveFormat, DownloadClient, DownloadSource, FetchRequest, FetchResult,
+    FetchState, WaitMode,
 };
 
 #[derive(Debug, Parser)]
@@ -34,7 +35,10 @@ enum Command {
         min_segment_size: Option<u64>,
     },
     Fetch {
-        url: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long = "part-url")]
+        part_urls: Vec<String>,
         destination: PathBuf,
         #[arg(long)]
         expanded: Option<PathBuf>,
@@ -49,14 +53,15 @@ enum Command {
         #[arg(long)]
         force: bool,
         #[arg(long)]
-        multipart_parts: Option<usize>,
-        #[arg(long)]
         max_connections: Option<usize>,
         #[arg(long)]
         min_segment_size: Option<u64>,
     },
     Exists {
-        url: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long = "part-url")]
+        part_urls: Vec<String>,
         destination: PathBuf,
         #[arg(long)]
         expanded: Option<PathBuf>,
@@ -151,6 +156,7 @@ fn main() -> std::process::ExitCode {
         },
         Command::Fetch {
             url,
+            part_urls,
             destination,
             expanded,
             expected_sha256,
@@ -158,15 +164,20 @@ fn main() -> std::process::ExitCode {
             no_wait,
             dry_run,
             force,
-            multipart_parts,
             max_connections,
             min_segment_size,
         } => {
-            let mut request = FetchRequest::new(url, destination);
+            let source = match resolve_fetch_source(url, part_urls) {
+                Ok(source) => source,
+                Err(err) => {
+                    eprintln!("{err}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let mut request = FetchRequest::new(source, destination);
             request.destination_path_expanded = expanded;
             request.expected_sha256 = expected_sha256;
             request.archive_format = parse_archive_format(&archive_format);
-            request.multipart_parts = multipart_parts;
             request.wait_mode = if no_wait {
                 WaitMode::NoWait
             } else {
@@ -176,7 +187,7 @@ fn main() -> std::process::ExitCode {
             request.force = force;
             request.download_options = DownloadOptions {
                 force,
-                max_connections: max_connections.or(multipart_parts),
+                max_connections,
                 min_segment_size,
             };
             match client.fetch(request) {
@@ -192,12 +203,20 @@ fn main() -> std::process::ExitCode {
         }
         Command::Exists {
             url,
+            part_urls,
             destination,
             expanded,
             expected_sha256,
             archive_format,
         } => {
-            let mut request = FetchRequest::new(url, destination);
+            let source = match resolve_fetch_source(url, part_urls) {
+                Ok(source) => source,
+                Err(err) => {
+                    eprintln!("{err}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            let mut request = FetchRequest::new(source, destination);
             request.destination_path_expanded = expanded;
             request.expected_sha256 = expected_sha256;
             request.archive_format = parse_archive_format(&archive_format);
@@ -442,5 +461,17 @@ fn parse_archive_format(value: &str) -> ArchiveFormat {
         "tar.zst" | "tarzst" => ArchiveFormat::TarZst,
         "7z" | "sevenz" => ArchiveFormat::SevenZip,
         _ => ArchiveFormat::Auto,
+    }
+}
+
+fn resolve_fetch_source(
+    url: Option<String>,
+    part_urls: Vec<String>,
+) -> Result<DownloadSource, String> {
+    match (url, part_urls.is_empty()) {
+        (Some(url), true) => Ok(DownloadSource::Url(url)),
+        (None, false) => Ok(DownloadSource::MultipartUrls(part_urls)),
+        (Some(_), false) => Err("use either --url or --part-url, not both".to_string()),
+        (None, true) => Err("provide either --url or at least one --part-url".to_string()),
     }
 }

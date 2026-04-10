@@ -26,8 +26,8 @@ use clap::{Parser, Subcommand};
 use std::path::Path;
 use std::process::ExitCode;
 use zccache_cli::{
-    client_download, run_ino_convert_cached, ArchiveFormat, DownloadParams, InoConvertOptions,
-    WaitMode,
+    client_download, run_ino_convert_cached, ArchiveFormat, DownloadParams, DownloadSource,
+    InoConvertOptions, WaitMode,
 };
 use zccache_core::NormalizedPath;
 
@@ -151,8 +151,12 @@ enum Commands {
     },
     /// Download and optionally unarchive an artifact using the dedicated download daemon.
     Download {
-        /// Source URL.
-        url: String,
+        /// Source URL for a normal single-file download.
+        #[arg(long)]
+        url: Option<String>,
+        /// One explicit URL per multipart segment, in concatenation order.
+        #[arg(long = "part-url")]
+        part_urls: Vec<String>,
         /// Optional archive/cache path. If omitted, zccache chooses a deterministic cache path.
         archive_path: Option<String>,
         /// Optional destination to expand or unarchive into.
@@ -161,9 +165,12 @@ enum Commands {
         /// Optional expected SHA-256 of the downloaded artifact.
         #[arg(long = "sha256")]
         expected_sha256: Option<String>,
-        /// Number of parallel range parts to use when the server supports it.
-        #[arg(long = "multipart-parts")]
-        multipart_parts: Option<usize>,
+        /// Number of parallel range connections to use for single-URL downloads.
+        #[arg(long)]
+        max_connections: Option<usize>,
+        /// Minimum segment size before single-URL downloads switch to ranged fetching.
+        #[arg(long)]
+        min_segment_size: Option<u64>,
         /// Return immediately with `locked` if another client owns the artifact lock.
         #[arg(long)]
         no_wait: bool,
@@ -332,20 +339,29 @@ fn main() -> ExitCode {
         },
         Commands::Download {
             url,
+            part_urls,
             archive_path,
             unarchive_path,
             expected_sha256,
-            multipart_parts,
+            max_connections,
+            min_segment_size,
             no_wait,
             dry_run,
             force,
         } => cmd_download(DownloadParams {
-            url,
+            source: match resolve_download_source(url, part_urls) {
+                Ok(source) => source,
+                Err(err) => {
+                    eprintln!("zccache download: {err}");
+                    return ExitCode::FAILURE;
+                }
+            },
             archive_path: archive_path.map(Into::into),
             unarchive_path: unarchive_path.map(Into::into),
             expected_sha256,
             archive_format: ArchiveFormat::Auto,
-            multipart_parts,
+            max_connections,
+            min_segment_size,
             wait_mode: if no_wait {
                 WaitMode::NoWait
             } else {
@@ -461,6 +477,18 @@ fn cmd_download(params: DownloadParams) -> ExitCode {
             eprintln!("zccache download: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn resolve_download_source(
+    url: Option<String>,
+    part_urls: Vec<String>,
+) -> Result<DownloadSource, String> {
+    match (url, part_urls.is_empty()) {
+        (Some(url), true) => Ok(DownloadSource::Url(url)),
+        (None, false) => Ok(DownloadSource::MultipartUrls(part_urls)),
+        (Some(_), false) => Err("use either --url or --part-url, not both".to_string()),
+        (None, true) => Err("provide either --url or at least one --part-url".to_string()),
     }
 }
 

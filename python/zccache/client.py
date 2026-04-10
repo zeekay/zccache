@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from zccache._native import NativeClient, default_endpoint as _default_endpoint
-from zccache.downloader import FetchResult, FetchState
+from zccache.downloader import DownloadSource, FetchResult, FetchState
 
 
 @dataclass(frozen=True)
@@ -118,21 +118,23 @@ class ZcCacheClient:
     def download(
         self,
         *,
-        source_url: str,
+        source: DownloadSource,
         destination: str | Path | None = None,
         unarchive: str | Path | None = None,
         expected_sha256: str | None = None,
-        multipart_parts: int | None = None,
+        max_connections: int | None = None,
+        min_segment_size: int | None = None,
         blocking: bool = True,
         dry_run: bool = False,
         force: bool = False,
     ) -> FetchResult:
         result = self._native.download(
-            source_url,
+            source,
             None if destination is None else str(Path(destination)),
             None if unarchive is None else str(Path(unarchive)),
             expected_sha256,
-            multipart_parts,
+            max_connections,
+            min_segment_size,
             blocking,
             dry_run,
             force,
@@ -148,13 +150,13 @@ class ZcCacheClient:
     def download_exists(
         self,
         *,
-        source_url: str,
+        source: DownloadSource,
         destination: str | Path | None = None,
         unarchive: str | Path | None = None,
         expected_sha256: str | None = None,
     ) -> FetchState:
         state = self._native.download_exists(
-            source_url,
+            source,
             None if destination is None else str(Path(destination)),
             None if unarchive is None else str(Path(unarchive)),
             expected_sha256,

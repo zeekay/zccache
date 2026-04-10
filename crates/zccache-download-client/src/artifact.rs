@@ -2,8 +2,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+use reqwest::header::ACCEPT_ENCODING;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use zccache_download::{canonical_destination, stable_download_id, DownloadOptions, DownloadPhase};
 
 use crate::DownloadClient;
@@ -47,13 +49,46 @@ pub enum FetchStateKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DownloadSource {
+    Url(String),
+    MultipartUrls(Vec<String>),
+}
+
+impl DownloadSource {
+    #[must_use]
+    pub fn primary_url(&self) -> &str {
+        match self {
+            Self::Url(url) => url,
+            Self::MultipartUrls(urls) => urls.first().map(String::as_str).unwrap_or(""),
+        }
+    }
+}
+
+impl From<String> for DownloadSource {
+    fn from(value: String) -> Self {
+        Self::Url(value)
+    }
+}
+
+impl From<&str> for DownloadSource {
+    fn from(value: &str) -> Self {
+        Self::Url(value.to_string())
+    }
+}
+
+impl From<Vec<String>> for DownloadSource {
+    fn from(value: Vec<String>) -> Self {
+        Self::MultipartUrls(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchRequest {
-    pub url: String,
+    pub source: DownloadSource,
     pub destination_path: PathBuf,
     pub destination_path_expanded: Option<PathBuf>,
     pub expected_sha256: Option<String>,
     pub archive_format: ArchiveFormat,
-    pub multipart_parts: Option<usize>,
     pub wait_mode: WaitMode,
     pub dry_run: bool,
     pub force: bool,
@@ -62,14 +97,13 @@ pub struct FetchRequest {
 
 impl FetchRequest {
     #[must_use]
-    pub fn new(url: impl Into<String>, destination_path: impl Into<PathBuf>) -> Self {
+    pub fn new(source: impl Into<DownloadSource>, destination_path: impl Into<PathBuf>) -> Self {
         Self {
-            url: url.into(),
+            source: source.into(),
             destination_path: destination_path.into(),
             destination_path_expanded: None,
             expected_sha256: None,
             archive_format: ArchiveFormat::Auto,
-            multipart_parts: None,
             wait_mode: WaitMode::Block,
             dry_run: false,
             force: false,
@@ -99,7 +133,7 @@ pub struct FetchState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ExpandedMarker {
-    url: String,
+    source: DownloadSource,
     cache_path: String,
     artifact_sha256: String,
     archive_format: ArchiveFormat,
@@ -107,7 +141,7 @@ struct ExpandedMarker {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ArtifactMarker {
-    url: String,
+    source: DownloadSource,
     cache_path: String,
     sha256: String,
     bytes: u64,
@@ -121,7 +155,7 @@ struct ArtifactFingerprint {
 
 #[derive(Debug, Clone)]
 struct ResolvedFetchRequest {
-    url: String,
+    source: DownloadSource,
     cache_path: PathBuf,
     expanded_path: Option<PathBuf>,
     expected_sha256: Option<String>,
@@ -233,23 +267,30 @@ impl DownloadClient {
 
         let mut downloaded_now = false;
         if resolved.force || current.kind != FetchStateKind::ArtifactReady {
-            let mut handle = self.download(
-                &resolved.url,
-                &resolved.cache_path,
-                resolved.download_options.clone(),
-            )?;
-            let status = loop {
-                let status = handle.wait(None)?;
-                if crate::is_terminal(&status) {
-                    break status;
+            match &resolved.source {
+                DownloadSource::Url(url) => {
+                    let mut handle = self.download(
+                        url,
+                        &resolved.cache_path,
+                        resolved.download_options.clone(),
+                    )?;
+                    let status = loop {
+                        let status = handle.wait(None)?;
+                        if crate::is_terminal(&status) {
+                            break status;
+                        }
+                    };
+                    if status.phase != DownloadPhase::Completed {
+                        return Err(status.error.unwrap_or_else(|| {
+                            format!("download finished in unexpected phase {:?}", status.phase)
+                        }));
+                    }
+                    handle.close()?;
                 }
-            };
-            if status.phase != DownloadPhase::Completed {
-                return Err(status.error.unwrap_or_else(|| {
-                    format!("download finished in unexpected phase {:?}", status.phase)
-                }));
+                DownloadSource::MultipartUrls(urls) => {
+                    download_explicit_parts(urls, &resolved.cache_path)?;
+                }
             }
-            handle.close()?;
             downloaded_now = true;
         }
 
@@ -317,12 +358,8 @@ impl DownloadClient {
 }
 
 fn resolve_request(request: &FetchRequest) -> Result<ResolvedFetchRequest, String> {
-    let mut download_options = request.download_options.clone();
-    if request.multipart_parts.is_some() {
-        download_options.max_connections = request.multipart_parts;
-    }
     Ok(ResolvedFetchRequest {
-        url: request.url.clone(),
+        source: normalize_source(request.source.clone())?,
         cache_path: canonical_destination(&request.destination_path)
             .map_err(|e| e.to_string())?
             .into_path_buf(),
@@ -336,17 +373,13 @@ fn resolve_request(request: &FetchRequest) -> Result<ResolvedFetchRequest, Strin
         wait_mode: request.wait_mode,
         dry_run: request.dry_run,
         force: request.force,
-        download_options,
+        download_options: request.download_options.clone(),
     })
 }
 
 fn resolve_request_no_create(request: &FetchRequest) -> Result<ResolvedFetchRequest, String> {
-    let mut download_options = request.download_options.clone();
-    if request.multipart_parts.is_some() {
-        download_options.max_connections = request.multipart_parts;
-    }
     Ok(ResolvedFetchRequest {
-        url: request.url.clone(),
+        source: normalize_source(request.source.clone())?,
         cache_path: normalize_target(&request.destination_path, false)?,
         expanded_path: request
             .destination_path_expanded
@@ -358,7 +391,7 @@ fn resolve_request_no_create(request: &FetchRequest) -> Result<ResolvedFetchRequ
         wait_mode: request.wait_mode,
         dry_run: request.dry_run,
         force: request.force,
-        download_options,
+        download_options: request.download_options.clone(),
     })
 }
 
@@ -388,6 +421,27 @@ fn normalize_target(path: &Path, create_parent: bool) -> Result<PathBuf, String>
 
 fn normalize_sha256(value: String) -> String {
     value.trim().to_ascii_lowercase()
+}
+
+fn normalize_source(source: DownloadSource) -> Result<DownloadSource, String> {
+    match source {
+        DownloadSource::Url(url) => {
+            if url.trim().is_empty() {
+                Err("download source URL must not be empty".to_string())
+            } else {
+                Ok(DownloadSource::Url(url))
+            }
+        }
+        DownloadSource::MultipartUrls(urls) => {
+            if urls.is_empty() {
+                return Err("multipart download source must include at least one URL".to_string());
+            }
+            if urls.iter().any(|url| url.trim().is_empty()) {
+                return Err("multipart download source contains an empty URL".to_string());
+            }
+            Ok(DownloadSource::MultipartUrls(urls))
+        }
+    }
 }
 
 fn exists_resolved(request: &ResolvedFetchRequest) -> Result<FetchState, String> {
@@ -510,6 +564,62 @@ fn cleanup_invalid_fetch_state(request: &ResolvedFetchRequest) {
     }
 }
 
+fn download_explicit_parts(part_urls: &[String], destination: &Path) -> Result<(), String> {
+    let temp_path = temp_download_path(destination);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
+    runtime.block_on(async move {
+        let client = reqwest::Client::builder()
+            .user_agent(format!("zccache-download/{}", zccache_core::VERSION))
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        let _ = tokio::fs::remove_file(&temp_path).await;
+
+        let result = async {
+            let mut output = tokio::fs::File::create(&temp_path)
+                .await
+                .map_err(|e| e.to_string())?;
+            for url in part_urls {
+                let mut response = client
+                    .get(url)
+                    .header(ACCEPT_ENCODING, "identity")
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !response.status().is_success() {
+                    return Err(format!("unexpected status {} for {url}", response.status()));
+                }
+                while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+                    output.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                }
+            }
+            output.flush().await.map_err(|e| e.to_string())?;
+            drop(output);
+            if destination.exists() {
+                let _ = tokio::fs::remove_file(destination).await;
+            }
+            tokio::fs::rename(&temp_path, destination)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        .await;
+
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+        }
+        result
+    })
+}
+
 fn sha256_file(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -528,6 +638,16 @@ fn compute_artifact_fingerprint(path: &Path) -> io::Result<ArtifactFingerprint> 
     let sha256 = sha256_file(path)?;
     let bytes = fs::metadata(path)?.len();
     Ok(ArtifactFingerprint { sha256, bytes })
+}
+
+fn temp_download_path(destination: &Path) -> PathBuf {
+    destination.with_extension(format!(
+        "{}part",
+        destination
+            .extension()
+            .map(|ext| format!("{}.", ext.to_string_lossy()))
+            .unwrap_or_default()
+    ))
 }
 
 struct FetchLock {
@@ -596,7 +716,7 @@ fn read_or_compute_artifact_fingerprint(
         compute_artifact_fingerprint(&request.cache_path).map_err(|e| e.to_string())?;
     if let Ok(content) = fs::read_to_string(artifact_marker_path(&request.cache_path)) {
         let marker: ArtifactMarker = serde_json::from_str(&content).map_err(|e| e.to_string())?;
-        if marker.url != request.url
+        if marker.source != request.source
             || marker.cache_path != request.cache_path.to_string_lossy()
             || marker.sha256 != fingerprint.sha256
             || marker.bytes != fingerprint.bytes
@@ -619,7 +739,7 @@ fn write_artifact_marker(
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let marker = ArtifactMarker {
-        url: request.url.clone(),
+        source: request.source.clone(),
         cache_path: request.cache_path.to_string_lossy().into_owned(),
         sha256: fingerprint.sha256.clone(),
         bytes: fingerprint.bytes,
@@ -640,7 +760,7 @@ fn expanded_marker_matches(
         Ok(content) => serde_json::from_str(&content).map_err(|e| e.to_string())?,
         Err(_) => return Ok(false),
     };
-    if marker.url != request.url {
+    if marker.source != request.source {
         return Ok(false);
     }
     if marker.cache_path != request.cache_path.to_string_lossy() {
@@ -667,7 +787,7 @@ fn write_expanded_marker(
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let marker = ExpandedMarker {
-        url: request.url.clone(),
+        source: request.source.clone(),
         cache_path: request.cache_path.to_string_lossy().into_owned(),
         artifact_sha256: fingerprint.sha256.clone(),
         archive_format: detect_archive_format(request)?,
@@ -1295,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_multipart_parts_uses_range_requests() {
+    fn fetch_single_url_max_connections_uses_range_requests() {
         let daemon = TestDaemon::start();
         let body: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
         let server = TestHttpServer::start(TestHttpConfig {
@@ -1309,7 +1429,7 @@ mod tests {
         let client = DownloadClient::new(Some(daemon.endpoint.clone()));
         let dir = tempfile::tempdir().unwrap();
         let mut request = FetchRequest::new(server.url.clone(), dir.path().join("multipart.bin"));
-        request.multipart_parts = Some(4);
+        request.download_options.max_connections = Some(4);
         request.download_options.min_segment_size = Some(1024);
         request.expected_sha256 = Some(sha256_hex(&body));
 
@@ -1317,6 +1437,81 @@ mod tests {
         assert_eq!(result.status, FetchStatus::Downloaded);
         assert_eq!(result.sha256, sha256_hex(&body));
         assert!(server.range_request_count() >= 2);
+    }
+
+    #[test]
+    fn fetch_explicit_multipart_urls_concatenates_and_stays_local() {
+        let daemon = TestDaemon::start();
+        let part_a = b"hello ".to_vec();
+        let part_b = b"multipart ".to_vec();
+        let part_c = b"world".to_vec();
+        let mut full = Vec::new();
+        full.extend_from_slice(&part_a);
+        full.extend_from_slice(&part_b);
+        full.extend_from_slice(&part_c);
+
+        let server_a = TestHttpServer::start(TestHttpConfig {
+            body: Arc::new(part_a),
+            accept_ranges: false,
+            send_content_length: true,
+            chunk_size: 0,
+            chunk_delay: Duration::ZERO,
+            path: "artifact.part-aa".to_string(),
+        });
+        let server_b = TestHttpServer::start(TestHttpConfig {
+            body: Arc::new(part_b),
+            accept_ranges: false,
+            send_content_length: true,
+            chunk_size: 0,
+            chunk_delay: Duration::ZERO,
+            path: "artifact.part-ab".to_string(),
+        });
+        let server_c = TestHttpServer::start(TestHttpConfig {
+            body: Arc::new(part_c),
+            accept_ranges: false,
+            send_content_length: true,
+            chunk_size: 0,
+            chunk_delay: Duration::ZERO,
+            path: "artifact.part-ac".to_string(),
+        });
+
+        let client = DownloadClient::new(Some(daemon.endpoint.clone()));
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("artifact.bin");
+        let mut request = FetchRequest::new(
+            vec![
+                server_a.url.clone(),
+                server_b.url.clone(),
+                server_c.url.clone(),
+            ],
+            &destination,
+        );
+        request.expected_sha256 = Some(sha256_hex(&full));
+
+        let first = client.fetch(request.clone()).unwrap();
+        assert_eq!(first.status, FetchStatus::Downloaded);
+        assert_eq!(first.sha256, sha256_hex(&full));
+        assert_eq!(fs::read(&destination).unwrap(), full);
+        let request_counts = (
+            server_a.request_count(),
+            server_b.request_count(),
+            server_c.request_count(),
+        );
+
+        let second = client.fetch(request.clone()).unwrap();
+        assert_eq!(second.status, FetchStatus::AlreadyPresent);
+        assert_eq!(
+            (
+                server_a.request_count(),
+                server_b.request_count(),
+                server_c.request_count()
+            ),
+            request_counts
+        );
+
+        let state = client.exists(&request).unwrap();
+        assert_eq!(state.kind, FetchStateKind::ArtifactReady);
+        assert_eq!(state.sha256.as_deref(), Some(first.sha256.as_str()));
     }
 
     #[test]
@@ -1353,6 +1548,58 @@ mod tests {
 
         let client = DownloadClient::new(Some(daemon.endpoint.clone()));
         let mut no_wait = FetchRequest::new(server.url.clone(), &destination);
+        no_wait.wait_mode = WaitMode::NoWait;
+        let locked = client.fetch(no_wait).unwrap();
+        assert_eq!(locked.status, FetchStatus::Locked);
+
+        let completed = download_thread.join().unwrap();
+        assert_eq!(completed.status, FetchStatus::Downloaded);
+    }
+
+    #[test]
+    fn fetch_multipart_no_wait_returns_locked_while_other_client_is_downloading() {
+        let daemon = TestDaemon::start();
+        let slow_server = TestHttpServer::start(TestHttpConfig {
+            body: Arc::new((0..512 * 1024).map(|i| (i % 251) as u8).collect()),
+            accept_ranges: false,
+            send_content_length: true,
+            chunk_size: 4096,
+            chunk_delay: Duration::from_millis(2),
+            path: "slow.part-aa".to_string(),
+        });
+        let fast_server = TestHttpServer::start(TestHttpConfig {
+            body: Arc::new(b"tail".to_vec()),
+            accept_ranges: false,
+            send_content_length: true,
+            chunk_size: 0,
+            chunk_delay: Duration::ZERO,
+            path: "slow.part-ab".to_string(),
+        });
+        let dest_dir = tempfile::tempdir().unwrap();
+        let destination = dest_dir.path().join("slow.bin");
+
+        let endpoint = daemon.endpoint.clone();
+        let source = vec![slow_server.url.clone(), fast_server.url.clone()];
+        let destination_for_thread = destination.clone();
+        let download_thread = thread::spawn(move || {
+            let client = DownloadClient::new(Some(endpoint));
+            let request = FetchRequest::new(source, &destination_for_thread);
+            client.fetch(request).unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if slow_server.request_count() > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let client = DownloadClient::new(Some(daemon.endpoint.clone()));
+        let mut no_wait = FetchRequest::new(
+            vec![slow_server.url.clone(), fast_server.url.clone()],
+            &destination,
+        );
         no_wait.wait_mode = WaitMode::NoWait;
         let locked = client.fetch(no_wait).unwrap();
         assert_eq!(locked.status, FetchStatus::Locked);

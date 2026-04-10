@@ -9,7 +9,7 @@ homepage.workspace = true
 description = "Rust client API for the zccache download daemon"
 
 [dependencies]
-tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "time", "fs"] }
 zccache-core = { workspace = true }
 zccache-ipc = { workspace = true }
 zccache-download = { workspace = true }
@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 fs2 = { workspace = true }
 tempfile = { workspace = true }
+reqwest = { workspace = true }
 zip = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
