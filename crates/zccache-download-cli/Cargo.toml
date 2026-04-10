@@ -17,4 +17,4 @@ zccache-download-client = { workspace = true }
 [[bin]]
 name = "zccache-download"
 path = "src/main.rs"
-
+doc = false
