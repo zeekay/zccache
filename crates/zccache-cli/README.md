@@ -1,6 +1,6 @@
 # zccache-cli
 
-CLI binary (`zccache`). Subcommands: start, stop, status, clear, wrap, inspect, session-start, session-end, session-stats, crashes.
+CLI binary (`zccache`). Subcommands: start, stop (`kill` alias), status, clear, wrap, inspect, session-start, session-end, session-stats, crashes, download.
 
 ## Top-Level Flags
 
@@ -44,3 +44,16 @@ zccache session-end <session_id>
 | `session-start` | `--endpoint <ep>` | IPC endpoint override |
 | `session-stats` | `--endpoint <ep>` | IPC endpoint override |
 | `session-end` | `--endpoint <ep>` | IPC endpoint override |
+
+## Download Command
+
+High-level artifact fetch and optional unarchive flow. The dedicated download daemon stays internal.
+
+```bash
+zccache download https://example.com/toolchain.tar.gz
+zccache download https://example.com/toolchain.tar.gz archive/toolchain.tar.gz
+zccache download https://example.com/toolchain.tar.gz --unarchive toolchain/
+zccache download https://example.com/toolchain.tar.gz archive/toolchain.tar.gz --unarchive toolchain/
+```
+
+If the archive path is omitted, `zccache` chooses a deterministic cache path under its own cache directory.

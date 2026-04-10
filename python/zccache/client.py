@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from zccache._native import NativeClient, default_endpoint as _default_endpoint
+from zccache.downloader import FetchResult, FetchState
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,59 @@ class ZcCacheClient:
 
     def status(self) -> DaemonStatus:
         return _coerce_status(self._native.status())
+
+    def download(
+        self,
+        *,
+        source_url: str,
+        destination: str | Path | None = None,
+        unarchive: str | Path | None = None,
+        expected_sha256: str | None = None,
+        multipart_parts: int | None = None,
+        blocking: bool = True,
+        dry_run: bool = False,
+        force: bool = False,
+    ) -> FetchResult:
+        result = self._native.download(
+            source_url,
+            None if destination is None else str(Path(destination)),
+            None if unarchive is None else str(Path(unarchive)),
+            expected_sha256,
+            multipart_parts,
+            blocking,
+            dry_run,
+            force,
+        )
+        return FetchResult(
+            status=result.status,
+            cache_path=result.cache_path,
+            expanded_path=result.expanded_path,
+            bytes=result.bytes,
+            sha256=result.sha256,
+        )
+
+    def download_exists(
+        self,
+        *,
+        source_url: str,
+        destination: str | Path | None = None,
+        unarchive: str | Path | None = None,
+        expected_sha256: str | None = None,
+    ) -> FetchState:
+        state = self._native.download_exists(
+            source_url,
+            None if destination is None else str(Path(destination)),
+            None if unarchive is None else str(Path(unarchive)),
+            expected_sha256,
+        )
+        return FetchState(
+            kind=state.kind,
+            cache_path=state.cache_path,
+            expanded_path=state.expanded_path,
+            bytes=state.bytes,
+            sha256=state.sha256,
+            reason=state.reason,
+        )
 
     def session_start(
         self,

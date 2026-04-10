@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
-from zccache import client, fingerprint, ino, watcher
+from zccache import client, downloader, fingerprint, ino, watcher
 from zccache.client import SessionStartResult, SessionStats, ZcCacheClient
+from zccache.downloader import (
+    DownloadApi,
+    DownloadDaemonStatus,
+    DownloadHandle,
+    DownloadStatus,
+    FetchResult,
+    FetchState,
+)
 from zccache.fingerprint import (
     Api,
     FingerprintCache,
@@ -23,6 +31,12 @@ from zccache.watcher import (
 __all__ = [
     "Api",
     "DebouncedFileWatcherProcess",
+    "DownloadApi",
+    "DownloadDaemonStatus",
+    "DownloadHandle",
+    "DownloadStatus",
+    "FetchResult",
+    "FetchState",
     "FileChangeEvent",
     "FileWatcher",
     "FileWatcherProcess",
@@ -36,6 +50,7 @@ __all__ = [
     "ZcCacheClient",
     "client",
     "convert_ino",
+    "downloader",
     "fingerprint",
     "ino",
     "watcher",

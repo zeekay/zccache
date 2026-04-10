@@ -6,6 +6,10 @@ use zccache_core::NormalizedPath;
 #[cfg(feature = "python")]
 mod python;
 
+pub use zccache_download_client::{
+    ArchiveFormat, FetchRequest, FetchResult, FetchState, FetchStateKind, FetchStatus, WaitMode,
+};
+
 #[derive(Debug, Clone)]
 pub struct InoConvertOptions {
     pub clang_args: Vec<String>,
@@ -25,6 +29,36 @@ impl Default for InoConvertOptions {
 pub struct InoConvertResult {
     pub cache_hit: bool,
     pub skipped_write: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadParams {
+    pub url: String,
+    pub archive_path: Option<std::path::PathBuf>,
+    pub unarchive_path: Option<std::path::PathBuf>,
+    pub expected_sha256: Option<String>,
+    pub archive_format: ArchiveFormat,
+    pub multipart_parts: Option<usize>,
+    pub wait_mode: WaitMode,
+    pub dry_run: bool,
+    pub force: bool,
+}
+
+impl DownloadParams {
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            archive_path: None,
+            unarchive_path: None,
+            expected_sha256: None,
+            archive_format: ArchiveFormat::Auto,
+            multipart_parts: None,
+            wait_mode: WaitMode::Block,
+            dry_run: false,
+            force: false,
+        }
+    }
 }
 
 pub fn run_ino_convert_cached(
@@ -119,6 +153,94 @@ fn resolve_endpoint(explicit: Option<&str>) -> String {
         return ep;
     }
     zccache_ipc::default_endpoint()
+}
+
+pub fn infer_download_archive_path(url: &str, archive_format: ArchiveFormat) -> std::path::PathBuf {
+    let file_name = infer_download_file_name(url, archive_format);
+    zccache_core::config::default_cache_dir()
+        .join("downloads")
+        .join("artifacts")
+        .join(file_name)
+        .into_path_buf()
+}
+
+#[must_use]
+pub fn build_download_request(params: DownloadParams) -> FetchRequest {
+    let archive_path = params
+        .archive_path
+        .unwrap_or_else(|| infer_download_archive_path(&params.url, params.archive_format));
+    let mut request = FetchRequest::new(params.url, archive_path);
+    request.destination_path_expanded = params.unarchive_path;
+    request.expected_sha256 = params.expected_sha256;
+    request.archive_format = params.archive_format;
+    request.multipart_parts = params.multipart_parts;
+    request.wait_mode = params.wait_mode;
+    request.dry_run = params.dry_run;
+    request.force = params.force;
+    request.download_options.force = params.force;
+    request.download_options.max_connections = params.multipart_parts;
+    request
+}
+
+pub fn client_download(
+    endpoint: Option<&str>,
+    params: DownloadParams,
+) -> Result<FetchResult, String> {
+    let request = build_download_request(params);
+    let client = zccache_download_client::DownloadClient::new(endpoint.map(ToOwned::to_owned));
+    client.fetch(request)
+}
+
+pub fn client_download_exists(
+    endpoint: Option<&str>,
+    params: DownloadParams,
+) -> Result<FetchState, String> {
+    let request = build_download_request(params);
+    let client = zccache_download_client::DownloadClient::new(endpoint.map(ToOwned::to_owned));
+    client.exists(&request)
+}
+
+fn infer_download_file_name(url: &str, archive_format: ArchiveFormat) -> String {
+    let base = url
+        .split(['?', '#'])
+        .next()
+        .and_then(|value| value.rsplit('/').next())
+        .filter(|value| !value.is_empty())
+        .map(sanitize_download_file_name)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "download".to_string());
+    let hash = blake3::hash(url.as_bytes()).to_hex().to_string();
+    let suffix = archive_suffix(archive_format);
+
+    if base.contains('.') || suffix.is_empty() {
+        format!("{hash}-{base}")
+    } else {
+        format!("{hash}-{base}{suffix}")
+    }
+}
+
+fn sanitize_download_file_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect()
+}
+
+fn archive_suffix(format: ArchiveFormat) -> &'static str {
+    match format {
+        ArchiveFormat::Auto | ArchiveFormat::None => "",
+        ArchiveFormat::Zst => ".zst",
+        ArchiveFormat::Zip => ".zip",
+        ArchiveFormat::Xz => ".xz",
+        ArchiveFormat::TarGz => ".tar.gz",
+        ArchiveFormat::TarXz => ".tar.xz",
+        ArchiveFormat::TarZst => ".tar.zst",
+        ArchiveFormat::SevenZip => ".7z",
+    }
 }
 
 fn run_async<T>(future: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
@@ -604,4 +726,37 @@ pub fn fingerprint_invalidate(endpoint: Option<&str>, cache_file: &Path) -> Resu
             Err(e) => Err(format!("broken connection to daemon: {e}")),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_download_path_keeps_url_filename() {
+        let path = infer_download_archive_path(
+            "https://example.com/releases/toolchain.tar.gz?download=1",
+            ArchiveFormat::Auto,
+        );
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        assert!(file_name.ends_with("-toolchain.tar.gz"));
+    }
+
+    #[test]
+    fn infer_download_path_uses_archive_format_suffix_when_needed() {
+        let path = infer_download_archive_path("https://example.com/download", ArchiveFormat::Zip);
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        assert!(file_name.ends_with(".zip"));
+    }
+
+    #[test]
+    fn build_download_request_derives_archive_path_when_missing() {
+        let request = build_download_request(DownloadParams::new("https://example.com/file.zip"));
+        let file_name = request
+            .destination_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        assert!(file_name.ends_with("-file.zip"));
+    }
 }

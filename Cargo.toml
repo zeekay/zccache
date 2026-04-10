@@ -4,6 +4,11 @@ members = [
     "crates/zccache-core",
     "crates/zccache-hash",
     "crates/zccache-protocol",
+    "crates/zccache-download-protocol",
+    "crates/zccache-download",
+    "crates/zccache-download-client",
+    "crates/zccache-download-daemon",
+    "crates/zccache-download-cli",
     "crates/zccache-fscache",
     "crates/zccache-artifact",
     "crates/zccache-depgraph",
@@ -30,7 +35,7 @@ homepage = "https://github.com/zackees/zccache"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive", "rc"] }
 bincode = "1"
-blake3 = { version = "1" }
+blake3 = { version = "1", features = ["pure"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -44,12 +49,28 @@ tempfile = "3"
 rayon = "1"
 jwalk = "0.8"
 bytes = "1"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "stream"] }
+tokio-util = "0.7"
+fs2 = "0.4"
+serde_json = "1"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
+ruzstd = "0.7"
+lzma-rs = "0.3"
+sevenz-rust = "0.6"
 rkyv = { version = "0.7", features = ["validation"] }
 tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 mimalloc = "0.1"
 zccache-core = { version = "=1.2.0", path = "crates/zccache-core" }
 zccache-hash = { version = "=1.2.0", path = "crates/zccache-hash" }
 zccache-protocol = { version = "=1.2.0", path = "crates/zccache-protocol" }
+zccache-download-protocol = { version = "=1.2.0", path = "crates/zccache-download-protocol" }
+zccache-download = { version = "=1.2.0", path = "crates/zccache-download" }
+zccache-download-client = { version = "=1.2.0", path = "crates/zccache-download-client" }
+zccache-download-daemon = { version = "=1.2.0", path = "crates/zccache-download-daemon" }
 zccache-fscache = { version = "=1.2.0", path = "crates/zccache-fscache" }
 zccache-artifact = { version = "=1.2.0", path = "crates/zccache-artifact" }
 zccache-depgraph = { version = "=1.2.0", path = "crates/zccache-depgraph" }

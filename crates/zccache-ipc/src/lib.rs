@@ -79,6 +79,55 @@ pub fn remove_lock_file() {
     let _ = std::fs::remove_file(lock_file_path());
 }
 
+/// Forcefully terminate a process by PID.
+///
+/// This is intended as a last-resort escape hatch when the daemon is no longer
+/// reachable over IPC, so graceful shutdown is not possible.
+pub fn force_kill_process(pid: u32) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        // SAFETY: kill is called with a PID provided by the caller and a fixed
+        // signal value. No pointers are involved.
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        let rc = unsafe { kill(pid as i32, SIGKILL) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+            fn TerminateProcess(handle: isize, exit_code: u32) -> i32;
+            fn CloseHandle(handle: isize) -> i32;
+        }
+        const PROCESS_TERMINATE: u32 = 0x0001;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid);
+            if handle == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let result = TerminateProcess(handle, 1);
+            let err = if result == 0 {
+                Some(std::io::Error::last_os_error())
+            } else {
+                None
+            };
+            CloseHandle(handle);
+            match err {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
 /// Check if a process with the given PID is alive.
 #[must_use]
 pub fn is_process_alive(pid: u32) -> bool {

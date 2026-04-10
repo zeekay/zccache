@@ -25,7 +25,10 @@ static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use clap::{Parser, Subcommand};
 use std::path::Path;
 use std::process::ExitCode;
-use zccache_cli::{run_ino_convert_cached, InoConvertOptions};
+use zccache_cli::{
+    client_download, run_ino_convert_cached, ArchiveFormat, DownloadParams, InoConvertOptions,
+    WaitMode,
+};
 use zccache_core::NormalizedPath;
 
 /// zccache -- fast local compiler cache.
@@ -49,6 +52,7 @@ enum Commands {
     /// Start the daemon (if not already running).
     Start,
     /// Stop the daemon.
+    #[command(visible_alias = "kill")]
     Stop,
     /// Show daemon and cache status.
     Status,
@@ -145,6 +149,31 @@ enum Commands {
         #[arg(long)]
         no_arduino_include: bool,
     },
+    /// Download and optionally unarchive an artifact using the dedicated download daemon.
+    Download {
+        /// Source URL.
+        url: String,
+        /// Optional archive/cache path. If omitted, zccache chooses a deterministic cache path.
+        archive_path: Option<String>,
+        /// Optional destination to expand or unarchive into.
+        #[arg(long = "unarchive")]
+        unarchive_path: Option<String>,
+        /// Optional expected SHA-256 of the downloaded artifact.
+        #[arg(long = "sha256")]
+        expected_sha256: Option<String>,
+        /// Number of parallel range parts to use when the server supports it.
+        #[arg(long = "multipart-parts")]
+        multipart_parts: Option<usize>,
+        /// Return immediately with `locked` if another client owns the artifact lock.
+        #[arg(long)]
+        no_wait: bool,
+        /// Report what would happen without mutating the filesystem.
+        #[arg(long)]
+        dry_run: bool,
+        /// Force re-download and re-expand even if cached state is already valid.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Fingerprint subcommands.
@@ -197,6 +226,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "crashes",
     "fp",
     "ino",
+    "download",
     "help",
     "--help",
     "-h",
@@ -300,6 +330,30 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Commands::Download {
+            url,
+            archive_path,
+            unarchive_path,
+            expected_sha256,
+            multipart_parts,
+            no_wait,
+            dry_run,
+            force,
+        } => cmd_download(DownloadParams {
+            url,
+            archive_path: archive_path.map(Into::into),
+            unarchive_path: unarchive_path.map(Into::into),
+            expected_sha256,
+            archive_format: ArchiveFormat::Auto,
+            multipart_parts,
+            wait_mode: if no_wait {
+                WaitMode::NoWait
+            } else {
+                WaitMode::Block
+            },
+            dry_run,
+            force,
+        }),
         Commands::SessionStart {
             cwd,
             log,
@@ -389,6 +443,27 @@ fn main() -> ExitCode {
 
 // ─── Subcommand implementations ────────────────────────────────────────────
 
+fn cmd_download(params: DownloadParams) -> ExitCode {
+    match client_download(None, params) {
+        Ok(result) => {
+            println!("status={:?}", result.status);
+            println!("archive_path={}", result.cache_path.display());
+            println!("sha256={}", result.sha256);
+            if let Some(unarchive_path) = &result.expanded_path {
+                println!("unarchive_path={}", unarchive_path.display());
+            }
+            if let Some(bytes) = result.bytes {
+                println!("bytes={bytes}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("zccache download: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 async fn cmd_start(endpoint: &str) -> ExitCode {
     match ensure_daemon(endpoint).await {
         Ok(()) => {
@@ -406,8 +481,36 @@ async fn cmd_stop(endpoint: &str) -> ExitCode {
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
         Err(_) => {
-            eprintln!("daemon not running at {endpoint}");
-            return ExitCode::SUCCESS;
+            let Some(pid) = zccache_ipc::check_running_daemon() else {
+                eprintln!("daemon not running at {endpoint}");
+                return ExitCode::SUCCESS;
+            };
+
+            match zccache_ipc::force_kill_process(pid) {
+                Ok(()) => {
+                    for _ in 0..50 {
+                        if !zccache_ipc::is_process_alive(pid) {
+                            zccache_ipc::remove_lock_file();
+                            eprintln!(
+                                "daemon process {pid} terminated after IPC connection failed"
+                            );
+                            return ExitCode::SUCCESS;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    eprintln!(
+                        "zccache: sent termination to daemon process {pid}, but it did not exit"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "zccache: cannot connect to daemon at {endpoint}, and failed to kill \
+                         locked process {pid}: {e}"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
         }
     };
 

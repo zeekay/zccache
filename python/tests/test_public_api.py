@@ -13,6 +13,7 @@ pytest.importorskip("zccache.fingerprint._native")
 
 import zccache
 from zccache.client import ZcCacheClient
+from zccache.downloader import DownloadApi, FetchResult, FetchState
 from zccache.fingerprint import FingerprintCache
 from zccache.watcher import FileWatcher
 
@@ -21,12 +22,16 @@ def test_top_level_import_exposes_expected_symbols() -> None:
     assert zccache.FileWatcher is FileWatcher
     assert zccache.FingerprintCache is FingerprintCache
     assert zccache.ZcCacheClient is ZcCacheClient
+    assert zccache.DownloadApi is DownloadApi
+    assert zccache.FetchResult is FetchResult
+    assert zccache.FetchState is FetchState
 
 
 def test_top_level_import_exposes_expected_submodules() -> None:
-    from zccache import client, fingerprint, watcher
+    from zccache import client, downloader, fingerprint, watcher
 
     assert client.ZcCacheClient is ZcCacheClient
+    assert downloader.DownloadApi is DownloadApi
     assert fingerprint.FingerprintCache is FingerprintCache
     assert watcher.FileWatcher is FileWatcher
 

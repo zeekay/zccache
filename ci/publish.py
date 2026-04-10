@@ -81,6 +81,10 @@ PLATFORMS: dict[str, list[str]] = {
     "windows-arm64": ["win_arm64"],
 }
 
+IGNORED_PUBLISH_STATUS_PATTERNS = (
+    "POST_HOOK_FAILURE_",
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -99,6 +103,24 @@ def run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
 def run_capture(cmd: list[str]) -> str:
     result: subprocess.CompletedProcess[str] = run(cmd, capture_output=True, text=True)
     return result.stdout.strip()
+
+
+def get_publish_blocking_dirty_entries() -> list[str]:
+    """Return git status entries that should block publishing."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    entries = [line for line in result.stdout.splitlines() if line.strip()]
+    blocking: list[str] = []
+    for entry in entries:
+        path = entry[3:] if len(entry) > 3 else entry
+        if any(path.startswith(prefix) for prefix in IGNORED_PUBLISH_STATUS_PATTERNS):
+            continue
+        blocking.append(entry)
+    return blocking
 
 
 def read_project_meta() -> tuple[str, str, str, str, str]:
@@ -781,11 +803,8 @@ def main() -> None:
         if run_pypi:
             # GH Actions builds from the remote branch, so local-only changes
             # produce binaries with stale version strings baked in.
-            dirty = subprocess.run(
-                ["git", "status", "--porcelain"],
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
+            dirty_entries = get_publish_blocking_dirty_entries()
+            dirty = "\n".join(dirty_entries)
             if dirty:
                 log(f"ERROR: Working tree is dirty. Commit and push before publishing PyPI artifacts.\n{dirty}")
                 sys.exit(1)

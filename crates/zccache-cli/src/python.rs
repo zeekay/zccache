@@ -4,9 +4,10 @@ use pyo3::exceptions::{PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
 
 use crate::{
-    client_session_end, client_session_start, client_session_stats, client_start, client_status,
-    client_stop, fingerprint_check, fingerprint_invalidate, fingerprint_mark_failure,
-    fingerprint_mark_success, run_ino_convert_cached, InoConvertOptions,
+    build_download_request, client_download, client_download_exists, client_session_end,
+    client_session_start, client_session_stats, client_start, client_status, client_stop,
+    fingerprint_check, fingerprint_invalidate, fingerprint_mark_failure, fingerprint_mark_success,
+    run_ino_convert_cached, DownloadParams, InoConvertOptions, WaitMode,
 };
 
 fn runtime_to_py_err(message: String) -> PyErr {
@@ -163,6 +164,340 @@ pub struct NativeInoConvertResult {
 }
 
 #[pyclass(module = "zccache._native")]
+#[derive(Clone)]
+pub struct NativeDownloadStatus {
+    #[pyo3(get)]
+    phase: String,
+    #[pyo3(get)]
+    total_bytes: Option<u64>,
+    #[pyo3(get)]
+    downloaded_bytes: u64,
+    #[pyo3(get)]
+    percentage: Option<f32>,
+    #[pyo3(get)]
+    active_clients: u32,
+    #[pyo3(get)]
+    destination: String,
+    #[pyo3(get)]
+    source_url: String,
+    #[pyo3(get)]
+    error: Option<String>,
+}
+
+impl From<zccache_download::DownloadStatus> for NativeDownloadStatus {
+    fn from(value: zccache_download::DownloadStatus) -> Self {
+        Self {
+            phase: format!("{:?}", value.phase).to_lowercase(),
+            total_bytes: value.total_bytes,
+            downloaded_bytes: value.downloaded_bytes,
+            percentage: value.percentage,
+            active_clients: value.active_clients,
+            destination: value.destination.display().to_string(),
+            source_url: value.source_url,
+            error: value.error,
+        }
+    }
+}
+
+#[pyclass(module = "zccache._native")]
+#[derive(Clone)]
+pub struct NativeDownloadDaemonStatus {
+    #[pyo3(get)]
+    version: String,
+    #[pyo3(get)]
+    active_downloads: u64,
+    #[pyo3(get)]
+    connected_clients: u64,
+    #[pyo3(get)]
+    uptime_secs: u64,
+    #[pyo3(get)]
+    endpoint: String,
+}
+
+impl From<zccache_download::DownloadDaemonStatus> for NativeDownloadDaemonStatus {
+    fn from(value: zccache_download::DownloadDaemonStatus) -> Self {
+        Self {
+            version: value.version,
+            active_downloads: value.active_downloads,
+            connected_clients: value.connected_clients,
+            uptime_secs: value.uptime_secs,
+            endpoint: value.endpoint,
+        }
+    }
+}
+
+fn parse_archive_format(value: &str) -> zccache_download_client::ArchiveFormat {
+    match value.to_ascii_lowercase().as_str() {
+        "none" => zccache_download_client::ArchiveFormat::None,
+        "zst" => zccache_download_client::ArchiveFormat::Zst,
+        "zip" => zccache_download_client::ArchiveFormat::Zip,
+        "xz" => zccache_download_client::ArchiveFormat::Xz,
+        "tar.gz" | "targz" => zccache_download_client::ArchiveFormat::TarGz,
+        "tar.xz" | "tarxz" => zccache_download_client::ArchiveFormat::TarXz,
+        "tar.zst" | "tarzst" => zccache_download_client::ArchiveFormat::TarZst,
+        "7z" | "sevenz" => zccache_download_client::ArchiveFormat::SevenZip,
+        _ => zccache_download_client::ArchiveFormat::Auto,
+    }
+}
+
+#[pyclass(module = "zccache._native")]
+#[derive(Clone)]
+pub struct NativeFetchResult {
+    #[pyo3(get)]
+    status: String,
+    #[pyo3(get)]
+    cache_path: String,
+    #[pyo3(get)]
+    expanded_path: Option<String>,
+    #[pyo3(get)]
+    bytes: Option<u64>,
+    #[pyo3(get)]
+    sha256: String,
+}
+
+impl From<zccache_download_client::FetchResult> for NativeFetchResult {
+    fn from(value: zccache_download_client::FetchResult) -> Self {
+        Self {
+            status: format!("{:?}", value.status).to_lowercase(),
+            cache_path: value.cache_path.display().to_string(),
+            expanded_path: value.expanded_path.map(|path| path.display().to_string()),
+            bytes: value.bytes,
+            sha256: value.sha256,
+        }
+    }
+}
+
+#[pyclass(module = "zccache._native")]
+#[derive(Clone)]
+pub struct NativeFetchState {
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    cache_path: String,
+    #[pyo3(get)]
+    expanded_path: Option<String>,
+    #[pyo3(get)]
+    bytes: Option<u64>,
+    #[pyo3(get)]
+    sha256: Option<String>,
+    #[pyo3(get)]
+    reason: Option<String>,
+}
+
+impl From<zccache_download_client::FetchState> for NativeFetchState {
+    fn from(value: zccache_download_client::FetchState) -> Self {
+        Self {
+            kind: format!("{:?}", value.kind).to_lowercase(),
+            cache_path: value.cache_path.display().to_string(),
+            expanded_path: value.expanded_path.map(|path| path.display().to_string()),
+            bytes: value.bytes,
+            sha256: value.sha256,
+            reason: value.reason,
+        }
+    }
+}
+
+#[pyclass(module = "zccache._native")]
+pub struct NativeDownloadHandle {
+    handle: Option<zccache_download_client::DownloadHandle>,
+    initiator: bool,
+    download_id: String,
+}
+
+#[pymethods]
+impl NativeDownloadHandle {
+    #[getter]
+    fn initiator(&self) -> bool {
+        self.initiator
+    }
+
+    #[getter]
+    fn download_id(&self) -> String {
+        self.download_id.clone()
+    }
+
+    fn status(&mut self) -> PyResult<NativeDownloadStatus> {
+        let handle = self
+            .handle
+            .as_mut()
+            .ok_or_else(|| runtime_to_py_err("download handle is closed".to_string()))?;
+        handle
+            .status()
+            .map(NativeDownloadStatus::from)
+            .map_err(runtime_to_py_err)
+    }
+
+    #[pyo3(signature = (timeout_ms=None))]
+    fn wait(&mut self, timeout_ms: Option<u64>) -> PyResult<NativeDownloadStatus> {
+        let handle = self
+            .handle
+            .as_mut()
+            .ok_or_else(|| runtime_to_py_err("download handle is closed".to_string()))?;
+        handle
+            .wait(timeout_ms)
+            .map(NativeDownloadStatus::from)
+            .map_err(runtime_to_py_err)
+    }
+
+    fn cancel(&mut self) -> PyResult<NativeDownloadStatus> {
+        let handle = self
+            .handle
+            .as_mut()
+            .ok_or_else(|| runtime_to_py_err("download handle is closed".to_string()))?;
+        handle
+            .cancel()
+            .map(NativeDownloadStatus::from)
+            .map_err(runtime_to_py_err)
+    }
+
+    fn close(&mut self) -> PyResult<()> {
+        if let Some(handle) = self.handle.take() {
+            handle.close().map_err(runtime_to_py_err)?;
+        }
+        Ok(())
+    }
+}
+
+#[pyclass(module = "zccache._native")]
+pub struct NativeDownloadApi {
+    client: zccache_download_client::DownloadClient,
+}
+
+#[pymethods]
+impl NativeDownloadApi {
+    #[new]
+    #[pyo3(signature = (endpoint=None))]
+    fn new(endpoint: Option<String>) -> Self {
+        let client = zccache_download_client::DownloadClient::new(endpoint.clone());
+        Self { client }
+    }
+
+    fn start(&self) -> PyResult<()> {
+        self.client.start_daemon().map_err(runtime_to_py_err)
+    }
+
+    fn stop(&self) -> PyResult<bool> {
+        self.client.stop_daemon().map_err(runtime_to_py_err)
+    }
+
+    fn daemon_status(&self) -> PyResult<NativeDownloadDaemonStatus> {
+        self.client
+            .daemon_status()
+            .map(NativeDownloadDaemonStatus::from)
+            .map_err(runtime_to_py_err)
+    }
+
+    #[pyo3(signature = (
+        source_url,
+        destination,
+        force=false,
+        max_connections=None,
+        min_segment_size=None
+    ))]
+    fn download(
+        &self,
+        source_url: String,
+        destination: String,
+        force: bool,
+        max_connections: Option<usize>,
+        min_segment_size: Option<u64>,
+    ) -> PyResult<NativeDownloadHandle> {
+        let options = zccache_download::DownloadOptions {
+            force,
+            max_connections,
+            min_segment_size,
+        };
+        let handle = self
+            .client
+            .download(&source_url, PathBuf::from(destination).as_path(), options)
+            .map_err(runtime_to_py_err)?;
+        let initiator = handle.initiator();
+        let download_id = handle.download_id().to_string();
+        Ok(NativeDownloadHandle {
+            handle: Some(handle),
+            initiator,
+            download_id,
+        })
+    }
+
+    #[pyo3(signature = (
+        source_url,
+        destination=None,
+        expanded=None,
+        expected_sha256=None,
+        archive_format="auto".to_string(),
+        multipart_parts=None,
+        blocking=true,
+        dry_run=false,
+        force=false
+    ))]
+    fn fetch(
+        &self,
+        source_url: String,
+        destination: Option<String>,
+        expanded: Option<String>,
+        expected_sha256: Option<String>,
+        archive_format: String,
+        multipart_parts: Option<usize>,
+        blocking: bool,
+        dry_run: bool,
+        force: bool,
+    ) -> PyResult<NativeFetchResult> {
+        let request = build_download_request(DownloadParams {
+            url: source_url,
+            archive_path: destination.map(PathBuf::from),
+            unarchive_path: expanded.map(PathBuf::from),
+            expected_sha256,
+            archive_format: parse_archive_format(&archive_format),
+            multipart_parts,
+            wait_mode: if blocking {
+                WaitMode::Block
+            } else {
+                WaitMode::NoWait
+            },
+            dry_run,
+            force,
+        });
+        self.client
+            .fetch(request)
+            .map(NativeFetchResult::from)
+            .map_err(runtime_to_py_err)
+    }
+
+    #[pyo3(signature = (
+        source_url,
+        destination=None,
+        expanded=None,
+        expected_sha256=None,
+        archive_format="auto".to_string()
+    ))]
+    fn exists(
+        &self,
+        source_url: String,
+        destination: Option<String>,
+        expanded: Option<String>,
+        expected_sha256: Option<String>,
+        archive_format: String,
+    ) -> PyResult<NativeFetchState> {
+        let request = build_download_request(DownloadParams {
+            url: source_url,
+            archive_path: destination.map(PathBuf::from),
+            unarchive_path: expanded.map(PathBuf::from),
+            expected_sha256,
+            archive_format: parse_archive_format(&archive_format),
+            multipart_parts: None,
+            wait_mode: WaitMode::Block,
+            dry_run: false,
+            force: false,
+        });
+        self.client
+            .exists(&request)
+            .map(NativeFetchState::from)
+            .map_err(runtime_to_py_err)
+    }
+}
+
+#[pyclass(module = "zccache._native")]
 pub struct NativeClient {
     endpoint: Option<String>,
 }
@@ -187,6 +522,80 @@ impl NativeClient {
         client_status(self.endpoint.as_deref())
             .map(NativeDaemonStatus::from)
             .map_err(runtime_to_py_err)
+    }
+
+    #[pyo3(signature = (
+        source_url,
+        destination=None,
+        expanded=None,
+        expected_sha256=None,
+        multipart_parts=None,
+        blocking=true,
+        dry_run=false,
+        force=false
+    ))]
+    fn download(
+        &self,
+        source_url: String,
+        destination: Option<String>,
+        expanded: Option<String>,
+        expected_sha256: Option<String>,
+        multipart_parts: Option<usize>,
+        blocking: bool,
+        dry_run: bool,
+        force: bool,
+    ) -> PyResult<NativeFetchResult> {
+        client_download(
+            self.endpoint.as_deref(),
+            DownloadParams {
+                url: source_url,
+                archive_path: destination.map(PathBuf::from),
+                unarchive_path: expanded.map(PathBuf::from),
+                expected_sha256,
+                archive_format: zccache_download_client::ArchiveFormat::Auto,
+                multipart_parts,
+                wait_mode: if blocking {
+                    WaitMode::Block
+                } else {
+                    WaitMode::NoWait
+                },
+                dry_run,
+                force,
+            },
+        )
+        .map(NativeFetchResult::from)
+        .map_err(runtime_to_py_err)
+    }
+
+    #[pyo3(signature = (
+        source_url,
+        destination=None,
+        expanded=None,
+        expected_sha256=None
+    ))]
+    fn download_exists(
+        &self,
+        source_url: String,
+        destination: Option<String>,
+        expanded: Option<String>,
+        expected_sha256: Option<String>,
+    ) -> PyResult<NativeFetchState> {
+        client_download_exists(
+            self.endpoint.as_deref(),
+            DownloadParams {
+                url: source_url,
+                archive_path: destination.map(PathBuf::from),
+                unarchive_path: expanded.map(PathBuf::from),
+                expected_sha256,
+                archive_format: zccache_download_client::ArchiveFormat::Auto,
+                multipart_parts: None,
+                wait_mode: WaitMode::Block,
+                dry_run: false,
+                force: false,
+            },
+        )
+        .map(NativeFetchState::from)
+        .map_err(runtime_to_py_err)
     }
 
     #[pyo3(signature = (cwd, log_file=None, track_stats=false, journal_path=None))]
@@ -331,6 +740,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NativeSessionStats>()?;
     m.add_class::<NativeFingerprintCheck>()?;
     m.add_class::<NativeInoConvertResult>()?;
+    m.add_class::<NativeDownloadStatus>()?;
+    m.add_class::<NativeDownloadDaemonStatus>()?;
+    m.add_class::<NativeFetchResult>()?;
+    m.add_class::<NativeFetchState>()?;
+    m.add_class::<NativeDownloadHandle>()?;
+    m.add_class::<NativeDownloadApi>()?;
     m.add_function(wrap_pyfunction!(convert_ino, m)?)?;
     m.add_function(wrap_pyfunction!(default_endpoint, m)?)?;
     m.add_function(wrap_pyfunction!(check_running_daemon, m)?)?;

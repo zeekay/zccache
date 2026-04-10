@@ -69,6 +69,24 @@ fn stop_daemon_and_wait(bin: &std::path::Path) {
     // If we get here, daemon is still running after 6s — proceed anyway
 }
 
+fn spawn_sleepy_process() -> std::process::Child {
+    #[cfg(windows)]
+    {
+        Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .spawn()
+            .expect("spawn sleeper")
+    }
+
+    #[cfg(unix)]
+    {
+        Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleeper")
+    }
+}
+
 /// `zccache start` must complete promptly when stdout/stderr are pipes.
 ///
 /// This is the core regression test for the Windows handle inheritance bug.
@@ -161,5 +179,40 @@ fn concurrent_starts_all_complete() {
         failures.is_empty(),
         "Some concurrent starts failed:\n{}",
         failures.join("\n")
+    );
+}
+
+/// `zccache stop` must still terminate a daemon process when IPC is unreachable
+/// but the lock file still points at a live PID.
+#[test]
+#[ignore] // Integration test — manipulates the real daemon lock file.
+fn stop_kills_locked_process_when_ipc_is_unreachable() {
+    let bin = zccache_bin();
+    stop_daemon_and_wait(&bin);
+
+    let lock_path = zccache_ipc::lock_file_path();
+    let mut child = spawn_sleepy_process();
+    std::fs::write(&lock_path, child.id().to_string()).expect("write daemon lock");
+
+    let output = Command::new(&bin)
+        .arg("stop")
+        .output()
+        .expect("failed to run zccache stop");
+
+    let status = child.wait().expect("wait for killed process");
+    let _ = std::fs::remove_file(&lock_path);
+
+    assert!(
+        output.status.success(),
+        "zccache stop failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !status.success(),
+        "expected stop to terminate the locked process, got exit status {status}"
+    );
+    assert!(
+        !lock_path.exists(),
+        "lock file should be removed after forced stop"
     );
 }

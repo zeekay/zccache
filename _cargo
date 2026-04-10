@@ -1,17 +1,34 @@
 #!/bin/bash
-# Trampoline: prefers the shared rustup proxy in ~/.cargo/bin when present.
+# Trampoline: prefer the repo-local rustup proxy when present.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 if [ -n "${CARGO_HOME:-}" ]; then
   CARGO_BIN="$CARGO_HOME/bin"
-elif [ -n "${HOME:-}" ]; then
+elif [ -d "$SCRIPT_DIR/.cargo/bin" ]; then
+  CARGO_BIN="$SCRIPT_DIR/.cargo/bin"
+elif [ -n "${HOME:-}" ] && [ -d "$HOME/.cargo/bin" ]; then
   CARGO_BIN="$HOME/.cargo/bin"
-elif [ -n "${USERPROFILE:-}" ]; then
+elif [ -n "${USERPROFILE:-}" ] && [ -d "$USERPROFILE/.cargo/bin" ]; then
   CARGO_BIN="$USERPROFILE/.cargo/bin"
 else
   CARGO_BIN=""
 fi
 
-if [ -n "$CARGO_BIN" ] && [ -d "$CARGO_BIN" ]; then
+if [ -n "$CARGO_BIN" ]; then
   export PATH="$CARGO_BIN:$PATH"
 fi
 
+if [ -z "${RUSTUP_HOME:-}" ] && [ -d "$SCRIPT_DIR/.rustup" ]; then
+  export RUSTUP_HOME="$SCRIPT_DIR/.rustup"
+fi
+
+if [ -z "${CARGO_HOME:-}" ] && [ -d "$SCRIPT_DIR/.cargo" ]; then
+  export CARGO_HOME="$SCRIPT_DIR/.cargo"
+fi
+
 exec cargo "$@"
+
+
+look at ~/dev/zccache for how it generates a dameon process. have a special function that does that in
+  RunningProcess like static method RunningProcess.spawn-daemon(...) investigate the special flags to do this and
+  eveyrhting that's need, add tests
