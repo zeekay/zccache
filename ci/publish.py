@@ -539,6 +539,15 @@ def get_pypi_release_filenames(name: str, version: str) -> set[str] | None:
         raise
 
 
+def expected_pypi_wheel_filenames(name: str, version: str) -> set[str]:
+    """Return the full wheel set this project publishes to PyPI."""
+    name_norm = name.replace("-", "_")
+    return {
+        f"{name_norm}-{version}-py3-none-{'.'.join(plat_tags)}.whl"
+        for plat_tags in PLATFORMS.values()
+    }
+
+
 def check_pypi_version(name: str, version: str) -> set[str]:
     """Report existing PyPI state and return any already-published filenames."""
     log(f"\n=== Step 1: Pre-check PyPI for {name} {version} ===")
@@ -546,9 +555,19 @@ def check_pypi_version(name: str, version: str) -> set[str]:
         url = f"https://pypi.org/pypi/{name}/json"
         with urllib.request.urlopen(url, timeout=10) as resp:
             data = json.loads(resp.read())
+        latest_version = data.get("info", {}).get("version")
         existing = set(data.get("releases", {}).keys())
         release_files = get_pypi_release_filenames(name, version)
         if release_files is not None:
+            expected_files = expected_pypi_wheel_filenames(name, version)
+            if latest_version == version and expected_files.issubset(release_files):
+                log(
+                    f"  ERROR: Current version {version} already matches the latest PyPI release "
+                    "and all expected wheels are present."
+                )
+                log("  Bump the package version before running the full publish flow again.")
+                log("  Use --skip-pypi if you only need to continue the crates.io release.")
+                sys.exit(1)
             log(
                 f"  {name} {version} already exists on PyPI with {len(release_files)} "
                 "file(s); missing files will be uploaded"
@@ -1079,6 +1098,9 @@ def main() -> None:
     log(f"Publishing {name} {version} to {', '.join(targets)}")
 
     if not args.dry_run:
+        if run_pypi:
+            existing_pypi_files = check_pypi_version(name, version)
+
         if run_rust and not has_cargo_publish_token():
             log(
                 "ERROR: crates.io publish requested but no cargo registry token was found. "
@@ -1100,8 +1122,6 @@ def main() -> None:
             if local_sha != remote_sha:
                 log(f"ERROR: Local HEAD ({local_sha[:12]}) differs from remote ({remote_sha[:12]}). Push before publishing PyPI artifacts.")
                 sys.exit(1)
-
-            existing_pypi_files = check_pypi_version(name, version)
 
         if run_rust:
             check_crates_versions(version)
