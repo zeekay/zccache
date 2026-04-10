@@ -1005,15 +1005,18 @@ fn remove_path_if_exists(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[path = "../../../../zccache-download-daemon/src/lib.rs"]
+    mod download_daemon_impl;
+
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use download_daemon_impl::DownloadDaemon;
     use flate2::write::GzEncoder;
     use flate2::Compression;
-    use zccache_download_daemon::DownloadDaemon;
 
     #[derive(Clone)]
     struct TestHttpConfig {

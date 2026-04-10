@@ -28,4 +28,6 @@ ruzstd = { workspace = true }
 sevenz-rust = { workspace = true }
 
 [dev-dependencies]
-zccache-download-daemon = { workspace = true }
+dashmap = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }

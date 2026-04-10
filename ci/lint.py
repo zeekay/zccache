@@ -13,6 +13,7 @@ from shutil import which
 from pathlib import Path
 
 from ci.env import activate, clean_env
+from ci.release_checks import ReleaseCheckError, validate_release_metadata
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 
@@ -169,6 +170,12 @@ def lint_workspace():
 
 def main():
     activate()
+    try:
+        validate_release_metadata()
+    except ReleaseCheckError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
     args = sys.argv[1:]
 
     if "--fix" in args:

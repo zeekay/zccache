@@ -43,26 +43,21 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent.parent
+SCRIPT_ROOT = Path(__file__).resolve().parent.parent
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+from ci.env import activate, clean_env
+from ci.release_checks import (
+    RUST_PUBLISH_ORDER,
+    ReleaseCheckError,
+    validate_release_metadata,
+)
+
+ROOT = SCRIPT_ROOT
 DIST_DIR = ROOT / "dist"
 WHEEL_DIR = DIST_DIR / "wheels"
 WORKFLOW_FILE = "build.yml"
-RUST_PUBLISH_ORDER = [
-    "zccache-core",
-    "zccache-hash",
-    "zccache-protocol",
-    "zccache-fscache",
-    "zccache-artifact",
-    "zccache-depgraph",
-    "zccache-compiler",
-    "zccache-ipc",
-    "zccache-watcher",
-    "zccache-fingerprint",
-    "zccache-test-support",
-    "zccache-cli",
-    "zccache-daemon",
-]
-
 # GitHub artifact name -> dist/ subdir
 ARTIFACT_MAP: dict[str, str] = {
     "binaries-x86_64-unknown-linux-gnu": "linux-x86_64-gnu",
@@ -141,6 +136,7 @@ def log(msg: str) -> None:
 
 def run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
     log(f"  $ {' '.join(cmd)}")
+    kwargs.setdefault("env", clean_env())
     return subprocess.run(cmd, check=True, **kwargs)
 
 
@@ -177,6 +173,23 @@ def run_capture_retry(
     raise AssertionError("unreachable")
 
 
+def configure_publish_env() -> None:
+    """Use repo rustup proxies, but prefer the user's cargo credentials store."""
+    repo_cargo_home = ROOT / ".cargo"
+    current_cargo_home = Path(os.environ.get("CARGO_HOME", repo_cargo_home)).expanduser()
+    home_cargo_home = Path.home() / ".cargo"
+
+    current_has_credentials = any(
+        (current_cargo_home / name).exists() for name in ("credentials.toml", "credentials")
+    )
+    home_has_credentials = any(
+        (home_cargo_home / name).exists() for name in ("credentials.toml", "credentials")
+    )
+
+    if current_cargo_home == repo_cargo_home and not current_has_credentials and home_has_credentials:
+        os.environ["CARGO_HOME"] = str(home_cargo_home)
+
+
 def has_cargo_publish_token() -> bool:
     """Return True when cargo publish credentials appear to be configured."""
     if os.environ.get("CARGO_REGISTRY_TOKEN"):
@@ -201,6 +214,7 @@ def get_publish_blocking_dirty_entries() -> list[str]:
         ["git", "status", "--porcelain"],
         capture_output=True,
         text=True,
+        env=clean_env(),
         check=True,
     )
     entries = [line for line in result.stdout.splitlines() if line.strip()]
@@ -231,12 +245,6 @@ def read_project_meta() -> tuple[str, str, str, str, str]:
         proj.get("requires-python", ">=3.9"),
         readme,
     )
-
-
-def read_workspace_version() -> str:
-    with open(ROOT / "Cargo.toml", "rb") as f:
-        data = tomllib.load(f)
-    return data["workspace"]["package"]["version"]
 
 
 def download_failed_logs(repo: str, run_id: int) -> list[Path]:
@@ -599,7 +607,7 @@ def crate_version_exists(name: str, version: str) -> bool:
         raise
 
 
-def check_crates_versions(version: str) -> None:
+def check_crates_versions(version: str) -> set[str]:
     log(f"\n=== Step 1b: Pre-check crates.io for Rust crates {version} ===")
     existing: list[str] = []
     for crate in RUST_PUBLISH_ORDER:
@@ -613,11 +621,18 @@ def check_crates_versions(version: str) -> None:
             log(f"  WARNING: Could not reach crates.io for {crate}: {e}")
 
     if existing:
-        log("  ERROR: These crates already exist on crates.io:")
+        if len(existing) == len(RUST_PUBLISH_ORDER):
+            log("  ERROR: These crates already exist on crates.io:")
+            for crate in existing:
+                log(f"    - {crate} {version}")
+            log("  Bump the workspace version in Cargo.toml before publishing.")
+            sys.exit(1)
+
+        log("  Resuming partial crates.io release; already-published crates will be skipped:")
         for crate in existing:
             log(f"    - {crate} {version}")
-        log("  Bump the workspace version in Cargo.toml before publishing.")
-        sys.exit(1)
+
+    return set(existing)
 
 
 # ---------------------------------------------------------------------------
@@ -969,6 +984,11 @@ def verify_pypi_wheels(name: str, version: str, expected_wheels: list[Path]) -> 
 
 def verify_rust_crates_locally() -> None:
     log("\n=== Step 7: Verify Rust crates locally ===")
+    try:
+        validate_release_metadata()
+    except ReleaseCheckError as e:
+        log(f"  ERROR: {e}")
+        sys.exit(1)
     compile_skipped = False
     for crate in RUST_PUBLISH_ORDER:
         result = subprocess.run(
@@ -976,6 +996,7 @@ def verify_rust_crates_locally() -> None:
             cwd=ROOT,
             capture_output=True,
             text=True,
+            env=clean_env(),
         )
         if result.returncode == 0:
             continue
@@ -1042,17 +1063,22 @@ def verify_crate_visible(crate: str, version: str) -> None:
     sys.exit(1)
 
 
-def publish_rust_crates(version: str, dry_run: bool) -> None:
+def publish_rust_crates(version: str, dry_run: bool, existing_crates: set[str] | None = None) -> None:
+    existing_crates = existing_crates or set()
     if dry_run:
         verify_rust_crates_locally()
         log("\n=== Step 8: Upload Rust crates (skipped - dry run) ===")
         for crate in RUST_PUBLISH_ORDER:
-            log(f"  {crate} {version}")
+            if crate not in existing_crates:
+                log(f"  {crate} {version}")
         return
 
     verify_rust_crates_locally()
     log("\n=== Step 8: Publish Rust crates to crates.io ===")
     for crate in RUST_PUBLISH_ORDER:
+        if crate in existing_crates:
+            log(f"  Skipping {crate} {version}; already on crates.io")
+            continue
         run(["cargo", "publish", "--allow-dirty", "--no-verify", "-p", crate], cwd=ROOT)
         verify_crate_visible(crate, version)
 
@@ -1063,6 +1089,8 @@ def publish_rust_crates(version: str, dry_run: bool) -> None:
 
 
 def main() -> None:
+    activate()
+    configure_publish_env()
     parser = argparse.ArgumentParser(description="Build and publish zccache to PyPI and crates.io")
     parser.add_argument("--dry-run", action="store_true", help="Build wheels but do not upload.")
     parser.add_argument("--skip-pypi", action="store_true", help="Skip the PyPI release flow.")
@@ -1082,11 +1110,13 @@ def main() -> None:
             log("ERROR: 'gh' (GitHub CLI) is not installed.")
             sys.exit(1)
 
-    name, version, summary, requires_python, readme = read_project_meta()
-    workspace_version = read_workspace_version()
-    if workspace_version != version:
-        log(f"ERROR: pyproject.toml version ({version}) does not match Cargo.toml version ({workspace_version}).")
+    try:
+        validate_release_metadata()
+    except ReleaseCheckError as e:
+        log(f"ERROR: {e}")
         sys.exit(1)
+
+    name, version, summary, requires_python, readme = read_project_meta()
 
     repo = detect_repo() if run_pypi else ""
     targets: list[str] = []
@@ -1097,6 +1127,7 @@ def main() -> None:
         targets.append("crates.io")
     log(f"Publishing {name} {version} to {', '.join(targets)}")
 
+    existing_rust_crates: set[str] = set()
     if not args.dry_run:
         if run_pypi:
             existing_pypi_files = check_pypi_version(name, version)
@@ -1124,7 +1155,7 @@ def main() -> None:
                 sys.exit(1)
 
         if run_rust:
-            check_crates_versions(version)
+            existing_rust_crates = check_crates_versions(version)
 
     if run_pypi:
         head_sha = run_capture(["git", "rev-parse", "HEAD"])
@@ -1152,7 +1183,7 @@ def main() -> None:
             verify_pypi_wheels(name, version, wheels)
 
     if run_rust:
-        publish_rust_crates(version, args.dry_run)
+        publish_rust_crates(version, args.dry_run, existing_rust_crates)
 
     log("\n=== Done ===")
 
