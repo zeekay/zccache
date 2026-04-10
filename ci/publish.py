@@ -553,6 +553,14 @@ def download_artifacts(repo: str, run_id: int) -> None:
 
         for f in src.iterdir():
             target = dest / f.name
+            if f.is_dir():
+                shutil.copytree(f, target, dirs_exist_ok=True)
+                for nested in target.rglob("*"):
+                    if nested.is_file() and not nested.name.endswith(".exe"):
+                        nested.chmod(0o755)
+                log(f"  {subdir}/{f.name}/")
+                continue
+
             shutil.copy2(f, target)
             if not f.name.endswith(".exe"):
                 target.chmod(0o755)
