@@ -50,7 +50,7 @@ rayon = "1"
 jwalk = "0.8"
 bytes = "1"
 futures = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["native-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
 tokio-util = "0.7"
 fs2 = "0.4"
 serde_json = "1"
