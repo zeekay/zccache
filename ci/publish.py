@@ -668,10 +668,21 @@ def build_all_wheels(name: str, version: str, summary: str, requires_python: str
         shutil.rmtree(WHEEL_DIR)
 
     wheels: list[Path] = []
+    missing_platforms: list[str] = []
     for subdir, plat_tags in PLATFORMS.items():
         whl = build_wheel(name, version, summary, requires_python, readme, subdir, plat_tags)
         if whl:
             wheels.append(whl)
+        else:
+            missing_platforms.append(subdir)
+
+    if missing_platforms:
+        log(
+            "  ERROR: Missing wheels for platform(s): "
+            + ", ".join(sorted(missing_platforms))
+        )
+        log("  Refusing to publish a partial wheel set.")
+        sys.exit(1)
 
     if not wheels:
         log("  ERROR: No wheels were built.")
