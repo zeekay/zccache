@@ -28,6 +28,7 @@ import csv
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import stat
@@ -131,6 +132,24 @@ def run_capture_retry(
                 log(f"    stdout: {stdout}")
             time.sleep(delay_seconds)
     raise AssertionError("unreachable")
+
+
+def has_cargo_publish_token() -> bool:
+    """Return True when cargo publish credentials appear to be configured."""
+    if os.environ.get("CARGO_REGISTRY_TOKEN"):
+        return True
+
+    cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
+    for credentials_path in (cargo_home / "credentials.toml", cargo_home / "credentials"):
+        if not credentials_path.exists():
+            continue
+        try:
+            text = credentials_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if "token" in text:
+            return True
+    return False
 
 
 def get_publish_blocking_dirty_entries() -> list[str]:
@@ -886,6 +905,13 @@ def main() -> None:
     log(f"Publishing {name} {version} to {', '.join(targets)}")
 
     if not args.dry_run:
+        if run_rust and not has_cargo_publish_token():
+            log(
+                "ERROR: crates.io publish requested but no cargo registry token was found. "
+                "Set CARGO_REGISTRY_TOKEN or run `cargo login` before publishing."
+            )
+            sys.exit(1)
+
         if run_pypi:
             # GH Actions builds from the remote branch, so local-only changes
             # produce binaries with stale version strings baked in.
