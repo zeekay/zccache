@@ -7,7 +7,7 @@
 [![crates.io: zccache-core](https://img.shields.io/crates/v/zccache-core)](https://crates.io/crates/zccache-core)
 [![crates.io: zccache-cli](https://img.shields.io/crates/v/zccache-cli)](https://crates.io/crates/zccache-cli)
 [![crates.io: zccache-daemon](https://img.shields.io/crates/v/zccache-daemon)](https://crates.io/crates/zccache-daemon)
-[![Rust Workspace Version](https://img.shields.io/badge/rust%20workspace-1.1.18-orange)](https://crates.io/search?q=zccache)
+[![Rust Workspace Version](https://img.shields.io/badge/rust%20workspace-1.2.1-orange)](https://crates.io/search?q=zccache)
 
 ![C/C++](https://img.shields.io/badge/C%2FC%2B%2B-555?logo=c%2B%2B&logoColor=white)
 [![clang](https://img.shields.io/badge/clang-supported-brightgreen?logo=llvm)](https://clang.llvm.org/)
@@ -524,7 +524,7 @@ steps that only need a yes/no change answer rather than a stream of file events.
 `pip install zccache` now exposes an importable `zccache` module in addition to
 the native binaries. The Python surface is aimed at the same hot-path features
 the CLI already exposes: watcher events, fingerprint decisions, daemon/session
-control, and Arduino `.ino` conversion.
+control, downloads, and Arduino `.ino` conversion.
 
 ```python
 from zccache.client import ZcCacheClient
@@ -658,6 +658,163 @@ watcher.start()?;
 let batch = watcher.poll_timeout(Duration::from_secs(1))?;
 watcher.stop()?;
 ```
+
+## Downloader APIs
+
+zccache also exposes the dedicated download subsystem in three places:
+
+- CLI: `zccache download ...` on the main binary, plus the standalone `zccache-download` tool
+- Python: `zccache.downloader.DownloadApi`
+- Rust: `zccache-download-client` for the client API and `zccache-download` for shared download types
+
+The downloader daemon is separate from the compiler-cache daemon. It is meant for
+long-lived artifact downloads, deterministic cache paths, optional unarchiving,
+and attach/wait/status flows from multiple clients.
+
+### Downloader CLI
+
+The main `zccache` binary includes a simple download subcommand:
+
+```bash
+zccache download \
+  https://example.com/toolchain.tar.zst \
+  --unarchive .cache/toolchain \
+  --sha256 0123456789abcdef \
+  --multipart-parts 8
+```
+
+That path blocks until the artifact is ready and prints the resolved cache path,
+SHA-256, and optional unarchive destination.
+
+For daemon lifecycle control, attach/wait/status operations, JSON output, and
+explicit archive-format selection, use the standalone downloader CLI:
+
+```bash
+zccache-download daemon start
+
+zccache-download fetch \
+  https://example.com/toolchain.tar.zst \
+  .cache/downloads/toolchain.tar.zst \
+  --expanded .cache/toolchain \
+  --archive-format tar.zst \
+  --max-connections 8
+
+zccache-download exists \
+  https://example.com/toolchain.tar.zst \
+  .cache/downloads/toolchain.tar.zst
+
+zccache-download --json daemon status
+```
+
+Additional standalone subcommands:
+
+- `get` to attach to a raw download handle
+- `wait`, `status`, and `cancel` for handle lifecycle operations
+- `daemon stop` to shut the download daemon down explicitly
+
+### Python Downloader API
+
+`pip install zccache` exposes the downloader as `zccache.downloader`.
+
+```python
+from zccache.downloader import DownloadApi
+
+api = DownloadApi()
+api.start()
+
+result = api.download(
+    source_url="https://example.com/toolchain.tar.zst",
+    destination=".cache/downloads/toolchain.tar.zst",
+    expanded=".cache/toolchain",
+    archive_format="tar.zst",
+    multipart_parts=8,
+)
+print(result.status, result.sha256, result.expanded_path)
+
+state = api.exists(
+    source_url="https://example.com/toolchain.tar.zst",
+    destination=".cache/downloads/toolchain.tar.zst",
+)
+print(state.kind, state.reason)
+```
+
+If you need attach/wait/status semantics instead of a blocking fetch call, use
+`DownloadApi.attach(...)` and operate on the returned `DownloadHandle`:
+
+```python
+from zccache.downloader import DownloadApi
+
+api = DownloadApi()
+with api.attach(
+    source_url="https://example.com/toolchain.tar.zst",
+    destination=".cache/downloads/toolchain.tar.zst",
+    max_connections=8,
+) as handle:
+    status = handle.wait(timeout_ms=1_000)
+    print(handle.download_id, status.phase, status.downloaded_bytes)
+```
+
+The Python downloader surface includes:
+
+- `DownloadApi.start()`, `stop()`, and `daemon_status()`
+- `DownloadApi.download()` / `fetch()` for blocking or non-blocking fetches
+- `DownloadApi.exists()` for cache-state checks
+- `DownloadApi.attach()` plus `DownloadHandle.status()`, `wait()`, and `cancel()`
+
+### Rust Downloader API
+
+For Rust code, use `zccache-download-client` as the entrypoint and
+`zccache-download` for shared status and option types.
+
+```rust
+use std::path::PathBuf;
+use zccache_download_client::{ArchiveFormat, DownloadClient, FetchRequest, WaitMode};
+
+let client = DownloadClient::new(None);
+client.start_daemon()?;
+
+let mut request = FetchRequest::new(
+    "https://example.com/toolchain.tar.zst",
+    PathBuf::from(".cache/downloads/toolchain.tar.zst"),
+);
+request.destination_path_expanded = Some(PathBuf::from(".cache/toolchain"));
+request.archive_format = ArchiveFormat::TarZst;
+request.multipart_parts = Some(8);
+request.wait_mode = WaitMode::Block;
+
+let result = client.fetch(request)?;
+println!("{:?} {} {}", result.status, result.sha256, result.cache_path.display());
+```
+
+For handle-based control, use `DownloadClient::download(...)`:
+
+```rust
+use std::path::Path;
+use zccache_download::DownloadOptions;
+use zccache_download_client::DownloadClient;
+
+let client = DownloadClient::new(None);
+let mut handle = client.download(
+    "https://example.com/toolchain.tar.zst",
+    Path::new(".cache/downloads/toolchain.tar.zst"),
+    DownloadOptions {
+        force: false,
+        max_connections: Some(8),
+        min_segment_size: None,
+    },
+)?;
+
+let status = handle.wait(Some(1_000))?;
+println!("{:?} {}", status.phase, status.downloaded_bytes);
+```
+
+The Rust downloader surface includes:
+
+- `DownloadClient::start_daemon()`, `stop_daemon()`, and `daemon_status()`
+- `DownloadClient::fetch()` and `exists()` with `FetchRequest`
+- `DownloadClient::download()` returning a `DownloadHandle`
+- `ArchiveFormat`, `FetchResult`, `FetchState`, `FetchStatus`, and `WaitMode`
+- `DownloadOptions`, `DownloadStatus`, and `DownloadDaemonStatus`
 
 ## License
 
