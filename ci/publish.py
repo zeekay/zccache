@@ -105,6 +105,34 @@ def run_capture(cmd: list[str]) -> str:
     return result.stdout.strip()
 
 
+def run_capture_retry(
+    cmd: list[str],
+    *,
+    retries: int = 3,
+    delay_seconds: float = 2.0,
+) -> str:
+    """Run a command and retry transient non-zero exits."""
+    attempts = retries + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return run_capture(cmd)
+        except subprocess.CalledProcessError as e:
+            if attempt >= attempts:
+                raise
+            log(
+                f"  WARNING: command failed (attempt {attempt}/{attempts}): "
+                f"{' '.join(cmd)}"
+            )
+            stdout = (e.stdout or "").strip()
+            stderr = (e.stderr or "").strip()
+            if stderr:
+                log(f"    stderr: {stderr}")
+            elif stdout:
+                log(f"    stdout: {stdout}")
+            time.sleep(delay_seconds)
+    raise AssertionError("unreachable")
+
+
 def get_publish_blocking_dirty_entries() -> list[str]:
     """Return git status entries that should block publishing."""
     result = subprocess.run(
@@ -161,7 +189,7 @@ def download_failed_logs(repo: str, run_id: int) -> list[Path]:
 
     # Identify which jobs failed
     try:
-        jobs_raw = run_capture([
+        jobs_raw = run_capture_retry([
             "gh", "run", "view", str(run_id),
             "--repo", repo,
             "--json", "jobs",
@@ -252,7 +280,7 @@ def record_hash(data: bytes) -> str:
 def list_run_artifacts(repo: str, run_id: int) -> list[str]:
     """Return artifact names produced by a workflow run."""
     try:
-        raw = run_capture([
+        raw = run_capture_retry([
             "gh",
             "api",
             f"repos/{repo}/actions/runs/{run_id}/artifacts",
@@ -266,7 +294,7 @@ def list_run_artifacts(repo: str, run_id: int) -> list[str]:
 def find_existing_build_run(repo: str, head_sha: str) -> int | None:
     """Return a successful build workflow run for this commit if artifacts are complete."""
     try:
-        raw = run_capture([
+        raw = run_capture_retry([
             "gh",
             "run",
             "list",
@@ -403,7 +431,7 @@ def trigger_and_wait(repo: str) -> int:
         return existing_run
 
     # Snapshot existing runs to detect the new one
-    existing_raw = run_capture(
+    existing_raw = run_capture_retry(
         [
             "gh",
             "run",
@@ -429,7 +457,7 @@ def trigger_and_wait(repo: str) -> int:
     run_id = None
     for _ in range(30):
         time.sleep(2)
-        result = run_capture(
+        result = run_capture_retry(
             [
                 "gh",
                 "run",
@@ -462,7 +490,7 @@ def trigger_and_wait(repo: str) -> int:
     timeout = 1800
     start = time.time()
     while time.time() - start < timeout:
-        result = run_capture(
+        result = run_capture_retry(
             [
                 "gh",
                 "run",
