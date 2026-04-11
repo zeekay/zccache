@@ -7,34 +7,24 @@ These trampolines are used by the remaining project scripts (`run_zccache`,
 """
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from ci.env import activate, find_cargo_bin
-
-
-def _find_cargo_bin():
-    """Find the preferred rustup .cargo/bin directory."""
-    return find_cargo_bin()
+from ci.env import activate, ensure_windows_msvc, require_tool_path
 
 
 def _run_tool(tool_name):
     """Prepend .cargo/bin to PATH and exec the given tool."""
     activate()
-    cargo_bin = _find_cargo_bin()
-    if not cargo_bin:
-        print("error: Cannot find .cargo/bin. Run ./install first.", file=sys.stderr)
+    try:
+        tool = require_tool_path(tool_name)
+        ensure_windows_msvc()
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
-
-    if not shutil.which(tool_name):
-        print(f"error: {tool_name} not found in {cargo_bin}.", file=sys.stderr)
-        sys.exit(1)
-
-    result = subprocess.run([tool_name] + sys.argv[1:])
+    result = subprocess.run([str(tool)] + sys.argv[1:], env=os.environ.copy())
     sys.exit(result.returncode)
 
 
@@ -57,22 +47,22 @@ def clippy_driver():
 def _run_cargo_bin(package):
     """Run a cargo binary with the correct toolchain on PATH."""
     activate()
-    cargo_bin = _find_cargo_bin()
-    if not cargo_bin:
-        print("error: Cannot find .cargo/bin. Run ./install first.", file=sys.stderr)
+    try:
+        cargo = require_tool_path("cargo")
+        ensure_windows_msvc()
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
-
-    os.environ["PATH"] = cargo_bin + os.pathsep + os.environ.get("PATH", "")
 
     extra = sys.argv[1:]
     # Strip leading '--' that uv inserts
     if extra and extra[0] == "--":
         extra = extra[1:]
-    cmd = ["cargo", "run", "-p", package]
+    cmd = [str(cargo), "run", "-p", package]
     if extra:
         cmd.append("--")
         cmd.extend(extra)
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, env=os.environ.copy())
     sys.exit(result.returncode)
 
 

@@ -8,36 +8,27 @@ Exit codes:
   0 - Success or graceful skip (sccache/rustc not found)
 """
 
-import os
 import subprocess
 import sys
 from pathlib import Path
 
-from ci.env import find_cargo_bin
+from ci.env import clean_env, ensure_windows_msvc, require_tool_path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 SCCACHE_BASE = PROJECT_ROOT / ".sccache"
 CARGO_CONFIG = PROJECT_ROOT / ".cargo" / "config.toml"
 
 
-def _rustup_env():
-    """Return env dict with .cargo/bin prepended to PATH."""
-    env = os.environ.copy()
-    cargo_bin = find_cargo_bin()
-    if cargo_bin:
-        env["PATH"] = cargo_bin + os.pathsep + env.get("PATH", "")
-    return env
-
-
 def get_rustc_verbose():
     """Get `rustc --version --verbose` output via the rustup toolchain."""
+    rustc = require_tool_path("rustc")
     result = subprocess.run(
-        ["rustc", "--version", "--verbose"],
+        [str(rustc), "--version", "--verbose"],
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
-        env=_rustup_env(),
+        env=clean_env(),
     )
     if result.returncode != 0:
         return None
@@ -78,6 +69,12 @@ SCCACHE_DIR = "{cache_dir_str}"
 
 
 def main():
+    try:
+        ensure_windows_msvc()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     # Check sccache is installed
     try:
         subprocess.run(

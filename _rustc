@@ -26,4 +26,14 @@ if [ -z "${CARGO_HOME:-}" ] && [ -d "$SCRIPT_DIR/.cargo" ]; then
   export CARGO_HOME="$SCRIPT_DIR/.cargo"
 fi
 
+if [ -n "$CARGO_BIN" ]; then
+  TOOL_PATH="$CARGO_BIN/rustc"
+  if [ -x "$TOOL_PATH.exe" ]; then
+    TOOL_PATH="$TOOL_PATH.exe"
+  fi
+  if [ -x "$TOOL_PATH" ]; then
+    exec "$TOOL_PATH" "$@"
+  fi
+fi
+
 exec rustc "$@"
