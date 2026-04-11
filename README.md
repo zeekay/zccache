@@ -3,6 +3,7 @@
 [![Linux](https://github.com/zackees/zccache/actions/workflows/ci-linux.yml/badge.svg)](https://github.com/zackees/zccache/actions/workflows/ci-linux.yml)
 [![macOS](https://github.com/zackees/zccache/actions/workflows/ci-macos.yml/badge.svg)](https://github.com/zackees/zccache/actions/workflows/ci-macos.yml)
 [![Windows](https://github.com/zackees/zccache/actions/workflows/ci-windows.yml/badge.svg)](https://github.com/zackees/zccache/actions/workflows/ci-windows.yml)
+[![codecov](https://codecov.io/gh/zackees/zccache/branch/main/graph/badge.svg)](https://codecov.io/gh/zackees/zccache)
 [![PyPI](https://img.shields.io/pypi/v/zccache)](https://pypi.org/project/zccache/)
 [![crates.io: zccache-core](https://img.shields.io/crates/v/zccache-core)](https://crates.io/crates/zccache-core)
 [![crates.io: zccache-cli](https://img.shields.io/crates/v/zccache-cli)](https://crates.io/crates/zccache-cli)
