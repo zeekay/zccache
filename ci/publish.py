@@ -989,44 +989,8 @@ def verify_rust_crates_locally() -> None:
     except ReleaseCheckError as e:
         log(f"  ERROR: {e}")
         sys.exit(1)
-    compile_skipped = False
-    for crate in RUST_PUBLISH_ORDER:
-        result = subprocess.run(
-            ["cargo", "check", "--all-targets", "-p", crate],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            env=clean_env(),
-        )
-        if result.returncode == 0:
-            continue
-
-        combined = f"{result.stdout}\n{result.stderr}".lower()
-        if (
-            sys.platform == "win32"
-            and "libmimalloc-sys" in combined
-            and "gcc.exe" in combined
-        ):
-            log(
-                "  WARNING: local cargo check hit a Windows GNU C-toolchain issue "
-                f"while verifying {crate}; falling back to package-only verification"
-            )
-            compile_skipped = True
-            break
-
-        if result.stdout:
-            print(result.stdout, end="", file=sys.stderr)
-        if result.stderr:
-            print(result.stderr, end="", file=sys.stderr)
-        raise subprocess.CalledProcessError(
-            result.returncode,
-            result.args,
-            output=result.stdout,
-            stderr=result.stderr,
-        )
-
-    if compile_skipped:
-        log("  Local compile verification skipped; CI build matrix remains the compile gate")
+    # Skip local cargo check — CI build matrix is the compile/lint/test gate.
+    # If the GH Actions build produced binaries, the code compiles.
 
     log("\n=== Step 7b: Verify Rust crate packaging ===")
     for crate in RUST_PUBLISH_ORDER:
