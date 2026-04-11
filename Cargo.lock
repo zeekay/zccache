@@ -3595,6 +3595,7 @@ dependencies = [
  "tracing",
  "zccache-core",
  "zccache-download",
+ "zccache-download-daemon",
  "zccache-download-protocol",
  "zccache-ipc",
  "zip",
