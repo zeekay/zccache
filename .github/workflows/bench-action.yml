@@ -224,10 +224,57 @@ jobs:
       - if: always()
         uses: ./action/cleanup
 
+  # ── zccache with target cache restored (simulates second CI run) ──
+  zccache-cached:
+    name: "zccache (cached target)"
+    needs: [zccache]
+    runs-on: ubuntu-24.04
+    outputs:
+      restored: ${{ steps.restored.outputs.ms }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Setup zccache — this should restore target/ from the previous job's save
+      - uses: ./
+        with:
+          shared-key: bench
+
+      - name: "Check if target was restored"
+        shell: bash
+        run: |
+          if [ -d target/debug/.fingerprint ]; then
+            COUNT=$(find target/debug/.fingerprint -type f | wc -l)
+            echo "Target restored: $COUNT fingerprint files"
+          else
+            echo "WARNING: target/ not restored from cache"
+          fi
+
+      - name: "Build with restored target (should be near-instant)"
+        id: restored
+        shell: bash
+        run: |
+          START=$(date +%s%N)
+          OUTPUT=$(cargo build -p $BUILD_TARGET 2>&1)
+          END=$(date +%s%N)
+          MS=$(( (END - START) / 1000000 ))
+          echo "$OUTPUT"
+          echo "ms=$MS" >> "$GITHUB_OUTPUT"
+          echo "::notice::zccache cached target: ${MS}ms"
+          if echo "$OUTPUT" | grep -q "Compiling"; then
+            CRATES=$(echo "$OUTPUT" | grep -c "Compiling")
+            echo "::warning::Recompiled $CRATES crates (expected 0 with restored target)"
+          else
+            echo "::notice::Zero recompilation — target cache working perfectly"
+          fi
+
+      - if: always()
+        uses: ./action/cleanup
+
   # ── Report ───────────────────────────────────────────────────
   report:
     name: "Results"
-    needs: [bare, sccache, zccache]
+    needs: [bare, sccache, zccache, zccache-cached]
     runs-on: ubuntu-24.04
     steps:
       - name: Print comparison table
@@ -288,3 +335,7 @@ jobs:
             printf "%-30s %8sms %8sms %8sms\n" "$LABEL" "${BARE[$KEY]}" "${SC[$KEY]}" "${ZC[$KEY]}"
           done
           echo ""
+          CACHED=${{ needs.zccache-cached.outputs.restored }}
+          printf "%-30s %8s   %8s   %8sms\n" "Cached target (2nd CI run)" "—" "—" "$CACHED"
+          echo ""
+          echo "| **Cached target (2nd CI run)** | — | — | **${CACHED}ms** | — | — |" >> "$GITHUB_STEP_SUMMARY"

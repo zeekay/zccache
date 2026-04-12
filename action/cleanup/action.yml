@@ -56,24 +56,11 @@ runs:
           ~/.cargo/git/db/
         key: ${{ steps.state.outputs.registry-key }}
 
-    - name: Save cargo target metadata cache
+    - name: Save cargo target cache
       if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-target == 'true'
       uses: actions/cache/save@v4
       with:
-        path: |
-          ${{ steps.state.outputs.target-dir }}/.fingerprint/
-          ${{ steps.state.outputs.target-dir }}/.cargo-lock
-          ${{ steps.state.outputs.target-dir }}/build/
-          ${{ steps.state.outputs.target-dir }}/debug/.fingerprint/
-          ${{ steps.state.outputs.target-dir }}/debug/build/
-          ${{ steps.state.outputs.target-dir }}/debug/deps/*.d
-          ${{ steps.state.outputs.target-dir }}/debug/deps/*.rmeta
-          ${{ steps.state.outputs.target-dir }}/debug/.cargo-lock
-          ${{ steps.state.outputs.target-dir }}/release/.fingerprint/
-          ${{ steps.state.outputs.target-dir }}/release/build/
-          ${{ steps.state.outputs.target-dir }}/release/deps/*.d
-          ${{ steps.state.outputs.target-dir }}/release/deps/*.rmeta
-          ${{ steps.state.outputs.target-dir }}/release/.cargo-lock
+        path: ${{ steps.state.outputs.target-dir }}
         key: ${{ steps.state.outputs.target-key }}
 
     - name: Clean up state

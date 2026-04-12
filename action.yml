@@ -120,27 +120,16 @@ runs:
         key: ${{ steps.keys.outputs.registry-key }}
         restore-keys: ${{ steps.keys.outputs.registry-restore }}
 
-    # --- Layer 3: Restore cargo target metadata cache ---
-    # Fingerprints, dep-info, build script outputs — lets cargo skip rustc entirely
-    - name: Restore cargo target metadata cache
+    # --- Layer 3: Restore cargo target directory ---
+    # Restores the full target/ so cargo sees fingerprints + artifacts as fresh.
+    # actions/cache handles compression internally. This is the key to
+    # eliminating the 2s cargo orchestration overhead on warm builds.
+    - name: Restore cargo target cache
       id: restore-target
       if: inputs.cache-target == 'true'
       uses: actions/cache/restore@v4
       with:
-        path: |
-          ${{ inputs.target-dir }}/.fingerprint/
-          ${{ inputs.target-dir }}/.cargo-lock
-          ${{ inputs.target-dir }}/build/
-          ${{ inputs.target-dir }}/debug/.fingerprint/
-          ${{ inputs.target-dir }}/debug/build/
-          ${{ inputs.target-dir }}/debug/deps/*.d
-          ${{ inputs.target-dir }}/debug/deps/*.rmeta
-          ${{ inputs.target-dir }}/debug/.cargo-lock
-          ${{ inputs.target-dir }}/release/.fingerprint/
-          ${{ inputs.target-dir }}/release/build/
-          ${{ inputs.target-dir }}/release/deps/*.d
-          ${{ inputs.target-dir }}/release/deps/*.rmeta
-          ${{ inputs.target-dir }}/release/.cargo-lock
+        path: ${{ inputs.target-dir }}
         key: ${{ steps.keys.outputs.target-key }}
         restore-keys: ${{ steps.keys.outputs.target-restore }}
 
