@@ -1,0 +1,143 @@
+name: "zccache"
+description: >
+  Unified Rust compilation + dependency caching for GitHub Actions.
+  Replaces both mozilla-actions/sccache-action and Swatinem/rust-cache
+  with a single, faster action. ~1ms per warm cache hit vs ~170ms for sccache.
+
+inputs:
+  cache-cargo-registry:
+    description: >
+      Cache cargo registry index, downloaded crate files, and git dependencies.
+      Replaces Swatinem/rust-cache registry caching.
+    required: false
+    default: "true"
+  cache-compilation:
+    description: >
+      Cache individual compilation units (.o/.rlib) via the zccache daemon.
+      Replaces sccache.
+    required: false
+    default: "true"
+  shared-key:
+    description: >
+      Additional key segment for cache isolation in matrix builds.
+      Typically the Rust target triple (e.g., x86_64-unknown-linux-gnu).
+    required: false
+    default: ""
+  zccache-version:
+    description: >
+      Version of zccache to install from PyPI.
+      Use "latest" for the newest release.
+    required: false
+    default: "latest"
+  save-cache:
+    description: >
+      Whether to save caches at the end. Set to "false" for PR builds
+      where you only want to restore (saves GHA cache budget).
+    required: false
+    default: "true"
+
+outputs:
+  cache-hit-compilation:
+    description: "Whether the zccache compilation cache was restored"
+    value: ${{ steps.restore-zccache.outputs.cache-hit }}
+  cache-hit-registry:
+    description: "Whether the cargo registry cache was restored"
+    value: ${{ steps.restore-registry.outputs.cache-hit }}
+
+runs:
+  using: "composite"
+  steps:
+    # --- Compute cache keys ---
+    - name: Compute cache keys
+      id: keys
+      shell: bash
+      run: |
+        # Build a composite key from OS, arch, shared-key, and cargo lock hash
+        OS="${{ runner.os }}"
+        ARCH="${{ runner.arch }}"
+        SHARED="${{ inputs.shared-key }}"
+        if [ -n "$SHARED" ]; then
+          PREFIX="zccache-${OS}-${ARCH}-${SHARED}"
+        else
+          PREFIX="zccache-${OS}-${ARCH}"
+        fi
+
+        # Hash Cargo.lock for registry cache key (falls back if no lock file)
+        if [ -f Cargo.lock ]; then
+          LOCK_HASH=$(sha256sum Cargo.lock | cut -c1-16)
+        else
+          LOCK_HASH="no-lock"
+        fi
+
+        echo "compilation-key=${PREFIX}-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+        echo "compilation-restore=${PREFIX}-" >> "$GITHUB_OUTPUT"
+        echo "registry-key=cargo-registry-${OS}-${ARCH}-${LOCK_HASH}" >> "$GITHUB_OUTPUT"
+        echo "registry-restore=cargo-registry-${OS}-${ARCH}-" >> "$GITHUB_OUTPUT"
+
+    # --- Layer 1: Restore zccache compilation cache ---
+    - name: Restore zccache compilation cache
+      id: restore-zccache
+      if: inputs.cache-compilation == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.zccache
+        key: ${{ steps.keys.outputs.compilation-key }}
+        restore-keys: ${{ steps.keys.outputs.compilation-restore }}
+
+    # --- Layer 2: Restore cargo registry cache ---
+    - name: Restore cargo registry cache
+      id: restore-registry
+      if: inputs.cache-cargo-registry == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: ${{ steps.keys.outputs.registry-key }}
+        restore-keys: ${{ steps.keys.outputs.registry-restore }}
+
+    # --- Install and start zccache ---
+    - name: Install zccache
+      shell: bash
+      run: |
+        VERSION="${{ inputs.zccache-version }}"
+        if [ "$VERSION" = "latest" ]; then
+          pip install zccache
+        else
+          pip install "zccache==${VERSION}"
+        fi
+
+    - name: Fix executable permissions (macOS/Linux)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        # PyPI-bundled binaries may lose execute bits on some platforms
+        SITE_PKGS=$(python -c "import site; print(site.getusersitepackages())" 2>/dev/null || true)
+        if [ -d "$SITE_PKGS/zccache" ]; then
+          find "$SITE_PKGS/zccache" -type f ! -perm -u=x -exec chmod +x {} + 2>/dev/null || true
+        fi
+        # Also check common pip install locations
+        find ~/.local -name 'zccache*' -type f -exec chmod +x {} + 2>/dev/null || true
+
+    - name: Start zccache daemon
+      shell: bash
+      run: zccache start
+
+    # --- Export environment ---
+    - name: Set build environment
+      shell: bash
+      run: |
+        echo "RUSTC_WRAPPER=zccache" >> "$GITHUB_ENV"
+
+    # --- Write state for cleanup action ---
+    - name: Save state for cleanup
+      shell: bash
+      run: |
+        # Write cache keys to a file so the cleanup action can read them
+        mkdir -p ~/.zccache-action-state
+        echo "${{ steps.keys.outputs.compilation-key }}" > ~/.zccache-action-state/compilation-key
+        echo "${{ steps.keys.outputs.registry-key }}" > ~/.zccache-action-state/registry-key
+        echo "${{ inputs.save-cache }}" > ~/.zccache-action-state/save-cache
+        echo "${{ inputs.cache-compilation }}" > ~/.zccache-action-state/cache-compilation
+        echo "${{ inputs.cache-cargo-registry }}" > ~/.zccache-action-state/cache-registry

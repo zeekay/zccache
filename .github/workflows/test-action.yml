@@ -1,0 +1,118 @@
+name: Test zccache-action
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "action.yml"
+      - "action/**"
+      - ".github/workflows/test-action.yml"
+  pull_request:
+    paths:
+      - "action.yml"
+      - "action/**"
+      - ".github/workflows/test-action.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: test-action-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-action:
+    name: "${{ matrix.name }}"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - name: Linux aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: macOS ARM
+            os: macos-15
+            target: aarch64-apple-darwin
+          - name: macOS x86_64
+            os: macos-14
+            target: x86_64-apple-darwin
+          - name: Windows x86_64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # --- Test the action ---
+      - name: Setup zccache (action under test)
+        uses: ./
+        with:
+          shared-key: test-${{ matrix.target }}
+
+      - name: Verify RUSTC_WRAPPER is set
+        shell: bash
+        run: |
+          echo "RUSTC_WRAPPER=$RUSTC_WRAPPER"
+          if [ "$RUSTC_WRAPPER" != "zccache" ]; then
+            echo "FAIL: RUSTC_WRAPPER not set to zccache"
+            exit 1
+          fi
+
+      - name: Verify zccache daemon is running
+        shell: bash
+        run: zccache status
+
+      # --- Cold build ---
+      - name: Build (cold cache)
+        shell: bash
+        run: cargo build -p zccache-core --target ${{ matrix.target }}
+
+      - name: Check zccache stats after cold build
+        shell: bash
+        run: zccache status
+
+      # --- Warm build (clean target, rebuild from zccache) ---
+      - name: Clean target directory
+        shell: bash
+        run: cargo clean
+
+      - name: Build (warm cache — should hit zccache)
+        shell: bash
+        run: cargo build -p zccache-core --target ${{ matrix.target }}
+
+      - name: Check zccache stats after warm build
+        shell: bash
+        run: zccache status
+
+      # --- Test the cleanup action ---
+      - name: Cleanup (action under test)
+        if: always()
+        uses: ./action/cleanup
+
+  # Test that save-cache: false works (for PR builds)
+  test-no-save:
+    name: "No-save mode (Linux)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup zccache (no save)
+        uses: ./
+        with:
+          save-cache: "false"
+
+      - name: Build something
+        run: cargo check -p zccache-core
+
+      - name: Cleanup (should skip save)
+        if: always()
+        uses: ./action/cleanup

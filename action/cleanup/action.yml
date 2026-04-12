@@ -1,0 +1,58 @@
+name: "zccache cleanup"
+description: >
+  Stop the zccache daemon and save caches.
+  Use this as the last step in every job that uses zackees/zccache.
+  Must run with `if: always()` to ensure cleanup on failure.
+
+runs:
+  using: "composite"
+  steps:
+    - name: Print zccache stats
+      if: always()
+      shell: bash
+      run: zccache status 2>/dev/null || true
+
+    - name: Stop zccache daemon
+      if: always()
+      shell: bash
+      run: zccache stop 2>/dev/null || true
+
+    - name: Read state from setup
+      if: always()
+      id: state
+      shell: bash
+      run: |
+        STATE_DIR="$HOME/.zccache-action-state"
+        if [ -d "$STATE_DIR" ]; then
+          echo "compilation-key=$(cat "$STATE_DIR/compilation-key" 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
+          echo "registry-key=$(cat "$STATE_DIR/registry-key" 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
+          echo "save-cache=$(cat "$STATE_DIR/save-cache" 2>/dev/null || echo 'true')" >> "$GITHUB_OUTPUT"
+          echo "cache-compilation=$(cat "$STATE_DIR/cache-compilation" 2>/dev/null || echo 'true')" >> "$GITHUB_OUTPUT"
+          echo "cache-registry=$(cat "$STATE_DIR/cache-registry" 2>/dev/null || echo 'true')" >> "$GITHUB_OUTPUT"
+        else
+          echo "save-cache=false" >> "$GITHUB_OUTPUT"
+          echo "cache-compilation=false" >> "$GITHUB_OUTPUT"
+          echo "cache-registry=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Save zccache compilation cache
+      if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-compilation == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.zccache
+        key: ${{ steps.state.outputs.compilation-key }}
+
+    - name: Save cargo registry cache
+      if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-registry == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: ${{ steps.state.outputs.registry-key }}
+
+    - name: Clean up state
+      if: always()
+      shell: bash
+      run: rm -rf ~/.zccache-action-state
