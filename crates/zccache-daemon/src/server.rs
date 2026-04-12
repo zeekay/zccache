@@ -2073,6 +2073,13 @@ fn collect_rustc_outputs(
 /// 3. Remove existing output and retry hardlink (2 syscalls)
 /// 4. Fall back to fs::write from memory (1 syscall)
 ///
+/// After writing, the output's mtime is set to the current time. This is
+/// critical for build system compatibility: cargo, make, and ninja use mtime
+/// to determine if an output is fresh relative to its dependencies. Without
+/// this, hardlinked outputs inherit the cache file's old mtime, causing
+/// build systems to consider them stale and triggering unnecessary rebuilds.
+/// See issue #15 for the full root cause analysis.
+///
 /// The hardlink-first order optimizes for the rebuild scenario where outputs
 /// don't exist yet (1 syscall). For incremental builds where outputs exist
 /// as hardlinks, the failed hardlink + same_file check is still fast.
@@ -2080,6 +2087,7 @@ fn write_cached_output(out_path: &Path, cache_file: &Path, data: &[u8]) -> std::
     // Fast path: hardlink directly (works when out_path doesn't exist yet).
     // This is the cheapest path — one kernel call when no output exists.
     if std::fs::hard_link(cache_file, out_path).is_ok() {
+        touch_mtime(out_path);
         return Ok(());
     }
     // Hardlink failed — output probably exists. Check if it's already
@@ -2088,15 +2096,25 @@ fn write_cached_output(out_path: &Path, cache_file: &Path, data: &[u8]) -> std::
     // compilations can produce .o files with identical sizes but
     // different content (alignment, padding).
     if same_file(out_path, cache_file) {
+        touch_mtime(out_path);
         return Ok(());
     }
     // Output exists but is different — remove and retry
     let _ = std::fs::remove_file(out_path);
     if std::fs::hard_link(cache_file, out_path).is_ok() {
+        touch_mtime(out_path);
         return Ok(());
     }
-    // Hardlink failed entirely (cross-device, no cache file) — copy from memory
+    // Hardlink failed entirely (cross-device, no cache file) — copy from memory.
+    // fs::write creates a new file with current mtime, so no touch needed.
     std::fs::write(out_path, data)
+}
+
+/// Set output mtime to current time so build systems (cargo, make, ninja)
+/// see the artifact as freshly produced, not stale from the cache file's
+/// original compilation time.
+fn touch_mtime(path: &Path) {
+    let _ = filetime::set_file_mtime(path, filetime::FileTime::now());
 }
 
 /// Check if two paths refer to the same file (hardlink check).
@@ -4905,5 +4923,98 @@ mod tests {
         //  but the test verifies the optimization path exists.)
         write_cached_output(&out, &cache, content).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), content.as_slice());
+    }
+
+    /// Regression test for issue #15: hardlink delivery must set output mtime
+    /// to current time. Without this, build systems (cargo, make, ninja) see
+    /// the output as older than its dependencies and trigger unnecessary rebuilds.
+    ///
+    /// Root cause: hardlinks share mtime with the cache file, which was created
+    /// during the original compilation (potentially minutes/hours ago). Cargo
+    /// checks "is library output older than build script output?" and if the
+    /// library was hardlinked from an old cache file, the answer is yes → dirty.
+    #[test]
+    fn write_cached_output_sets_fresh_mtime_on_hardlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cached.rlib");
+        let out = dir.path().join("output.rlib");
+
+        let content = b"cached rlib data";
+        std::fs::write(&cache, content).unwrap();
+
+        // Backdate the cache file to simulate an artifact from a previous build.
+        let old_time = filetime::FileTime::from_unix_time(1_000_000_000, 0); // 2001-09-09
+        filetime::set_file_mtime(&cache, old_time).unwrap();
+
+        // Deliver via write_cached_output (will hardlink)
+        write_cached_output(&out, &cache, content).unwrap();
+
+        // Output must have recent mtime, NOT the 2001 mtime from the cache file.
+        let out_mtime = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(&out).unwrap(),
+        );
+        let now = filetime::FileTime::now();
+        let diff = now.unix_seconds() - out_mtime.unix_seconds();
+
+        assert!(
+            diff < 5,
+            "output mtime is {diff}s old — should be <5s.\n\
+             Cache file had mtime from 2001; hardlink must touch mtime to now.\n\
+             Output mtime: {out_mtime:?}, expected ~{now:?}"
+        );
+    }
+
+    /// Same as above but for the same_file (already hardlinked) path.
+    #[test]
+    fn write_cached_output_refreshes_mtime_on_existing_hardlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cached.rlib");
+        let out = dir.path().join("output.rlib");
+
+        let content = b"cached rlib data";
+        std::fs::write(&cache, content).unwrap();
+
+        // First delivery: creates hardlink
+        write_cached_output(&out, &cache, content).unwrap();
+
+        // Backdate both files (they share the same inode)
+        let old_time = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&out, old_time).unwrap();
+
+        // Second delivery: same_file path should still refresh mtime
+        write_cached_output(&out, &cache, content).unwrap();
+
+        let out_mtime = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(&out).unwrap(),
+        );
+        let now = filetime::FileTime::now();
+        let diff = now.unix_seconds() - out_mtime.unix_seconds();
+
+        assert!(
+            diff < 5,
+            "mtime not refreshed on existing hardlink path — {diff}s old"
+        );
+    }
+
+    /// write_cached_output fallback (fs::write) naturally sets fresh mtime.
+    #[test]
+    fn write_cached_output_fallback_has_fresh_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("output.rlib");
+        let cache = dir.path().join("nonexistent_cache.rlib");
+
+        let content = b"data from memory";
+        write_cached_output(&out, &cache, content).unwrap();
+
+        let out_mtime = filetime::FileTime::from_last_modification_time(
+            &std::fs::metadata(&out).unwrap(),
+        );
+        let now = filetime::FileTime::now();
+        let diff = now.unix_seconds() - out_mtime.unix_seconds();
+
+        assert!(
+            diff < 5,
+            "fallback path should produce fresh mtime — {diff}s old"
+        );
     }
 }
