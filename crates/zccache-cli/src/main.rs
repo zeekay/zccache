@@ -555,11 +555,10 @@ fn main() -> ExitCode {
         Commands::Warm {
             target_dir,
             profile,
-            endpoint,
+            ..
         } => {
-            let endpoint = resolve_endpoint(endpoint.as_deref());
             let target_dir = absolute_path(&target_dir);
-            run_async(cmd_warm(&endpoint, &target_dir, &profile))
+            cmd_warm(&target_dir, &profile)
         }
     }
 }
@@ -836,56 +835,45 @@ async fn cmd_clear(endpoint: &str) -> ExitCode {
     }
 }
 
-async fn cmd_warm(endpoint: &str, target_dir: &Path, profile: &str) -> ExitCode {
-    // Ensure daemon is running.
-    if let Err(e) = ensure_daemon(endpoint).await {
-        eprintln!("zccache warm: cannot start daemon at {endpoint}: {e}");
-        return ExitCode::FAILURE;
+fn cmd_warm(target_dir: &Path, profile: &str) -> ExitCode {
+    // Read artifacts directly from the on-disk redb index.
+    // This works even with a fresh daemon that hasn't loaded the index yet (#19).
+    let db_path = zccache_core::config::index_path();
+    let db_path_ref: &std::path::Path = db_path.as_ref();
+    if !db_path_ref.exists() {
+        println!("zccache warm: no artifact index at {}", db_path.display());
+        return ExitCode::SUCCESS;
     }
 
-    let mut conn = match connect(endpoint).await {
-        Ok(c) => c,
+    let store = match zccache_artifact::ArtifactStore::open(&db_path) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("zccache warm: cannot connect to daemon: {e}");
+            eprintln!("zccache warm: failed to open artifact index: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    // Send ListRustArtifacts request.
-    if let Err(e) = conn
-        .send(&zccache_protocol::Request::ListRustArtifacts)
-        .await
-    {
-        eprintln!("zccache warm: failed to send to daemon: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    let recv_result = match conn.recv().await {
-        Ok(r) => r,
+    let all_entries = match store.load_all() {
+        Ok(entries) => entries,
         Err(e) => {
-            eprintln!("zccache warm: broken connection to daemon: {e}");
+            eprintln!("zccache warm: failed to read artifact index: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    let artifacts = match recv_result {
-        Some(zccache_protocol::Response::RustArtifactList { artifacts }) => artifacts,
-        None => {
-            eprintln!("zccache warm: lost connection to daemon (no response)");
-            return ExitCode::FAILURE;
-        }
-        Some(zccache_protocol::Response::Error { message }) => {
-            eprintln!("zccache warm: daemon error: {message}");
-            return ExitCode::FAILURE;
-        }
-        Some(other) => {
-            eprintln!("zccache warm: unexpected response: {other:?}");
-            return ExitCode::FAILURE;
-        }
-    };
+    // Filter to Rust artifacts (output names ending in .rlib, .rmeta, .d, .so, .dylib)
+    let rust_extensions = [".rlib", ".rmeta", ".d", ".so", ".dylib", ".dll"];
+    let artifacts: Vec<_> = all_entries
+        .iter()
+        .filter(|(_, idx)| {
+            idx.output_names
+                .iter()
+                .any(|n| rust_extensions.iter().any(|ext| n.ends_with(ext)))
+        })
+        .collect();
 
     if artifacts.is_empty() {
-        println!("zccache warm: no cached Rust artifacts found");
+        println!("zccache warm: no cached Rust artifacts found ({} total entries in index)", all_entries.len());
         return ExitCode::SUCCESS;
     }
 
@@ -908,10 +896,10 @@ async fn cmd_warm(endpoint: &str, target_dir: &Path, profile: &str) -> ExitCode 
     let mut skipped = 0u64;
     let mut errors = 0u64;
 
-    for artifact in &artifacts {
-        for (i, name) in artifact.output_names.iter().enumerate() {
-            let src = artifact_dir.join(format!("{}_{i}", artifact.cache_key));
-            let dst = deps_dir.join(name);
+    for (key_hex, idx) in &artifacts {
+        for (i, name) in idx.output_names.iter().enumerate() {
+            let src = artifact_dir.join(format!("{key_hex}_{i}"));
+            let dst = deps_dir.join(name.as_str());
 
             // Skip if source payload does not exist on disk.
             if !src.exists() {

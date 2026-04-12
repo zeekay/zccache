@@ -23,6 +23,7 @@ clap = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
 zccache-core = { workspace = true }
+zccache-artifact = { workspace = true }
 zccache-compiler = { workspace = true }
 zccache-hash = { workspace = true }
 zccache-protocol = { workspace = true }

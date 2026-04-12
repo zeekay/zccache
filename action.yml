@@ -39,9 +39,9 @@ inputs:
   zccache-version:
     description: >
       Version of zccache to install.
-      Use "latest" for the newest release, or a specific version like "1.2.3".
+      Use "latest" for the newest release, or a specific version like "1.2.5".
     required: false
-    default: "latest"
+    default: "1.2.5"
   save-cache:
     description: >
       Whether to save caches at the end. Set to "false" for PR builds
@@ -132,28 +132,16 @@ runs:
         key: ${{ steps.keys.outputs.target-key }}
         restore-keys: ${{ steps.keys.outputs.target-restore }}
 
-    - name: Extract target metadata + warm from zccache
+    - name: Extract target metadata
       if: inputs.cache-target == 'true'
       shell: bash
       run: |
         TARGET="${{ inputs.target-dir }}"
-
-        # Step 1: Extract cached target metadata (fingerprints, build outputs)
         META_TAR="$HOME/.zccache-target-meta/target-meta.tar"
         if [ -f "$META_TAR" ]; then
           mkdir -p "$TARGET"
           tar xf "$META_TAR" -C "$TARGET" 2>/dev/null || true
           echo "Restored target metadata ($(du -sh "$META_TAR" | cut -f1))"
-        fi
-
-        # Step 2: Fill in .rlib/.rmeta from zccache artifact cache
-        if command -v zccache &>/dev/null; then
-          zccache warm --target-dir "$TARGET" 2>/dev/null || true
-        fi
-
-        # Step 3: Touch everything so cargo sees artifacts as newer than source
-        if [ -d "$TARGET" ]; then
-          find "$TARGET" -type f -exec touch {} + 2>/dev/null || true
         fi
 
     # --- Install zccache ---
@@ -226,9 +214,27 @@ runs:
           fi
         fi
 
-        # Verify and start
+        # Verify install
         which zccache || { echo "ERROR: zccache not found on PATH"; echo "PATH=$PATH"; exit 1; }
-        zccache start
+
+    # --- Pre-populate target/ from zccache before daemon starts ---
+    # warm reads the redb index directly (no daemon needed), fills in
+    # .rlib/.rmeta from cached artifacts, and touches mtimes.
+    - name: Warm target from zccache
+      if: inputs.cache-target == 'true'
+      shell: bash
+      run: |
+        TARGET="${{ inputs.target-dir }}"
+        if [ -d "$TARGET" ]; then
+          zccache warm --target-dir "$TARGET" || true
+          # Touch all target files so cargo sees them as newer than source
+          find "$TARGET" -type f -exec touch {} + 2>/dev/null || true
+        fi
+
+    # --- Start daemon ---
+    - name: Start zccache daemon
+      shell: bash
+      run: zccache start
 
     # --- Export environment ---
     - name: Set build environment
