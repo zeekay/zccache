@@ -17,8 +17,8 @@ RUST_PUBLISH_ORDER = [
     "zccache-download",
     "zccache-download-protocol",
     "zccache-ipc",
-    "zccache-download-daemon",
     "zccache-download-client",
+    "zccache-download-daemon",
     "zccache-download-cli",
     "zccache-fscache",
     "zccache-artifact",
@@ -120,6 +120,21 @@ def validate_rust_publish_order() -> None:
 
     if not errors:
         order_index = {crate: i for i, crate in enumerate(RUST_PUBLISH_ORDER)}
+        # Build a set of mutual (circular) dependency pairs to allow them
+        mutual_deps: set[tuple[str, str]] = set()
+        for crate in RUST_PUBLISH_ORDER:
+            pkg = package_by_name[crate]
+            for dep in pkg.get("dependencies", []):
+                dep_name = dep["name"]
+                if dep_name not in publishable or not dep.get("path"):
+                    continue
+                dep_pkg = package_by_name.get(dep_name)
+                if dep_pkg and any(
+                    d["name"] == crate and d.get("path")
+                    for d in dep_pkg.get("dependencies", [])
+                ):
+                    mutual_deps.add((min(crate, dep_name), max(crate, dep_name)))
+
         for crate in RUST_PUBLISH_ORDER:
             pkg = package_by_name[crate]
             for dep in pkg.get("dependencies", []):
@@ -130,6 +145,9 @@ def validate_rust_publish_order() -> None:
                     continue
                 if dep.get("kind") not in (None, "build"):
                     continue
+                pair = (min(crate, dep_name), max(crate, dep_name))
+                if pair in mutual_deps:
+                    continue  # circular deps are OK (prior version on crates.io)
                 if order_index[dep_name] >= order_index[crate]:
                     errors.append(
                         f"RUST_PUBLISH_ORDER schedules {crate} before its dependency {dep_name}"
