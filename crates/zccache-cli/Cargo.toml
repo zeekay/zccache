@@ -44,6 +44,11 @@ tikv-jemallocator = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 mimalloc = { workspace = true }
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/{ version }/zccache-{ version }-{ target }.tar.gz"
+bin-dir = "zccache-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [[bin]]
 name = "zccache"
 path = "src/main.rs"
