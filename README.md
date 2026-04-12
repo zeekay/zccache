@@ -8,7 +8,8 @@
 [![crates.io: zccache-core](https://img.shields.io/crates/v/zccache-core)](https://crates.io/crates/zccache-core)
 [![crates.io: zccache-cli](https://img.shields.io/crates/v/zccache-cli)](https://crates.io/crates/zccache-cli)
 [![crates.io: zccache-daemon](https://img.shields.io/crates/v/zccache-daemon)](https://crates.io/crates/zccache-daemon)
-[![Rust Workspace Version](https://img.shields.io/badge/rust%20workspace-1.2.1-orange)](https://crates.io/search?q=zccache)
+[![Rust Workspace Version](https://img.shields.io/badge/rust%20workspace-1.2.3-orange)](https://crates.io/search?q=zccache)
+[![GitHub Action](https://github.com/zackees/zccache/actions/workflows/test-action.yml/badge.svg)](https://github.com/zackees/zccache/actions/workflows/test-action.yml)
 
 ![C/C++](https://img.shields.io/badge/C%2FC%2B%2B-555?logo=c%2B%2B&logoColor=white)
 [![clang](https://img.shields.io/badge/clang-supported-brightgreen?logo=llvm)](https://clang.llvm.org/)
@@ -325,6 +326,134 @@ subprocess.run(["cargo", "check"], check=True, env=env)
 
 </details>
 
+## GitHub Actions
+
+zccache provides a composite GitHub Action that replaces **both** [`mozilla-actions/sccache-action`](https://github.com/mozilla-actions/sccache-action) and [`Swatinem/rust-cache`](https://github.com/Swatinem/rust-cache) with a single action.
+
+### Minimal example
+
+```yaml
+name: CI
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: zackees/zccache@main
+        with:
+          shared-key: ${{ runner.os }}
+
+      - run: cargo build --release
+
+      - run: cargo test
+
+      # REQUIRED: always clean up at end of job
+      - if: always()
+        uses: zackees/zccache/action/cleanup@main
+```
+
+### Multi-platform matrix
+
+```yaml
+name: CI
+on: [push, pull_request]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04,     target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-15,         target: aarch64-apple-darwin }
+          - { os: macos-14,         target: x86_64-apple-darwin }
+          - { os: windows-2025,     target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # One action replaces sccache + rust-cache
+      - uses: zackees/zccache@main
+        with:
+          shared-key: ${{ matrix.target }}
+
+      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo test --target ${{ matrix.target }}
+
+      - if: always()
+        uses: zackees/zccache/action/cleanup@main
+```
+
+### What it does
+
+The action provides two cache layers in a single step:
+
+| Layer | What | Replaces | Hit latency |
+|---|---|---|---|
+| **Compilation cache** | Per-unit `.o`/`.rlib` files via zccache daemon | sccache | ~1ms |
+| **Cargo registry cache** | `~/.cargo/registry/` + `~/.cargo/git/` | Swatinem/rust-cache | ~0.2s restore |
+
+### Inputs
+
+| Input | Default | Description |
+|---|---|---|
+| `cache-cargo-registry` | `true` | Cache cargo registry index + crate files + git deps |
+| `cache-compilation` | `true` | Cache compilation units via zccache daemon |
+| `shared-key` | `""` | Extra key for matrix isolation (typically the target triple) |
+| `zccache-version` | `latest` | Version to install |
+| `save-cache` | `true` | Set `false` for PR builds (restore-only, saves cache budget) |
+
+### Outputs
+
+| Output | Description |
+|---|---|
+| `cache-hit-compilation` | Whether the zccache compilation cache was restored |
+| `cache-hit-registry` | Whether the cargo registry cache was restored |
+
+### Why two parts?
+
+Composite GitHub Actions don't support `post` steps (automatic cleanup). The action is split into:
+
+1. **`zackees/zccache`** — setup: restore caches, install zccache, start daemon, set `RUSTC_WRAPPER`
+2. **`zackees/zccache/action/cleanup`** — teardown: print stats, stop daemon, save caches
+
+The cleanup action **must** be called with `if: always()` to ensure caches are saved even on failure.
+
+### Migrating from sccache + rust-cache
+
+Before (two actions):
+```yaml
+- uses: mozilla-actions/sccache-action@v0.0.9
+- uses: Swatinem/rust-cache@v2
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
+```
+
+After (one action):
+```yaml
+- uses: zackees/zccache@main
+  with:
+    shared-key: ${{ matrix.target }}
+# ... build steps ...
+- if: always()
+  uses: zackees/zccache/action/cleanup@main
+```
+
+No env vars needed — the action sets `RUSTC_WRAPPER=zccache` automatically.
+
+---
+
 ### C/C++ build system integration (ninja, meson, cmake, make)
 
 zccache is a **drop-in compiler wrapper**. Point your build system's compiler
@@ -461,6 +590,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full system design.
 | `zccache-artifact` | Disk-backed artifact store with redb index |
 | `zccache-watcher` | File watcher subsystem: daemon `notify` pipeline plus Rust-backed Python watcher bindings |
 | `zccache-compiler` | Compiler detection and argument parsing |
+| `zccache-gha` | GitHub Actions Cache API client |
 | `zccache-test-support` | Test utilities and fixtures |
 
 ## Building
