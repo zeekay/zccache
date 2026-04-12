@@ -240,33 +240,84 @@ jobs:
         with:
           shared-key: bench
 
-      - name: "Check if target was restored"
+      - name: "Diagnostics: target restore status"
         shell: bash
         run: |
+          echo "=== target/ exists? ==="
+          ls -la target/ 2>/dev/null || echo "NO target/"
+          echo ""
+          echo "=== .fingerprint count ==="
           if [ -d target/debug/.fingerprint ]; then
             COUNT=$(find target/debug/.fingerprint -type f | wc -l)
-            echo "Target restored: $COUNT fingerprint files"
+            echo "Fingerprint files: $COUNT"
           else
-            echo "WARNING: target/ not restored from cache"
+            echo "NO .fingerprint/"
           fi
+          echo ""
+          echo "=== deps/ file counts ==="
+          for ext in rlib rmeta d so dylib; do
+            COUNT=$(find target/debug/deps -name "*.$ext" 2>/dev/null | wc -l)
+            echo "  .$ext: $COUNT files"
+          done
+          echo ""
+          echo "=== build/ dirs ==="
+          ls target/debug/build/ 2>/dev/null | head -10 || echo "NO build/"
+          echo ""
+          echo "=== deps/*.rlib mtimes (first 5) ==="
+          find target/debug/deps -name "*.rlib" -exec stat -c "%n mtime=%Y" {} \; 2>/dev/null | head -5
+          echo ""
+          echo "=== source file mtimes ==="
+          stat -c "%n mtime=%Y" crates/zccache-core/src/*.rs 2>/dev/null | head -5
+          echo ""
+          echo "=== zccache binary ==="
+          which zccache && zccache --version
+          echo ""
+          echo "=== RUSTC_WRAPPER ==="
+          echo "RUSTC_WRAPPER=$RUSTC_WRAPPER"
+          echo ""
+          echo "=== rustc version + path ==="
+          which rustc && rustc --version
 
-      - name: "Build with restored target (should be near-instant)"
+      - name: "Build with restored target + cargo fingerprint trace"
         id: restored
         shell: bash
         run: |
+          # Start a zccache session with journal for full logging
+          zccache status || true
+
           START=$(date +%s%N)
-          OUTPUT=$(cargo build -p $BUILD_TARGET 2>&1)
+          CARGO_LOG="cargo::core::compiler::fingerprint=info" \
+            cargo build -p $BUILD_TARGET 2> /tmp/cargo-fingerprint.log
           END=$(date +%s%N)
           MS=$(( (END - START) / 1000000 ))
-          echo "$OUTPUT"
           echo "ms=$MS" >> "$GITHUB_OUTPUT"
           echo "::notice::zccache cached target: ${MS}ms"
-          if echo "$OUTPUT" | grep -q "Compiling"; then
-            CRATES=$(echo "$OUTPUT" | grep -c "Compiling")
-            echo "::warning::Recompiled $CRATES crates (expected 0 with restored target)"
+
+          echo ""
+          echo "=== Cargo output ==="
+          grep -E "Compiling|Finished|Fresh" /tmp/cargo-fingerprint.log | head -20
+
+          echo ""
+          echo "=== Why dirty? (fingerprint trace) ==="
+          grep -iE "dirty|stale|newer than|fingerprint.*changed|is newer" /tmp/cargo-fingerprint.log | head -20
+
+          echo ""
+          echo "=== Full fingerprint trace (first 50 lines) ==="
+          head -50 /tmp/cargo-fingerprint.log
+
+          COMPILING=$(grep -c "Compiling" /tmp/cargo-fingerprint.log || echo 0)
+          if [ "$COMPILING" -gt 0 ]; then
+            echo "::warning::Recompiled $COMPILING crates (expected 0 with restored target)"
           else
             echo "::notice::Zero recompilation — target cache working perfectly"
           fi
+
+      - name: "Upload diagnostic logs"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cached-target-diagnostics
+          path: /tmp/cargo-fingerprint.log
 
       - if: always()
         uses: ./action/cleanup
