@@ -75,8 +75,6 @@ def validate_release_versions() -> None:
                 f"{rel_path} has version {project_version}, expected {workspace_version}"
             )
 
-    # Workspace path dependencies: version pin is optional.
-    # If present, it must match. If absent, that's fine (cargo resolves by path).
     expected_dependency_version = f"={workspace_version}"
     workspace_deps = workspace_data["workspace"].get("dependencies", {})
     for name, spec in workspace_deps.items():
@@ -85,7 +83,7 @@ def validate_release_versions() -> None:
         if not isinstance(spec, dict) or "path" not in spec:
             continue
         actual = spec.get("version")
-        if actual is not None and actual != expected_dependency_version:
+        if actual != expected_dependency_version:
             errors.append(
                 f"workspace dependency {name} has version {actual}, "
                 f"expected {expected_dependency_version}"
