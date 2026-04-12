@@ -17,6 +17,19 @@ inputs:
       Replaces sccache.
     required: false
     default: "true"
+  cache-target:
+    description: >
+      Cache cargo target/ metadata (fingerprints, dep-info, build script outputs).
+      Allows cargo to skip invoking rustc entirely on warm builds.
+      Only caches lightweight metadata, not full .rlib files.
+    required: false
+    default: "true"
+  target-dir:
+    description: >
+      Path to the cargo target directory.
+      Default: ./target
+    required: false
+    default: "target"
   shared-key:
     description: >
       Additional key segment for cache isolation in matrix builds.
@@ -43,6 +56,9 @@ outputs:
   cache-hit-registry:
     description: "Whether the cargo registry cache was restored"
     value: ${{ steps.restore-registry.outputs.cache-hit }}
+  cache-hit-target:
+    description: "Whether the cargo target metadata cache was restored"
+    value: ${{ steps.restore-target.outputs.cache-hit }}
 
 runs:
   using: "composite"
@@ -78,6 +94,8 @@ runs:
         echo "compilation-restore=${PREFIX}-" >> "$GITHUB_OUTPUT"
         echo "registry-key=cargo-registry-${OS}-${ARCH}-${LOCK_HASH}" >> "$GITHUB_OUTPUT"
         echo "registry-restore=cargo-registry-${OS}-${ARCH}-" >> "$GITHUB_OUTPUT"
+        echo "target-key=cargo-target-${OS}-${ARCH}-${LOCK_HASH}-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+        echo "target-restore=cargo-target-${OS}-${ARCH}-${LOCK_HASH}-" >> "$GITHUB_OUTPUT"
 
     # --- Layer 1: Restore zccache compilation cache ---
     - name: Restore zccache compilation cache
@@ -101,6 +119,30 @@ runs:
           ~/.cargo/git/db/
         key: ${{ steps.keys.outputs.registry-key }}
         restore-keys: ${{ steps.keys.outputs.registry-restore }}
+
+    # --- Layer 3: Restore cargo target metadata cache ---
+    # Fingerprints, dep-info, build script outputs — lets cargo skip rustc entirely
+    - name: Restore cargo target metadata cache
+      id: restore-target
+      if: inputs.cache-target == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ${{ inputs.target-dir }}/.fingerprint/
+          ${{ inputs.target-dir }}/.cargo-lock
+          ${{ inputs.target-dir }}/build/
+          ${{ inputs.target-dir }}/debug/.fingerprint/
+          ${{ inputs.target-dir }}/debug/build/
+          ${{ inputs.target-dir }}/debug/deps/*.d
+          ${{ inputs.target-dir }}/debug/deps/*.rmeta
+          ${{ inputs.target-dir }}/debug/.cargo-lock
+          ${{ inputs.target-dir }}/release/.fingerprint/
+          ${{ inputs.target-dir }}/release/build/
+          ${{ inputs.target-dir }}/release/deps/*.d
+          ${{ inputs.target-dir }}/release/deps/*.rmeta
+          ${{ inputs.target-dir }}/release/.cargo-lock
+        key: ${{ steps.keys.outputs.target-key }}
+        restore-keys: ${{ steps.keys.outputs.target-restore }}
 
     # --- Install zccache ---
     # Try binary download first (faster, no Python dependency), fall back to pip
@@ -190,6 +232,9 @@ runs:
         mkdir -p ~/.zccache-action-state
         echo "${{ steps.keys.outputs.compilation-key }}" > ~/.zccache-action-state/compilation-key
         echo "${{ steps.keys.outputs.registry-key }}" > ~/.zccache-action-state/registry-key
+        echo "${{ steps.keys.outputs.target-key }}" > ~/.zccache-action-state/target-key
         echo "${{ inputs.save-cache }}" > ~/.zccache-action-state/save-cache
         echo "${{ inputs.cache-compilation }}" > ~/.zccache-action-state/cache-compilation
         echo "${{ inputs.cache-cargo-registry }}" > ~/.zccache-action-state/cache-registry
+        echo "${{ inputs.cache-target }}" > ~/.zccache-action-state/cache-target
+        echo "${{ inputs.target-dir }}" > ~/.zccache-action-state/target-dir

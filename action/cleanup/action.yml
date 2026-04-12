@@ -26,13 +26,17 @@ runs:
         if [ -d "$STATE_DIR" ]; then
           echo "compilation-key=$(cat "$STATE_DIR/compilation-key" 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
           echo "registry-key=$(cat "$STATE_DIR/registry-key" 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
+          echo "target-key=$(cat "$STATE_DIR/target-key" 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
           echo "save-cache=$(cat "$STATE_DIR/save-cache" 2>/dev/null || echo 'true')" >> "$GITHUB_OUTPUT"
           echo "cache-compilation=$(cat "$STATE_DIR/cache-compilation" 2>/dev/null || echo 'true')" >> "$GITHUB_OUTPUT"
           echo "cache-registry=$(cat "$STATE_DIR/cache-registry" 2>/dev/null || echo 'true')" >> "$GITHUB_OUTPUT"
+          echo "cache-target=$(cat "$STATE_DIR/cache-target" 2>/dev/null || echo 'true')" >> "$GITHUB_OUTPUT"
+          echo "target-dir=$(cat "$STATE_DIR/target-dir" 2>/dev/null || echo 'target')" >> "$GITHUB_OUTPUT"
         else
           echo "save-cache=false" >> "$GITHUB_OUTPUT"
           echo "cache-compilation=false" >> "$GITHUB_OUTPUT"
           echo "cache-registry=false" >> "$GITHUB_OUTPUT"
+          echo "cache-target=false" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Save zccache compilation cache
@@ -51,6 +55,26 @@ runs:
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
         key: ${{ steps.state.outputs.registry-key }}
+
+    - name: Save cargo target metadata cache
+      if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-target == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ${{ steps.state.outputs.target-dir }}/.fingerprint/
+          ${{ steps.state.outputs.target-dir }}/.cargo-lock
+          ${{ steps.state.outputs.target-dir }}/build/
+          ${{ steps.state.outputs.target-dir }}/debug/.fingerprint/
+          ${{ steps.state.outputs.target-dir }}/debug/build/
+          ${{ steps.state.outputs.target-dir }}/debug/deps/*.d
+          ${{ steps.state.outputs.target-dir }}/debug/deps/*.rmeta
+          ${{ steps.state.outputs.target-dir }}/debug/.cargo-lock
+          ${{ steps.state.outputs.target-dir }}/release/.fingerprint/
+          ${{ steps.state.outputs.target-dir }}/release/build/
+          ${{ steps.state.outputs.target-dir }}/release/deps/*.d
+          ${{ steps.state.outputs.target-dir }}/release/deps/*.rmeta
+          ${{ steps.state.outputs.target-dir }}/release/.cargo-lock
+        key: ${{ steps.state.outputs.target-key }}
 
     - name: Clean up state
       if: always()
