@@ -49,6 +49,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Ensure target stdlib
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
       # --- Test the action ---
       - name: Setup zccache (action under test)
         uses: ./
