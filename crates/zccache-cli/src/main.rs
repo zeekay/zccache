@@ -875,23 +875,11 @@ fn warm_target(
         .load_all()
         .map_err(|e| format!("failed to read artifact index: {e}"))?;
 
-    // Filter to Rust artifacts
-    let rust_extensions = [".rlib", ".rmeta", ".d", ".so", ".dylib", ".dll"];
-    let artifacts: Vec<_> = all_entries
-        .iter()
-        .filter(|(_, idx)| {
-            idx.output_names
-                .iter()
-                .any(|n| rust_extensions.iter().any(|ext| n.ends_with(ext)))
-        })
-        .collect();
-
-    if artifacts.is_empty() {
-        return Err(format!(
-            "no cached Rust artifacts found ({} total entries in index)",
-            all_entries.len()
-        ));
+    if all_entries.is_empty() {
+        return Err("no cached artifacts found in index".to_string());
     }
+
+    let artifacts = all_entries;
 
     let deps_dir = target_dir.join(profile).join("deps");
     std::fs::create_dir_all(&deps_dir)
@@ -2716,7 +2704,7 @@ mod tests {
 
         // Verify counts
         assert_eq!(errors, 0, "should have 0 errors");
-        assert_eq!(restored, 4, "should restore 4 Rust files (3 from serde + 1 from proc_macro2)");
+        assert_eq!(restored, 5, "should restore all 5 files (3 serde + 1 proc_macro2 + 1 C++ .o)");
         assert_eq!(skipped, 0, "all payloads exist on disk");
 
         // Verify files exist at correct paths
@@ -2730,8 +2718,9 @@ mod tests {
         assert_eq!(std::fs::read(deps.join("libserde-abc123.rlib")).unwrap(), b"rlib-content");
         assert_eq!(std::fs::read(deps.join("libproc_macro2-def456.rlib")).unwrap(), b"proc-macro2-rlib");
 
-        // Verify C++ artifact was NOT restored
-        assert!(!deps.join("foo.o").exists(), "C++ .o file should NOT be in deps/");
+        // Verify C++ artifact IS restored (warm restores everything, not just Rust)
+        assert!(deps.join("foo.o").exists(), "C++ .o file should also be in deps/");
+        assert_eq!(std::fs::read(deps.join("foo.o")).unwrap(), b"object-file");
 
         // Verify mtime is recent (within 5 seconds)
         let meta = std::fs::metadata(deps.join("libserde-abc123.rlib")).unwrap();
