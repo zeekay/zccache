@@ -133,6 +133,17 @@ runs:
         key: ${{ steps.keys.outputs.target-key }}
         restore-keys: ${{ steps.keys.outputs.target-restore }}
 
+    - name: Freshen target timestamps
+      if: inputs.cache-target == 'true' && steps.restore-target.outputs.cache-hit != ''
+      shell: bash
+      run: |
+        # actions/checkout gives source files the current timestamp, which is
+        # newer than the cached target artifacts. Touch everything in target/
+        # so cargo's fingerprint check sees artifacts as newer than sources.
+        if [ -d "${{ inputs.target-dir }}" ]; then
+          find "${{ inputs.target-dir }}" -type f -exec touch {} + 2>/dev/null || true
+        fi
+
     # --- Install zccache ---
     # Try binary download first (faster, no Python dependency), fall back to pip
     - name: Install zccache and start daemon
