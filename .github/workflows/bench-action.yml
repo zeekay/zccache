@@ -13,16 +13,19 @@ concurrency:
   group: bench-action-${{ github.ref }}
   cancel-in-progress: true
 
-# The benchmark builds zccache-core (a real crate with dependencies) three ways:
-# 1. Bare cargo (no caching)
-# 2. sccache (mozilla-actions/sccache-action)
-# 3. zccache (this repo's action)
+# Benchmarks three caching strategies building zccache-core:
 #
-# Each approach does: cold build → clean → warm build → clean → warm build
-# and reports wall-clock seconds for every step.
+# 1. Bare cargo (no caching at all)
+# 2. sccache (mozilla-actions/sccache-action)
+# 3. zccache (this repo's action, with target metadata caching)
+#
+# Each measures:
+# - Cold build: first build, empty caches
+# - Warm (clean target): cargo clean then rebuild — tests compilation cache only
+# - Warm (with target): no clean, cargo sees fingerprints — tests full cache stack
+# - No-op: immediate rebuild, nothing changed — tests cargo skip path
 
 env:
-  # Build a real crate that takes non-trivial time
   BUILD_TARGET: zccache-core
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
@@ -33,9 +36,10 @@ jobs:
     name: "Bare (no cache)"
     runs-on: ubuntu-24.04
     outputs:
-      cold: ${{ steps.cold.outputs.seconds }}
-      warm1: ${{ steps.warm1.outputs.seconds }}
-      warm2: ${{ steps.warm2.outputs.seconds }}
+      cold: ${{ steps.cold.outputs.ms }}
+      warm_clean: ${{ steps.warm_clean.outputs.ms }}
+      warm_target: ${{ steps.warm_target.outputs.ms }}
+      noop: ${{ steps.noop.outputs.ms }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,46 +52,54 @@ jobs:
           START=$(date +%s%N)
           cargo build -p $BUILD_TARGET 2>&1
           END=$(date +%s%N)
-          ELAPSED=$(( (END - START) / 1000000 ))
-          echo "seconds=$ELAPSED" >> "$GITHUB_OUTPUT"
-          echo "::notice::Bare cold build: ${ELAPSED}ms"
+          MS=$(( (END - START) / 1000000 ))
+          echo "ms=$MS" >> "$GITHUB_OUTPUT"
+          echo "::notice::Bare cold: ${MS}ms"
 
-      - name: "Clean"
-        run: cargo clean
-
-      - name: "Warm build 1 (no cache = full rebuild)"
-        id: warm1
+      - name: "No-op rebuild (nothing changed)"
+        id: noop
         shell: bash
         run: |
           START=$(date +%s%N)
           cargo build -p $BUILD_TARGET 2>&1
           END=$(date +%s%N)
-          ELAPSED=$(( (END - START) / 1000000 ))
-          echo "seconds=$ELAPSED" >> "$GITHUB_OUTPUT"
-          echo "::notice::Bare warm1 build: ${ELAPSED}ms"
+          MS=$(( (END - START) / 1000000 ))
+          echo "ms=$MS" >> "$GITHUB_OUTPUT"
+          echo "::notice::Bare no-op: ${MS}ms"
 
-      - name: "Clean"
-        run: cargo clean
+      - name: "Clean target, rebuild"
+        id: warm_clean
+        shell: bash
+        run: |
+          cargo clean
+          START=$(date +%s%N)
+          cargo build -p $BUILD_TARGET 2>&1
+          END=$(date +%s%N)
+          MS=$(( (END - START) / 1000000 ))
+          echo "ms=$MS" >> "$GITHUB_OUTPUT"
+          echo "::notice::Bare warm (clean target): ${MS}ms"
 
-      - name: "Warm build 2 (no cache = full rebuild)"
-        id: warm2
+      # "warm_target" = same as cold for bare, since there's no external cache
+      - name: "Rebuild with target intact"
+        id: warm_target
         shell: bash
         run: |
           START=$(date +%s%N)
           cargo build -p $BUILD_TARGET 2>&1
           END=$(date +%s%N)
-          ELAPSED=$(( (END - START) / 1000000 ))
-          echo "seconds=$ELAPSED" >> "$GITHUB_OUTPUT"
-          echo "::notice::Bare warm2 build: ${ELAPSED}ms"
+          MS=$(( (END - START) / 1000000 ))
+          echo "ms=$MS" >> "$GITHUB_OUTPUT"
+          echo "::notice::Bare warm (target intact): ${MS}ms"
 
-  # ── sccache (legacy) ─────────────────────────────────────────
+  # ── sccache ──────────────────────────────────────────────────
   sccache:
     name: "sccache"
     runs-on: ubuntu-24.04
     outputs:
-      cold: ${{ steps.cold.outputs.seconds }}
-      warm1: ${{ steps.warm1.outputs.seconds }}
-      warm2: ${{ steps.warm2.outputs.seconds }}
+      cold: ${{ steps.cold.outputs.ms }}
+      warm_clean: ${{ steps.warm_clean.outputs.ms }}
+      warm_target: ${{ steps.warm_target.outputs.ms }}
+      noop: ${{ steps.noop.outputs.ms }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -96,7 +108,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: "Cold build (sccache cold cache)"
+      - name: "Cold build"
         id: cold
         shell: bash
         run: |
@@ -104,55 +116,55 @@ jobs:
           START=$(date +%s%N)
           cargo build -p $BUILD_TARGET 2>&1
           END=$(date +%s%N)
-          ELAPSED=$(( (END - START) / 1000000 ))
-          echo "seconds=$ELAPSED" >> "$GITHUB_OUTPUT"
-          echo "::notice::sccache cold build: ${ELAPSED}ms"
+          MS=$(( (END - START) / 1000000 ))
+          echo "ms=$MS" >> "$GITHUB_OUTPUT"
+          echo "::notice::sccache cold: ${MS}ms"
 
-      - name: "sccache stats after cold"
-        run: sccache --show-stats
-
-      - name: "Clean"
-        run: cargo clean
-
-      - name: "Warm build 1 (sccache warm cache)"
-        id: warm1
+      - name: "No-op rebuild"
+        id: noop
         shell: bash
         run: |
           START=$(date +%s%N)
           cargo build -p $BUILD_TARGET 2>&1
           END=$(date +%s%N)
-          ELAPSED=$(( (END - START) / 1000000 ))
-          echo "seconds=$ELAPSED" >> "$GITHUB_OUTPUT"
-          echo "::notice::sccache warm1 build: ${ELAPSED}ms"
+          MS=$(( (END - START) / 1000000 ))
+          echo "ms=$MS" >> "$GITHUB_OUTPUT"
+          echo "::notice::sccache no-op: ${MS}ms"
 
-      - name: "sccache stats after warm1"
-        run: sccache --show-stats
+      - name: "Clean target, rebuild (sccache warm)"
+        id: warm_clean
+        shell: bash
+        run: |
+          cargo clean
+          START=$(date +%s%N)
+          cargo build -p $BUILD_TARGET 2>&1
+          END=$(date +%s%N)
+          MS=$(( (END - START) / 1000000 ))
+          echo "ms=$MS" >> "$GITHUB_OUTPUT"
+          echo "::notice::sccache warm (clean target): ${MS}ms"
 
-      - name: "Clean"
-        run: cargo clean
-
-      - name: "Warm build 2 (sccache warm cache)"
-        id: warm2
+      - name: "Rebuild with target intact"
+        id: warm_target
         shell: bash
         run: |
           START=$(date +%s%N)
           cargo build -p $BUILD_TARGET 2>&1
           END=$(date +%s%N)
-          ELAPSED=$(( (END - START) / 1000000 ))
-          echo "seconds=$ELAPSED" >> "$GITHUB_OUTPUT"
-          echo "::notice::sccache warm2 build: ${ELAPSED}ms"
+          MS=$(( (END - START) / 1000000 ))
+          echo "ms=$MS" >> "$GITHUB_OUTPUT"
+          echo "::notice::sccache warm (target intact): ${MS}ms"
 
-      - name: "sccache final stats"
-        run: sccache --show-stats
+      - run: sccache --show-stats
 
-  # ── zccache (new) ────────────────────────────────────────────
+  # ── zccache ──────────────────────────────────────────────────
   zccache:
     name: "zccache"
     runs-on: ubuntu-24.04
     outputs:
-      cold: ${{ steps.cold.outputs.seconds }}
-      warm1: ${{ steps.warm1.outputs.seconds }}
-      warm2: ${{ steps.warm2.outputs.seconds }}
+      cold: ${{ steps.cold.outputs.ms }}
+      warm_clean: ${{ steps.warm_clean.outputs.ms }}
+      warm_target: ${{ steps.warm_target.outputs.ms }}
+      noop: ${{ steps.noop.outputs.ms }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -161,7 +173,7 @@ jobs:
         with:
           shared-key: bench
 
-      - name: "Cold build (zccache cold cache)"
+      - name: "Cold build"
         id: cold
         shell: bash
         run: |
@@ -169,46 +181,45 @@ jobs:
           START=$(date +%s%N)
           cargo build -p $BUILD_TARGET 2>&1
           END=$(date +%s%N)
-          ELAPSED=$(( (END - START) / 1000000 ))
-          echo "seconds=$ELAPSED" >> "$GITHUB_OUTPUT"
-          echo "::notice::zccache cold build: ${ELAPSED}ms"
+          MS=$(( (END - START) / 1000000 ))
+          echo "ms=$MS" >> "$GITHUB_OUTPUT"
+          echo "::notice::zccache cold: ${MS}ms"
 
-      - name: "zccache stats after cold"
-        run: zccache status
-
-      - name: "Clean"
-        run: cargo clean
-
-      - name: "Warm build 1 (zccache warm cache)"
-        id: warm1
+      - name: "No-op rebuild (cargo sees fingerprints, skips everything)"
+        id: noop
         shell: bash
         run: |
           START=$(date +%s%N)
           cargo build -p $BUILD_TARGET 2>&1
           END=$(date +%s%N)
-          ELAPSED=$(( (END - START) / 1000000 ))
-          echo "seconds=$ELAPSED" >> "$GITHUB_OUTPUT"
-          echo "::notice::zccache warm1 build: ${ELAPSED}ms"
+          MS=$(( (END - START) / 1000000 ))
+          echo "ms=$MS" >> "$GITHUB_OUTPUT"
+          echo "::notice::zccache no-op: ${MS}ms"
 
-      - name: "zccache stats after warm1"
-        run: zccache status
+      - name: "Clean target, rebuild (zccache warm, no fingerprints)"
+        id: warm_clean
+        shell: bash
+        run: |
+          cargo clean
+          START=$(date +%s%N)
+          cargo build -p $BUILD_TARGET 2>&1
+          END=$(date +%s%N)
+          MS=$(( (END - START) / 1000000 ))
+          echo "ms=$MS" >> "$GITHUB_OUTPUT"
+          echo "::notice::zccache warm (clean target): ${MS}ms"
 
-      - name: "Clean"
-        run: cargo clean
-
-      - name: "Warm build 2 (zccache warm cache)"
-        id: warm2
+      - name: "Rebuild with target intact (full cache stack)"
+        id: warm_target
         shell: bash
         run: |
           START=$(date +%s%N)
           cargo build -p $BUILD_TARGET 2>&1
           END=$(date +%s%N)
-          ELAPSED=$(( (END - START) / 1000000 ))
-          echo "seconds=$ELAPSED" >> "$GITHUB_OUTPUT"
-          echo "::notice::zccache warm2 build: ${ELAPSED}ms"
+          MS=$(( (END - START) / 1000000 ))
+          echo "ms=$MS" >> "$GITHUB_OUTPUT"
+          echo "::notice::zccache warm (target intact): ${MS}ms"
 
-      - name: "zccache final stats"
-        run: zccache status
+      - run: zccache status
 
       - if: always()
         uses: ./action/cleanup
@@ -222,61 +233,58 @@ jobs:
       - name: Print comparison table
         shell: bash
         run: |
-          BARE_COLD=${{ needs.bare.outputs.cold }}
-          BARE_WARM1=${{ needs.bare.outputs.warm1 }}
-          BARE_WARM2=${{ needs.bare.outputs.warm2 }}
-          SC_COLD=${{ needs.sccache.outputs.cold }}
-          SC_WARM1=${{ needs.sccache.outputs.warm1 }}
-          SC_WARM2=${{ needs.sccache.outputs.warm2 }}
-          ZC_COLD=${{ needs.zccache.outputs.cold }}
-          ZC_WARM1=${{ needs.zccache.outputs.warm1 }}
-          ZC_WARM2=${{ needs.zccache.outputs.warm2 }}
-
-          echo "## Benchmark Results: zccache-core build" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Benchmark: \`cargo build -p zccache-core\` on ubuntu-24.04" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Phase | Bare (no cache) | sccache | zccache | zccache vs sccache | zccache vs bare |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Scenario | Bare | sccache | zccache | zccache vs sccache | zccache vs bare |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
 
-          for PHASE in cold warm1 warm2; do
-            case $PHASE in
-              cold)  B=$BARE_COLD;  S=$SC_COLD;  Z=$ZC_COLD;  LABEL="Cold build" ;;
-              warm1) B=$BARE_WARM1; S=$SC_WARM1; Z=$ZC_WARM1; LABEL="Warm build 1" ;;
-              warm2) B=$BARE_WARM2; S=$SC_WARM2; Z=$ZC_WARM2; LABEL="Warm build 2" ;;
+          declare -A BARE=( [cold]=${{ needs.bare.outputs.cold }} [warm_clean]=${{ needs.bare.outputs.warm_clean }} [warm_target]=${{ needs.bare.outputs.warm_target }} [noop]=${{ needs.bare.outputs.noop }} )
+          declare -A SC=( [cold]=${{ needs.sccache.outputs.cold }} [warm_clean]=${{ needs.sccache.outputs.warm_clean }} [warm_target]=${{ needs.sccache.outputs.warm_target }} [noop]=${{ needs.sccache.outputs.noop }} )
+          declare -A ZC=( [cold]=${{ needs.zccache.outputs.cold }} [warm_clean]=${{ needs.zccache.outputs.warm_clean }} [warm_target]=${{ needs.zccache.outputs.warm_target }} [noop]=${{ needs.zccache.outputs.noop }} )
+
+          for KEY in cold noop warm_clean warm_target; do
+            case $KEY in
+              cold)        LABEL="Cold build (empty cache)" ;;
+              noop)        LABEL="No-op (nothing changed)" ;;
+              warm_clean)  LABEL="Warm (clean target)" ;;
+              warm_target) LABEL="Warm (target intact)" ;;
             esac
 
-            # Calculate speedup ratios
+            B=${BARE[$KEY]}; S=${SC[$KEY]}; Z=${ZC[$KEY]}
+
+            VS_SC="N/A"; VS_BARE="N/A"
             if [ "$Z" -gt 0 ] 2>/dev/null; then
-              if [ "$S" -gt 0 ] 2>/dev/null; then
-                VS_SC=$(awk "BEGIN {printf \"%.1fx\", $S/$Z}")
-              else
-                VS_SC="N/A"
-              fi
-              if [ "$B" -gt 0 ] 2>/dev/null; then
-                VS_BARE=$(awk "BEGIN {printf \"%.1fx\", $B/$Z}")
-              else
-                VS_BARE="N/A"
-              fi
-            else
-              VS_SC="N/A"
-              VS_BARE="N/A"
+              [ "$S" -gt 0 ] 2>/dev/null && VS_SC=$(awk "BEGIN {printf \"%.1fx\", $S/$Z}")
+              [ "$B" -gt 0 ] 2>/dev/null && VS_BARE=$(awk "BEGIN {printf \"%.1fx\", $B/$Z}")
             fi
 
-            echo "| **$LABEL** | ${B}ms | ${S}ms | ${Z}ms | **${VS_SC}** | **${VS_BARE}** |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| **$LABEL** | ${B}ms | ${S}ms | **${Z}ms** | ${VS_SC} | ${VS_BARE} |" >> "$GITHUB_STEP_SUMMARY"
           done
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "> Cold = first build (empty cache). Warm = rebuild after \`cargo clean\` (cache hot)." >> "$GITHUB_STEP_SUMMARY"
-          echo "> All runs on \`ubuntu-24.04\`, same hardware. \`CARGO_INCREMENTAL=0\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "<details><summary>What each scenario means</summary>" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Cold build**: First build, all caches empty." >> "$GITHUB_STEP_SUMMARY"
+          echo "- **No-op**: Immediate rebuild, nothing changed. Measures cargo's fingerprint check speed." >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Warm (clean target)**: \`cargo clean\` then rebuild. Target dir is empty but compilation cache has artifacts. This is the worst case for CI (new runner, no target cache)." >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Warm (target intact)**: Rebuild after the clean+rebuild. Target dir has fingerprints + artifacts. This is the best case — what happens when target metadata cache is restored." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
 
           echo ""
           echo "============================================"
-          echo "  BENCHMARK RESULTS: zccache-core build"
+          echo "  BENCHMARK RESULTS"
           echo "============================================"
           echo ""
-          printf "%-20s %12s %12s %12s\n" "Phase" "Bare" "sccache" "zccache"
-          printf "%-20s %12s %12s %12s\n" "---" "---" "---" "---"
-          printf "%-20s %10sms %10sms %10sms\n" "Cold build" "$BARE_COLD" "$SC_COLD" "$ZC_COLD"
-          printf "%-20s %10sms %10sms %10sms\n" "Warm build 1" "$BARE_WARM1" "$SC_WARM1" "$ZC_WARM1"
-          printf "%-20s %10sms %10sms %10sms\n" "Warm build 2" "$BARE_WARM2" "$SC_WARM2" "$ZC_WARM2"
+          printf "%-30s %10s %10s %10s\n" "Scenario" "Bare" "sccache" "zccache"
+          printf "%-30s %10s %10s %10s\n" "---" "---" "---" "---"
+          for KEY in cold noop warm_clean warm_target; do
+            case $KEY in
+              cold)        LABEL="Cold build" ;;
+              noop)        LABEL="No-op" ;;
+              warm_clean)  LABEL="Warm (clean target)" ;;
+              warm_target) LABEL="Warm (target intact)" ;;
+            esac
+            printf "%-30s %8sms %8sms %8sms\n" "$LABEL" "${BARE[$KEY]}" "${SC[$KEY]}" "${ZC[$KEY]}"
+          done
           echo ""
