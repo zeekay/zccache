@@ -144,7 +144,34 @@ runs:
         done
 
         # Verify zccache is available and start
-        which zccache || { echo "ERROR: zccache not found on PATH after pip install"; exit 1; }
+        if ! which zccache 2>/dev/null; then
+          echo "zccache not found on PATH, searching..."
+          # Find where pip put it
+          ZCCACHE_BIN="$(python -c 'import zccache; import os; print(os.path.dirname(zccache.__file__))' 2>/dev/null || true)"
+          echo "zccache package dir: $ZCCACHE_BIN"
+          find "$(python -c 'import site; print(site.getusersitepackages())' 2>/dev/null || echo /dev/null)" -name 'zccache' -type f 2>/dev/null || true
+          find "$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))' 2>/dev/null || echo /dev/null)" -name 'zccache*' 2>/dev/null || true
+          # Last resort: find it via the pip show and add to PATH
+          INSTALL_LOC="$(pip show -f zccache 2>/dev/null | grep 'Location:' | awk '{print $2}')"
+          if [ -n "$INSTALL_LOC" ]; then
+            echo "pip install location: $INSTALL_LOC"
+            # The entry_points scripts are in a bin/ relative to the install
+            for BIN_DIR in \
+              "$(python -c 'import sysconfig; print(sysconfig.get_path("scripts", "posix_user"))' 2>/dev/null || true)" \
+              "$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))' 2>/dev/null || true)" \
+              "$HOME/.local/bin" \
+              "/usr/local/bin" \
+              "$(dirname "$(python -c 'import sys; print(sys.executable)')")" ; do
+              if [ -f "$BIN_DIR/zccache" ] || [ -f "$BIN_DIR/run_zccache" ]; then
+                echo "Found zccache in: $BIN_DIR"
+                export PATH="$BIN_DIR:$PATH"
+                echo "$BIN_DIR" >> "$GITHUB_PATH"
+                break
+              fi
+            done
+          fi
+          which zccache || { echo "ERROR: zccache still not found on PATH"; exit 1; }
+        fi
         zccache start
 
     # --- Export environment ---
