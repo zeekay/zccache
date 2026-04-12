@@ -141,28 +141,34 @@ runs:
           else
             pip install "zccache==${VERSION}"
           fi
-
-          # Add pip scripts directories to PATH
+          # pip may put scripts in various locations depending on platform/permissions
+          # Find where the zccache binary actually landed
+          FOUND_DIR=""
           for DIR in \
-            "$(python -c 'import sysconfig; print(sysconfig.get_path("scripts", "posix_user"))' 2>/dev/null || true)" \
             "$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))' 2>/dev/null || true)" \
+            "$(python -c 'import sysconfig; print(sysconfig.get_path("scripts", "posix_user"))' 2>/dev/null || true)" \
+            "$(python -c 'import sysconfig; print(sysconfig.get_path("scripts", "nt_user"))' 2>/dev/null || true)" \
             "$(dirname "$(python -c 'import sys; print(sys.executable)')")" \
-            "$HOME/.local/bin"; do
-            if [ -n "$DIR" ] && [ -d "$DIR" ]; then
-              export PATH="$DIR:$PATH"
-              echo "$DIR" >> "$GITHUB_PATH"
+            "$HOME/.local/bin" \
+            "/usr/local/bin"; do
+            if [ -n "$DIR" ] && [ -f "$DIR/zccache" -o -f "$DIR/zccache.exe" ]; then
+              FOUND_DIR="$DIR"
+              break
             fi
           done
 
-          # Fix executable permissions (macOS PyPI bundles may lose +x)
-          if [ "${{ runner.os }}" != "Windows" ]; then
-            for DIR in \
-              "$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))' 2>/dev/null || true)" \
-              "$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))' 2>/dev/null || true)"; do
-              if [ -n "$DIR" ] && [ -d "$DIR" ]; then
-                find "$DIR" -name 'zccache*' -type f ! -perm -u=x -exec chmod +x {} + 2>/dev/null || true
-              fi
-            done
+          # If not found in standard locations, ask pip directly
+          if [ -z "$FOUND_DIR" ]; then
+            FOUND_DIR="$(python -c 'import importlib.metadata as m,os;d=m.distribution("zccache");[print(os.path.dirname(str((d._path.parent/f).resolve()))) for f in d.files if f.name in("zccache","zccache.exe")]' 2>/dev/null | head -1 || true)"
+          fi
+
+          if [ -n "$FOUND_DIR" ]; then
+            export PATH="$FOUND_DIR:$PATH"
+            echo "$FOUND_DIR" >> "$GITHUB_PATH"
+            # Fix executable permissions (macOS PyPI bundles may lose +x)
+            if [ "${{ runner.os }}" != "Windows" ]; then
+              chmod +x "$FOUND_DIR/zccache" "$FOUND_DIR/zccache-daemon" 2>/dev/null || true
+            fi
           fi
         fi
 
