@@ -113,6 +113,20 @@ runs:
           pip install "zccache==${VERSION}"
         fi
 
+        # Ensure pip scripts directory is on PATH
+        # pip may install to ~/.local/bin (Linux) or ~/Library/Python/X.Y/bin (macOS)
+        PIP_SCRIPTS="$(python -c 'import sysconfig; print(sysconfig.get_path("scripts", "posix_user"))' 2>/dev/null || true)"
+        if [ -n "$PIP_SCRIPTS" ] && [ -d "$PIP_SCRIPTS" ]; then
+          echo "$PIP_SCRIPTS" >> "$GITHUB_PATH"
+          export PATH="$PIP_SCRIPTS:$PATH"
+        fi
+        # Also add the system scripts directory
+        PIP_SCRIPTS_SYS="$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))' 2>/dev/null || true)"
+        if [ -n "$PIP_SCRIPTS_SYS" ] && [ -d "$PIP_SCRIPTS_SYS" ]; then
+          echo "$PIP_SCRIPTS_SYS" >> "$GITHUB_PATH"
+          export PATH="$PIP_SCRIPTS_SYS:$PATH"
+        fi
+
     - name: Fix executable permissions and start daemon
       shell: bash
       run: |
