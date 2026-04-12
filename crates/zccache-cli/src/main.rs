@@ -194,6 +194,18 @@ enum Commands {
         #[command(subcommand)]
         action: CargoRegistryCommands,
     },
+    /// Pre-populate target/ with cached artifacts for near-instant builds.
+    Warm {
+        /// Cargo target directory (default: ./target).
+        #[arg(long, default_value = "target")]
+        target_dir: String,
+        /// Build profile (default: debug).
+        #[arg(long, default_value = "debug")]
+        profile: String,
+        /// IPC endpoint (default: platform-specific).
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -304,6 +316,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "download",
     "cargo-registry",
     "gha-cache",
+    "warm",
     "help",
     "--help",
     "-h",
@@ -539,6 +552,15 @@ fn main() -> ExitCode {
             CargoRegistryCommands::Hash { lockfile } => cmd_cargo_registry_hash(&lockfile),
             CargoRegistryCommands::Clean => cmd_cargo_registry_clean(),
         },
+        Commands::Warm {
+            target_dir,
+            profile,
+            endpoint,
+        } => {
+            let endpoint = resolve_endpoint(endpoint.as_deref());
+            let target_dir = absolute_path(&target_dir);
+            run_async(cmd_warm(&endpoint, &target_dir, &profile))
+        }
     }
 }
 
@@ -812,6 +834,140 @@ async fn cmd_clear(endpoint: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+async fn cmd_warm(endpoint: &str, target_dir: &Path, profile: &str) -> ExitCode {
+    // Ensure daemon is running.
+    if let Err(e) = ensure_daemon(endpoint).await {
+        eprintln!("zccache warm: cannot start daemon at {endpoint}: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let mut conn = match connect(endpoint).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("zccache warm: cannot connect to daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Send ListRustArtifacts request.
+    if let Err(e) = conn
+        .send(&zccache_protocol::Request::ListRustArtifacts)
+        .await
+    {
+        eprintln!("zccache warm: failed to send to daemon: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let recv_result = match conn.recv().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("zccache warm: broken connection to daemon: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let artifacts = match recv_result {
+        Some(zccache_protocol::Response::RustArtifactList { artifacts }) => artifacts,
+        None => {
+            eprintln!("zccache warm: lost connection to daemon (no response)");
+            return ExitCode::FAILURE;
+        }
+        Some(zccache_protocol::Response::Error { message }) => {
+            eprintln!("zccache warm: daemon error: {message}");
+            return ExitCode::FAILURE;
+        }
+        Some(other) => {
+            eprintln!("zccache warm: unexpected response: {other:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if artifacts.is_empty() {
+        println!("zccache warm: no cached Rust artifacts found");
+        return ExitCode::SUCCESS;
+    }
+
+    let deps_dir = target_dir.join(profile).join("deps");
+    if let Err(e) = std::fs::create_dir_all(&deps_dir) {
+        eprintln!(
+            "zccache warm: failed to create deps dir {}: {e}",
+            deps_dir.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let artifact_dir = zccache_core::config::artifacts_dir();
+    let now = std::time::SystemTime::now();
+    let file_times = std::fs::FileTimes::new()
+        .set_accessed(now)
+        .set_modified(now);
+
+    let mut restored = 0u64;
+    let mut skipped = 0u64;
+    let mut errors = 0u64;
+
+    for artifact in &artifacts {
+        for (i, name) in artifact.output_names.iter().enumerate() {
+            let src = artifact_dir.join(format!("{}_{i}", artifact.cache_key));
+            let dst = deps_dir.join(name);
+
+            // Skip if source payload does not exist on disk.
+            if !src.exists() {
+                skipped += 1;
+                continue;
+            }
+
+            // Remove existing file at destination (hardlink will fail if it exists).
+            if dst.exists() {
+                if let Err(e) = std::fs::remove_file(&dst) {
+                    eprintln!(
+                        "zccache warm: failed to remove existing {}: {e}",
+                        dst.display()
+                    );
+                    errors += 1;
+                    continue;
+                }
+            }
+
+            // Try hardlink first, fall back to copy.
+            let linked = std::fs::hard_link(&src, &dst).is_ok();
+            if !linked {
+                if let Err(e) = std::fs::copy(&src, &dst) {
+                    eprintln!(
+                        "zccache warm: failed to copy {} -> {}: {e}",
+                        src.display(),
+                        dst.display()
+                    );
+                    errors += 1;
+                    continue;
+                }
+            }
+
+            // Touch mtime to current time so cargo sees the file as fresh.
+            if let Ok(f) = std::fs::File::open(&dst) {
+                let _ = f.set_times(file_times);
+            }
+
+            restored += 1;
+        }
+    }
+
+    println!(
+        "zccache warm: restored {restored} files from {} artifacts into {}",
+        artifacts.len(),
+        deps_dir.display()
+    );
+    if skipped > 0 {
+        println!("  skipped: {skipped} (payload not on disk)");
+    }
+    if errors > 0 {
+        eprintln!("  errors: {errors}");
+        return ExitCode::FAILURE;
+    }
+
+    ExitCode::SUCCESS
 }
 
 async fn cmd_session_start(

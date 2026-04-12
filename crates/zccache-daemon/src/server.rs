@@ -1077,6 +1077,35 @@ async fn handle_connection(
                 state.fingerprint.invalidate(&cache_file);
                 (Response::FingerprintAck, None)
             }
+            Request::ListRustArtifacts => {
+                let mut artifacts = Vec::new();
+                for entry in state.artifacts.iter() {
+                    let key = entry.key().clone();
+                    let cached = entry.value();
+                    // Only include artifacts that look like Rust outputs
+                    // (.rlib, .rmeta, .d files).
+                    let names: Vec<String> = cached.meta.output_names.to_vec();
+                    let is_rust = names.iter().any(|n| {
+                        n.ends_with(".rlib")
+                            || n.ends_with(".rmeta")
+                            || n.ends_with(".d")
+                            || n.ends_with(".so")
+                            || n.ends_with(".dylib")
+                            || n.ends_with(".dll")
+                    });
+                    if is_rust {
+                        artifacts.push(zccache_protocol::RustArtifactInfo {
+                            cache_key: key,
+                            output_names: names.clone(),
+                            payload_count: names.len(),
+                        });
+                    }
+                }
+                (
+                    Response::RustArtifactList { artifacts },
+                    None,
+                )
+            }
         };
 
         // Log to compile journal for journalable requests.

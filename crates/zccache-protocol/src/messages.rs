@@ -130,6 +130,9 @@ pub enum Request {
         /// Path to the cache file.
         cache_file: NormalizedPath,
     },
+    /// List all cached Rust artifacts with their output paths.
+    /// NOTE: Appended at end to preserve bincode variant indices.
+    ListRustArtifacts,
 }
 
 /// A response from daemon to client.
@@ -215,6 +218,11 @@ pub enum Response {
     },
     /// Fingerprint mark/invalidate acknowledged.
     FingerprintAck,
+    /// List of cached Rust artifacts.
+    /// NOTE: Appended at end to preserve bincode variant indices.
+    RustArtifactList {
+        artifacts: Vec<RustArtifactInfo>,
+    },
 }
 
 /// Daemon status information.
@@ -332,6 +340,17 @@ pub struct ArtifactOutput {
     pub name: String,
     /// File contents (Arc-wrapped to avoid deep copies during caching).
     pub data: Arc<Vec<u8>>,
+}
+
+/// Information about a cached Rust compilation artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RustArtifactInfo {
+    /// Cache key hex.
+    pub cache_key: String,
+    /// Output file names (e.g., ["libfoo-abc123.rlib", "libfoo-abc123.rmeta", "foo-abc123.d"]).
+    pub output_names: Vec<String>,
+    /// Number of payload files.
+    pub payload_count: usize,
 }
 
 #[cfg(test)]
@@ -648,8 +667,8 @@ mod tests {
 
     // Compile-time check: PROTOCOL_VERSION must be positive.
     const _: () = assert!(crate::PROTOCOL_VERSION > 0);
-    // Compile-time check: PROTOCOL_VERSION == 5 after LinkEphemeral working_dir removal.
-    const _FINGERPRINT_VERSION: () = assert!(crate::PROTOCOL_VERSION == 5);
+    // Compile-time check: PROTOCOL_VERSION == 6 after ListRustArtifacts addition.
+    const _FINGERPRINT_VERSION: () = assert!(crate::PROTOCOL_VERSION == 6);
 
     #[test]
     fn fingerprint_check_roundtrip() {
@@ -714,6 +733,46 @@ mod tests {
     #[test]
     fn fingerprint_ack_roundtrip() {
         roundtrip(&Response::FingerprintAck);
+    }
+
+    #[test]
+    fn list_rust_artifacts_request_roundtrip() {
+        roundtrip(&Request::ListRustArtifacts);
+    }
+
+    #[test]
+    fn rust_artifact_list_response_roundtrip() {
+        roundtrip(&Response::RustArtifactList {
+            artifacts: vec![
+                RustArtifactInfo {
+                    cache_key: "abc123def456".into(),
+                    output_names: vec![
+                        "libfoo-abc123.rlib".into(),
+                        "libfoo-abc123.rmeta".into(),
+                        "foo-abc123.d".into(),
+                    ],
+                    payload_count: 3,
+                },
+                RustArtifactInfo {
+                    cache_key: "deadbeef".into(),
+                    output_names: vec!["libbar-deadbeef.rlib".into()],
+                    payload_count: 1,
+                },
+            ],
+        });
+        // Empty list
+        roundtrip(&Response::RustArtifactList {
+            artifacts: vec![],
+        });
+    }
+
+    #[test]
+    fn rust_artifact_info_roundtrip() {
+        roundtrip(&RustArtifactInfo {
+            cache_key: "0123456789abcdef".into(),
+            output_names: vec!["test.o".into()],
+            payload_count: 1,
+        });
     }
 
     #[test]
