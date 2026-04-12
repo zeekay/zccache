@@ -227,8 +227,11 @@ runs:
         TARGET="${{ inputs.target-dir }}"
         if [ -d "$TARGET" ]; then
           zccache warm --target-dir "$TARGET" || true
-          # Touch all target files so cargo sees them as newer than source
-          find "$TARGET" -type f -exec touch {} + 2>/dev/null || true
+          # Touch all target files to ONE fixed timestamp so cargo sees
+          # consistent mtimes. Plain 'touch' gives 1ms differences between
+          # files, which cargo interprets as "dep newer than output" → dirty.
+          STAMP=$(date -d '+1 minute' +%Y%m%d%H%M.%S 2>/dev/null || date -v+1M +%Y%m%d%H%M.%S)
+          find "$TARGET" -type f -exec touch -t "$STAMP" {} + 2>/dev/null || true
         fi
 
     # --- Start daemon ---
