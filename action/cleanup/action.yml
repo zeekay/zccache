@@ -65,15 +65,11 @@ runs:
         rm -rf "$SNAPSHOT_DIR"
         mkdir -p "$SNAPSHOT_DIR"
         if [ -d "$TARGET" ]; then
-          # Tar only lightweight metadata — .rlib/.rmeta come from zccache warm
+          # Tar target/ excluding only incremental compilation data.
+          # zccache warm restores .rlib/.rmeta from its artifact cache,
+          # but we keep them in the tar too as a fallback. The tar
+          # includes proc-macro .so/.dll which warm also restores.
           tar cf "$SNAPSHOT_DIR/target-meta.tar" -C "$TARGET" \
-            --exclude='deps/*.rlib' \
-            --exclude='deps/*.so' \
-            --exclude='deps/*.dylib' \
-            --exclude='deps/*.dll' \
-            --exclude='deps/*.exe' \
-            --exclude='deps/*.pdb' \
-            --exclude='deps/lib*.rmeta' \
             --exclude='incremental' \
             . 2>/dev/null || true
           SIZE=$(du -sh "$SNAPSHOT_DIR/target-meta.tar" 2>/dev/null | cut -f1 || echo "?")
