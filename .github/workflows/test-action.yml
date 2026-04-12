@@ -6,11 +6,15 @@ on:
     paths:
       - "action.yml"
       - "action/**"
+      - "crates/zccache-cli/**"
+      - "crates/zccache-gha/**"
       - ".github/workflows/test-action.yml"
   pull_request:
     paths:
       - "action.yml"
       - "action/**"
+      - "crates/zccache-cli/**"
+      - "crates/zccache-gha/**"
       - ".github/workflows/test-action.yml"
   workflow_dispatch:
 
@@ -120,3 +124,166 @@ jobs:
       - name: Cleanup (should skip save)
         if: always()
         uses: ./action/cleanup
+
+  # Test cargo-registry subcommand (issue #10)
+  test-cargo-registry:
+    name: "cargo-registry (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build zccache CLI
+        shell: bash
+        run: cargo build -p zccache-cli
+
+      # --- Test cargo-registry hash ---
+      - name: "cargo-registry hash: produces 16-char hex"
+        shell: bash
+        run: |
+          HASH=$(./target/debug/zccache cargo-registry hash --lockfile Cargo.lock)
+          echo "Hash: $HASH"
+          if [ ${#HASH} -ne 16 ]; then
+            echo "FAIL: expected 16-char hash, got ${#HASH} chars: $HASH"
+            exit 1
+          fi
+
+      - name: "cargo-registry hash: deterministic"
+        shell: bash
+        run: |
+          H1=$(./target/debug/zccache cargo-registry hash --lockfile Cargo.lock)
+          H2=$(./target/debug/zccache cargo-registry hash --lockfile Cargo.lock)
+          if [ "$H1" != "$H2" ]; then
+            echo "FAIL: hash not deterministic: $H1 vs $H2"
+            exit 1
+          fi
+          echo "OK: both runs produced $H1"
+
+      - name: "cargo-registry hash: fails on missing file"
+        shell: bash
+        run: |
+          if ./target/debug/zccache cargo-registry hash --lockfile nonexistent.lock 2>/dev/null; then
+            echo "FAIL: should have failed on missing file"
+            exit 1
+          fi
+          echo "OK: correctly failed on missing file"
+
+      # --- Test cargo-registry save/restore round-trip ---
+      - name: "cargo-registry save: creates archive"
+        shell: bash
+        run: |
+          # Ensure there's something in the cargo registry
+          cargo fetch
+          ./target/debug/zccache cargo-registry save --key test-roundtrip
+          ARCHIVE="$HOME/.zccache/cargo-registry/test-roundtrip.tar.gz"
+          if [ ! -f "$ARCHIVE" ]; then
+            echo "FAIL: archive not created at $ARCHIVE"
+            exit 1
+          fi
+          SIZE=$(wc -c < "$ARCHIVE")
+          echo "OK: archive created ($SIZE bytes)"
+
+      - name: "cargo-registry restore: restores from archive"
+        shell: bash
+        run: |
+          # Save original registry state
+          CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          BEFORE_COUNT=$(find "$CARGO_HOME/registry" -type f 2>/dev/null | wc -l || echo 0)
+
+          # Delete registry and restore
+          rm -rf "$CARGO_HOME/registry/cache" "$CARGO_HOME/registry/index"
+          ./target/debug/zccache cargo-registry restore --key test-roundtrip
+
+          AFTER_COUNT=$(find "$CARGO_HOME/registry" -type f 2>/dev/null | wc -l || echo 0)
+          echo "Files before delete: $BEFORE_COUNT, after restore: $AFTER_COUNT"
+          if [ "$AFTER_COUNT" -eq 0 ]; then
+            echo "FAIL: restore produced no files"
+            exit 1
+          fi
+          echo "OK: registry restored"
+
+      # --- Test cargo-registry clean ---
+      - name: "cargo-registry clean: removes archives"
+        shell: bash
+        run: |
+          ./target/debug/zccache cargo-registry clean
+          ARCHIVE="$HOME/.zccache/cargo-registry/test-roundtrip.tar.gz"
+          if [ -f "$ARCHIVE" ]; then
+            echo "FAIL: archive still exists after clean"
+            exit 1
+          fi
+          echo "OK: archives cleaned"
+
+  # Test gha-cache subcommand (issue #11)
+  test-gha-cache:
+    name: "gha-cache (Linux)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build zccache CLI
+        shell: bash
+        run: cargo build -p zccache-cli
+
+      # --- Test gha-cache status ---
+      - name: "gha-cache status: detects GHA environment"
+        shell: bash
+        run: |
+          # Inside GHA, ACTIONS_CACHE_URL and ACTIONS_RUNTIME_TOKEN are set
+          OUTPUT=$(./target/debug/zccache gha-cache status 2>&1)
+          echo "$OUTPUT"
+          # Should say either "available" or "not available" depending on env
+          if echo "$OUTPUT" | grep -qi "gha cache"; then
+            echo "OK: status command works"
+          else
+            echo "FAIL: unexpected output"
+            exit 1
+          fi
+
+      # --- Test gha-cache save/restore round-trip (uses real GHA cache API) ---
+      - name: "gha-cache save: upload test data"
+        shell: bash
+        run: |
+          # Create test directory with known content
+          mkdir -p /tmp/gha-test-data
+          echo "hello from zccache test" > /tmp/gha-test-data/test.txt
+          date >> /tmp/gha-test-data/test.txt
+
+          ./target/debug/zccache gha-cache save \
+            --key "zccache-test-${{ github.sha }}" \
+            --path /tmp/gha-test-data
+          echo "OK: save completed"
+
+      - name: "gha-cache restore: download and verify"
+        shell: bash
+        run: |
+          # Remove original data
+          rm -rf /tmp/gha-test-data
+          mkdir -p /tmp/gha-restored
+
+          ./target/debug/zccache gha-cache restore \
+            --key "zccache-test-${{ github.sha }}" \
+            --path /tmp/gha-restored
+
+          if [ -f /tmp/gha-restored/test.txt ]; then
+            echo "OK: file restored"
+            cat /tmp/gha-restored/test.txt
+          else
+            echo "FAIL: restored file not found"
+            ls -la /tmp/gha-restored/ 2>/dev/null || echo "(empty)"
+            exit 1
+          fi
+
+      # --- Test unit tests in CI ---
+      - name: "zccache-gha unit tests"
+        shell: bash
+        run: cargo test -p zccache-gha
