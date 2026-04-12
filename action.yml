@@ -25,8 +25,8 @@ inputs:
     default: ""
   zccache-version:
     description: >
-      Version of zccache to install from PyPI.
-      Use "latest" for the newest release.
+      Version of zccache to install.
+      Use "latest" for the newest release, or a specific version like "1.2.3".
     required: false
     default: "latest"
   save-cache:
@@ -102,8 +102,36 @@ runs:
         key: ${{ steps.keys.outputs.registry-key }}
         restore-keys: ${{ steps.keys.outputs.registry-restore }}
 
-    # --- Install and start zccache ---
-    - name: Install zccache and start daemon
+    # --- Install zccache via binary download (no Python dependency) ---
+    - name: Install zccache (Linux/macOS)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        VERSION="${{ inputs.zccache-version }}"
+        INSTALL_DIR="$HOME/.local/bin"
+        mkdir -p "$INSTALL_DIR"
+
+        # Use the install.sh from this repo (or download from GitHub Releases)
+        if [ -f "${{ github.action_path }}/install.sh" ]; then
+          ZCCACHE_INSTALL_VERSION="$VERSION" \
+          ZCCACHE_INSTALL_DIR="$INSTALL_DIR" \
+          ZCCACHE_NO_MODIFY_PATH=1 \
+            sh "${{ github.action_path }}/install.sh"
+        else
+          curl -fsSL https://raw.githubusercontent.com/zackees/zccache/main/install.sh | \
+            ZCCACHE_INSTALL_VERSION="$VERSION" \
+            ZCCACHE_INSTALL_DIR="$INSTALL_DIR" \
+            ZCCACHE_NO_MODIFY_PATH=1 \
+              sh
+        fi
+
+        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+        export PATH="$INSTALL_DIR:$PATH"
+        which zccache
+        zccache start
+
+    - name: Install zccache (Windows)
+      if: runner.os == 'Windows'
       shell: bash
       run: |
         VERSION="${{ inputs.zccache-version }}"
@@ -112,39 +140,13 @@ runs:
         else
           pip install "zccache==${VERSION}"
         fi
-
-        # Collect all possible bin directories where pip may have installed
-        SEARCH_DIRS=""
-        for DIR in \
-          "$(python -c 'import sysconfig; print(sysconfig.get_path("scripts", "posix_user"))' 2>/dev/null || true)" \
-          "$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))' 2>/dev/null || true)" \
-          "$(dirname "$(python -c 'import sys; print(sys.executable)')")" \
-          "$HOME/.local/bin" \
-          "/usr/local/bin"; do
-          if [ -n "$DIR" ] && [ -d "$DIR" ]; then
-            SEARCH_DIRS="$SEARCH_DIRS $DIR"
-            export PATH="$DIR:$PATH"
-            echo "$DIR" >> "$GITHUB_PATH"
-          fi
-        done
-
-        # Fix executable permissions on all candidate directories (macOS/Linux)
-        if [ "${{ runner.os }}" != "Windows" ]; then
-          for DIR in $SEARCH_DIRS; do
-            find "$DIR" -name 'zccache*' -type f ! -perm -u=x -exec chmod +x {} + 2>/dev/null || true
-          done
-          # Also fix inside the site-packages directory itself
-          for SITE_DIR in \
-            "$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))' 2>/dev/null || true)" \
-            "$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))' 2>/dev/null || true)"; do
-            if [ -n "$SITE_DIR" ] && [ -d "$SITE_DIR" ]; then
-              find "$SITE_DIR" -name 'zccache*' -type f ! -perm -u=x -exec chmod +x {} + 2>/dev/null || true
-            fi
-          done
+        # pip scripts dir is typically already on PATH on Windows runners
+        PIP_SCRIPTS="$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))' 2>/dev/null || true)"
+        if [ -n "$PIP_SCRIPTS" ] && [ -d "$PIP_SCRIPTS" ]; then
+          echo "$PIP_SCRIPTS" >> "$GITHUB_PATH"
+          export PATH="$PIP_SCRIPTS:$PATH"
         fi
-
-        # Verify and start
-        which zccache || { echo "ERROR: zccache not found on PATH"; echo "PATH=$PATH"; exit 1; }
+        which zccache
         zccache start
 
     # --- Export environment ---
