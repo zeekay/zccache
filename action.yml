@@ -63,8 +63,13 @@ runs:
         fi
 
         # Hash Cargo.lock for registry cache key (falls back if no lock file)
+        # Use shasum on macOS (sha256sum doesn't exist there)
         if [ -f Cargo.lock ]; then
-          LOCK_HASH=$(sha256sum Cargo.lock | cut -c1-16)
+          if command -v sha256sum &>/dev/null; then
+            LOCK_HASH=$(sha256sum Cargo.lock | cut -c1-16)
+          else
+            LOCK_HASH=$(shasum -a 256 Cargo.lock | cut -c1-16)
+          fi
         else
           LOCK_HASH="no-lock"
         fi
@@ -108,21 +113,25 @@ runs:
           pip install "zccache==${VERSION}"
         fi
 
-    - name: Fix executable permissions (macOS/Linux)
-      if: runner.os != 'Windows'
+    - name: Fix executable permissions and start daemon
       shell: bash
       run: |
         # PyPI-bundled binaries may lose execute bits on some platforms
-        SITE_PKGS=$(python -c "import site; print(site.getusersitepackages())" 2>/dev/null || true)
-        if [ -d "$SITE_PKGS/zccache" ]; then
-          find "$SITE_PKGS/zccache" -type f ! -perm -u=x -exec chmod +x {} + 2>/dev/null || true
-        fi
-        # Also check common pip install locations
-        find ~/.local -name 'zccache*' -type f -exec chmod +x {} + 2>/dev/null || true
+        # Fix permissions everywhere pip might install
+        for SITE_DIR in \
+          "$(python -c 'import site; print(site.getusersitepackages())' 2>/dev/null || true)" \
+          "$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))' 2>/dev/null || true)" \
+          "$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))' 2>/dev/null || true)" \
+          "$HOME/.local" \
+          "/usr/local"; do
+          if [ -n "$SITE_DIR" ] && [ -d "$SITE_DIR" ]; then
+            find "$SITE_DIR" -name 'zccache*' -type f ! -perm -u=x -exec chmod +x {} + 2>/dev/null || true
+          fi
+        done
 
-    - name: Start zccache daemon
-      shell: bash
-      run: zccache start
+        # Verify zccache is available and start
+        which zccache || { echo "ERROR: zccache not found on PATH after pip install"; exit 1; }
+        zccache start
 
     # --- Export environment ---
     - name: Set build environment
