@@ -21,43 +21,9 @@ type ClientConn = zccache_ipc::IpcConnection;
 #[cfg(windows)]
 type ClientConn = zccache_ipc::IpcClientConnection;
 
-pub fn default_endpoint() -> String {
-    #[cfg(unix)]
-    {
-        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-            return format!("{runtime_dir}/zccache-download/sock");
-        }
-        let user = std::env::var("USER").unwrap_or_else(|_| String::from("unknown"));
-        format!("/tmp/zccache-download-{user}/sock")
-    }
-    #[cfg(windows)]
-    {
-        let username = std::env::var("USERNAME").unwrap_or_else(|_| String::from("unknown"));
-        format!(r"\\.\pipe\zccache-download-{username}")
-    }
-}
-
-pub fn lock_file_path() -> NormalizedPath {
-    zccache_core::config::default_cache_dir().join("download-daemon.lock")
-}
-
-pub fn write_lock_file(pid: u32) -> Result<(), std::io::Error> {
-    let path = lock_file_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, pid.to_string())
-}
-
-pub fn remove_lock_file() {
-    let _ = std::fs::remove_file(lock_file_path());
-}
-
-pub fn read_lock_file_pid() -> Option<u32> {
-    std::fs::read_to_string(lock_file_path())
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-}
+pub use zccache_download_protocol::daemon_mgmt::{
+    default_endpoint, lock_file_path, read_lock_file_pid, remove_lock_file, write_lock_file,
+};
 
 pub fn check_running_daemon() -> Option<u32> {
     let pid = read_lock_file_pid()?;

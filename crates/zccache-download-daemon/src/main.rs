@@ -7,6 +7,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::Parser;
+use zccache_download_protocol::daemon_mgmt;
+use zccache_download_protocol::{Request, Response};
 
 #[derive(Debug, Parser)]
 #[command(name = "zccache-download-daemon", version, about)]
@@ -35,16 +37,15 @@ fn print_status(args: &Args) {
     let endpoint = args
         .endpoint
         .clone()
-        .unwrap_or_else(zccache_download_client::default_endpoint);
+        .unwrap_or_else(daemon_mgmt::default_endpoint);
     println!("zccache-download-daemon v{}", env!("CARGO_PKG_VERSION"));
     println!();
     println!("  endpoint:   {endpoint}");
     println!(
         "  lock file:  {}",
-        zccache_download_client::lock_file_path().display()
+        daemon_mgmt::lock_file_path().display()
     );
-    let client = zccache_download_client::DownloadClient::new(Some(endpoint));
-    match client.daemon_status() {
+    match query_daemon_status(&endpoint) {
         Ok(status) => {
             println!("  status:     running");
             println!("  uptime:     {}s", status.uptime_secs);
@@ -57,12 +58,37 @@ fn print_status(args: &Args) {
     }
 }
 
+/// Connect to a running daemon over IPC and query its status.
+fn query_daemon_status(
+    endpoint: &str,
+) -> Result<zccache_download::DownloadDaemonStatus, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to create runtime: {e}"))?;
+    rt.block_on(async {
+        let mut conn = zccache_ipc::connect(endpoint)
+            .await
+            .map_err(|e| format!("download daemon not running at {endpoint}: {e}"))?;
+        conn.send(&Request::Status)
+            .await
+            .map_err(|e| format!("failed to query download daemon: {e}"))?;
+        match conn.recv::<Response>().await {
+            Ok(Some(Response::Status(status))) => Ok(status),
+            Ok(Some(Response::Error { message })) => Err(message),
+            Ok(Some(other)) => Err(format!("unexpected response: {other:?}")),
+            Ok(None) => Err("download daemon closed connection unexpectedly".to_string()),
+            Err(e) => Err(format!("broken connection to download daemon: {e}")),
+        }
+    })
+}
+
 fn run_server(args: Args) {
     let endpoint = args
         .endpoint
-        .unwrap_or_else(zccache_download_client::default_endpoint);
+        .unwrap_or_else(daemon_mgmt::default_endpoint);
     let pid = std::process::id();
-    if let Err(err) = zccache_download_client::write_lock_file(pid) {
+    if let Err(err) = daemon_mgmt::write_lock_file(pid) {
         tracing::warn!("failed to write download daemon lock file: {err}");
     }
 
@@ -75,7 +101,7 @@ fn run_server(args: Args) {
             Ok(server) => server,
             Err(err) => {
                 eprintln!("failed to bind download daemon at {endpoint}: {err}");
-                zccache_download_client::remove_lock_file();
+                daemon_mgmt::remove_lock_file();
                 std::process::exit(1);
             }
         };
@@ -87,10 +113,10 @@ fn run_server(args: Args) {
         });
         if let Err(err) = server.run().await {
             eprintln!("download daemon error: {err}");
-            zccache_download_client::remove_lock_file();
+            daemon_mgmt::remove_lock_file();
             std::process::exit(1);
         }
-        zccache_download_client::remove_lock_file();
+        daemon_mgmt::remove_lock_file();
     });
 }
 

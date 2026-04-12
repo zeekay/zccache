@@ -1,5 +1,7 @@
 #![allow(clippy::missing_errors_doc)]
 
+pub mod daemon_mgmt;
+
 use serde::{Deserialize, Serialize};
 use zccache_core::NormalizedPath;
 use zccache_download::{DownloadDaemonStatus, DownloadOptions, DownloadStatus};

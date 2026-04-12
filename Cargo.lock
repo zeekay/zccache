@@ -3620,7 +3620,6 @@ dependencies = [
  "tracing-subscriber",
  "zccache-core",
  "zccache-download",
- "zccache-download-client",
  "zccache-download-protocol",
  "zccache-ipc",
 ]

@@ -18,7 +18,6 @@ zccache-core = { workspace = true }
 zccache-ipc = { workspace = true }
 zccache-download = { workspace = true }
 zccache-download-protocol = { workspace = true }
-zccache-download-client = { workspace = true }
 tokio-util = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
