@@ -120,28 +120,40 @@ runs:
         key: ${{ steps.keys.outputs.registry-key }}
         restore-keys: ${{ steps.keys.outputs.registry-restore }}
 
-    # --- Layer 3: Restore cargo target directory ---
-    # Restores the full target/ so cargo sees fingerprints + artifacts as fresh.
-    # actions/cache handles compression internally. This is the key to
-    # eliminating the 2s cargo orchestration overhead on warm builds.
-    - name: Restore cargo target cache
+    # --- Layer 3: Restore cargo target metadata ---
+    # Restores lightweight target metadata (fingerprints, build script outputs,
+    # dep-info). The heavy .rlib/.rmeta files are filled in by `zccache warm`.
+    - name: Restore cargo target metadata
       id: restore-target
       if: inputs.cache-target == 'true'
       uses: actions/cache/restore@v4
       with:
-        path: ${{ inputs.target-dir }}
+        path: ~/.zccache-target-meta
         key: ${{ steps.keys.outputs.target-key }}
         restore-keys: ${{ steps.keys.outputs.target-restore }}
 
-    - name: Freshen target timestamps
-      if: inputs.cache-target == 'true' && steps.restore-target.outputs.cache-hit != ''
+    - name: Extract target metadata + warm from zccache
+      if: inputs.cache-target == 'true'
       shell: bash
       run: |
-        # actions/checkout gives source files the current timestamp, which is
-        # newer than the cached target artifacts. Touch everything in target/
-        # so cargo's fingerprint check sees artifacts as newer than sources.
-        if [ -d "${{ inputs.target-dir }}" ]; then
-          find "${{ inputs.target-dir }}" -type f -exec touch {} + 2>/dev/null || true
+        TARGET="${{ inputs.target-dir }}"
+
+        # Step 1: Extract cached target metadata (fingerprints, build outputs)
+        META_TAR="$HOME/.zccache-target-meta/target-meta.tar"
+        if [ -f "$META_TAR" ]; then
+          mkdir -p "$TARGET"
+          tar xf "$META_TAR" -C "$TARGET" 2>/dev/null || true
+          echo "Restored target metadata ($(du -sh "$META_TAR" | cut -f1))"
+        fi
+
+        # Step 2: Fill in .rlib/.rmeta from zccache artifact cache
+        if command -v zccache &>/dev/null; then
+          zccache warm --target-dir "$TARGET" 2>/dev/null || true
+        fi
+
+        # Step 3: Touch everything so cargo sees artifacts as newer than source
+        if [ -d "$TARGET" ]; then
+          find "$TARGET" -type f -exec touch {} + 2>/dev/null || true
         fi
 
     # --- Install zccache ---

@@ -56,11 +56,35 @@ runs:
           ~/.cargo/git/db/
         key: ${{ steps.state.outputs.registry-key }}
 
-    - name: Save cargo target cache
+    - name: Create target metadata snapshot
+      if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-target == 'true'
+      shell: bash
+      run: |
+        TARGET="${{ steps.state.outputs.target-dir }}"
+        SNAPSHOT_DIR="$HOME/.zccache-target-meta"
+        rm -rf "$SNAPSHOT_DIR"
+        mkdir -p "$SNAPSHOT_DIR"
+        if [ -d "$TARGET" ]; then
+          # Tar only lightweight metadata — .rlib/.rmeta come from zccache warm
+          tar cf "$SNAPSHOT_DIR/target-meta.tar" -C "$TARGET" \
+            --exclude='deps/*.rlib' \
+            --exclude='deps/*.so' \
+            --exclude='deps/*.dylib' \
+            --exclude='deps/*.dll' \
+            --exclude='deps/*.exe' \
+            --exclude='deps/*.pdb' \
+            --exclude='deps/lib*.rmeta' \
+            --exclude='incremental' \
+            . 2>/dev/null || true
+          SIZE=$(du -sh "$SNAPSHOT_DIR/target-meta.tar" 2>/dev/null | cut -f1 || echo "?")
+          echo "Saved target metadata snapshot ($SIZE)"
+        fi
+
+    - name: Save cargo target metadata
       if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-target == 'true'
       uses: actions/cache/save@v4
       with:
-        path: ${{ steps.state.outputs.target-dir }}
+        path: ~/.zccache-target-meta
         key: ${{ steps.state.outputs.target-key }}
 
     - name: Clean up state
