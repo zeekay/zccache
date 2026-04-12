@@ -41,7 +41,7 @@ inputs:
       Version of zccache to install.
       Use "latest" for the newest release, or a specific version like "1.2.5".
     required: false
-    default: "1.2.5"
+    default: "1.2.6"
   save-cache:
     description: >
       Whether to save caches at the end. Set to "false" for PR builds
