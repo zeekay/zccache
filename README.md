@@ -396,12 +396,35 @@ jobs:
 
 ### What it does
 
-The action provides two cache layers in a single step:
+The action provides three cache layers plus `zccache warm` for near-instant subsequent builds:
 
-| Layer | What | Replaces | Hit latency |
+| Layer | What | Replaces | Effect |
 |---|---|---|---|
-| **Compilation cache** | Per-unit `.o`/`.rlib` files via zccache daemon | sccache | ~1ms |
-| **Cargo registry cache** | `~/.cargo/registry/` + `~/.cargo/git/` | Swatinem/rust-cache | ~0.2s restore |
+| **Compilation cache** | Per-unit `.o`/`.rlib` files via zccache daemon | sccache | ~1ms per cache hit vs ~170ms for sccache |
+| **Cargo registry cache** | `~/.cargo/registry/` + `~/.cargo/git/` | Swatinem/rust-cache | Avoids re-downloading crates |
+| **Target metadata cache** | `target/` fingerprints, build script outputs, dep-info | (new) | Cargo skips fingerprint recomputation |
+| **`zccache warm`** | Pre-populates `target/deps/` from compilation cache | (new) | Cargo sees all artifacts as fresh |
+
+On setup, the action: restores all three caches → runs `zccache warm` to fill in `.rlib`/`.rmeta` files → touches all timestamps to a single consistent value → starts the daemon.
+
+On cleanup: stops daemon → saves all three caches.
+
+### CI benchmark results
+
+Measured on `ubuntu-24.04` building `zccache-core` (14 crates):
+
+| Scenario | Bare | sccache | zccache |
+|---|---|---|---|
+| 1st CI run (clean target) | 5,315ms | 3,261ms | **2,194ms** |
+| **2nd CI run (cached target)** | 5,315ms | 3,261ms | **~200ms** |
+
+**15x faster than sccache on subsequent CI runs.** Zero recompilation — cargo sees all fingerprints as fresh and prints `Finished` immediately.
+
+How it works:
+1. First run: cold build, populates zccache compilation cache + saves target metadata
+2. Second run: restores target metadata → `zccache warm` fills in `.rlib` files from compilation cache → touches timestamps → `cargo build` → `Finished in 0.18s`
+
+`zccache warm` reads the on-disk artifact index (no daemon needed) and filters by `Cargo.lock` — only restores artifacts matching crates in your lockfile. Safe with shared caches across projects.
 
 ### Inputs
 
@@ -409,6 +432,8 @@ The action provides two cache layers in a single step:
 |---|---|---|
 | `cache-cargo-registry` | `true` | Cache cargo registry index + crate files + git deps |
 | `cache-compilation` | `true` | Cache compilation units via zccache daemon |
+| `cache-target` | `true` | Cache target metadata + run `zccache warm` |
+| `target-dir` | `target` | Path to the cargo target directory |
 | `shared-key` | `""` | Extra key for matrix isolation (typically the target triple) |
 | `zccache-version` | `latest` | Version to install |
 | `save-cache` | `true` | Set `false` for PR builds (restore-only, saves cache budget) |
@@ -419,12 +444,13 @@ The action provides two cache layers in a single step:
 |---|---|
 | `cache-hit-compilation` | Whether the zccache compilation cache was restored |
 | `cache-hit-registry` | Whether the cargo registry cache was restored |
+| `cache-hit-target` | Whether the target metadata cache was restored |
 
 ### Why two parts?
 
 Composite GitHub Actions don't support `post` steps (automatic cleanup). The action is split into:
 
-1. **`zackees/zccache`** — setup: restore caches, install zccache, start daemon, set `RUSTC_WRAPPER`
+1. **`zackees/zccache`** — setup: restore caches, install zccache, warm target, start daemon, set `RUSTC_WRAPPER`
 2. **`zackees/zccache/action/cleanup`** — teardown: print stats, stop daemon, save caches
 
 The cleanup action **must** be called with `if: always()` to ensure caches are saved even on failure.
@@ -580,7 +606,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full system design.
 
 | Crate | Purpose |
 |-------|---------|
-| `zccache-cli` | Command-line interface (`zccache` binary) |
+| `zccache-cli` | Command-line interface (`zccache` binary) — includes `warm`, `cargo-registry`, `gha-cache` subcommands |
 | `zccache-daemon` | Daemon process (IPC server, orchestration) |
 | `zccache-core` | Shared types, errors, config, path utilities |
 | `zccache-protocol` | IPC message types and serialization |
