@@ -836,32 +836,46 @@ async fn cmd_clear(endpoint: &str) -> ExitCode {
 }
 
 fn cmd_warm(target_dir: &Path, profile: &str) -> ExitCode {
-    // Read artifacts directly from the on-disk redb index.
-    // This works even with a fresh daemon that hasn't loaded the index yet (#19).
-    let db_path = zccache_core::config::index_path();
-    let db_path_ref: &std::path::Path = db_path.as_ref();
-    if !db_path_ref.exists() {
-        println!("zccache warm: no artifact index at {}", db_path.display());
-        return ExitCode::SUCCESS;
+    let cache_dir = zccache_core::config::default_cache_dir();
+    let index_path = cache_dir.join("index.redb");
+    let artifact_dir = cache_dir.join("artifacts");
+    match warm_target(index_path.as_ref(), artifact_dir.as_ref(), target_dir, profile) {
+        Ok((restored, skipped, errors)) => {
+            println!(
+                "zccache warm: restored {restored} files, skipped {skipped}, errors {errors}"
+            );
+            if errors > 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(e) => {
+            eprintln!("zccache warm: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Core logic for `zccache warm` — testable with custom paths.
+fn warm_target(
+    index_path: &Path,
+    artifact_dir: &Path,
+    target_dir: &Path,
+    profile: &str,
+) -> Result<(u64, u64, u64), String> {
+    if !index_path.exists() {
+        return Err(format!("no artifact index at {}", index_path.display()));
     }
 
-    let store = match zccache_artifact::ArtifactStore::open(&db_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("zccache warm: failed to open artifact index: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let store = zccache_artifact::ArtifactStore::open(index_path)
+        .map_err(|e| format!("failed to open artifact index: {e}"))?;
 
-    let all_entries = match store.load_all() {
-        Ok(entries) => entries,
-        Err(e) => {
-            eprintln!("zccache warm: failed to read artifact index: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let all_entries = store
+        .load_all()
+        .map_err(|e| format!("failed to read artifact index: {e}"))?;
 
-    // Filter to Rust artifacts (output names ending in .rlib, .rmeta, .d, .so, .dylib)
+    // Filter to Rust artifacts
     let rust_extensions = [".rlib", ".rmeta", ".d", ".so", ".dylib", ".dll"];
     let artifacts: Vec<_> = all_entries
         .iter()
@@ -873,20 +887,15 @@ fn cmd_warm(target_dir: &Path, profile: &str) -> ExitCode {
         .collect();
 
     if artifacts.is_empty() {
-        println!("zccache warm: no cached Rust artifacts found ({} total entries in index)", all_entries.len());
-        return ExitCode::SUCCESS;
+        return Err(format!(
+            "no cached Rust artifacts found ({} total entries in index)",
+            all_entries.len()
+        ));
     }
 
     let deps_dir = target_dir.join(profile).join("deps");
-    if let Err(e) = std::fs::create_dir_all(&deps_dir) {
-        eprintln!(
-            "zccache warm: failed to create deps dir {}: {e}",
-            deps_dir.display()
-        );
-        return ExitCode::FAILURE;
-    }
-
-    let artifact_dir = zccache_core::config::artifacts_dir();
+    std::fs::create_dir_all(&deps_dir)
+        .map_err(|e| format!("failed to create {}: {e}", deps_dir.display()))?;
     let now = std::time::SystemTime::now();
     let file_times = std::fs::FileTimes::new()
         .set_accessed(now)
@@ -942,20 +951,7 @@ fn cmd_warm(target_dir: &Path, profile: &str) -> ExitCode {
         }
     }
 
-    println!(
-        "zccache warm: restored {restored} files from {} artifacts into {}",
-        artifacts.len(),
-        deps_dir.display()
-    );
-    if skipped > 0 {
-        println!("  skipped: {skipped} (payload not on disk)");
-    }
-    if errors > 0 {
-        eprintln!("  errors: {errors}");
-        return ExitCode::FAILURE;
-    }
-
-    ExitCode::SUCCESS
+    Ok((restored, skipped, errors))
 }
 
 async fn cmd_session_start(
@@ -2654,5 +2650,135 @@ mod tests {
     fn exit_code_257_keeps_low_byte() {
         // 257 & 0xFF == 1, non-zero, so kept as-is.
         assert_eq!(exit_code_from_i32(257), ExitCode::from(1));
+    }
+
+    #[test]
+    fn warm_restores_rust_artifacts_to_correct_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let artifact_dir = cache_dir.join("artifacts");
+        let index_path = cache_dir.join("index.redb");
+        let target_dir = dir.path().join("target");
+
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+
+        // Create a fake artifact store with two Rust crates
+        let store = zccache_artifact::ArtifactStore::open(&index_path).unwrap();
+
+        // Artifact 1: libserde-abc123.rlib + libserde-abc123.rmeta + serde-abc123.d
+        let key1 = "aaaaaaaabbbbbbbb";
+        let idx1 = zccache_artifact::ArtifactIndex::new(
+            vec![
+                "libserde-abc123.rlib".to_string(),
+                "libserde-abc123.rmeta".to_string(),
+                "serde-abc123.d".to_string(),
+            ],
+            vec![100, 50, 10],
+            vec![],
+            vec![],
+            0,
+        );
+        store.insert(key1, &idx1).unwrap();
+        // Write payload files on disk
+        std::fs::write(artifact_dir.join(format!("{key1}_0")), b"rlib-content").unwrap();
+        std::fs::write(artifact_dir.join(format!("{key1}_1")), b"rmeta-content").unwrap();
+        std::fs::write(artifact_dir.join(format!("{key1}_2")), b"dep-info").unwrap();
+
+        // Artifact 2: libproc_macro2-def456.rlib
+        let key2 = "ccccccccdddddddd";
+        let idx2 = zccache_artifact::ArtifactIndex::new(
+            vec!["libproc_macro2-def456.rlib".to_string()],
+            vec![200],
+            vec![],
+            vec![],
+            0,
+        );
+        store.insert(key2, &idx2).unwrap();
+        std::fs::write(artifact_dir.join(format!("{key2}_0")), b"proc-macro2-rlib").unwrap();
+
+        // Artifact 3: NOT Rust (C++ object file) — should be filtered out
+        let key3 = "eeeeeeeeffffffff";
+        let idx3 = zccache_artifact::ArtifactIndex::new(
+            vec!["foo.o".to_string()],
+            vec![300],
+            vec![],
+            vec![],
+            0,
+        );
+        store.insert(key3, &idx3).unwrap();
+        std::fs::write(artifact_dir.join(format!("{key3}_0")), b"object-file").unwrap();
+
+        drop(store); // Release redb lock
+
+        // Run warm
+        let (restored, skipped, errors) =
+            warm_target(&index_path, &artifact_dir, &target_dir, "debug").unwrap();
+
+        // Verify counts
+        assert_eq!(errors, 0, "should have 0 errors");
+        assert_eq!(restored, 4, "should restore 4 Rust files (3 from serde + 1 from proc_macro2)");
+        assert_eq!(skipped, 0, "all payloads exist on disk");
+
+        // Verify files exist at correct paths
+        let deps = target_dir.join("debug").join("deps");
+        assert!(deps.join("libserde-abc123.rlib").exists(), "serde rlib missing");
+        assert!(deps.join("libserde-abc123.rmeta").exists(), "serde rmeta missing");
+        assert!(deps.join("serde-abc123.d").exists(), "serde dep-info missing");
+        assert!(deps.join("libproc_macro2-def456.rlib").exists(), "proc_macro2 rlib missing");
+
+        // Verify content is correct
+        assert_eq!(std::fs::read(deps.join("libserde-abc123.rlib")).unwrap(), b"rlib-content");
+        assert_eq!(std::fs::read(deps.join("libproc_macro2-def456.rlib")).unwrap(), b"proc-macro2-rlib");
+
+        // Verify C++ artifact was NOT restored
+        assert!(!deps.join("foo.o").exists(), "C++ .o file should NOT be in deps/");
+
+        // Verify mtime is recent (within 5 seconds)
+        let meta = std::fs::metadata(deps.join("libserde-abc123.rlib")).unwrap();
+        let age = meta.modified().unwrap().elapsed().unwrap();
+        assert!(age.as_secs() < 5, "mtime should be fresh, got {age:?}");
+    }
+
+    #[test]
+    fn warm_skips_missing_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let artifact_dir = cache_dir.join("artifacts");
+        let index_path = cache_dir.join("index.redb");
+        let target_dir = dir.path().join("target");
+
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+
+        let store = zccache_artifact::ArtifactStore::open(&index_path).unwrap();
+        let key = "1111111122222222";
+        let idx = zccache_artifact::ArtifactIndex::new(
+            vec!["libfoo-xyz.rlib".to_string()],
+            vec![100],
+            vec![],
+            vec![],
+            0,
+        );
+        store.insert(key, &idx).unwrap();
+        // DON'T write the payload file — simulate missing artifact on disk
+        drop(store);
+
+        let (restored, skipped, errors) =
+            warm_target(&index_path, &artifact_dir, &target_dir, "debug").unwrap();
+
+        assert_eq!(restored, 0);
+        assert_eq!(skipped, 1, "should skip 1 missing payload");
+        assert_eq!(errors, 0);
+    }
+
+    #[test]
+    fn warm_returns_error_on_missing_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = warm_target(
+            &dir.path().join("nonexistent.redb"),
+            &dir.path().join("artifacts"),
+            &dir.path().join("target"),
+            "debug",
+        );
+        assert!(result.is_err());
     }
 }
