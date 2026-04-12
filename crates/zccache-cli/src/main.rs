@@ -23,13 +23,14 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::{Parser, Subcommand};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use zccache_cli::{
     client_download, run_ino_convert_cached, ArchiveFormat, DownloadParams, DownloadSource,
     InoConvertOptions, WaitMode,
 };
 use zccache_core::NormalizedPath;
+use zccache_gha::{GhaCache, GhaError};
 
 /// zccache -- fast local compiler cache.
 #[derive(Debug, Parser)]
@@ -149,6 +150,12 @@ enum Commands {
         #[arg(long)]
         no_arduino_include: bool,
     },
+    /// GitHub Actions cache operations.
+    #[command(name = "gha-cache")]
+    GhaCache {
+        #[command(subcommand)]
+        action: GhaCacheCommands,
+    },
     /// Download and optionally unarchive an artifact using the dedicated download daemon.
     Download {
         /// Source URL for a normal single-file download.
@@ -181,6 +188,42 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Manage cargo registry cache (save/restore/hash/clean).
+    #[command(name = "cargo-registry")]
+    CargoRegistry {
+        #[command(subcommand)]
+        action: CargoRegistryCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CargoRegistryCommands {
+    /// Save cargo registry to a compressed archive.
+    Save {
+        /// Cache key (used as filename).
+        #[arg(long)]
+        key: String,
+        /// Cargo home directory (default: ~/.cargo or $CARGO_HOME).
+        #[arg(long)]
+        cargo_home: Option<String>,
+    },
+    /// Restore cargo registry from a compressed archive.
+    Restore {
+        /// Cache key to restore.
+        #[arg(long)]
+        key: String,
+        /// Cargo home directory (default: ~/.cargo or $CARGO_HOME).
+        #[arg(long)]
+        cargo_home: Option<String>,
+    },
+    /// Print hash of Cargo.lock for use as cache key.
+    Hash {
+        /// Path to Cargo.lock (default: ./Cargo.lock).
+        #[arg(long, default_value = "Cargo.lock")]
+        lockfile: String,
+    },
+    /// Remove cached registry archives.
+    Clean,
 }
 
 /// Fingerprint subcommands.
@@ -219,6 +262,31 @@ enum FpCommands {
     Invalidate,
 }
 
+/// GitHub Actions cache subcommands.
+#[derive(Debug, Subcommand)]
+enum GhaCacheCommands {
+    /// Check if GHA cache API is available (env vars set).
+    Status,
+    /// Save a directory to the GHA cache (tar+gzip, then upload).
+    Save {
+        /// Cache key (must be unique per content).
+        #[arg(long)]
+        key: String,
+        /// Path to the directory to cache.
+        #[arg(long)]
+        path: String,
+    },
+    /// Restore a directory from the GHA cache.
+    Restore {
+        /// Cache key to look up.
+        #[arg(long)]
+        key: String,
+        /// Path to restore the directory into.
+        #[arg(long)]
+        path: String,
+    },
+}
+
 /// Known subcommand names for auto-detect.
 const KNOWN_SUBCOMMANDS: &[&str] = &[
     "start",
@@ -234,6 +302,8 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "fp",
     "ino",
     "download",
+    "cargo-registry",
+    "gha-cache",
     "help",
     "--help",
     "-h",
@@ -336,6 +406,11 @@ fn main() -> ExitCode {
                 eprintln!("zccache: {err}");
                 ExitCode::FAILURE
             }
+        },
+        Commands::GhaCache { action } => match action {
+            GhaCacheCommands::Status => cmd_gha_status(),
+            GhaCacheCommands::Save { key, path } => run_async(cmd_gha_save(&key, &path)),
+            GhaCacheCommands::Restore { key, path } => run_async(cmd_gha_restore(&key, &path)),
         },
         Commands::Download {
             url,
@@ -454,6 +529,16 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Commands::CargoRegistry { action } => match action {
+            CargoRegistryCommands::Save { key, cargo_home } => {
+                cmd_cargo_registry_save(&key, cargo_home.as_deref())
+            }
+            CargoRegistryCommands::Restore { key, cargo_home } => {
+                cmd_cargo_registry_restore(&key, cargo_home.as_deref())
+            }
+            CargoRegistryCommands::Hash { lockfile } => cmd_cargo_registry_hash(&lockfile),
+            CargoRegistryCommands::Clean => cmd_cargo_registry_clean(),
+        },
     }
 }
 
@@ -999,6 +1084,342 @@ fn cmd_crashes(clear: bool) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+// ─── Cargo registry subcommands ──────────────────────────────────────────
+
+/// Resolve the cargo home directory from an explicit argument, the `CARGO_HOME`
+/// env var, or the default `~/.cargo`.
+fn resolve_cargo_home(explicit: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(p) = explicit {
+        return Ok(PathBuf::from(p));
+    }
+    if let Ok(ch) = std::env::var("CARGO_HOME") {
+        if !ch.is_empty() {
+            return Ok(PathBuf::from(ch));
+        }
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| "cannot determine home directory (set HOME or CARGO_HOME)".to_string())?;
+    Ok(PathBuf::from(home).join(".cargo"))
+}
+
+/// Directory where cargo-registry archives are stored.
+fn cargo_registry_cache_dir() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| "cannot determine home directory (set HOME)".to_string())?;
+    Ok(PathBuf::from(home).join(".zccache").join("cargo-registry"))
+}
+
+fn cmd_cargo_registry_save(key: &str, cargo_home: Option<&str>) -> ExitCode {
+    let cargo_home = match resolve_cargo_home(cargo_home) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("zccache cargo-registry save: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cache_dir = match cargo_registry_cache_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("zccache cargo-registry save: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+        eprintln!(
+            "zccache cargo-registry save: failed to create {}: {e}",
+            cache_dir.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let archive_path = cache_dir.join(format!("{key}.tar.gz"));
+
+    // Collect paths to archive.
+    let subdirs: &[&str] = &["registry/index", "registry/cache", "git/db"];
+    let mut paths: Vec<(PathBuf, String)> = Vec::new();
+    for subdir in subdirs {
+        let p = cargo_home.join(subdir);
+        if p.exists() {
+            paths.push((p, subdir.to_string()));
+        }
+    }
+
+    if paths.is_empty() {
+        eprintln!(
+            "no cargo registry directories found in {}",
+            cargo_home.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    // Create tar.gz archive.
+    let file = match std::fs::File::create(&archive_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "zccache cargo-registry save: failed to create {}: {e}",
+                archive_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let gz = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+    let mut tar = tar::Builder::new(gz);
+
+    for (path, name) in &paths {
+        if let Err(e) = tar.append_dir_all(name, path) {
+            eprintln!("zccache cargo-registry save: failed to add {name}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if let Err(e) = tar.finish() {
+        eprintln!("zccache cargo-registry save: failed to finalize archive: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let size = std::fs::metadata(&archive_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    println!(
+        "saved cargo registry to {} ({})",
+        archive_path.display(),
+        format_bytes(size)
+    );
+    ExitCode::SUCCESS
+}
+
+fn cmd_cargo_registry_restore(key: &str, cargo_home: Option<&str>) -> ExitCode {
+    let cargo_home = match resolve_cargo_home(cargo_home) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("zccache cargo-registry restore: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cache_dir = match cargo_registry_cache_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("zccache cargo-registry restore: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let archive_path = cache_dir.join(format!("{key}.tar.gz"));
+
+    if !archive_path.exists() {
+        eprintln!("no cached registry found for key: {key}");
+        return ExitCode::FAILURE;
+    }
+
+    let file = match std::fs::File::open(&archive_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "zccache cargo-registry restore: failed to open {}: {e}",
+                archive_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut tar = tar::Archive::new(gz);
+    if let Err(e) = tar.unpack(&cargo_home) {
+        eprintln!("zccache cargo-registry restore: failed to unpack archive: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    println!(
+        "restored cargo registry from {}",
+        archive_path.display()
+    );
+    ExitCode::SUCCESS
+}
+
+fn cmd_cargo_registry_hash(lockfile: &str) -> ExitCode {
+    let path = Path::new(lockfile);
+    if !path.exists() {
+        eprintln!("lockfile not found: {lockfile}");
+        return ExitCode::FAILURE;
+    }
+    let hash = match zccache_hash::hash_file(path) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("zccache cargo-registry hash: failed to hash {lockfile}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Print first 16 hex chars (matches action's cache key format).
+    let hex = hash.to_hex();
+    println!("{}", &hex[..16]);
+    ExitCode::SUCCESS
+}
+
+fn cmd_cargo_registry_clean() -> ExitCode {
+    let cache_dir = match cargo_registry_cache_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("zccache cargo-registry clean: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if cache_dir.exists() {
+        let count = match std::fs::read_dir(&cache_dir) {
+            Ok(entries) => entries.count(),
+            Err(e) => {
+                eprintln!(
+                    "zccache cargo-registry clean: failed to read {}: {e}",
+                    cache_dir.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
+            eprintln!(
+                "zccache cargo-registry clean: failed to remove {}: {e}",
+                cache_dir.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        println!("removed {count} cached registry archive(s)");
+    } else {
+        println!("no cached archives to clean");
+    }
+    ExitCode::SUCCESS
+}
+
+// ─── GHA cache subcommands ────────────────────────────────────────────────
+
+fn cmd_gha_status() -> ExitCode {
+    if GhaCache::is_available() {
+        let url = std::env::var("ACTIONS_CACHE_URL").unwrap_or_default();
+        println!("GHA cache: available");
+        println!("  ACTIONS_CACHE_URL = {url}");
+        ExitCode::SUCCESS
+    } else {
+        println!("GHA cache: not available (ACTIONS_CACHE_URL or ACTIONS_RUNTIME_TOKEN not set)");
+        ExitCode::SUCCESS
+    }
+}
+
+async fn cmd_gha_save(key: &str, path: &str) -> ExitCode {
+    let cache = match GhaCache::from_env() {
+        Ok(c) => c,
+        Err(GhaError::NotAvailable) => {
+            eprintln!("zccache gha-cache: not running in GitHub Actions");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("zccache gha-cache: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let src = Path::new(path);
+    if !src.exists() {
+        eprintln!("zccache gha-cache save: path does not exist: {path}");
+        return ExitCode::FAILURE;
+    }
+
+    // Create a tar.gz archive in memory.
+    let data = match tar_gz_encode(src) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("zccache gha-cache save: failed to create archive: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let version = GhaCache::version_hash(&[path]);
+    match cache.save(key, &version, &data).await {
+        Ok(()) => {
+            eprintln!(
+                "zccache gha-cache save: uploaded {} bytes for key '{key}'",
+                data.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("zccache gha-cache save: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn cmd_gha_restore(key: &str, path: &str) -> ExitCode {
+    let cache = match GhaCache::from_env() {
+        Ok(c) => c,
+        Err(GhaError::NotAvailable) => {
+            eprintln!("zccache gha-cache: not running in GitHub Actions");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("zccache gha-cache: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let version = GhaCache::version_hash(&[path]);
+    let data = match cache.restore(key, &version).await {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            eprintln!("zccache gha-cache restore: cache miss for key '{key}'");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("zccache gha-cache restore: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let dest = Path::new(path);
+    if let Err(e) = std::fs::create_dir_all(dest) {
+        eprintln!("zccache gha-cache restore: failed to create directory: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    match tar_gz_decode(&data, dest) {
+        Ok(()) => {
+            eprintln!(
+                "zccache gha-cache restore: restored {} bytes for key '{key}' to {path}",
+                data.len()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("zccache gha-cache restore: failed to extract archive: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Create a tar.gz archive from a directory path.
+fn tar_gz_encode(src: &Path) -> Result<Vec<u8>, std::io::Error> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let buf = Vec::new();
+    let enc = GzEncoder::new(buf, Compression::fast());
+    let mut tar = tar::Builder::new(enc);
+    // Use the last component of the path as the archive prefix so that
+    // extraction recreates the directory structure relative to the target.
+    let prefix = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    tar.append_dir_all(&prefix, src)?;
+    let enc = tar.into_inner()?;
+    enc.finish()
+}
+
+/// Extract a tar.gz archive into a destination directory.
+fn tar_gz_decode(data: &[u8], dest: &Path) -> Result<(), std::io::Error> {
+    use flate2::read::GzDecoder;
+
+    let dec = GzDecoder::new(data);
+    let mut archive = tar::Archive::new(dec);
+    archive.unpack(dest)
 }
 
 // ─── Fingerprint subcommands ──────────────────────────────────────────────

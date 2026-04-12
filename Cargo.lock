@@ -3455,10 +3455,13 @@ version = "1.2.3"
 dependencies = [
  "blake3",
  "clap",
+ "flate2",
  "mimalloc",
  "pyo3",
  "pyo3-build-config",
  "rayon",
+ "serde_json",
+ "tar",
  "tempfile",
  "thiserror",
  "tikv-jemallocator",
@@ -3469,6 +3472,7 @@ dependencies = [
  "zccache-core",
  "zccache-download",
  "zccache-download-client",
+ "zccache-gha",
  "zccache-hash",
  "zccache-ipc",
  "zccache-protocol",
@@ -3665,6 +3669,19 @@ dependencies = [
  "tracing",
  "zccache-core",
  "zccache-hash",
+]
+
+[[package]]
+name = "zccache-gha"
+version = "1.2.3"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

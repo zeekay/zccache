@@ -29,7 +29,11 @@ zccache-protocol = { workspace = true }
 zccache-ipc = { workspace = true }
 zccache-download = { workspace = true }
 zccache-download-client = { workspace = true }
+zccache-gha = { workspace = true }
+serde_json = { workspace = true }
 rayon = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
 tempfile = { workspace = true }
 pyo3 = { version = "0.23", features = ["extension-module", "generate-import-lib", "abi3-py310"], optional = true }
 
