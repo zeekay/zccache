@@ -220,9 +220,7 @@ pub enum Response {
     FingerprintAck,
     /// List of cached Rust artifacts.
     /// NOTE: Appended at end to preserve bincode variant indices.
-    RustArtifactList {
-        artifacts: Vec<RustArtifactInfo>,
-    },
+    RustArtifactList { artifacts: Vec<RustArtifactInfo> },
 }
 
 /// Daemon status information.
@@ -761,9 +759,7 @@ mod tests {
             ],
         });
         // Empty list
-        roundtrip(&Response::RustArtifactList {
-            artifacts: vec![],
-        });
+        roundtrip(&Response::RustArtifactList { artifacts: vec![] });
     }
 
     #[test]

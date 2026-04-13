@@ -137,7 +137,59 @@ fn def_path_starts_with(
             .all(|(actual, expected)| *actual == Symbol::intern(expected))
 }
 
+#[cfg(test)]
+fn ensure_suffixed_library_exists() {
+    use std::path::PathBuf;
+
+    let toolchain = match std::env::var("RUSTUP_TOOLCHAIN") {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let target_debug = manifest_dir.join("target").join("debug");
+    let extension = if cfg!(target_os = "windows") {
+        "dll"
+    } else if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    };
+    let stem = if cfg!(target_os = "windows") {
+        env!("CARGO_PKG_NAME").to_string()
+    } else {
+        format!("lib{}", env!("CARGO_PKG_NAME"))
+    };
+    let expected = target_debug.join(format!("{stem}@{toolchain}.{extension}"));
+    if expected.exists() {
+        return;
+    }
+
+    let direct = target_debug.join(format!("{stem}.{extension}"));
+    if direct.exists() {
+        let _ = std::fs::copy(&direct, &expected);
+        return;
+    }
+
+    for directory in [target_debug.join("deps"), target_debug.clone()] {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if name.starts_with(&stem) && name.ends_with(&format!(".{extension}")) {
+                let _ = std::fs::copy(&path, &expected);
+                return;
+            }
+        }
+    }
+}
+
 #[test]
 fn ui() {
+    ensure_suffixed_library_exists();
     dylint_testing::ui_test(env!("CARGO_PKG_NAME"), "ui");
 }
