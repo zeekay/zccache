@@ -150,6 +150,62 @@ impl CurrentDirGuard {
 }
 
 #[cfg(test)]
+fn prepare_dylint_library() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let status = std::process::Command::new("cargo")
+        .arg("build")
+        .current_dir(manifest_dir)
+        .status()
+        .expect("cargo build should start");
+    assert!(status.success(), "cargo build should succeed");
+
+    let toolchain = std::env::var("RUSTUP_TOOLCHAIN").expect("RUSTUP_TOOLCHAIN should be set");
+    let library_name = env!("CARGO_PKG_NAME").replace('-', "_");
+    let target_debug = manifest_dir.join("target").join("debug");
+    let expected = target_debug.join(format!(
+        "{}{}@{}{}",
+        std::env::consts::DLL_PREFIX,
+        library_name,
+        toolchain,
+        std::env::consts::DLL_SUFFIX
+    ));
+    if expected.exists() {
+        return;
+    }
+
+    let plain = target_debug.join(format!(
+        "{}{}{}",
+        std::env::consts::DLL_PREFIX,
+        library_name,
+        std::env::consts::DLL_SUFFIX
+    ));
+    if plain.exists() {
+        std::fs::copy(&plain, &expected).expect("toolchain-suffixed dylint library should be copied");
+        return;
+    }
+
+    let deps_dir = target_debug.join("deps");
+    for entry in std::fs::read_dir(&deps_dir).expect("deps dir should be readable") {
+        let path = entry.expect("deps entry should be readable").path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&format!("{}{}", std::env::consts::DLL_PREFIX, library_name))
+            && name.ends_with(std::env::consts::DLL_SUFFIX)
+        {
+            std::fs::copy(&path, &expected)
+                .expect("hashed dylint library should be copied to the expected filename");
+            return;
+        }
+    }
+
+    panic!(
+        "could not find a built dylint library to copy into {}",
+        expected.display()
+    );
+}
+
+#[cfg(test)]
 impl Drop for CurrentDirGuard {
     fn drop(&mut self) {
         std::env::set_current_dir(&self.0).expect("current dir should be restored");
@@ -159,5 +215,6 @@ impl Drop for CurrentDirGuard {
 #[test]
 fn ui() {
     let _guard = CurrentDirGuard::set(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    prepare_dylint_library();
     dylint_testing::ui_test(env!("CARGO_PKG_NAME"), "ui");
 }
