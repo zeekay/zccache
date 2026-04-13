@@ -424,7 +424,7 @@ How it works:
 1. First run: cold build, populates zccache compilation cache + saves target metadata
 2. Second run: restores target metadata → `zccache warm` fills in `.rlib` files from compilation cache → touches timestamps → `cargo build` → `Finished in 0.18s`
 
-`zccache warm` reads the on-disk artifact index (no daemon needed) and filters by `Cargo.lock` — only restores artifacts matching crates in your lockfile. Safe with shared caches across projects.
+`zccache warm` reads the on-disk artifact index (no daemon needed) and filters by `Cargo.lock` — only restores artifacts matching crates in your lockfile. That is a speed optimization, not a full integrity-verification pass: warmed artifacts are trusted and Cargo is expected to reject or rebuild anything incompatible.
 
 ### Inputs
 
@@ -433,10 +433,39 @@ How it works:
 | `cache-cargo-registry` | `true` | Cache cargo registry index + crate files + git deps |
 | `cache-compilation` | `true` | Cache compilation units via zccache daemon |
 | `cache-target` | `true` | Cache target metadata + run `zccache warm` |
+| `compilation-restore-fallback` | `true` | Allow prefix fallback for compilation cache restores |
+| `target-restore-fallback` | `false` | Allow prefix fallback for target metadata restores |
 | `target-dir` | `target` | Path to the cargo target directory |
 | `shared-key` | `""` | Extra key for matrix isolation (typically the target triple) |
 | `zccache-version` | `latest` | Version to install |
 | `save-cache` | `true` | Set `false` for PR builds (restore-only, saves cache budget) |
+
+### Restore policy
+
+The action now treats the two cache layers differently:
+
+- Compilation cache fallback stays enabled by default. That preserves fast incremental reuse across nearby commits while still letting zccache validate cache hits when `rustc` actually runs.
+- Target metadata fallback is disabled by default. Reusing stale Cargo fingerprints and build-script outputs across different source trees can make a PR merge ref look fresh when it is not.
+
+If you want the old fastest-possible behavior for developer CI, opt back in explicitly:
+
+```yaml
+- uses: zackees/zccache@main
+  with:
+    compilation-restore-fallback: true
+    target-restore-fallback: true
+```
+
+If you want a more release-hardened setup, prefer exact restores and avoid target metadata entirely:
+
+```yaml
+- uses: zackees/zccache@main
+  with:
+    cache-target: false
+    compilation-restore-fallback: false
+```
+
+This project is optimized for developer speed, not full artifact attestation. `zccache warm` does not checksum every restored object on every run, and the action does not try to prove cache integrity before building. If you need that level of assurance, disable the speed-focused layers for that workflow.
 
 ### Outputs
 
