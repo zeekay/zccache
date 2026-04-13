@@ -1074,6 +1074,9 @@ mod tests {
             ready_rx
                 .recv_timeout(Duration::from_secs(1))
                 .expect("test http server failed to start");
+            wait_for_test_http_server(&addr, &config.path);
+            request_count.store(0, Ordering::Relaxed);
+            range_request_count.store(0, Ordering::Relaxed);
             Self {
                 url,
                 request_count,
@@ -1090,6 +1093,58 @@ mod tests {
         fn range_request_count(&self) -> usize {
             self.range_request_count.load(Ordering::Relaxed)
         }
+    }
+
+    fn wait_for_test_http_server(addr: &std::net::SocketAddr, path: &str) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let request = format!("HEAD /{path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        while Instant::now() < deadline {
+            match TcpStream::connect(addr) {
+                Ok(mut stream) => {
+                    if stream
+                        .set_read_timeout(Some(Duration::from_millis(100)))
+                        .is_err()
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    if stream
+                        .set_write_timeout(Some(Duration::from_millis(100)))
+                        .is_err()
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    if stream.write_all(request.as_bytes()).is_err() {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    let mut response = Vec::new();
+                    let mut buf = [0u8; 256];
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                response.extend_from_slice(&buf[..n]);
+                                if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    return;
+                                }
+                            }
+                            Err(err)
+                                if err.kind() == io::ErrorKind::WouldBlock
+                                    || err.kind() == io::ErrorKind::TimedOut =>
+                            {
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("test http server at {addr} did not respond in time");
     }
 
     impl Drop for TestHttpServer {

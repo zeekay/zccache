@@ -42,7 +42,7 @@ jobs:
       - name: Test Dylint Library
         run: cargo +nightly-2025-09-18 test --manifest-path dylints/ban_std_pathbuf/Cargo.toml
       - name: Run Dylint
-        run: cargo dylint --all --workspace
+        run: python3 ci/lint.py --dylint-only
 
   msrv:
     name: MSRV (1.75)
