@@ -856,7 +856,7 @@ fn cmd_warm(target_dir: &Path, profile: &str) -> ExitCode {
         artifact_dir.as_ref(),
         target_dir,
         profile,
-        lockfile.as_deref().map(|p| p.as_ref()),
+        lockfile.as_deref(),
     ) {
         Ok((restored, skipped, errors)) => {
             println!(
