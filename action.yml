@@ -176,6 +176,20 @@ runs:
           fi
         fi
 
+        # Try cargo-binstall (downloads pre-built binary, no Python needed)
+        if [ "$INSTALLED" = "false" ] && command -v cargo-binstall &>/dev/null; then
+          INSTALL_DIR="$HOME/.cargo/bin"
+          if [ "$VERSION" = "latest" ]; then
+            cargo-binstall zccache-cli --no-confirm --install-path "$INSTALL_DIR" 2>/dev/null && INSTALLED=true
+          else
+            cargo-binstall "zccache-cli@${VERSION}" --no-confirm --install-path "$INSTALL_DIR" 2>/dev/null && INSTALLED=true
+          fi
+          if [ "$INSTALLED" = "true" ]; then
+            echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+            export PATH="$INSTALL_DIR:$PATH"
+          fi
+        fi
+
         # Fall back to pip install (works on all platforms)
         if [ "$INSTALLED" = "false" ]; then
           if [ "$VERSION" = "latest" ]; then
