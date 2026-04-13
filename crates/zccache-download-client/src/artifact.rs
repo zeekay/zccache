@@ -1046,7 +1046,9 @@ mod tests {
             let range_request_count_clone = Arc::clone(&range_request_count);
             let shutdown_clone = Arc::clone(&shutdown);
             let config_for_thread = config.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
             let thread = thread::spawn(move || {
+                ready_tx.send(()).unwrap();
                 while !shutdown_clone.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => {
@@ -1069,6 +1071,9 @@ mod tests {
                     }
                 }
             });
+            ready_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("test http server failed to start");
             Self {
                 url,
                 request_count,

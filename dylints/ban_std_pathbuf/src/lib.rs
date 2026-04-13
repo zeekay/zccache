@@ -180,7 +180,8 @@ fn prepare_dylint_library() {
         std::env::consts::DLL_SUFFIX
     ));
     if plain.exists() {
-        std::fs::copy(&plain, &expected).expect("toolchain-suffixed dylint library should be copied");
+        std::fs::copy(&plain, &expected)
+            .expect("toolchain-suffixed dylint library should be copied");
         return;
     }
 
