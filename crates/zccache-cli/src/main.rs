@@ -23,7 +23,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::{Parser, Subcommand};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use zccache_cli::{
     client_download, run_ino_convert_cached, ArchiveFormat, DownloadParams, DownloadSource,
@@ -31,6 +31,9 @@ use zccache_cli::{
 };
 use zccache_core::NormalizedPath;
 use zccache_gha::{GhaCache, GhaError};
+
+#[cfg(test)]
+use std::path::PathBuf;
 
 /// zccache -- fast local compiler cache.
 #[derive(Debug, Parser)]
