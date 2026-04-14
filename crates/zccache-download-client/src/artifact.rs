@@ -1064,7 +1064,17 @@ mod tests {
                                 );
                             });
                         }
-                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                io::ErrorKind::WouldBlock
+                                    | io::ErrorKind::Interrupted
+                                    | io::ErrorKind::ConnectionAborted
+                                    | io::ErrorKind::ConnectionReset
+                            ) =>
+                        {
+                            // Windows can surface transient listener errors while the probe
+                            // connection is racing with the first real client request.
                             thread::sleep(Duration::from_millis(10));
                         }
                         Err(_) => break,
