@@ -41,10 +41,7 @@ fn print_status(args: &Args) {
     println!("zccache-download-daemon v{}", env!("CARGO_PKG_VERSION"));
     println!();
     println!("  endpoint:   {endpoint}");
-    println!(
-        "  lock file:  {}",
-        daemon_mgmt::lock_file_path().display()
-    );
+    println!("  lock file:  {}", daemon_mgmt::lock_file_path().display());
     match query_daemon_status(&endpoint) {
         Ok(status) => {
             println!("  status:     running");
@@ -59,9 +56,7 @@ fn print_status(args: &Args) {
 }
 
 /// Connect to a running daemon over IPC and query its status.
-fn query_daemon_status(
-    endpoint: &str,
-) -> Result<zccache_download::DownloadDaemonStatus, String> {
+fn query_daemon_status(endpoint: &str) -> Result<zccache_download::DownloadDaemonStatus, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -84,9 +79,7 @@ fn query_daemon_status(
 }
 
 fn run_server(args: Args) {
-    let endpoint = args
-        .endpoint
-        .unwrap_or_else(daemon_mgmt::default_endpoint);
+    let endpoint = args.endpoint.unwrap_or_else(daemon_mgmt::default_endpoint);
     let pid = std::process::id();
     if let Err(err) = daemon_mgmt::write_lock_file(pid) {
         tracing::warn!("failed to write download daemon lock file: {err}");

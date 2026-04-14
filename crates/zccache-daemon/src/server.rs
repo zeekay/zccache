@@ -1101,10 +1101,7 @@ async fn handle_connection(
                         });
                     }
                 }
-                (
-                    Response::RustArtifactList { artifacts },
-                    None,
-                )
+                (Response::RustArtifactList { artifacts }, None)
             }
         };
 
@@ -4979,9 +4976,8 @@ mod tests {
         write_cached_output(&out, &cache, content).unwrap();
 
         // Output must have recent mtime, NOT the 2001 mtime from the cache file.
-        let out_mtime = filetime::FileTime::from_last_modification_time(
-            &std::fs::metadata(&out).unwrap(),
-        );
+        let out_mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&out).unwrap());
         let now = filetime::FileTime::now();
         let diff = now.unix_seconds() - out_mtime.unix_seconds();
 
@@ -5013,9 +5009,8 @@ mod tests {
         // Second delivery: same_file path should still refresh mtime
         write_cached_output(&out, &cache, content).unwrap();
 
-        let out_mtime = filetime::FileTime::from_last_modification_time(
-            &std::fs::metadata(&out).unwrap(),
-        );
+        let out_mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&out).unwrap());
         let now = filetime::FileTime::now();
         let diff = now.unix_seconds() - out_mtime.unix_seconds();
 
@@ -5035,9 +5030,8 @@ mod tests {
         let content = b"data from memory";
         write_cached_output(&out, &cache, content).unwrap();
 
-        let out_mtime = filetime::FileTime::from_last_modification_time(
-            &std::fs::metadata(&out).unwrap(),
-        );
+        let out_mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&out).unwrap());
         let now = filetime::FileTime::now();
         let diff = now.unix_seconds() - out_mtime.unix_seconds();
 

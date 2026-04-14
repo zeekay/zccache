@@ -64,10 +64,8 @@ impl GhaCache {
     /// Returns `Err(GhaError::NotAvailable)` when not running inside GitHub
     /// Actions (i.e., the required env vars are missing).
     pub fn from_env() -> Result<Self, GhaError> {
-        let base_url =
-            std::env::var("ACTIONS_CACHE_URL").map_err(|_| GhaError::NotAvailable)?;
-        let token =
-            std::env::var("ACTIONS_RUNTIME_TOKEN").map_err(|_| GhaError::NotAvailable)?;
+        let base_url = std::env::var("ACTIONS_CACHE_URL").map_err(|_| GhaError::NotAvailable)?;
+        let token = std::env::var("ACTIONS_RUNTIME_TOKEN").map_err(|_| GhaError::NotAvailable)?;
 
         let client = Client::builder()
             .user_agent("zccache")
@@ -83,8 +81,7 @@ impl GhaCache {
 
     /// Check whether GHA cache env vars are present.
     pub fn is_available() -> bool {
-        std::env::var("ACTIONS_CACHE_URL").is_ok()
-            && std::env::var("ACTIONS_RUNTIME_TOKEN").is_ok()
+        std::env::var("ACTIONS_CACHE_URL").is_ok() && std::env::var("ACTIONS_RUNTIME_TOKEN").is_ok()
     }
 
     fn api_url(&self, path: &str) -> String {
@@ -187,11 +184,7 @@ impl GhaCache {
     }
 
     /// Restore a blob from the GHA cache. Returns `None` if no entry was found.
-    pub async fn restore(
-        &self,
-        key: &str,
-        version: &str,
-    ) -> Result<Option<Vec<u8>>, GhaError> {
+    pub async fn restore(&self, key: &str, version: &str) -> Result<Option<Vec<u8>>, GhaError> {
         let url = self.api_url(&format!("cache?keys={key}&version={version}"));
         let resp = self
             .client
@@ -229,9 +222,45 @@ impl GhaCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        old_cache_url: Option<String>,
+        old_runtime_token: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            Self {
+                _lock: env_lock().lock().unwrap(),
+                old_cache_url: std::env::var("ACTIONS_CACHE_URL").ok(),
+                old_runtime_token: std::env::var("ACTIONS_RUNTIME_TOKEN").ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old_cache_url {
+                Some(value) => std::env::set_var("ACTIONS_CACHE_URL", value),
+                None => std::env::remove_var("ACTIONS_CACHE_URL"),
+            }
+            match &self.old_runtime_token {
+                Some(value) => std::env::set_var("ACTIONS_RUNTIME_TOKEN", value),
+                None => std::env::remove_var("ACTIONS_RUNTIME_TOKEN"),
+            }
+        }
+    }
 
     #[test]
     fn is_available_returns_false_without_env_vars() {
+        let _guard = EnvGuard::new();
         // Clear env vars in case they happen to be set.
         std::env::remove_var("ACTIONS_CACHE_URL");
         std::env::remove_var("ACTIONS_RUNTIME_TOKEN");
@@ -255,6 +284,7 @@ mod tests {
 
     #[test]
     fn from_env_returns_not_available_without_env_vars() {
+        let _guard = EnvGuard::new();
         std::env::remove_var("ACTIONS_CACHE_URL");
         std::env::remove_var("ACTIONS_RUNTIME_TOKEN");
         let err = GhaCache::from_env().unwrap_err();
@@ -266,23 +296,22 @@ mod tests {
 
     #[test]
     fn from_env_returns_not_available_with_partial_env() {
+        let _guard = EnvGuard::new();
         // Only one of the two vars set.
         std::env::set_var("ACTIONS_CACHE_URL", "https://example.com");
         std::env::remove_var("ACTIONS_RUNTIME_TOKEN");
         let err = GhaCache::from_env().unwrap_err();
         assert!(matches!(err, GhaError::NotAvailable));
-        std::env::remove_var("ACTIONS_CACHE_URL");
     }
 
     #[test]
     fn from_env_succeeds_with_both_env_vars() {
+        let _guard = EnvGuard::new();
         std::env::set_var("ACTIONS_CACHE_URL", "https://example.com/cache/");
         std::env::set_var("ACTIONS_RUNTIME_TOKEN", "test-token");
         let cache = GhaCache::from_env().expect("should succeed with both vars set");
         // Verify trailing slash is stripped.
         assert_eq!(cache.base_url, "https://example.com/cache");
         assert_eq!(cache.token, "test-token");
-        std::env::remove_var("ACTIONS_CACHE_URL");
-        std::env::remove_var("ACTIONS_RUNTIME_TOKEN");
     }
 }

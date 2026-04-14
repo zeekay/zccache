@@ -43,11 +43,8 @@ def run_cmd_capture(cmd):
     )
 
 
-def ensure_windows_dylint_aliases():
-    """Create cargo-dylint's expected `name@toolchain.dll` aliases on Windows."""
-    if os.name != "nt":
-        return False
-
+def ensure_dylint_aliases():
+    """Create cargo-dylint's expected `name@toolchain` aliases when missing."""
     libraries_root = SCRIPT_DIR / "target" / "dylint" / "libraries"
     if not libraries_root.is_dir():
         return False
@@ -59,16 +56,43 @@ def ensure_windows_dylint_aliases():
         release_dir = toolchain_dir / "release"
         if not release_dir.is_dir():
             continue
-        suffix = f"@{toolchain_dir.name}.dll"
-        for dll in release_dir.glob("*.dll"):
-            if "@" in dll.stem:
+        for library in release_dir.iterdir():
+            if not library.is_file():
                 continue
-            alias = dll.with_name(f"{dll.stem}{suffix}")
+            if library.suffix not in {".dll", ".dylib", ".so"}:
+                continue
+            if "@" in library.stem:
+                continue
+            alias = library.with_name(
+                f"{library.stem}@{toolchain_dir.name}{library.suffix}"
+            )
             if alias.exists():
                 continue
-            alias.write_bytes(dll.read_bytes())
+            alias.write_bytes(library.read_bytes())
             created = True
     return created
+
+
+def lint_dylint_only():
+    """Run workspace dylint, retrying after alias repair if cargo-dylint misses it."""
+    if which("cargo-dylint") is None:
+        print(
+            "cargo-dylint is required for workspace linting. Install with "
+            "'cargo install cargo-dylint dylint-link'.",
+            file=sys.stderr,
+        )
+        return 1
+
+    result = run_cmd_capture([
+        "cargo", "dylint", "--all", "--workspace",
+    ])
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    if result.returncode != 0 and ensure_dylint_aliases():
+        result = run_cmd([
+            "cargo", "dylint", "--all", "--workspace",
+        ])
+    return result.returncode
 
 
 def detect_crate(file_path):
@@ -134,26 +158,9 @@ def lint_workspace():
     if result.returncode != 0:
         return result.returncode
 
-    if which("cargo-dylint") is None:
-        print(
-            "cargo-dylint is required for workspace linting. Install with "
-            "'cargo install cargo-dylint dylint-link'.",
-            file=sys.stderr,
-        )
-        return 1
-
-    result = run_cmd_capture([
-        "cargo", "dylint", "--all", "--workspace",
-    ])
-    sys.stdout.write(result.stdout)
-    sys.stderr.write(result.stderr)
-    if result.returncode != 0:
-        if ensure_windows_dylint_aliases():
-            result = run_cmd([
-                "cargo", "dylint", "--all", "--workspace",
-            ])
-        if result.returncode != 0:
-            return result.returncode
+    result = lint_dylint_only()
+    if result != 0:
+        return result
 
     env = clean_env()
     env["RUSTDOCFLAGS"] = "-D warnings"
@@ -192,6 +199,9 @@ def main():
 
     if args and args[0].endswith(".rs"):
         return lint_single_file(args[0])
+
+    if args == ["--dylint-only"]:
+        return lint_dylint_only()
 
     return lint_workspace()
 

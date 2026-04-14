@@ -23,7 +23,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::{Parser, Subcommand};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use zccache_cli::{
     client_download, run_ino_convert_cached, ArchiveFormat, DownloadParams, DownloadSource,
@@ -31,6 +31,9 @@ use zccache_cli::{
 };
 use zccache_core::NormalizedPath;
 use zccache_gha::{GhaCache, GhaError};
+
+#[cfg(test)]
+use std::path::PathBuf;
 
 /// zccache -- fast local compiler cache.
 #[derive(Debug, Parser)]
@@ -846,7 +849,11 @@ fn cmd_warm(target_dir: &Path, profile: &str) -> ExitCode {
         if cwd.exists() {
             Some(cwd.to_path_buf())
         } else if let Some(ref p) = parent {
-            if p.exists() { Some(p.clone()) } else { None }
+            if p.exists() {
+                Some(p.clone())
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -856,12 +863,10 @@ fn cmd_warm(target_dir: &Path, profile: &str) -> ExitCode {
         artifact_dir.as_ref(),
         target_dir,
         profile,
-        lockfile.as_deref().map(|p| p.as_ref()),
+        lockfile.as_deref(),
     ) {
         Ok((restored, skipped, errors)) => {
-            println!(
-                "zccache warm: restored {restored} files, skipped {skipped}, errors {errors}"
-            );
+            println!("zccache warm: restored {restored} files, skipped {skipped}, errors {errors}");
             if errors > 0 {
                 ExitCode::FAILURE
             } else {
@@ -1293,27 +1298,29 @@ fn cmd_crashes(clear: bool) -> ExitCode {
 
 /// Resolve the cargo home directory from an explicit argument, the `CARGO_HOME`
 /// env var, or the default `~/.cargo`.
-fn resolve_cargo_home(explicit: Option<&str>) -> Result<PathBuf, String> {
+fn resolve_cargo_home(explicit: Option<&str>) -> Result<NormalizedPath, String> {
     if let Some(p) = explicit {
-        return Ok(PathBuf::from(p));
+        return Ok(NormalizedPath::from(p));
     }
     if let Ok(ch) = std::env::var("CARGO_HOME") {
         if !ch.is_empty() {
-            return Ok(PathBuf::from(ch));
+            return Ok(NormalizedPath::from(ch));
         }
     }
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map_err(|_| "cannot determine home directory (set HOME or CARGO_HOME)".to_string())?;
-    Ok(PathBuf::from(home).join(".cargo"))
+    Ok(NormalizedPath::from(home).join(".cargo"))
 }
 
 /// Directory where cargo-registry archives are stored.
-fn cargo_registry_cache_dir() -> Result<PathBuf, String> {
+fn cargo_registry_cache_dir() -> Result<NormalizedPath, String> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map_err(|_| "cannot determine home directory (set HOME)".to_string())?;
-    Ok(PathBuf::from(home).join(".zccache").join("cargo-registry"))
+    Ok(NormalizedPath::from(home)
+        .join(".zccache")
+        .join("cargo-registry"))
 }
 
 fn cmd_cargo_registry_save(key: &str, cargo_home: Option<&str>) -> ExitCode {
@@ -1342,7 +1349,7 @@ fn cmd_cargo_registry_save(key: &str, cargo_home: Option<&str>) -> ExitCode {
 
     // Collect paths to archive.
     let subdirs: &[&str] = &["registry/index", "registry/cache", "git/db"];
-    let mut paths: Vec<(PathBuf, String)> = Vec::new();
+    let mut paths: Vec<(NormalizedPath, String)> = Vec::new();
     for subdir in subdirs {
         let p = cargo_home.join(subdir);
         if p.exists() {
@@ -1433,10 +1440,7 @@ fn cmd_cargo_registry_restore(key: &str, cargo_home: Option<&str>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    println!(
-        "restored cargo registry from {}",
-        archive_path.display()
-    );
+    println!("restored cargo registry from {}", archive_path.display());
     ExitCode::SUCCESS
 }
 
@@ -2779,22 +2783,46 @@ mod tests {
 
         // Verify counts
         assert_eq!(errors, 0, "should have 0 errors");
-        assert_eq!(restored, 5, "should restore all 5 files (3 serde + 1 proc_macro2 + 1 C++ .o)");
+        assert_eq!(
+            restored, 5,
+            "should restore all 5 files (3 serde + 1 proc_macro2 + 1 C++ .o)"
+        );
         assert_eq!(skipped, 0, "all payloads exist on disk");
 
         // Verify files exist at correct paths
         let deps = target_dir.join("debug").join("deps");
-        assert!(deps.join("libserde-abc123.rlib").exists(), "serde rlib missing");
-        assert!(deps.join("libserde-abc123.rmeta").exists(), "serde rmeta missing");
-        assert!(deps.join("serde-abc123.d").exists(), "serde dep-info missing");
-        assert!(deps.join("libproc_macro2-def456.rlib").exists(), "proc_macro2 rlib missing");
+        assert!(
+            deps.join("libserde-abc123.rlib").exists(),
+            "serde rlib missing"
+        );
+        assert!(
+            deps.join("libserde-abc123.rmeta").exists(),
+            "serde rmeta missing"
+        );
+        assert!(
+            deps.join("serde-abc123.d").exists(),
+            "serde dep-info missing"
+        );
+        assert!(
+            deps.join("libproc_macro2-def456.rlib").exists(),
+            "proc_macro2 rlib missing"
+        );
 
         // Verify content is correct
-        assert_eq!(std::fs::read(deps.join("libserde-abc123.rlib")).unwrap(), b"rlib-content");
-        assert_eq!(std::fs::read(deps.join("libproc_macro2-def456.rlib")).unwrap(), b"proc-macro2-rlib");
+        assert_eq!(
+            std::fs::read(deps.join("libserde-abc123.rlib")).unwrap(),
+            b"rlib-content"
+        );
+        assert_eq!(
+            std::fs::read(deps.join("libproc_macro2-def456.rlib")).unwrap(),
+            b"proc-macro2-rlib"
+        );
 
         // Verify C++ artifact IS restored (warm restores everything, not just Rust)
-        assert!(deps.join("foo.o").exists(), "C++ .o file should also be in deps/");
+        assert!(
+            deps.join("foo.o").exists(),
+            "C++ .o file should also be in deps/"
+        );
         assert_eq!(std::fs::read(deps.join("foo.o")).unwrap(), b"object-file");
 
         // Verify mtime is recent (within 5 seconds)
@@ -2859,36 +2887,72 @@ mod tests {
 
         // serde (in a typical Cargo.lock)
         let k1 = "aaaa0001";
-        store.insert(k1, &zccache_artifact::ArtifactIndex::new(
-            vec!["libserde-abc123.rlib".into(), "libserde-abc123.rmeta".into(), "serde-abc123.d".into()],
-            vec![100, 50, 10], vec![], vec![], 0,
-        )).unwrap();
+        store
+            .insert(
+                k1,
+                &zccache_artifact::ArtifactIndex::new(
+                    vec![
+                        "libserde-abc123.rlib".into(),
+                        "libserde-abc123.rmeta".into(),
+                        "serde-abc123.d".into(),
+                    ],
+                    vec![100, 50, 10],
+                    vec![],
+                    vec![],
+                    0,
+                ),
+            )
+            .unwrap();
         std::fs::write(artifact_dir.join(format!("{k1}_0")), b"serde-rlib").unwrap();
         std::fs::write(artifact_dir.join(format!("{k1}_1")), b"serde-rmeta").unwrap();
         std::fs::write(artifact_dir.join(format!("{k1}_2")), b"serde-d").unwrap();
 
         // proc-macro2 (hyphen → underscore in filename)
         let k2 = "aaaa0002";
-        store.insert(k2, &zccache_artifact::ArtifactIndex::new(
-            vec!["libproc_macro2-def456.rlib".into()],
-            vec![200], vec![], vec![], 0,
-        )).unwrap();
+        store
+            .insert(
+                k2,
+                &zccache_artifact::ArtifactIndex::new(
+                    vec!["libproc_macro2-def456.rlib".into()],
+                    vec![200],
+                    vec![],
+                    vec![],
+                    0,
+                ),
+            )
+            .unwrap();
         std::fs::write(artifact_dir.join(format!("{k2}_0")), b"proc-macro2-rlib").unwrap();
 
         // tokio (NOT in our test lockfile)
         let k3 = "aaaa0003";
-        store.insert(k3, &zccache_artifact::ArtifactIndex::new(
-            vec!["libtokio-ghi789.rlib".into()],
-            vec![300], vec![], vec![], 0,
-        )).unwrap();
+        store
+            .insert(
+                k3,
+                &zccache_artifact::ArtifactIndex::new(
+                    vec!["libtokio-ghi789.rlib".into()],
+                    vec![300],
+                    vec![],
+                    vec![],
+                    0,
+                ),
+            )
+            .unwrap();
         std::fs::write(artifact_dir.join(format!("{k3}_0")), b"tokio-rlib").unwrap();
 
         // C++ object file (no crate name pattern)
         let k4 = "aaaa0004";
-        store.insert(k4, &zccache_artifact::ArtifactIndex::new(
-            vec!["foo.o".into()],
-            vec![50], vec![], vec![], 0,
-        )).unwrap();
+        store
+            .insert(
+                k4,
+                &zccache_artifact::ArtifactIndex::new(
+                    vec!["foo.o".into()],
+                    vec![50],
+                    vec![],
+                    vec![],
+                    0,
+                ),
+            )
+            .unwrap();
         std::fs::write(artifact_dir.join(format!("{k4}_0")), b"cpp-object").unwrap();
 
         drop(store);
@@ -2915,7 +2979,10 @@ mod tests {
         let lf = write_lockfile(dir.path(), &["serde", "proc-macro2", "unicode-ident"]);
         let crates = parse_lockfile_crates(&lf).unwrap();
         assert!(crates.contains("serde"));
-        assert!(crates.contains("proc_macro2"), "hyphens should be underscores");
+        assert!(
+            crates.contains("proc_macro2"),
+            "hyphens should be underscores"
+        );
         assert!(crates.contains("unicode_ident"));
         assert!(!crates.contains("tokio"), "tokio not in lockfile");
     }
@@ -2929,7 +2996,10 @@ mod tests {
         assert!(artifact_matches_lockfile("libserde-abc123.rlib", &allowed));
         assert!(artifact_matches_lockfile("libserde-abc123.rmeta", &allowed));
         assert!(artifact_matches_lockfile("serde-abc123.d", &allowed));
-        assert!(artifact_matches_lockfile("libproc_macro2-def456.rlib", &allowed));
+        assert!(artifact_matches_lockfile(
+            "libproc_macro2-def456.rlib",
+            &allowed
+        ));
         assert!(!artifact_matches_lockfile("libtokio-ghi789.rlib", &allowed));
         // No hash separator → allowed (could be build script output)
         assert!(artifact_matches_lockfile("build_script_build", &allowed));
@@ -2943,15 +3013,20 @@ mod tests {
         let (index_path, artifact_dir) = make_test_store(dir.path());
         let target_dir = dir.path().join("target");
 
-        let (restored, _, _) = warm_target(
-            &index_path, &artifact_dir, &target_dir, "debug", None,
-        ).unwrap();
+        let (restored, _, _) =
+            warm_target(&index_path, &artifact_dir, &target_dir, "debug", None).unwrap();
 
         let deps = target_dir.join("debug").join("deps");
         assert_eq!(restored, 6, "without lockfile: restore all 6 files");
         assert!(deps.join("libserde-abc123.rlib").exists());
-        assert!(deps.join("libtokio-ghi789.rlib").exists(), "tokio restored without filter");
-        assert!(deps.join("foo.o").exists(), "C++ file restored without filter");
+        assert!(
+            deps.join("libtokio-ghi789.rlib").exists(),
+            "tokio restored without filter"
+        );
+        assert!(
+            deps.join("foo.o").exists(),
+            "C++ file restored without filter"
+        );
     }
 
     #[test]
@@ -2962,16 +3037,27 @@ mod tests {
         let lockfile = write_lockfile(dir.path(), &["serde", "proc-macro2"]);
 
         let (restored, skipped, _) = warm_target(
-            &index_path, &artifact_dir, &target_dir, "debug", Some(&lockfile),
-        ).unwrap();
+            &index_path,
+            &artifact_dir,
+            &target_dir,
+            "debug",
+            Some(&lockfile),
+        )
+        .unwrap();
 
         let deps = target_dir.join("debug").join("deps");
         // serde (3) + proc-macro2 (1) + foo.o (1, no hash separator = allowed)
         assert_eq!(restored, 5);
         assert!(deps.join("libserde-abc123.rlib").exists());
         assert!(deps.join("libproc_macro2-def456.rlib").exists());
-        assert!(!deps.join("libtokio-ghi789.rlib").exists(), "tokio NOT in lockfile");
-        assert!(deps.join("foo.o").exists(), "no hash separator = allowed through");
+        assert!(
+            !deps.join("libtokio-ghi789.rlib").exists(),
+            "tokio NOT in lockfile"
+        );
+        assert!(
+            deps.join("foo.o").exists(),
+            "no hash separator = allowed through"
+        );
         assert!(skipped > 0, "tokio should be skipped");
     }
 
@@ -2989,13 +3075,20 @@ mod tests {
         let lockfile = write_lockfile(dir.path(), &["serde"]);
 
         let (restored, _, _) = warm_target(
-            &index_path, &artifact_dir, &target_dir, "debug", Some(&lockfile),
-        ).unwrap();
+            &index_path,
+            &artifact_dir,
+            &target_dir,
+            "debug",
+            Some(&lockfile),
+        )
+        .unwrap();
 
         let deps = target_dir.join("debug").join("deps");
         assert!(deps.join("libserde-abc123.rlib").exists());
-        assert!(!deps.join("libtokio-ghi789.rlib").exists(),
-            "removed crate must NOT be restored");
+        assert!(
+            !deps.join("libtokio-ghi789.rlib").exists(),
+            "removed crate must NOT be restored"
+        );
         // serde (3) + foo.o (1, no hash separator = allowed)
         assert_eq!(restored, 4);
     }
@@ -3017,12 +3110,19 @@ mod tests {
         // Now warm with lockfile that excludes tokio
         let lockfile = write_lockfile(dir.path(), &["serde"]);
         warm_target(
-            &index_path, &artifact_dir, &target_dir, "debug", Some(&lockfile),
-        ).unwrap();
+            &index_path,
+            &artifact_dir,
+            &target_dir,
+            "debug",
+            Some(&lockfile),
+        )
+        .unwrap();
 
         // Stale file still there (warm doesn't delete)
-        assert!(deps.join("libtokio-ghi789.rlib").exists(),
-            "warm doesn't clean up stale files — cargo ignores them");
+        assert!(
+            deps.join("libtokio-ghi789.rlib").exists(),
+            "warm doesn't clean up stale files — cargo ignores them"
+        );
         // But it wasn't overwritten with fresh content
         assert_eq!(
             std::fs::read(deps.join("libtokio-ghi789.rlib")).unwrap(),
@@ -3046,18 +3146,34 @@ mod tests {
 
         // Old version's artifact (different hash suffix)
         let k_old = "bbbb0001";
-        store.insert(k_old, &zccache_artifact::ArtifactIndex::new(
-            vec!["libserde-old111.rlib".into()],
-            vec![100], vec![], vec![], 0,
-        )).unwrap();
+        store
+            .insert(
+                k_old,
+                &zccache_artifact::ArtifactIndex::new(
+                    vec!["libserde-old111.rlib".into()],
+                    vec![100],
+                    vec![],
+                    vec![],
+                    0,
+                ),
+            )
+            .unwrap();
         std::fs::write(artifact_dir.join(format!("{k_old}_0")), b"old-serde").unwrap();
 
         // New version's artifact (different hash suffix)
         let k_new = "bbbb0002";
-        store.insert(k_new, &zccache_artifact::ArtifactIndex::new(
-            vec!["libserde-new222.rlib".into()],
-            vec![100], vec![], vec![], 0,
-        )).unwrap();
+        store
+            .insert(
+                k_new,
+                &zccache_artifact::ArtifactIndex::new(
+                    vec!["libserde-new222.rlib".into()],
+                    vec![100],
+                    vec![],
+                    vec![],
+                    0,
+                ),
+            )
+            .unwrap();
         std::fs::write(artifact_dir.join(format!("{k_new}_0")), b"new-serde").unwrap();
 
         drop(store);
@@ -3066,8 +3182,13 @@ mod tests {
         let lockfile = write_lockfile(dir.path(), &["serde"]);
 
         let (restored, _, _) = warm_target(
-            &index_path, &artifact_dir, &target_dir, "debug", Some(&lockfile),
-        ).unwrap();
+            &index_path,
+            &artifact_dir,
+            &target_dir,
+            "debug",
+            Some(&lockfile),
+        )
+        .unwrap();
 
         let deps = target_dir.join("debug").join("deps");
         // Both old and new are restored — cargo will use the one matching
@@ -3092,26 +3213,35 @@ mod tests {
 
         let store = zccache_artifact::ArtifactStore::open(&index_path).unwrap();
         let key = "cccc0001";
-        store.insert(key, &zccache_artifact::ArtifactIndex::new(
-            vec!["libserde-abc123.rlib".into()],
-            vec![1000], // Claims 1000 bytes
-            vec![], vec![], 0,
-        )).unwrap();
+        store
+            .insert(
+                key,
+                &zccache_artifact::ArtifactIndex::new(
+                    vec!["libserde-abc123.rlib".into()],
+                    vec![1000], // Claims 1000 bytes
+                    vec![],
+                    vec![],
+                    0,
+                ),
+            )
+            .unwrap();
         // But payload is only 5 bytes (corrupted/truncated)
         std::fs::write(artifact_dir.join(format!("{key}_0")), b"short").unwrap();
         drop(store);
 
         let target_dir = dir.path().join("target");
-        let (restored, _, errors) = warm_target(
-            &index_path, &artifact_dir, &target_dir, "debug", None,
-        ).unwrap();
+        let (restored, _, errors) =
+            warm_target(&index_path, &artifact_dir, &target_dir, "debug", None).unwrap();
 
         // Warm restores it without error (it doesn't validate content)
         assert_eq!(restored, 1);
         assert_eq!(errors, 0);
         // Cargo will detect the corruption via its own hash check and rebuild
         let deps = target_dir.join("debug").join("deps");
-        assert_eq!(std::fs::read(deps.join("libserde-abc123.rlib")).unwrap(), b"short");
+        assert_eq!(
+            std::fs::read(deps.join("libserde-abc123.rlib")).unwrap(),
+            b"short"
+        );
     }
 
     #[test]
@@ -3123,8 +3253,13 @@ mod tests {
         let lockfile = write_lockfile(dir.path(), &[]);
 
         let (restored, skipped, _) = warm_target(
-            &index_path, &artifact_dir, &target_dir, "debug", Some(&lockfile),
-        ).unwrap();
+            &index_path,
+            &artifact_dir,
+            &target_dir,
+            "debug",
+            Some(&lockfile),
+        )
+        .unwrap();
 
         // foo.o has no hash separator → allowed through. Everything else skipped.
         assert_eq!(restored, 1, "only foo.o (no hash separator) passes");

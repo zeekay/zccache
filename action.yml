@@ -24,6 +24,20 @@ inputs:
       Only caches lightweight metadata, not full .rlib files.
     required: false
     default: "true"
+  compilation-restore-fallback:
+    description: >
+      Whether restore-key fallback is allowed for the zccache compilation cache.
+      Keep "true" for faster incremental CI across commits. Set to "false" for
+      exact-key-only restores.
+    required: false
+    default: "true"
+  target-restore-fallback:
+    description: >
+      Whether restore-key fallback is allowed for cargo target metadata.
+      Default "false" because fallback metadata can be stale for changed source
+      trees, especially on pull_request merge refs.
+    required: false
+    default: "false"
   target-dir:
     description: >
       Path to the cargo target directory.
@@ -91,11 +105,19 @@ runs:
         fi
 
         echo "compilation-key=${PREFIX}-${{ github.sha }}" >> "$GITHUB_OUTPUT"
-        echo "compilation-restore=${PREFIX}-" >> "$GITHUB_OUTPUT"
+        if [ "${{ inputs.compilation-restore-fallback }}" = "true" ]; then
+          echo "compilation-restore=${PREFIX}-" >> "$GITHUB_OUTPUT"
+        else
+          echo "compilation-restore=" >> "$GITHUB_OUTPUT"
+        fi
         echo "registry-key=cargo-registry-${OS}-${ARCH}-${LOCK_HASH}" >> "$GITHUB_OUTPUT"
         echo "registry-restore=cargo-registry-${OS}-${ARCH}-" >> "$GITHUB_OUTPUT"
         echo "target-key=cargo-target-${OS}-${ARCH}-${LOCK_HASH}-${{ github.sha }}" >> "$GITHUB_OUTPUT"
-        echo "target-restore=cargo-target-${OS}-${ARCH}-${LOCK_HASH}-" >> "$GITHUB_OUTPUT"
+        if [ "${{ inputs.target-restore-fallback }}" = "true" ]; then
+          echo "target-restore=cargo-target-${OS}-${ARCH}-${LOCK_HASH}-" >> "$GITHUB_OUTPUT"
+        else
+          echo "target-restore=" >> "$GITHUB_OUTPUT"
+        fi
 
     # --- Layer 1: Restore zccache compilation cache ---
     - name: Restore zccache compilation cache
