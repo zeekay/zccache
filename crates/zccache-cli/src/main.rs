@@ -1295,27 +1295,29 @@ fn cmd_crashes(clear: bool) -> ExitCode {
 
 /// Resolve the cargo home directory from an explicit argument, the `CARGO_HOME`
 /// env var, or the default `~/.cargo`.
-fn resolve_cargo_home(explicit: Option<&str>) -> Result<PathBuf, String> {
+fn resolve_cargo_home(explicit: Option<&str>) -> Result<NormalizedPath, String> {
     if let Some(p) = explicit {
-        return Ok(PathBuf::from(p));
+        return Ok(NormalizedPath::from(p));
     }
     if let Ok(ch) = std::env::var("CARGO_HOME") {
         if !ch.is_empty() {
-            return Ok(PathBuf::from(ch));
+            return Ok(NormalizedPath::from(ch));
         }
     }
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map_err(|_| "cannot determine home directory (set HOME or CARGO_HOME)".to_string())?;
-    Ok(PathBuf::from(home).join(".cargo"))
+    Ok(NormalizedPath::from(home).join(".cargo"))
 }
 
 /// Directory where cargo-registry archives are stored.
-fn cargo_registry_cache_dir() -> Result<PathBuf, String> {
+fn cargo_registry_cache_dir() -> Result<NormalizedPath, String> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map_err(|_| "cannot determine home directory (set HOME)".to_string())?;
-    Ok(PathBuf::from(home).join(".zccache").join("cargo-registry"))
+    Ok(NormalizedPath::from(home)
+        .join(".zccache")
+        .join("cargo-registry"))
 }
 
 fn cmd_cargo_registry_save(key: &str, cargo_home: Option<&str>) -> ExitCode {
@@ -1344,7 +1346,7 @@ fn cmd_cargo_registry_save(key: &str, cargo_home: Option<&str>) -> ExitCode {
 
     // Collect paths to archive.
     let subdirs: &[&str] = &["registry/index", "registry/cache", "git/db"];
-    let mut paths: Vec<(PathBuf, String)> = Vec::new();
+    let mut paths: Vec<(NormalizedPath, String)> = Vec::new();
     for subdir in subdirs {
         let p = cargo_home.join(subdir);
         if p.exists() {
