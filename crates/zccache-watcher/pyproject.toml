@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "zccache-watcher"
-version = "1.2.8"
+version = "1.2.9"
 description = "Cross-platform filesystem watcher backed by zccache"
 requires-python = ">=3.10"
 license = "MIT OR Apache-2.0"
