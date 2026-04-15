@@ -591,7 +591,13 @@ impl DaemonServer {
         loop {
             tokio::select! {
                 result = self.listener.accept() => {
-                    let conn = result?;
+                    let conn = match result {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!("accept failed, continuing: {e}");
+                            continue;
+                        }
+                    };
                     let state = Arc::clone(&self.state);
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(conn, state).await {
