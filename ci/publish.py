@@ -227,8 +227,17 @@ def get_publish_blocking_dirty_entries() -> list[str]:
     return blocking
 
 
+def read_workspace_version() -> str:
+    """Read version from [workspace.package] in Cargo.toml (single source of truth)."""
+    cargo_text = (ROOT / "Cargo.toml").read_text()
+    match = re.search(r'\[workspace\.package\]\s*\nversion\s*=\s*"([^"]+)"', cargo_text)
+    if not match:
+        raise SystemExit("ERROR: Could not find [workspace.package] version in Cargo.toml")
+    return match.group(1)
+
+
 def read_project_meta() -> tuple[str, str, str, str, str]:
-    """Return (name, version, summary, requires_python, readme) from pyproject.toml."""
+    """Return (name, version, summary, requires_python, readme) from pyproject.toml + Cargo.toml."""
     with open(ROOT / "pyproject.toml", "rb") as f:
         data = tomllib.load(f)
     proj = data["project"]
@@ -240,7 +249,7 @@ def read_project_meta() -> tuple[str, str, str, str, str]:
             readme = readme_path.read_text(encoding="utf-8")
     return (
         proj["name"],
-        proj["version"],
+        read_workspace_version(),
         proj.get("description", ""),
         proj.get("requires-python", ">=3.9"),
         readme,
