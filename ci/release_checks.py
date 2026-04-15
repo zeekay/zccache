@@ -30,7 +30,7 @@ RUST_PUBLISH_ORDER = [
     "zccache-cli",
     "zccache-daemon",
 ]
-VERSIONED_PYPROJECTS = (
+DYNAMIC_VERSION_PYPROJECTS = (
     ROOT / "pyproject.toml",
     ROOT / "crates" / "zccache-watcher" / "pyproject.toml",
     ROOT / "crates" / "zccache-fingerprint" / "pyproject.toml",
@@ -67,12 +67,19 @@ def validate_release_versions() -> None:
     workspace_version = workspace_data["workspace"]["package"]["version"]
     errors: list[str] = []
 
-    for path in VERSIONED_PYPROJECTS:
-        project_version = _read_toml(path)["project"]["version"]
-        if project_version != workspace_version:
+    for path in DYNAMIC_VERSION_PYPROJECTS:
+        project = _read_toml(path)["project"]
+        if "version" in project:
+            # Hardcoded version — must match workspace
+            if project["version"] != workspace_version:
+                rel_path = path.relative_to(ROOT)
+                errors.append(
+                    f"{rel_path} has version {project['version']}, expected {workspace_version}"
+                )
+        elif "version" not in project.get("dynamic", []):
             rel_path = path.relative_to(ROOT)
             errors.append(
-                f"{rel_path} has version {project_version}, expected {workspace_version}"
+                f"{rel_path} has no version and does not declare it as dynamic"
             )
 
     expected_dependency_version = f"={workspace_version}"
