@@ -59,12 +59,15 @@ def bump(current: str, part: str) -> str:
     return ".".join(map(str, parts))
 
 
-def write_version(new_version: str) -> None:
+def write_version(current: str, new_version: str) -> None:
     text = CARGO_TOML.read_text()
+    # Update [workspace.package] version
     text, count = VERSION_RE.subn(rf"\g<1>{new_version}\3", text)
     if count != 1:
-        print("ERROR: Failed to update version in Cargo.toml", file=sys.stderr)
+        print("ERROR: Failed to update workspace version in Cargo.toml", file=sys.stderr)
         sys.exit(1)
+    # Update pinned workspace dependency versions: version = "=X.Y.Z"
+    text = text.replace(f'version = "={current}"', f'version = "={new_version}"')
     CARGO_TOML.write_text(text)
 
 
@@ -88,7 +91,7 @@ def main() -> None:
         print(f"Version is already {current}")
         return
 
-    write_version(new_version)
+    write_version(current, new_version)
     print(f"{current} -> {new_version}")
 
 
