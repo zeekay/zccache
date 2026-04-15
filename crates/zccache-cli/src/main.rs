@@ -2393,6 +2393,36 @@ async fn spawn_and_wait(endpoint: &str) -> Result<(), String> {
 /// Handles concurrent calls gracefully: when multiple processes race to start
 /// the daemon, only one wins the bind. The losers detect this and connect to
 /// the winning daemon instead of failing.
+/// Stop a stale daemon that is unreachable or version-incompatible.
+///
+/// Attempts graceful shutdown via IPC first, then falls back to force-killing
+/// the process via the lock file PID. Waits for the endpoint to be released.
+async fn stop_stale_daemon(endpoint: &str) {
+    // Try graceful shutdown via IPC
+    if let Ok(mut conn) = connect(endpoint).await {
+        let _ = conn.send(&zccache_protocol::Request::Shutdown).await;
+        // Give it a moment to process the shutdown
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // Force-kill via lock file PID if the daemon is still alive
+    if let Some(pid) = zccache_ipc::check_running_daemon() {
+        tracing::debug!(pid, "force-killing stale daemon process");
+        if zccache_ipc::force_kill_process(pid).is_ok() {
+            for _ in 0..50 {
+                if !zccache_ipc::is_process_alive(pid) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        zccache_ipc::remove_lock_file();
+    }
+
+    // Wait briefly for the endpoint (named pipe / socket) to be fully released
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+}
+
 async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
     // Fast path: connect + version check
     match check_daemon_version(endpoint).await {
@@ -2406,18 +2436,18 @@ async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
             return Ok(());
         }
         VersionCheck::DaemonOlder { daemon_ver } => {
-            return Err(format!(
-                "daemon v{daemon_ver} is older than client v{}. \
-                 Run `zccache stop` first.",
-                zccache_core::VERSION,
-            ));
+            tracing::info!(
+                daemon_ver,
+                client_ver = zccache_core::VERSION,
+                "daemon is older than client, auto-recovering"
+            );
+            stop_stale_daemon(endpoint).await;
+            return spawn_and_wait(endpoint).await;
         }
         VersionCheck::CommError => {
-            return Err(
-                "cannot communicate with daemon (possible protocol mismatch). \
-                 Run `zccache stop` first."
-                    .to_string(),
-            );
+            tracing::info!("cannot communicate with daemon, auto-recovering");
+            stop_stale_daemon(endpoint).await;
+            return spawn_and_wait(endpoint).await;
         }
         VersionCheck::Unreachable => {
             // Fall through to lock-file check / spawn
@@ -2439,18 +2469,20 @@ async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
                     return Ok(());
                 }
                 VersionCheck::DaemonOlder { daemon_ver } => {
-                    return Err(format!(
-                        "daemon v{daemon_ver} is older than client v{}. \
-                         Run `zccache stop` first.",
-                        zccache_core::VERSION,
-                    ));
+                    tracing::info!(
+                        daemon_ver,
+                        client_ver = zccache_core::VERSION,
+                        "daemon is older than client during startup, auto-recovering"
+                    );
+                    stop_stale_daemon(endpoint).await;
+                    return spawn_and_wait(endpoint).await;
                 }
                 VersionCheck::CommError => {
-                    return Err(
-                        "cannot communicate with daemon (possible protocol mismatch). \
-                         Run `zccache stop` first."
-                            .to_string(),
+                    tracing::info!(
+                        "cannot communicate with daemon during startup, auto-recovering"
                     );
+                    stop_stale_daemon(endpoint).await;
+                    return spawn_and_wait(endpoint).await;
                 }
                 VersionCheck::Unreachable => continue,
             }
