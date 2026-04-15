@@ -20,8 +20,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// Ensures the root pyproject.toml declares version as dynamic (derived
     /// from Cargo.toml at build time via setup.py). A hardcoded version would
     /// drift from the workspace version and cause release mismatches.
@@ -37,13 +35,18 @@ mod tests {
             .expect("failed to read pyproject.toml");
 
         assert!(
-            pyproject.lines().any(|line| line.trim().contains("dynamic") && line.contains("version")),
+            pyproject
+                .lines()
+                .any(|line| line.trim().contains("dynamic") && line.contains("version")),
             "pyproject.toml must use dynamic = [\"version\"] (derived from Cargo.toml)"
         );
         assert!(
             !pyproject.lines().any(|line| {
                 let t = line.trim();
-                t.starts_with("version") && t.contains('=') && t.contains('"') && !t.contains("dynamic")
+                t.starts_with("version")
+                    && t.contains('=')
+                    && t.contains('"')
+                    && !t.contains("dynamic")
             }),
             "pyproject.toml must not have a hardcoded version field"
         );
