@@ -1430,7 +1430,30 @@ async fn handle_link_ephemeral(
     // side-effect files (e.g., runtime DLLs deployed by compiler wrappers).
     let dir_snapshot = crate::side_effect::snapshot_directory(output_dir);
 
+    // Extract post-link deploy command from env (if any) BEFORE we consume
+    // `env` in the passthrough call. See run_post_link_deploy_hook for rationale.
+    let deploy_cmd = env
+        .as_ref()
+        .and_then(|v| {
+            v.iter()
+                .find(|(k, _)| k == "ZCCACHE_LINK_DEPLOY_CMD")
+                .map(|(_, val)| val.clone())
+        })
+        .filter(|s| !s.is_empty());
+    // Clone env for the hook (we need to re-use it; passthrough consumes env).
+    let env_for_hook = env.clone();
+
     let result = run_tool_passthrough(tool, args, cwd, env).await;
+
+    // 6b. Invoke optional post-link deploy command on successful link.
+    // This handles the case where the compiler driver does NOT auto-deploy
+    // runtime DLLs (e.g. a native trampoline that skips the Python wrapper
+    // layer where clang-tool-chain's `post_link_dll_deployment` lives).
+    // The hook runs BEFORE the side-effect scan so scanning picks up
+    // whatever it deployed.
+    if let (Some(cmd), Response::LinkResult { exit_code: 0, .. }) = (&deploy_cmd, &result) {
+        run_post_link_deploy_hook(cmd, &output_path, env_for_hook.as_deref()).await;
+    }
 
     // 7. If successful, cache the output
     if let Response::LinkResult {
@@ -1629,6 +1652,101 @@ async fn run_tool_passthrough(
         Err(e) => Response::Error {
             message: format!("failed to run {}: {e}", tool.display()),
         },
+    }
+}
+
+/// Run an optional post-link deploy command on the link output.
+///
+/// Invoked when `ZCCACHE_LINK_DEPLOY_CMD` is set in the client's env. The
+/// command is expected to be a tool like `clang-tool-chain-libdeploy` that
+/// takes one positional argument — the path to the just-linked binary — and
+/// deploys any runtime dependencies (runtime DLLs on Windows, libc++/libunwind
+/// on Linux/macOS) alongside it.
+///
+/// This fills a gap that exists when the compiler driver does not auto-deploy
+/// runtime dependencies during link (for example a native-compiled trampoline
+/// that bypasses the driver's post-link Python hooks). The subsequent
+/// `side_effect::detect_side_effects` scan in the caller will then pick up
+/// whatever this hook deployed and cache it alongside the primary output.
+///
+/// Failures are non-fatal: we log a warning and return. The link itself has
+/// already succeeded — the build will continue, just without the deployed
+/// runtime files cached. Consumers relying on the hook should surface
+/// failures at their own layer (e.g. via a separate post-build lint).
+///
+/// The command is parsed as shell-style (split on whitespace) with one trailing
+/// argument appended: the output path. For example:
+/// ```text
+/// ZCCACHE_LINK_DEPLOY_CMD=clang-tool-chain-libdeploy
+/// # runs: clang-tool-chain-libdeploy <output_path>
+/// ZCCACHE_LINK_DEPLOY_CMD="clang-tool-chain-libdeploy --quiet"
+/// # runs: clang-tool-chain-libdeploy --quiet <output_path>
+/// ```
+async fn run_post_link_deploy_hook(
+    cmd_str: &str,
+    output_path: &Path,
+    env: Option<&[(String, String)]>,
+) {
+    // Split command string on whitespace — first token is the executable,
+    // remaining tokens are extra args. We don't support quoted args yet;
+    // keep it simple.
+    let mut parts = cmd_str.split_whitespace();
+    let program = match parts.next() {
+        Some(p) => p,
+        None => {
+            tracing::warn!("ZCCACHE_LINK_DEPLOY_CMD is empty — skipping deploy hook");
+            return;
+        }
+    };
+    let extra_args: Vec<&str> = parts.collect();
+
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(&extra_args);
+    cmd.arg(output_path);
+
+    // Run the hook in the output directory so any relative paths the deploy
+    // tool emits land sensibly next to the binary.
+    if let Some(parent) = output_path.parent() {
+        cmd.current_dir(parent);
+    }
+
+    // Propagate the client's env — the deploy tool may rely on PATH, TMP,
+    // language-specific vars (CLANG_TOOL_CHAIN_*), etc.
+    if let Some(env_vars) = env {
+        cmd.env_clear();
+        for (k, v) in env_vars {
+            cmd.env(k, v);
+        }
+    }
+
+    tracing::debug!(
+        program = %program,
+        output = %output_path.display(),
+        "running post-link deploy hook"
+    );
+
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            tracing::debug!(
+                program = %program,
+                "post-link deploy hook succeeded"
+            );
+        }
+        Ok(out) => {
+            tracing::warn!(
+                program = %program,
+                exit_code = out.status.code().unwrap_or(-1),
+                stderr = %String::from_utf8_lossy(&out.stderr),
+                "post-link deploy hook exited non-zero"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                program = %program,
+                error = %e,
+                "post-link deploy hook failed to start"
+            );
+        }
     }
 }
 
@@ -5045,5 +5163,120 @@ mod tests {
             diff < 5,
             "fallback path should produce fresh mtime — {diff}s old"
         );
+    }
+
+    // ── run_post_link_deploy_hook unit tests ────────────────────────────
+    //
+    // These tests use a tiny helper program that writes a file next to the
+    // provided output path and exits 0, simulating a real deploy tool like
+    // `clang-tool-chain-libdeploy`. They verify:
+    //   - the hook runs when invoked
+    //   - failures don't panic / propagate (hook is best-effort)
+    //   - the env is propagated
+
+    /// Run the hook with a command that creates a sidecar file next to the
+    /// output. Verifies the sidecar appears — this is the contract that
+    /// `side_effect::detect_side_effects` relies on.
+    #[cfg(unix)] // uses /bin/sh; Windows has its own test below
+    #[tokio::test]
+    async fn post_link_deploy_hook_runs_and_creates_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        std::fs::write(&output, b"binary").unwrap();
+
+        // Fake deploy tool: creates a sidecar DLL next to the passed path.
+        let script = dir.path().join("fake_deploy.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ntouch \"$(dirname \"$1\")/libruntime.so\"\n",
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .args(["+x"])
+            .arg(&script)
+            .status()
+            .unwrap();
+
+        let cmd_str = script.to_string_lossy().to_string();
+        run_post_link_deploy_hook(&cmd_str, &output, None).await;
+
+        assert!(
+            dir.path().join("libruntime.so").exists(),
+            "hook should have created the sidecar"
+        );
+    }
+
+    /// Hook that exits non-zero must not panic — failures are best-effort.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_link_deploy_hook_failure_is_non_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        std::fs::write(&output, b"binary").unwrap();
+
+        // Just exit 1 — no side effect.
+        run_post_link_deploy_hook("false", &output, None).await;
+        // If we reached here without panic, the test passes. A warning should
+        // have been logged by the hook.
+    }
+
+    /// Nonexistent program — hook should log a warning, not panic.
+    #[tokio::test]
+    async fn post_link_deploy_hook_nonexistent_program_is_non_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app.dll");
+        std::fs::write(&output, b"binary").unwrap();
+
+        run_post_link_deploy_hook(
+            "this-program-does-not-exist-zccache-test-12345",
+            &output,
+            None,
+        )
+        .await;
+        // No panic = pass.
+    }
+
+    /// Empty command string — must early-return without attempting to spawn.
+    #[tokio::test]
+    async fn post_link_deploy_hook_empty_cmd_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app.dll");
+        std::fs::write(&output, b"binary").unwrap();
+
+        run_post_link_deploy_hook("", &output, None).await;
+        run_post_link_deploy_hook("   ", &output, None).await;
+        // No panic = pass.
+    }
+
+    /// Env is propagated to the hook process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_link_deploy_hook_propagates_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        std::fs::write(&output, b"binary").unwrap();
+
+        // Script reads $ZCCACHE_TEST_MARKER from env and writes it to a
+        // marker file next to the output.
+        let script = dir.path().join("read_env.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s' \"$ZCCACHE_TEST_MARKER\" > \"$(dirname \"$1\")/marker.txt\"\n",
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .args(["+x"])
+            .arg(&script)
+            .status()
+            .unwrap();
+
+        let env = vec![
+            ("PATH".to_string(), std::env::var("PATH").unwrap_or_default()),
+            ("ZCCACHE_TEST_MARKER".to_string(), "hello-hook".to_string()),
+        ];
+        run_post_link_deploy_hook(&script.to_string_lossy(), &output, Some(&env)).await;
+
+        let marker = std::fs::read_to_string(dir.path().join("marker.txt")).unwrap();
+        assert_eq!(marker, "hello-hook");
     }
 }
