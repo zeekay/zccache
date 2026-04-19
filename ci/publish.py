@@ -851,7 +851,20 @@ def build_wheel(
     for pt in plat_tags:
         wheel_meta += f"Tag: py3-none-{pt}\n"
 
-    exec_perms = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
+    # Both bits are required for pip/installer to chmod +x on Linux/macOS:
+    #   - create_system=3 tells the unpacker to interpret external_attr as
+    #     Unix mode bits (default is 0 = DOS attributes, ignored as perms).
+    #   - S_IFREG is the file-type bit; pip's installer calls stat.S_ISREG()
+    #     on the upper 16 bits and falls back to umask defaults (0o644) if
+    #     it's missing, even when mode bits are set to 0o755.
+    # Reference: uv/ruff/maturin wheels all ship external_attr=0x81ed0000.
+    # See zackees/self#25 for the ecosystem-wide audit.
+    exec_perms = (
+        stat.S_IFREG
+        | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+        | stat.S_IRGRP | stat.S_IXGRP
+        | stat.S_IROTH | stat.S_IXOTH
+    )
 
     WHEEL_DIR.mkdir(parents=True, exist_ok=True)
     wheel_path = WHEEL_DIR / wheel_filename
@@ -862,6 +875,7 @@ def build_wheel(
             data = binary.read_bytes()
             arcname = f"{data_dir}/scripts/{binary.name}"
             info = zipfile.ZipInfo(arcname)
+            info.create_system = 3
             info.external_attr = exec_perms << 16
             info.compress_type = zipfile.ZIP_DEFLATED
             whl.writestr(info, data)
