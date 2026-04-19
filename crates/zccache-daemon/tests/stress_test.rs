@@ -753,6 +753,100 @@ async fn adversarial_output_path_does_not_affect_cache_key() {
 }
 
 #[tokio::test]
+#[ignore] // integration: spawns clang twice, run with --full
+async fn adversarial_workspace_rename_hits_cache() {
+    let clang = match zccache_test_support::find_clang() {
+        Some(p) => p,
+        None => return,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_a = tmp.path().join("workspace-a");
+    let ws_b = tmp.path().join("workspace-b");
+    let src_rel = std::path::Path::new("src").join("main.cpp");
+    let header_rel = std::path::Path::new("include").join("demo.h");
+    let obj_rel = std::path::Path::new("build").join("main.o");
+    for ws in [&ws_a, &ws_b] {
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(ws.join("include")).unwrap();
+        std::fs::create_dir_all(ws.join("build")).unwrap();
+        std::fs::write(
+            ws.join(&header_rel),
+            "#pragma once\ninline int demo() { return 7; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join(&src_rel),
+            "#include \"demo.h\"\nint main() { return demo(); }\n",
+        )
+        .unwrap();
+    }
+    let log = tmp.path().join("workspace-rename.log");
+
+    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let mut client_a = zccache_ipc::connect(&endpoint).await.unwrap();
+    let cwd_a = ws_a.to_string_lossy().into_owned();
+    let (sid_a, comp_a) =
+        start_session(&mut client_a, &clang, &cwd_a, &log.to_string_lossy()).await;
+    let src_a = ws_a.join(&src_rel);
+    let obj_a = ws_a.join(&obj_rel);
+    let include_a = ws_a.join("include");
+
+    let (ec, cached) = compile(
+        &mut client_a,
+        &sid_a,
+        &comp_a,
+        &[
+            "-I",
+            &include_a.to_string_lossy(),
+            "-c",
+            &src_a.to_string_lossy(),
+            "-o",
+            &obj_a.to_string_lossy(),
+        ],
+        &cwd_a,
+    )
+    .await;
+    assert_eq!(ec, 0);
+    assert!(!cached);
+
+    let mut client_b = zccache_ipc::connect(&endpoint).await.unwrap();
+    let cwd_b = ws_b.to_string_lossy().into_owned();
+    let (sid_b, comp_b) =
+        start_session(&mut client_b, &clang, &cwd_b, &log.to_string_lossy()).await;
+    let src_b = ws_b.join(&src_rel);
+    let obj_b = ws_b.join(&obj_rel);
+    let include_b = ws_b.join("include");
+
+    let (ec, cached) = compile(
+        &mut client_b,
+        &sid_b,
+        &comp_b,
+        &[
+            "-I",
+            &include_b.to_string_lossy(),
+            "-c",
+            &src_b.to_string_lossy(),
+            "-o",
+            &obj_b.to_string_lossy(),
+        ],
+        &cwd_b,
+    )
+    .await;
+    assert_eq!(ec, 0);
+    assert!(
+        cached,
+        "same tree under a different workspace root should hit cache"
+    );
+    assert_eq!(
+        std::fs::read(&obj_a).unwrap(),
+        std::fs::read(&obj_b).unwrap()
+    );
+
+    shutdown.notify_one();
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
 #[ignore] // integration: spawns clang 20x, run with --full
 async fn adversarial_rapid_recompile_cycle() {
     let clang = match zccache_test_support::find_clang() {
