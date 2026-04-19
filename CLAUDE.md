@@ -47,15 +47,8 @@ uv run python ci/build_dist.py --skip-build
 
 ### Publishing
 
-```bash
-uv run --script ci/publish.py     # pre-check PyPI -> build -> download -> wheel -> upload
-```
-
-- **Script**: `ci/publish.py` - PEP 723 script executed via `uv run --script`
-- **Pre-check**: Fails fast if version from `pyproject.toml` already exists on PyPI
-- **Pipeline**: Triggers GH Actions build -> waits -> downloads artifacts -> builds platform wheels -> uploads via `uv publish`
-- **Auth**: `UV_PUBLISH_TOKEN`, `~/.pypirc`, or interactive prompt
-- **Automation**: `.github/workflows/release.yml` is the canonical tag-driven release workflow. It validates release metadata, fails fast when the current version is already fully published on PyPI/crates.io, builds wheel/release artifacts, publishes PyPI wheels, publishes Rust crates, and creates the GitHub release.
+- **Automation**: `.github/workflows/release.yml` is the only supported release entrypoint. It validates release metadata, fails fast when the current version is already fully published on PyPI/crates.io, builds wheel/release artifacts, publishes PyPI wheels, publishes Rust crates, and creates the GitHub release.
+- **Helper module**: `ci/release_workflow.py` contains workflow-only Python helpers for preflight checks, wheel assembly, and crates.io publish order. It does not dispatch other GitHub workflows.
 - **Tag rule**: Push `1.3.0` or `v1.3.0`; the workflow normalizes the tag and requires it to match `[workspace.package].version` in `Cargo.toml`.
 - **Manual runs**: `Run workflow` may leave `tag` empty. The workflow then uses the current workspace version from the selected branch, prefers an existing matching tag, and fails early if that version already has a published GitHub release.
 - **PyPI setup**: Prefer Trusted Publishing. Configure PyPI to trust repo `zackees/zccache`, workflow `.github/workflows/release.yml`, environment `pypi`.

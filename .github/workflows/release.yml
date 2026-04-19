@@ -132,13 +132,7 @@ jobs:
 
       - name: Fail fast if version already exists on PyPI or crates.io
         run: |
-          python - <<'PY'
-          from ci.publish import check_crates_versions, check_pypi_version, read_project_meta
-
-          name, version, *_ = read_project_meta()
-          check_pypi_version(name, version)
-          check_crates_versions(version)
-          PY
+          python -m ci.release_workflow check-registries
 
   build:
     name: Build (${{ matrix.target }})
@@ -251,15 +245,13 @@ jobs:
         with:
           python-version: "3.13"
 
-      - uses: astral-sh/setup-uv@v5
-
       - uses: actions/download-artifact@v4
         with:
           pattern: binaries-*
           path: artifact-downloads
 
       - name: Build wheels from downloaded artifacts
-        run: uv run --script ci/publish.py --skip-rust --dry-run --artifact-download-dir artifact-downloads
+        run: python -m ci.release_workflow build-wheels --artifact-download-dir artifact-downloads
 
       - uses: actions/upload-artifact@v4
         with:
@@ -302,8 +294,6 @@ jobs:
         with:
           python-version: "3.13"
 
-      - uses: astral-sh/setup-uv@v5
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.85.1
@@ -311,7 +301,7 @@ jobs:
       - name: Publish crates to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: uv run --script ci/publish.py --skip-pypi
+        run: python -m ci.release_workflow publish-crates
 
   publish-release:
     name: Publish GitHub Release

@@ -13,8 +13,8 @@ Python scripts for development tooling. Project-root trampolines (`_cargo`, `_ru
 
 ## Release Automation
 
-- **`uv run --script ci/publish.py`** - Local release operator path; can also build wheels from pre-downloaded `binaries-*` artifacts via `--artifact-download-dir`
-- **Canonical workflow** - `.github/workflows/release.yml`
+- **Canonical workflow** - `.github/workflows/release.yml` is the only supported release entrypoint
+- **Workflow helper** - `ci/release_workflow.py` provides preflight checks, wheel assembly, and crates publish helpers for the release workflow only
 - **Fast fail** - preflight checks PyPI and crates.io before any build fan-out and stops if the current version is already published
 - **Trigger** - push a tag matching the workspace version (`1.3.0` or `v1.3.0`)
 - **Manual runs** - `Run workflow` can leave `tag` empty; the workflow derives the current workspace version from the selected branch and fails if that version already has a published GitHub release
