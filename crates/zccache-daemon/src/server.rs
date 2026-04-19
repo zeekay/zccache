@@ -2704,9 +2704,7 @@ async fn handle_compile(
     let build_result = build_compile_context(&compilation, &cwd_path, &system_includes, env_slice);
     let (ctx, dep_flags, rustc_args_opt, context_key) = match build_result {
         BuildContextResult::Cc { ctx, dep_flags } => {
-            let key = state
-                .dep_graph
-                .register_with_root(ctx.clone(), Some(cwd_path.clone()));
+            let key = state.dep_graph.register(ctx.clone());
             (ctx, dep_flags, None, key)
         }
         BuildContextResult::Rustc {
@@ -2715,11 +2713,7 @@ async fn handle_compile(
             rustc_args,
         } => {
             let key = rustc_ctx.context_key();
-            state.dep_graph.register_with_key_and_root(
-                key,
-                compat_ctx.clone(),
-                Some(cwd_path.clone()),
-            );
+            state.dep_graph.register_with_key(key, compat_ctx.clone());
             (compat_ctx, UserDepFlags::default(), Some(rustc_args), key)
         }
     };
@@ -3621,9 +3615,7 @@ fn check_unit_cache(
         }
     };
     let t_ctx = t0.elapsed();
-    let context_key = state
-        .dep_graph
-        .register_with_root(ctx.clone(), Some(cwd_path.into()));
+    let context_key = state.dep_graph.register(ctx.clone());
     let t_register = t0.elapsed();
 
     // ── Ultra-fast path: per-file freshness skip ────────────────────

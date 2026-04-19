@@ -109,82 +109,73 @@ impl CompileContext {
     /// sorted flags, unknown flags, force includes.
     #[must_use]
     pub fn context_key(&self) -> ContextKey {
-        compute_context_key(self, None)
-    }
-}
+        let mut hasher = blake3::Hasher::new();
 
-fn normalize_key_path(path: &Path, key_root: Option<&Path>) -> String {
-    if let Some(root) = key_root {
-        if let Ok(stripped) = path.strip_prefix(root) {
-            return normalize_for_key(stripped);
+        // Domain separation.
+        hasher.update(b"zccache-context-key-v1\0");
+
+        // Source file (absolute path).
+        let source_file = normalize_for_key(&self.source_file);
+        hasher.update(source_file.as_bytes());
+        hasher.update(b"\0");
+
+        // Include dirs in order (order matters for resolution!).
+        hasher.update(b"iquote\0");
+        for dir in &self.include_search.iquote {
+            let dir = normalize_for_key(dir);
+            hasher.update(dir.as_bytes());
+            hasher.update(b"\0");
         }
+        hasher.update(b"user\0");
+        for dir in &self.include_search.user {
+            let dir = normalize_for_key(dir);
+            hasher.update(dir.as_bytes());
+            hasher.update(b"\0");
+        }
+        hasher.update(b"system\0");
+        for dir in &self.include_search.system {
+            let dir = normalize_for_key(dir);
+            hasher.update(dir.as_bytes());
+            hasher.update(b"\0");
+        }
+        hasher.update(b"after\0");
+        for dir in &self.include_search.after {
+            let dir = normalize_for_key(dir);
+            hasher.update(dir.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Sorted defines.
+        hasher.update(b"defines\0");
+        for def in &self.defines {
+            hasher.update(def.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Sorted flags.
+        hasher.update(b"flags\0");
+        for flag in &self.flags {
+            hasher.update(flag.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Force includes.
+        hasher.update(b"force-include\0");
+        for fi in &self.force_includes {
+            let fi = normalize_for_key(fi);
+            hasher.update(fi.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Unknown flags â€” not recognized but still affect compilation.
+        hasher.update(b"unknown\0");
+        for flag in &self.unknown_flags {
+            hasher.update(flag.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        ContextKey(ContentHash::from_bytes(*hasher.finalize().as_bytes()))
     }
-
-    normalize_for_key(path)
-}
-
-/// Compute the context key for a C/C++ compilation context.
-///
-/// When `key_root` is provided, paths under that root are hashed relative to it
-/// so equivalent workspaces can share cache keys across root-directory renames.
-#[must_use]
-pub fn compute_context_key(ctx: &CompileContext, key_root: Option<&Path>) -> ContextKey {
-    let mut hasher = blake3::Hasher::new();
-
-    hasher.update(b"zccache-context-key-v1\0");
-
-    hasher.update(normalize_key_path(&ctx.source_file, key_root).as_bytes());
-    hasher.update(b"\0");
-
-    hasher.update(b"iquote\0");
-    for dir in &ctx.include_search.iquote {
-        hasher.update(normalize_key_path(dir, key_root).as_bytes());
-        hasher.update(b"\0");
-    }
-
-    hasher.update(b"user\0");
-    for dir in &ctx.include_search.user {
-        hasher.update(normalize_key_path(dir, key_root).as_bytes());
-        hasher.update(b"\0");
-    }
-
-    hasher.update(b"system\0");
-    for dir in &ctx.include_search.system {
-        hasher.update(normalize_key_path(dir, key_root).as_bytes());
-        hasher.update(b"\0");
-    }
-
-    hasher.update(b"after\0");
-    for dir in &ctx.include_search.after {
-        hasher.update(normalize_key_path(dir, key_root).as_bytes());
-        hasher.update(b"\0");
-    }
-
-    hasher.update(b"defines\0");
-    for def in &ctx.defines {
-        hasher.update(def.as_bytes());
-        hasher.update(b"\0");
-    }
-
-    hasher.update(b"flags\0");
-    for flag in &ctx.flags {
-        hasher.update(flag.as_bytes());
-        hasher.update(b"\0");
-    }
-
-    hasher.update(b"force-include\0");
-    for fi in &ctx.force_includes {
-        hasher.update(normalize_key_path(fi, key_root).as_bytes());
-        hasher.update(b"\0");
-    }
-
-    hasher.update(b"unknown\0");
-    for flag in &ctx.unknown_flags {
-        hasher.update(flag.as_bytes());
-        hasher.update(b"\0");
-    }
-
-    ContextKey(ContentHash::from_bytes(*hasher.finalize().as_bytes()))
 }
 
 /// Compute the artifact key from a context key and file content hashes.
@@ -195,7 +186,6 @@ pub fn compute_context_key(ctx: &CompileContext, key_root: Option<&Path>) -> Con
 pub fn compute_artifact_key<P: AsRef<Path> + Ord>(
     context_key: &ContextKey,
     file_hashes: &mut [(P, ContentHash)],
-    key_root: Option<&Path>,
 ) -> ArtifactKey {
     // Sort by path for determinism.
     file_hashes.sort_by(|a, b| a.0.cmp(&b.0));
@@ -206,7 +196,7 @@ pub fn compute_artifact_key<P: AsRef<Path> + Ord>(
     hasher.update(b"\0");
 
     for (path, hash) in file_hashes.iter() {
-        let path = normalize_key_path(path.as_ref(), key_root);
+        let path = normalize_for_key(path.as_ref());
         hasher.update(path.as_bytes());
         hasher.update(b"\0");
         hasher.update(hash.as_bytes());
@@ -323,7 +313,7 @@ impl RustcCompileContext {
 
         hasher.update(b"zccache-rustc-context-key-v2\0");
 
-        // Compiler binary hash (different rustc versions -> different output).
+        // Compiler binary hash (different rustc versions â†’ different output).
         if let Some(ref ch) = self.compiler_hash {
             hasher.update(b"compiler\0");
             hasher.update(ch.as_bytes());
@@ -398,7 +388,7 @@ impl RustcCompileContext {
             hasher.update(b"\0");
         }
 
-        // Extern crate (name, path) pairs - path included so different
+        // Extern crate (name, path) pairs â€” path included so different
         // --extern a=v1.rlib vs --extern a=v2.rlib get different context keys.
         hasher.update(b"externs\0");
         for (name, path) in &self.extern_crates {
@@ -609,8 +599,8 @@ mod tests {
         ];
 
         assert_eq!(
-            compute_artifact_key(&key, &mut file_hashes_a, None),
-            compute_artifact_key(&key, &mut file_hashes_b, None)
+            compute_artifact_key(&key, &mut file_hashes_a),
+            compute_artifact_key(&key, &mut file_hashes_b)
         );
     }
 
@@ -649,10 +639,8 @@ mod tests {
         let hash_a = zccache_hash::hash_bytes(b"content A");
         let hash_b = zccache_hash::hash_bytes(b"content B");
 
-        let ak1 =
-            compute_artifact_key(&ck, &mut [(NormalizedPath::from("/src/a.c"), hash_a)], None);
-        let ak2 =
-            compute_artifact_key(&ck, &mut [(NormalizedPath::from("/src/a.c"), hash_b)], None);
+        let ak1 = compute_artifact_key(&ck, &mut [(NormalizedPath::from("/src/a.c"), hash_a)]);
+        let ak2 = compute_artifact_key(&ck, &mut [(NormalizedPath::from("/src/a.c"), hash_b)]);
         assert_ne!(ak1, ak2);
     }
 
@@ -663,8 +651,8 @@ mod tests {
 
         let hash = zccache_hash::hash_bytes(b"content");
 
-        let ak1 = compute_artifact_key(&ck, &mut [(NormalizedPath::from("/src/a.c"), hash)], None);
-        let ak2 = compute_artifact_key(&ck, &mut [(NormalizedPath::from("/src/a.c"), hash)], None);
+        let ak1 = compute_artifact_key(&ck, &mut [(NormalizedPath::from("/src/a.c"), hash)]);
+        let ak2 = compute_artifact_key(&ck, &mut [(NormalizedPath::from("/src/a.c"), hash)]);
         assert_eq!(ak1, ak2);
     }
 
@@ -682,7 +670,6 @@ mod tests {
                 (NormalizedPath::from("/a.h"), h1),
                 (NormalizedPath::from("/b.h"), h2),
             ],
-            None,
         );
         let ak2 = compute_artifact_key(
             &ck,
@@ -690,59 +677,8 @@ mod tests {
                 (NormalizedPath::from("/b.h"), h2),
                 (NormalizedPath::from("/a.h"), h1),
             ],
-            None,
         );
         assert_eq!(ak1, ak2, "file order should not affect artifact key");
-    }
-
-    #[test]
-    fn context_key_ignores_workspace_root_when_key_root_is_stable() {
-        let ctx_a = make_context(
-            "/workspace-a/src/main.cpp",
-            &["/workspace-a/include"],
-            &["DEBUG"],
-        );
-        let ctx_b = make_context(
-            "/workspace-b/src/main.cpp",
-            &["/workspace-b/include"],
-            &["DEBUG"],
-        );
-
-        let key_a = compute_context_key(&ctx_a, Some(Path::new("/workspace-a")));
-        let key_b = compute_context_key(&ctx_b, Some(Path::new("/workspace-b")));
-
-        assert_eq!(key_a, key_b);
-    }
-
-    #[test]
-    fn artifact_key_ignores_workspace_root_when_key_root_is_stable() {
-        let ctx = make_context("/workspace-a/src/main.cpp", &["/workspace-a/include"], &[]);
-        let key = compute_context_key(&ctx, Some(Path::new("/workspace-a")));
-        let mut hashes_a = vec![
-            (
-                NormalizedPath::from("/workspace-a/include/foo.h"),
-                zccache_hash::hash_bytes(b"header"),
-            ),
-            (
-                NormalizedPath::from("/workspace-a/src/main.cpp"),
-                zccache_hash::hash_bytes(b"source"),
-            ),
-        ];
-        let mut hashes_b = vec![
-            (
-                NormalizedPath::from("/workspace-b/include/foo.h"),
-                zccache_hash::hash_bytes(b"header"),
-            ),
-            (
-                NormalizedPath::from("/workspace-b/src/main.cpp"),
-                zccache_hash::hash_bytes(b"source"),
-            ),
-        ];
-
-        assert_eq!(
-            compute_artifact_key(&key, &mut hashes_a, Some(Path::new("/workspace-a"))),
-            compute_artifact_key(&key, &mut hashes_b, Some(Path::new("/workspace-b")))
-        );
     }
 
     #[test]

@@ -12,9 +12,7 @@ use dashmap::DashMap;
 use zccache_core::NormalizedPath;
 use zccache_hash::ContentHash;
 
-use crate::context::{
-    compute_artifact_key, compute_context_key, ArtifactKey, CompileContext, ContextKey,
-};
+use crate::context::{compute_artifact_key, ArtifactKey, CompileContext, ContextKey};
 use crate::scanner::{IncludeDirective, ScanResult};
 
 /// A file node in the graph. Shared across all contexts.
@@ -42,8 +40,6 @@ pub enum ContextState {
 pub struct ContextEntry {
     /// The compilation context (source + flags).
     pub context: CompileContext,
-    /// Optional root used to normalize project-local paths in cache keys.
-    pub key_root: Option<NormalizedPath>,
     /// Flat list of all transitive resolved headers (absolute paths).
     pub resolved_includes: Vec<NormalizedPath>,
     /// Include names that could not be resolved to any file.
@@ -127,18 +123,8 @@ impl DepGraph {
     /// Register a compilation context. Returns the context key.
     /// If the context already exists, returns the existing key.
     pub fn register(&self, ctx: CompileContext) -> ContextKey {
-        self.register_with_root(ctx, None)
-    }
-
-    /// Register a compilation context with an optional key root used to
-    /// normalize project-local paths across workspace renames.
-    pub fn register_with_root(
-        &self,
-        ctx: CompileContext,
-        key_root: Option<NormalizedPath>,
-    ) -> ContextKey {
-        let key = compute_context_key(&ctx, key_root.as_deref());
-        self.register_with_key_and_root(key, ctx, key_root)
+        let key = ctx.context_key();
+        self.register_with_key(key, ctx)
     }
 
     /// Register a compilation context with a precomputed key.
@@ -147,18 +133,8 @@ impl DepGraph {
     /// `RustcCompileContext` (different domain tag) but the dep_graph stores
     /// a `CompileContext` with the source file path for freshness checks.
     pub fn register_with_key(&self, key: ContextKey, ctx: CompileContext) -> ContextKey {
-        self.register_with_key_and_root(key, ctx, None)
-    }
-
-    pub fn register_with_key_and_root(
-        &self,
-        key: ContextKey,
-        ctx: CompileContext,
-        key_root: Option<NormalizedPath>,
-    ) -> ContextKey {
         self.contexts.entry(key).or_insert_with(|| ContextEntry {
             context: ctx,
-            key_root,
             resolved_includes: Vec::new(),
             unresolved_includes: Vec::new(),
             has_computed_includes: false,
@@ -269,7 +245,7 @@ impl DepGraph {
             }
         }
 
-        let artifact_key = compute_artifact_key(key, &mut file_hashes, entry.key_root.as_deref());
+        let artifact_key = compute_artifact_key(key, &mut file_hashes);
 
         if source_fresh {
             // Ultra-fast path: nothing changed at all.
@@ -404,7 +380,7 @@ impl DepGraph {
             }
         }
 
-        let artifact_key = compute_artifact_key(key, &mut file_hashes, entry.key_root.as_deref());
+        let artifact_key = compute_artifact_key(key, &mut file_hashes);
 
         if source_fresh {
             if entry.artifact_key == Some(artifact_key) {
@@ -524,7 +500,7 @@ impl DepGraph {
             file_hashes.push((fi.as_path(), get_hash(fi)?));
         }
 
-        let computed = compute_artifact_key(key, &mut file_hashes, entry.key_root.as_deref());
+        let computed = compute_artifact_key(key, &mut file_hashes);
 
         if computed == *stored_key {
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -576,7 +552,7 @@ impl DepGraph {
             }
         }
 
-        let artifact_key = compute_artifact_key(key, &mut file_hashes, entry.key_root.as_deref());
+        let artifact_key = compute_artifact_key(key, &mut file_hashes);
 
         // SUCCESS: all hashes computed â€” transition to Warm atomically with artifact key.
         entry.state = ContextState::Warm;
@@ -1297,7 +1273,6 @@ mod tests {
             key,
             ContextEntry {
                 context: ctx,
-                key_root: None,
                 resolved_includes: vec![NormalizedPath::from("/inc/b.h")],
                 unresolved_includes: Vec::new(),
                 has_computed_includes: false,

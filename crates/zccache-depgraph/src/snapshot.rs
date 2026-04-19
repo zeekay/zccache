@@ -18,7 +18,7 @@ use crate::scanner::{IncludeDirective, IncludeKind};
 use crate::search_paths::IncludeSearchPaths;
 
 /// On-disk format version. Bump when snapshot layout changes.
-pub const DEPGRAPH_VERSION: u32 = 2;
+pub const DEPGRAPH_VERSION: u32 = 3;
 
 /// Magic bytes identifying a depgraph snapshot file ("ZCDG").
 pub const DEPGRAPH_MAGIC: [u8; 4] = [0x5A, 0x43, 0x44, 0x47];
@@ -64,7 +64,6 @@ pub struct IncludeDirectiveSnapshot {
 #[archive(check_bytes)]
 pub struct ContextEntrySnapshot {
     pub context_key: [u8; 32],
-    pub key_root: Option<String>,
     pub source_file: String,
     pub iquote: Vec<String>,
     pub user: Vec<String>,
@@ -146,10 +145,6 @@ impl DepGraph {
                 let ctx = entry.value();
                 ContextEntrySnapshot {
                     context_key: *key.hash().as_bytes(),
-                    key_root: ctx
-                        .key_root
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().into_owned()),
                     source_file: ctx.context.source_file.to_string_lossy().into_owned(),
                     iquote: paths_to_strings(&ctx.context.include_search.iquote),
                     user: paths_to_strings(&ctx.context.include_search.user),
@@ -239,7 +234,6 @@ impl DepGraph {
             };
             let entry = ContextEntry {
                 context,
-                key_root: c.key_root.map(|root| NormalizedPath::from(root.as_str())),
                 resolved_includes: strings_to_paths(c.resolved_includes),
                 unresolved_includes: c.unresolved_includes,
                 has_computed_includes: c.has_computed_includes,
