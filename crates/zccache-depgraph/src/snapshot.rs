@@ -18,7 +18,7 @@ use crate::scanner::{IncludeDirective, IncludeKind};
 use crate::search_paths::IncludeSearchPaths;
 
 /// On-disk format version. Bump when snapshot layout changes.
-pub const DEPGRAPH_VERSION: u32 = 1;
+pub const DEPGRAPH_VERSION: u32 = 3;
 
 /// Magic bytes identifying a depgraph snapshot file ("ZCDG").
 pub const DEPGRAPH_MAGIC: [u8; 4] = [0x5A, 0x43, 0x44, 0x47];
@@ -510,7 +510,7 @@ mod tests {
         match load_from_file(&path) {
             Err(SnapshotError::VersionMismatch {
                 file: 99,
-                expected: 1,
+                expected: DEPGRAPH_VERSION,
             }) => {}
             other => panic!("expected VersionMismatch, got {other:?}"),
         }
