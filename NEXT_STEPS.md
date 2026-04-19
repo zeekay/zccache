@@ -10,7 +10,7 @@ Commit and push the release automation changes, ideally to `main`:
 - [.github/workflows/release.yml](/C:/Users/niteris/dev/zccache/.github/workflows/release.yml)
 - [.github/workflows/build.yml](/C:/Users/niteris/dev/zccache/.github/workflows/build.yml)
 - [.github/actions/build-target/action.yml](/C:/Users/niteris/dev/zccache/.github/actions/build-target/action.yml)
-- [ci/publish.py](/C:/Users/niteris/dev/zccache/ci/publish.py)
+- [ci/release_workflow.py](/C:/Users/niteris/dev/zccache/ci/release_workflow.py)
 
 2. Create the GitHub environment for PyPI.
 
@@ -130,7 +130,7 @@ The repo must include the updated:
 - `.github/workflows/build.yml`
 - `.github/actions/build-target/action.yml`
 - `action.yml`
-- `ci/publish.py`
+- `ci/release_workflow.py`
 
 4. Set up PyPI Trusted Publishing.
 

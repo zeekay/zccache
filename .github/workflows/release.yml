@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Optional tag to publish, for example 1.2.15 or v1.2.15. Leave empty to use the current workspace version.
+        description: Optional tag to publish, for example 1.3.0 or v1.3.0. Leave empty to use the current workspace version.
         required: false
         type: string
 
@@ -130,6 +130,10 @@ jobs:
           echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Fail fast if version already exists on PyPI or crates.io
+        run: |
+          python -m ci.release_workflow check-registries
+
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -225,7 +229,7 @@ jobs:
         if: matrix.upload_release == 'true'
         with:
           name: release-${{ matrix.target }}
-          path: ${{ steps.build_target.outputs.standalone_archive }}
+          path: ${{ format('{0}/*{1}', steps.build_target.outputs.standalone_dir, matrix.binary_ext == '.exe' && '.zip' || '.tar.gz') }}
           if-no-files-found: error
 
   build-wheels:
@@ -241,15 +245,13 @@ jobs:
         with:
           python-version: "3.13"
 
-      - uses: astral-sh/setup-uv@v5
-
       - uses: actions/download-artifact@v4
         with:
           pattern: binaries-*
           path: artifact-downloads
 
       - name: Build wheels from downloaded artifacts
-        run: ./publish --skip-rust --dry-run --artifact-download-dir artifact-downloads
+        run: python -m ci.release_workflow build-wheels --artifact-download-dir artifact-downloads
 
       - uses: actions/upload-artifact@v4
         with:
@@ -292,8 +294,6 @@ jobs:
         with:
           python-version: "3.13"
 
-      - uses: astral-sh/setup-uv@v5
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.85.1
@@ -301,7 +301,7 @@ jobs:
       - name: Publish crates to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: ./publish --skip-pypi
+        run: python -m ci.release_workflow publish-crates
 
   publish-release:
     name: Publish GitHub Release

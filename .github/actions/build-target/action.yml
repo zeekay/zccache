@@ -40,9 +40,6 @@ outputs:
   standalone_dir:
     description: Directory containing packaged standalone archives.
     value: ${{ steps.paths.outputs.standalone_dir }}
-  standalone_archive:
-    description: Path to the packaged standalone archive file.
-    value: ${{ steps.package.outputs.archive }}
 
 runs:
   using: composite
@@ -178,17 +175,15 @@ runs:
         fi
 
     - name: Package standalone archive
-      id: package
       shell: bash
       run: |
         VERSION="${{ inputs.version }}"
         if [ -z "$VERSION" ]; then
           VERSION=$(python -c "import tomllib; from pathlib import Path; print(tomllib.loads(Path('Cargo.toml').read_text(encoding='utf-8'))['workspace']['package']['version'])")
         fi
-        ARCHIVE=$(python ci/package_release.py \
+        python ci/package_release.py \
           --version "$VERSION" \
           --target "${{ inputs.target }}" \
           --binary-ext "${{ inputs.binary_ext }}" \
           --input-dir staging \
-          --output-dir standalone)
-        echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          --output-dir standalone
