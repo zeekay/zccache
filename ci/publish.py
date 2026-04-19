@@ -14,12 +14,12 @@ Zero-argument release pipeline:
   6. Dry-run and publish Rust crates to crates.io in dependency order
 
 Usage:
-    ./publish                  # publish PyPI and crates.io
-    ./publish --dry-run        # build and verify publishability without uploading
-    ./publish --skip-pypi      # publish only Rust crates
-    ./publish --skip-rust      # publish only PyPI wheels
-    ./publish --skip-rust --artifact-download-dir artifact-downloads
-                               # build wheels from pre-downloaded binaries-* artifacts
+    uv run --script ci/publish.py                  # publish PyPI and crates.io
+    uv run --script ci/publish.py --dry-run        # build and verify publishability without uploading
+    uv run --script ci/publish.py --skip-pypi      # publish only Rust crates
+    uv run --script ci/publish.py --skip-rust      # publish only PyPI wheels
+    uv run --script ci/publish.py --skip-rust --artifact-download-dir artifact-downloads
+                                # build wheels from pre-downloaded binaries-* artifacts
 """
 
 from __future__ import annotations
