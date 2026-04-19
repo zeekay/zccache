@@ -235,7 +235,7 @@ jobs:
         if: matrix.upload_release == 'true'
         with:
           name: release-${{ matrix.target }}
-          path: ${{ steps.build_target.outputs.standalone_archive }}
+          path: ${{ format('{0}/*{1}', steps.build_target.outputs.standalone_dir, matrix.binary_ext == '.exe' && '.zip' || '.tar.gz') }}
           if-no-files-found: error
 
   build-wheels:
