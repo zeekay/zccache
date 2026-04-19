@@ -11,6 +11,16 @@ Python scripts for development tooling. Project-root trampolines (`_cargo`, `_ru
 - **`./test`** — Workspace tests, supports per-crate filtering
 - **`./perf`** — Performance benchmarks (zccache vs sccache vs bare clang)
 
+## Release Automation
+
+- **`./publish`** â€” Local release operator path; can also build wheels from pre-downloaded `binaries-*` artifacts via `--artifact-download-dir`
+- **Canonical workflow** â€” `.github/workflows/release.yml`
+- **Trigger** â€” push a tag matching the workspace version (`1.2.15` or `v1.2.15`)
+- **PyPI** â€” use Trusted Publishing with GitHub environment `pypi` and workflow `.github/workflows/release.yml`
+- **crates.io** â€” add repository secret `CARGO_REGISTRY_TOKEN`
+- **GitHub Release** â€” created automatically with standalone archives, installer scripts, and `SHA256SUMS`
+- **Marketplace** â€” still manual in the GitHub UI; edit the generated GitHub release and check `Publish this action to the GitHub Marketplace`
+
 ## Hooks (`ci/hooks/`)
 
 Claude Code hooks that enforce project conventions:
