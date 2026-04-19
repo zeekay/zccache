@@ -95,5 +95,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
-          path: ${{ steps.build_target.outputs.standalone_dir }}/
+          path: ${{ steps.build_target.outputs.standalone_archive }}
           if-no-files-found: error

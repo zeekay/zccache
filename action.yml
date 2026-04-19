@@ -1,4 +1,5 @@
 name: "zccache"
+author: "Zachary Vorhies"
 description: >
   Unified Rust compilation + dependency caching for GitHub Actions.
   Replaces both mozilla-actions/sccache-action and Swatinem/rust-cache
@@ -303,3 +304,7 @@ runs:
         echo "${{ inputs.cache-cargo-registry }}" > ~/.zccache-action-state/cache-registry
         echo "${{ inputs.cache-target }}" > ~/.zccache-action-state/cache-target
         echo "${{ inputs.target-dir }}" > ~/.zccache-action-state/target-dir
+
+branding:
+  icon: "zap"
+  color: "orange"

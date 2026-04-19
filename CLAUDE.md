@@ -40,7 +40,7 @@ uv run python ci/build_dist.py --run-id <run_id>
 uv run python ci/build_dist.py --skip-build
 ```
 
-- **Workflow**: `.github/workflows/build.yml` (workflow_dispatch, 6 targets)
+- **Workflow**: `.github/workflows/build.yml` (workflow_dispatch, 8 targets)
 - **Script**: `ci/build_dist.py` — orchestrates `gh` CLI to trigger, wait, download, organize
 - **Output**: `dist/` with per-platform subdirs + `manifest.json` (gitignored)
 - **Targets**: linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64, windows-x86_64, windows-arm64
@@ -55,6 +55,11 @@ uv run python ci/build_dist.py --skip-build
 - **Pre-check**: Fails fast if version from `pyproject.toml` already exists on PyPI
 - **Pipeline**: Triggers GH Actions build → waits → downloads artifacts → builds platform wheels → uploads via `uv publish`
 - **Auth**: `UV_PUBLISH_TOKEN`, `~/.pypirc`, or interactive prompt
+- **Automation**: `.github/workflows/release.yml` is the canonical tag-driven release workflow. It validates release metadata, builds wheel/release artifacts, publishes PyPI wheels, publishes Rust crates, and creates the GitHub release.
+- **Tag rule**: Push `1.2.15` or `v1.2.15`; the workflow normalizes the tag and requires it to match `[workspace.package].version` in `Cargo.toml`.
+- **PyPI setup**: Prefer Trusted Publishing. Configure PyPI to trust repo `zackees/zccache`, workflow `.github/workflows/release.yml`, environment `pypi`.
+- **crates.io setup**: Add GitHub Actions secret `CARGO_REGISTRY_TOKEN` from https://crates.io/me.
+- **Marketplace**: GitHub Marketplace publishing is not API-automated. After the workflow creates the GitHub release, open that release in GitHub, select `Publish this action to the GitHub Marketplace`, choose categories, and publish.
 
 ## Hooks (enforced automatically)
 

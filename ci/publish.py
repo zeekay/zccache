@@ -18,6 +18,8 @@ Usage:
     ./publish --dry-run        # build and verify publishability without uploading
     ./publish --skip-pypi      # publish only Rust crates
     ./publish --skip-rust      # publish only PyPI wheels
+    ./publish --skip-rust --artifact-download-dir artifact-downloads
+                               # build wheels from pre-downloaded binaries-* artifacts
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import urllib.error
@@ -761,22 +764,22 @@ def trigger_and_wait(repo: str, version: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 
-def download_artifacts(repo: str, run_id: int, head_sha: str, version: str) -> None:
-    """Download build artifacts and organize into dist/."""
-    log(f"\n=== Step 3: Download artifacts from run {run_id} ===")
-
+def organize_downloaded_artifacts(
+    artifacts_root: Path,
+    repo: str,
+    run_id: int | None,
+    head_sha: str,
+    version: str,
+) -> None:
+    """Copy downloaded binaries-* artifacts into dist/ in the expected layout."""
     if DIST_DIR.exists():
         shutil.rmtree(DIST_DIR)
     DIST_DIR.mkdir()
 
-    tmp = DIST_DIR / "_tmp"
-    tmp.mkdir()
-    run(["gh", "run", "download", str(run_id), "--repo", repo, "--dir", str(tmp)])
-
     found = 0
     missing: list[str] = []
     for artifact_name, subdir in ARTIFACT_MAP.items():
-        src = tmp / artifact_name
+        src = artifacts_root / artifact_name
         if not src.exists():
             log(f"  MISSING: {artifact_name}")
             missing.append(artifact_name)
@@ -803,7 +806,6 @@ def download_artifacts(repo: str, run_id: int, head_sha: str, version: str) -> N
 
         found += 1
 
-    shutil.rmtree(tmp)
     log(f"  {found}/{len(ARTIFACT_MAP)} platforms downloaded")
 
     if missing:
@@ -812,6 +814,18 @@ def download_artifacts(repo: str, run_id: int, head_sha: str, version: str) -> N
         sys.exit(1)
 
     write_dist_manifest(repo, run_id, head_sha, version)
+
+
+def download_artifacts(repo: str, run_id: int, head_sha: str, version: str) -> None:
+    """Download build artifacts and organize them into dist/."""
+    log(f"\n=== Step 3: Download artifacts from run {run_id} ===")
+
+    tmp = Path(tempfile.mkdtemp(prefix="zccache-artifacts-"))
+    try:
+        run(["gh", "run", "download", str(run_id), "--repo", repo, "--dir", str(tmp)])
+        organize_downloaded_artifacts(tmp, repo, run_id, head_sha, version)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1082,6 +1096,14 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Build wheels but do not upload.")
     parser.add_argument("--skip-pypi", action="store_true", help="Skip the PyPI release flow.")
     parser.add_argument("--skip-rust", action="store_true", help="Skip the crates.io release flow.")
+    parser.add_argument(
+        "--artifact-download-dir",
+        help=(
+            "Directory containing pre-downloaded GitHub Actions artifacts named "
+            "binaries-<target>. When set, PyPI packaging reuses those artifacts "
+            "instead of triggering build.yml."
+        ),
+    )
     args = parser.parse_args()
 
     run_pypi = not args.skip_pypi
@@ -1090,7 +1112,7 @@ def main() -> None:
         log("ERROR: Nothing to do. Remove one of --skip-pypi / --skip-rust.")
         sys.exit(1)
 
-    if run_pypi:
+    if run_pypi and not args.artifact_download_dir:
         try:
             run_capture(["gh", "--version"])
         except FileNotFoundError:
@@ -1126,7 +1148,7 @@ def main() -> None:
             )
             sys.exit(1)
 
-        if run_pypi:
+        if run_pypi and not args.artifact_download_dir:
             # GH Actions builds from the remote branch, so local-only changes
             # produce binaries with stale version strings baked in.
             dirty_entries = get_publish_blocking_dirty_entries()
@@ -1146,11 +1168,19 @@ def main() -> None:
 
     if run_pypi:
         head_sha = run_capture(["git", "rev-parse", "HEAD"])
-        run_id = trigger_and_wait(repo, version)
-        if run_id is not None:
-            download_artifacts(repo, run_id, head_sha, version)
+        if args.artifact_download_dir:
+            artifact_download_dir = Path(args.artifact_download_dir).expanduser().resolve()
+            if not artifact_download_dir.is_dir():
+                log(f"ERROR: Artifact directory does not exist: {artifact_download_dir}")
+                sys.exit(1)
+            log(f"\n=== Step 3: Prepare dist/ from {artifact_download_dir} ===")
+            organize_downloaded_artifacts(artifact_download_dir, repo, None, head_sha, version)
         else:
-            write_dist_manifest(repo, None, head_sha, version)
+            run_id = trigger_and_wait(repo, version)
+            if run_id is not None:
+                download_artifacts(repo, run_id, head_sha, version)
+            else:
+                write_dist_manifest(repo, None, head_sha, version)
         wheels = build_all_wheels(name, version, summary, requires_python, readme)
         wheels_to_upload = [wheel for wheel in wheels if wheel.name not in existing_pypi_files]
 

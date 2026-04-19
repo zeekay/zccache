@@ -1,10 +1,16 @@
-name: Release Standalone Binaries
+name: Release
 
 on:
   push:
     tags:
       - "[0-9]*"
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish, for example 1.2.15 or v1.2.15
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -16,9 +22,65 @@ env:
   RUSTUP_HOME: ${{ github.workspace }}/.rustup
 
 jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.1
+
+      - name: Validate release metadata
+        run: |
+          python - <<'PY'
+          from ci.release_checks import validate_release_metadata
+          validate_release_metadata()
+          PY
+
+      - name: Validate tag matches workspace version
+        id: meta
+        shell: bash
+        env:
+          RAW_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+        run: |
+          VERSION="$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+          data = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))
+          print(data["workspace"]["package"]["version"])
+          PY
+          )"
+          TAG="${RAW_TAG#refs/tags/}"
+          NORMALIZED_TAG="${TAG#v}"
+
+          if [ -z "$NORMALIZED_TAG" ]; then
+            echo "Release tag is empty" >&2
+            exit 1
+          fi
+
+          if [ "$NORMALIZED_TAG" != "$VERSION" ]; then
+            echo "Tag $TAG does not match workspace version $VERSION" >&2
+            exit 1
+          fi
+
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -26,54 +88,176 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             binary_ext: ""
+            include_python: "false"
+            upload_binaries: "false"
+            upload_release: "true"
 
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             binary_ext: ""
-            cross: true
             linker: aarch64-unknown-linux-musl-gcc
             strip: aarch64-unknown-linux-musl-strip
+            include_python: "false"
+            upload_binaries: "false"
+            upload_release: "true"
+
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary_ext: ""
+            include_python: "true"
+            upload_binaries: "true"
+            upload_release: "false"
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary_ext: ""
+            linker: aarch64-linux-gnu-gcc
+            strip: aarch64-linux-gnu-strip
+            include_python: "true"
+            upload_binaries: "true"
+            upload_release: "false"
 
           - target: x86_64-apple-darwin
             os: macos-14
             binary_ext: ""
+            include_python: "true"
+            upload_binaries: "true"
+            upload_release: "true"
 
           - target: aarch64-apple-darwin
             os: macos-latest
             binary_ext: ""
+            include_python: "true"
+            upload_binaries: "true"
+            upload_release: "true"
 
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             binary_ext: ".exe"
+            include_python: "true"
+            upload_binaries: "true"
+            upload_release: "true"
 
           - target: aarch64-pc-windows-msvc
             os: windows-latest
             binary_ext: ".exe"
+            include_python: "true"
+            upload_binaries: "true"
+            upload_release: "true"
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.release_tag }}
+
       - uses: ./.github/actions/build-target
         id: build_target
         with:
           target: ${{ matrix.target }}
           binary_ext: ${{ matrix.binary_ext }}
           cache_key: release-${{ matrix.target }}
+          include_python: ${{ matrix.include_python }}
           linker: ${{ matrix.linker || '' }}
           strip: ${{ matrix.strip || '' }}
-          version: ${{ github.ref_name }}
+          version: ${{ needs.preflight.outputs.version }}
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.upload_binaries == 'true'
+        with:
+          name: binaries-${{ matrix.target }}
+          path: ${{ steps.build_target.outputs.staging_dir }}/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.upload_release == 'true'
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ steps.build_target.outputs.standalone_archive }}
+          if-no-files-found: error
+
+  build-wheels:
+    name: Build PyPI Wheels
+    runs-on: ubuntu-latest
+    needs: [preflight, build]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.release_tag }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: artifact-downloads
+
+      - name: Build wheels from downloaded artifacts
+        run: ./publish --skip-rust --dry-run --artifact-download-dir artifact-downloads
 
       - uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.target }}
-          path: ${{ steps.build_target.outputs.standalone_dir }}/
+          name: pypi-wheels
+          path: dist/wheels/*
           if-no-files-found: error
 
-  publish:
-    name: Publish GitHub Release
+  publish-pypi:
+    name: Publish PyPI
     runs-on: ubuntu-latest
-    needs: build
+    needs: [preflight, build-wheels]
+    environment: pypi
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pypi-wheels
+          path: dist/wheels
+
+      - name: Publish wheel distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/wheels/
+          print-hash: true
+          skip-existing: true
+
+  publish-crates:
+    name: Publish crates.io
+    runs-on: ubuntu-latest
+    needs: [preflight, publish-pypi]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.release_tag }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.1
+
+      - name: Publish crates to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: ./publish --skip-pypi
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [preflight, build, publish-pypi, publish-crates]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.release_tag }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -91,9 +275,26 @@ jobs:
         shell: bash
         run: |
           cd release-assets
-          sha256sum * > SHA256SUMS
+          find . -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.preflight.outputs.release_tag }}
+          name: zccache ${{ needs.preflight.outputs.version }}
+          body: |
+            ## Install
+
+            ```bash
+            curl -LsSf https://github.com/zackees/zccache/releases/latest/download/install.sh | sh
+            ```
+
+            ```powershell
+            powershell -ExecutionPolicy Bypass -c "irm https://github.com/zackees/zccache/releases/latest/download/install.ps1 | iex"
+            ```
+
+            GitHub Marketplace publication remains a manual GitHub UI step:
+            open the generated release, select `Publish this action to the GitHub Marketplace`,
+            choose categories, and publish.
           files: release-assets/*
+          fail_on_unmatched_files: true
