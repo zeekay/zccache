@@ -16,6 +16,7 @@ from ci.env import activate, clean_env
 from ci.release_checks import ReleaseCheckError, validate_release_metadata
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
+DYLINT_TOOLCHAIN = "nightly-2025-09-18"
 DYLINT_COMPONENTS = ["llvm-tools-preview", "rust-src", "rustc-dev"]
 
 
@@ -83,7 +84,11 @@ def ensure_dylint_components():
         )
         return 1
 
-    result = run_cmd_capture(["rustup", "component", "list", "--installed"])
+    result = run_cmd_capture([
+        "rustup", "component", "list",
+        "--toolchain", DYLINT_TOOLCHAIN,
+        "--installed",
+    ])
     if result.returncode != 0:
         sys.stdout.write(result.stdout)
         sys.stderr.write(result.stderr)
@@ -103,7 +108,11 @@ def ensure_dylint_components():
         + ", ".join(missing),
         file=sys.stderr,
     )
-    result = run_cmd(["rustup", "component", "add", *missing])
+    result = run_cmd([
+        "rustup", "component", "add",
+        "--toolchain", DYLINT_TOOLCHAIN,
+        *missing,
+    ])
     return result.returncode
 
 
@@ -121,15 +130,14 @@ def lint_dylint_only():
     if result != 0:
         return result
 
-    result = run_cmd_capture([
-        "cargo", "dylint", "--all", "--workspace",
-    ])
+    dylint_cmd = [
+        "cargo", f"+{DYLINT_TOOLCHAIN}", "dylint", "--all", "--workspace",
+    ]
+    result = run_cmd_capture(dylint_cmd)
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
     if result.returncode != 0 and ensure_dylint_aliases():
-        result = run_cmd([
-            "cargo", "dylint", "--all", "--workspace",
-        ])
+        result = run_cmd(dylint_cmd)
     return result.returncode
 
 

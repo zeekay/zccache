@@ -118,13 +118,15 @@ def _activate_env(env: dict[str, str]) -> None:
     path_parts = current_path.split(os.pathsep) if current_path else []
     prefix_parts: list[str] = []
 
-    toolchain_dir = toolchain_bin()
-    if toolchain_dir is not None and toolchain_dir.is_dir():
-        prefix_parts.append(str(toolchain_dir))
-
     bin_dir = cargo_bin()
     if bin_dir.is_dir():
         prefix_parts.append(str(bin_dir))
+
+    toolchain_dir = toolchain_bin()
+    if toolchain_dir is not None and toolchain_dir.is_dir():
+        # Keep rustup's proxy shims ahead of the resolved toolchain binaries so
+        # nested `rust-toolchain.toml` files can still select their own channel.
+        prefix_parts.append(str(toolchain_dir))
 
     normalized_prefixes = {
         os.path.normcase(os.path.normpath(part)) for part in prefix_parts
