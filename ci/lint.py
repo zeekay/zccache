@@ -16,6 +16,7 @@ from ci.env import activate, clean_env
 from ci.release_checks import ReleaseCheckError, validate_release_metadata
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
+DYLINT_COMPONENTS = ["llvm-tools-preview", "rust-src", "rustc-dev"]
 
 
 def run_cmd(cmd):
@@ -73,6 +74,39 @@ def ensure_dylint_aliases():
     return created
 
 
+def ensure_dylint_components():
+    """Install the Rust components required to build the workspace dylint."""
+    if which("rustup") is None:
+        print(
+            "rustup is required for workspace dylint setup.",
+            file=sys.stderr,
+        )
+        return 1
+
+    result = run_cmd_capture(["rustup", "component", "list", "--installed"])
+    if result.returncode != 0:
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        return result.returncode
+
+    installed = result.stdout.splitlines()
+    missing = [
+        component
+        for component in DYLINT_COMPONENTS
+        if not any(line.startswith(component) for line in installed)
+    ]
+    if not missing:
+        return 0
+
+    print(
+        "Installing missing Rust components for dylint: "
+        + ", ".join(missing),
+        file=sys.stderr,
+    )
+    result = run_cmd(["rustup", "component", "add", *missing])
+    return result.returncode
+
+
 def lint_dylint_only():
     """Run workspace dylint, retrying after alias repair if cargo-dylint misses it."""
     if which("cargo-dylint") is None:
@@ -82,6 +116,10 @@ def lint_dylint_only():
             file=sys.stderr,
         )
         return 1
+
+    result = ensure_dylint_components()
+    if result != 0:
+        return result
 
     result = run_cmd_capture([
         "cargo", "dylint", "--all", "--workspace",
@@ -158,9 +196,15 @@ def lint_workspace():
     if result.returncode != 0:
         return result.returncode
 
-    result = lint_dylint_only()
-    if result != 0:
-        return result
+    if os.name == "nt":
+        print(
+            "Skipping workspace dylint on Windows; the dedicated Dylint CI job runs on Ubuntu.",
+            file=sys.stderr,
+        )
+    else:
+        result = lint_dylint_only()
+        if result != 0:
+            return result
 
     env = clean_env()
     env["RUSTDOCFLAGS"] = "-D warnings"

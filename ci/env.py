@@ -40,6 +40,38 @@ def cargo_bin() -> Path:
     return cargo_home() / "bin"
 
 
+def _run_rustup_which(tool_name: str, env: dict[str, str]) -> Path | None:
+    rustup = shutil.which("rustup", path=env.get("PATH"))
+    if rustup is None:
+        return None
+
+    result = subprocess.run(
+        [rustup, "which", tool_name],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    if result.returncode != 0:
+        return None
+
+    tool_path = result.stdout.strip()
+    if not tool_path:
+        return None
+    return Path(tool_path)
+
+
+def toolchain_bin() -> Path | None:
+    env = os.environ.copy()
+    env.setdefault("CARGO_HOME", str(cargo_home()))
+    env.setdefault("RUSTUP_HOME", str(rustup_home()))
+    tool_path = _run_rustup_which("cargo", env)
+    if tool_path is None:
+        return None
+    return tool_path.parent
+
+
 def find_cargo_bin() -> str | None:
     bin_dir = cargo_bin()
     if bin_dir.is_dir():
@@ -60,6 +92,11 @@ def find_tool_path(tool_name: str) -> Path | None:
         if candidate.exists():
             return candidate
 
+    env = clean_env()
+    resolved_via_rustup = _run_rustup_which(tool_name, env)
+    if resolved_via_rustup is not None and resolved_via_rustup.exists():
+        return resolved_via_rustup
+
     resolved = shutil.which(tool_name)
     if resolved:
         return Path(resolved)
@@ -77,19 +114,28 @@ def _activate_env(env: dict[str, str]) -> None:
     env.setdefault("CARGO_HOME", str(cargo_home()))
     env.setdefault("RUSTUP_HOME", str(rustup_home()))
 
-    bin_dir = cargo_bin()
-    if not bin_dir.is_dir():
-        return
-
     current_path = env.get("PATH", "")
     path_parts = current_path.split(os.pathsep) if current_path else []
-    normalized_bin = os.path.normcase(os.path.normpath(str(bin_dir)))
+    prefix_parts: list[str] = []
+
+    toolchain_dir = toolchain_bin()
+    if toolchain_dir is not None and toolchain_dir.is_dir():
+        prefix_parts.append(str(toolchain_dir))
+
+    bin_dir = cargo_bin()
+    if bin_dir.is_dir():
+        prefix_parts.append(str(bin_dir))
+
+    normalized_prefixes = {
+        os.path.normcase(os.path.normpath(part)) for part in prefix_parts
+    }
     filtered_parts = [
         part
         for part in path_parts
-        if part and os.path.normcase(os.path.normpath(part)) != normalized_bin
+        if part
+        and os.path.normcase(os.path.normpath(part)) not in normalized_prefixes
     ]
-    env["PATH"] = os.pathsep.join([str(bin_dir), *filtered_parts])
+    env["PATH"] = os.pathsep.join([*prefix_parts, *filtered_parts])
 
 
 def activate() -> None:
