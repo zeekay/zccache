@@ -204,7 +204,7 @@ def crate_version_exists(name: str, version: str) -> bool:
         raise
 
 
-def check_crates_versions(version: str) -> set[str]:
+def check_crates_versions(version: str, *, fail_if_all_exist: bool = True) -> set[str]:
     log(f"\n=== Pre-check crates.io for Rust crates {version} ===")
     existing: list[str] = []
     for crate in RUST_PUBLISH_ORDER:
@@ -217,11 +217,14 @@ def check_crates_versions(version: str) -> set[str]:
         except (urllib.error.URLError, TimeoutError) as e:
             log(f"  WARNING: Could not reach crates.io for {crate} ({e})")
 
-    if len(existing) == len(RUST_PUBLISH_ORDER):
-        log("  ERROR: all publishable crates already exist on crates.io")
-        raise SystemExit(1)
+    all_crates_exist = len(existing) == len(RUST_PUBLISH_ORDER)
+    if all_crates_exist:
+        if fail_if_all_exist:
+            log("  ERROR: all publishable crates already exist on crates.io")
+            raise SystemExit(1)
+        log("  All publishable crates already exist on crates.io; nothing to publish.")
 
-    if existing:
+    if existing and not all_crates_exist:
         log("  Resuming partial crates.io release; already-published crates will be skipped.")
 
     return set(existing)
@@ -572,7 +575,7 @@ def command_publish_crates(_: argparse.Namespace) -> None:
     if not os.environ.get("CARGO_REGISTRY_TOKEN"):
         raise SystemExit("ERROR: CARGO_REGISTRY_TOKEN is required for crates.io publish")
     version = read_workspace_version()
-    existing_crates = check_crates_versions(version)
+    existing_crates = check_crates_versions(version, fail_if_all_exist=False)
     publish_rust_crates(version, existing_crates)
 
 
