@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from ci import release_workflow
 from ci.release_workflow import (
     assert_installed_wheel_scripts_executable,
     assert_wheel_script_metadata,
@@ -90,3 +91,25 @@ def test_assert_installed_wheel_scripts_executable_accepts_pip_target_install(
     )
 
     assert_installed_wheel_scripts_executable(wheel_path)
+
+
+def test_check_crates_versions_fails_preflight_when_all_crates_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(release_workflow, "RUST_PUBLISH_ORDER", ["zccache-a", "zccache-b"])
+    monkeypatch.setattr(release_workflow, "crate_version_exists", lambda _name, _version: True)
+
+    with pytest.raises(SystemExit):
+        release_workflow.check_crates_versions("1.2.3")
+
+
+def test_check_crates_versions_allows_publish_resume_when_all_crates_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(release_workflow, "RUST_PUBLISH_ORDER", ["zccache-a", "zccache-b"])
+    monkeypatch.setattr(release_workflow, "crate_version_exists", lambda _name, _version: True)
+
+    assert release_workflow.check_crates_versions(
+        "1.2.3",
+        fail_if_all_exist=False,
+    ) == {"zccache-a", "zccache-b"}
