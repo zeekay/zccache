@@ -13,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import urllib.error
@@ -374,6 +375,7 @@ def build_wheel(
         whl.writestr(f"{dist_info}/RECORD", buf.getvalue().encode())
 
     assert_wheel_script_metadata(wheel_path)
+    assert_installed_wheel_scripts_executable(wheel_path)
     return wheel_path
 
 
@@ -404,6 +406,74 @@ def assert_wheel_script_metadata(wheel_path: Path) -> None:
         raise SystemExit(
             f"ERROR: no wheel script entries found in {wheel_path.name}"
         )
+
+
+def assert_installed_wheel_scripts_executable(wheel_path: Path) -> None:
+    """Install a built wheel into a scratch target and validate script modes."""
+
+    if not _can_smoke_install_wheel_on_host(wheel_path):
+        return
+
+    exec_mask = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    script_names: list[str] = []
+
+    with zipfile.ZipFile(wheel_path) as whl:
+        for info in whl.infolist():
+            if ".data/scripts/" not in info.filename:
+                continue
+            script_names.append(Path(info.filename).name)
+
+    if not script_names:
+        raise SystemExit(
+            f"ERROR: no wheel script entries found in {wheel_path.name}"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="zccache-wheel-install-") as tmp:
+        target = Path(tmp) / "target"
+        run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-deps",
+                "--target",
+                str(target),
+                str(wheel_path),
+            ]
+        )
+
+        scripts_dir = target / "bin"
+        for script_name in script_names:
+            installed = scripts_dir / script_name
+            if not installed.is_file():
+                raise SystemExit(
+                    "ERROR: installed wheel script missing for "
+                    f"{wheel_path.name}:{script_name} at {installed}"
+                )
+            mode = installed.stat().st_mode
+            if not stat.S_ISREG(mode) or not mode & exec_mask:
+                raise SystemExit(
+                    "ERROR: installed wheel script is not executable for "
+                    f"{wheel_path.name}:{script_name} "
+                    f"(path={installed}, mode={oct(mode)})"
+                )
+
+
+def _can_smoke_install_wheel_on_host(wheel_path: Path) -> bool:
+    """Return true when pip can install this wheel on the current host."""
+
+    name = wheel_path.name
+    if os.name == "nt":
+        return False
+    if "-py3-none-any.whl" in name:
+        return True
+    if sys.platform.startswith("linux"):
+        return "manylinux" in name or "musllinux" in name
+    if sys.platform == "darwin":
+        return "macosx" in name
+    return False
 
 
 def build_all_wheels(
