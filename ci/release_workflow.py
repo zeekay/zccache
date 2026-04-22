@@ -26,6 +26,7 @@ from ci.release_checks import (
     RUST_PUBLISH_ORDER,
     ReleaseCheckError,
     read_workspace_version,
+    stamp_internal_dependency_versions,
     validate_release_metadata,
 )
 
@@ -406,8 +407,15 @@ def build_all_wheels(
 def verify_rust_crates_locally() -> None:
     try:
         validate_release_metadata()
+        stamped = stamp_internal_dependency_versions()
     except ReleaseCheckError as e:
         raise SystemExit(f"ERROR: {e}") from e
+
+    if stamped:
+        log(
+            "  Stamped exact internal dependency versions for crates.io publish: "
+            + ", ".join(stamped)
+        )
 
     for crate in RUST_PUBLISH_ORDER:
         run(["cargo", "package", "--allow-dirty", "--no-verify", "-p", crate, "--list"], cwd=ROOT)
