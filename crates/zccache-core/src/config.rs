@@ -2,6 +2,7 @@
 
 use crate::NormalizedPath;
 use std::ffi::OsString;
+use std::path::Path;
 
 /// Environment variable used to override the zccache cache root.
 pub const CACHE_DIR_ENV: &str = "ZCCACHE_CACHE_DIR";
@@ -87,6 +88,25 @@ pub fn depfile_dir() -> NormalizedPath {
     tmp_dir().join("depfiles")
 }
 
+/// Remove legacy zccache state left directly under the OS temp directory.
+///
+/// Older builds stored the full cache root at `%TEMP%/.zccache` and created
+/// depfile directories as `%TEMP%/zccache-depfiles-*`. Those paths are safe to
+/// remove only when they are exact legacy matches and do not point at the
+/// current cache directory.
+pub fn cleanup_legacy_temp_root_state<F>(
+    temp_root: &Path,
+    current_cache_dir: &Path,
+    is_alive: F,
+) -> usize
+where
+    F: Fn(u32) -> bool,
+{
+    let mut cleaned = cleanup_legacy_temp_cache_dir(temp_root, current_cache_dir);
+    cleaned += cleanup_legacy_temp_depfile_dirs(temp_root, is_alive);
+    cleaned
+}
+
 /// Remove stale depfile directories from previous (dead) daemon instances.
 ///
 /// Scans [`depfile_dir()`] for subdirectories matching `{pid}-{instance}`.
@@ -132,6 +152,89 @@ where
         }
     }
     cleaned
+}
+
+fn cleanup_legacy_temp_cache_dir(temp_root: &Path, current_cache_dir: &Path) -> usize {
+    let legacy_cache_dir = temp_root.join(".zccache");
+    if legacy_cache_dir == current_cache_dir {
+        return 0;
+    }
+
+    if !is_real_dir(&legacy_cache_dir) {
+        return 0;
+    }
+
+    match std::fs::remove_dir_all(&legacy_cache_dir) {
+        Ok(()) => {
+            tracing::info!(path = %legacy_cache_dir.display(), "removed legacy temp cache dir");
+            1
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %legacy_cache_dir.display(),
+                "failed to remove legacy temp cache dir: {e}"
+            );
+            0
+        }
+    }
+}
+
+fn cleanup_legacy_temp_depfile_dirs<F>(temp_root: &Path, is_alive: F) -> usize
+where
+    F: Fn(u32) -> bool,
+{
+    let entries = match std::fs::read_dir(temp_root) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+
+    let mut cleaned = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let name = match file_name.to_str() {
+            Some(name) if name.starts_with("zccache-depfiles-") => name,
+            _ => continue,
+        };
+
+        if !is_real_dir(&path) {
+            continue;
+        }
+
+        let pid = match legacy_temp_depfile_pid(name) {
+            Some(pid) => pid,
+            None => continue,
+        };
+
+        if is_alive(pid) {
+            continue;
+        }
+
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                cleaned += 1;
+                tracing::info!(path = %path.display(), "removed legacy temp depfile dir");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "failed to remove legacy temp depfile dir: {e}"
+                );
+            }
+        }
+    }
+    cleaned
+}
+
+fn legacy_temp_depfile_pid(name: &str) -> Option<u32> {
+    let suffix = name.strip_prefix("zccache-depfiles-")?;
+    suffix.split('-').next()?.parse().ok()
+}
+
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_dir())
+        .unwrap_or(false)
 }
 
 /// Returns the directory for serialized dependency graph storage (future).
@@ -356,6 +459,55 @@ mod tests {
         // Non-existent directory returns 0.
         let cleaned = cleanup_stale_with_base(std::path::Path::new("/nonexistent/path"), |_| false);
         assert_eq!(cleaned, 0);
+    }
+
+    #[test]
+    fn cleanup_legacy_temp_root_state_removes_legacy_dirs() {
+        let temp_root = tempfile::tempdir().unwrap();
+        let current_cache_dir = tempfile::tempdir().unwrap();
+
+        let legacy_cache = temp_root.path().join(".zccache");
+        std::fs::create_dir_all(&legacy_cache).unwrap();
+        std::fs::write(legacy_cache.join("sentinel"), "legacy").unwrap();
+
+        let dead_depfile = temp_root.path().join("zccache-depfiles-1234-0");
+        std::fs::create_dir_all(&dead_depfile).unwrap();
+        std::fs::write(dead_depfile.join("sentinel"), "dead").unwrap();
+
+        let live_depfile = temp_root.path().join("zccache-depfiles-4321-0");
+        std::fs::create_dir_all(&live_depfile).unwrap();
+
+        let unrelated = temp_root.path().join("not-legacy");
+        std::fs::create_dir_all(&unrelated).unwrap();
+
+        let cleaned =
+            cleanup_legacy_temp_root_state(temp_root.path(), current_cache_dir.path(), |pid| {
+                pid != 1234
+            });
+
+        assert_eq!(cleaned, 2);
+        assert!(!legacy_cache.exists());
+        assert!(!dead_depfile.exists());
+        assert!(live_depfile.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn cleanup_legacy_temp_root_state_skips_current_cache_dir() {
+        let temp_root = tempfile::tempdir().unwrap();
+        let current_cache_dir = temp_root.path().join(".zccache");
+        std::fs::create_dir_all(&current_cache_dir).unwrap();
+        std::fs::write(current_cache_dir.join("sentinel"), "keep").unwrap();
+
+        let cleaned =
+            cleanup_legacy_temp_root_state(temp_root.path(), &current_cache_dir, |_| false);
+
+        assert_eq!(cleaned, 0);
+        assert!(current_cache_dir.exists());
+        assert_eq!(
+            std::fs::read_to_string(current_cache_dir.join("sentinel")).unwrap(),
+            "keep"
+        );
     }
 
     /// Test helper: runs cleanup logic against an arbitrary base dir.

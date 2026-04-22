@@ -465,9 +465,12 @@ impl DaemonServer {
     pub async fn run(&mut self, idle_timeout_secs: u64) -> Result<(), zccache_ipc::IpcError> {
         tracing::info!("daemon server running");
 
+        let cache_dir = zccache_core::config::default_cache_dir();
+        let temp_root = std::env::temp_dir();
+
         // Clean up legacy log backup directory (Bug 7).
         {
-            let legacy_logs = zccache_core::config::default_cache_dir().join("logs.bak");
+            let legacy_logs = cache_dir.join("logs.bak");
             if legacy_logs.is_dir() {
                 match std::fs::remove_dir_all(&legacy_logs) {
                     Ok(()) => tracing::info!("removed legacy logs.bak directory"),
@@ -478,8 +481,20 @@ impl DaemonServer {
                 }
             }
             // Also remove stale daemon.lock.bak if present.
-            let legacy_lock = zccache_core::config::default_cache_dir().join("daemon.lock.bak");
+            let legacy_lock = cache_dir.join("daemon.lock.bak");
             let _ = std::fs::remove_file(&legacy_lock);
+        }
+
+        // Remove legacy temp-root state from older builds before starting the daemon.
+        {
+            let cleaned = zccache_core::config::cleanup_legacy_temp_root_state(
+                &temp_root,
+                &cache_dir,
+                zccache_ipc::is_process_alive,
+            );
+            if cleaned > 0 {
+                tracing::info!(cleaned, "cleaned legacy temp-root zccache state");
+            }
         }
 
         // Clean up stale depfile directories from dead daemon instances.
