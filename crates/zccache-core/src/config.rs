@@ -55,10 +55,11 @@ impl Default for Config {
 /// together. If unset, this falls back to `~/.zccache` on all platforms.
 #[must_use]
 pub fn default_cache_dir() -> NormalizedPath {
-    if let Some(cache_dir) = cache_dir_override() {
-        return cache_dir;
-    }
-    dirs_fallback().join(".zccache")
+    default_cache_dir_from_env_value(std::env::var_os(CACHE_DIR_ENV))
+}
+
+fn default_cache_dir_from_env_value(value: Option<OsString>) -> NormalizedPath {
+    cache_dir_from_env_value(value).unwrap_or_else(|| dirs_fallback().join(".zccache"))
 }
 
 /// Returns the cache directory override from `ZCCACHE_CACHE_DIR`, if set.
@@ -70,13 +71,13 @@ pub fn cache_dir_override() -> Option<NormalizedPath> {
 /// Returns the directory for content-addressed compiled outputs.
 #[must_use]
 pub fn artifacts_dir() -> NormalizedPath {
-    default_cache_dir().join("artifacts")
+    artifacts_dir_from_cache_dir(&default_cache_dir())
 }
 
 /// Returns the directory for in-progress artifact writes (cleaned on startup).
 #[must_use]
 pub fn tmp_dir() -> NormalizedPath {
-    default_cache_dir().join("tmp")
+    tmp_dir_from_cache_dir(&default_cache_dir())
 }
 
 /// Returns the base directory for compiler-injected depfiles.
@@ -85,7 +86,7 @@ pub fn tmp_dir() -> NormalizedPath {
 /// Stale subdirectories from dead daemon processes are cleaned on startup.
 #[must_use]
 pub fn depfile_dir() -> NormalizedPath {
-    tmp_dir().join("depfiles")
+    depfile_dir_from_cache_dir(&default_cache_dir())
 }
 
 /// Remove legacy zccache state left directly under the OS temp directory.
@@ -240,25 +241,53 @@ fn is_real_dir(path: &Path) -> bool {
 /// Returns the directory for serialized dependency graph storage (future).
 #[must_use]
 pub fn depgraph_dir() -> NormalizedPath {
-    default_cache_dir().join("depgraph")
+    depgraph_dir_from_cache_dir(&default_cache_dir())
 }
 
 /// Returns the path to the artifact index database.
 #[must_use]
 pub fn index_path() -> NormalizedPath {
-    default_cache_dir().join("index.redb")
+    index_path_from_cache_dir(&default_cache_dir())
 }
 
 /// Returns the directory for crash dump files.
 #[must_use]
 pub fn crash_dump_dir() -> NormalizedPath {
-    default_cache_dir().join("crashes")
+    crash_dump_dir_from_cache_dir(&default_cache_dir())
 }
 
 /// Returns the directory for daemon log files.
 #[must_use]
 pub fn log_dir() -> NormalizedPath {
-    default_cache_dir().join("logs")
+    log_dir_from_cache_dir(&default_cache_dir())
+}
+
+fn artifacts_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+    cache_dir.join("artifacts")
+}
+
+fn tmp_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+    cache_dir.join("tmp")
+}
+
+fn depfile_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+    tmp_dir_from_cache_dir(cache_dir).join("depfiles")
+}
+
+fn depgraph_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+    cache_dir.join("depgraph")
+}
+
+fn index_path_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+    cache_dir.join("index.redb")
+}
+
+fn crash_dump_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+    cache_dir.join("crashes")
+}
+
+fn log_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+    cache_dir.join("logs")
 }
 
 fn dirs_fallback() -> NormalizedPath {
@@ -290,50 +319,10 @@ fn normalize_cache_dir_override(path: &std::path::Path) -> NormalizedPath {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        _lock: MutexGuard<'static, ()>,
-        previous: Option<OsString>,
-    }
-
-    impl EnvGuard {
-        fn set_cache_dir(value: &std::path::Path) -> Self {
-            let lock = ENV_LOCK.lock().unwrap();
-            let previous = std::env::var_os(CACHE_DIR_ENV);
-            std::env::set_var(CACHE_DIR_ENV, value);
-            Self {
-                _lock: lock,
-                previous,
-            }
-        }
-
-        fn remove_cache_dir() -> Self {
-            let lock = ENV_LOCK.lock().unwrap();
-            let previous = std::env::var_os(CACHE_DIR_ENV);
-            std::env::remove_var(CACHE_DIR_ENV);
-            Self {
-                _lock: lock,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(CACHE_DIR_ENV, value),
-                None => std::env::remove_var(CACHE_DIR_ENV),
-            }
-        }
-    }
 
     #[test]
     fn default_cache_dir_ends_with_zccache() {
-        let _env = EnvGuard::remove_cache_dir();
-        let dir = default_cache_dir();
+        let dir = default_cache_dir_from_env_value(None);
         assert!(dir.ends_with(".zccache"));
     }
 
@@ -341,15 +330,31 @@ mod tests {
     fn cache_dir_override_uses_non_empty_env_value() {
         let root = tempfile::tempdir().unwrap();
         let override_dir = root.path().join("zc");
-        let _env = EnvGuard::set_cache_dir(&override_dir);
+        let cache_dir =
+            default_cache_dir_from_env_value(Some(override_dir.clone().into_os_string()));
 
-        assert_eq!(default_cache_dir(), override_dir);
-        assert_eq!(artifacts_dir(), override_dir.join("artifacts"));
-        assert_eq!(tmp_dir(), override_dir.join("tmp"));
-        assert_eq!(depgraph_dir(), override_dir.join("depgraph"));
-        assert_eq!(index_path(), override_dir.join("index.redb"));
-        assert_eq!(crash_dump_dir(), override_dir.join("crashes"));
-        assert_eq!(log_dir(), override_dir.join("logs"));
+        assert_eq!(cache_dir, override_dir);
+        assert_eq!(
+            artifacts_dir_from_cache_dir(&cache_dir),
+            override_dir.join("artifacts")
+        );
+        assert_eq!(tmp_dir_from_cache_dir(&cache_dir), override_dir.join("tmp"));
+        assert_eq!(
+            depgraph_dir_from_cache_dir(&cache_dir),
+            override_dir.join("depgraph")
+        );
+        assert_eq!(
+            index_path_from_cache_dir(&cache_dir),
+            override_dir.join("index.redb")
+        );
+        assert_eq!(
+            crash_dump_dir_from_cache_dir(&cache_dir),
+            override_dir.join("crashes")
+        );
+        assert_eq!(
+            log_dir_from_cache_dir(&cache_dir),
+            override_dir.join("logs")
+        );
     }
 
     #[test]
@@ -366,56 +371,63 @@ mod tests {
 
     #[test]
     fn crash_dump_dir_ends_with_crashes() {
-        let dir = crash_dump_dir();
+        let (_temp, cache) = temp_cache_dir();
+        let dir = crash_dump_dir_from_cache_dir(&cache);
         assert!(dir.ends_with("crashes"));
     }
 
     #[test]
     fn crash_dump_dir_is_under_cache_dir() {
-        let cache = default_cache_dir();
-        let crashes = crash_dump_dir();
+        let (_temp, cache) = temp_cache_dir();
+        let crashes = crash_dump_dir_from_cache_dir(&cache);
         assert!(crashes.starts_with(&cache));
     }
 
     #[test]
     fn log_dir_ends_with_logs() {
-        let dir = log_dir();
+        let (_temp, cache) = temp_cache_dir();
+        let dir = log_dir_from_cache_dir(&cache);
         assert!(dir.ends_with("logs"));
     }
 
     #[test]
     fn log_dir_is_under_cache_dir() {
-        let cache = default_cache_dir();
-        let logs = log_dir();
+        let (_temp, cache) = temp_cache_dir();
+        let logs = log_dir_from_cache_dir(&cache);
         assert!(logs.starts_with(&cache));
     }
 
     #[test]
     fn artifacts_dir_ends_with_artifacts() {
-        let dir = artifacts_dir();
+        let (_temp, cache) = temp_cache_dir();
+        let dir = artifacts_dir_from_cache_dir(&cache);
         assert!(dir.ends_with("artifacts"));
-        assert!(dir.starts_with(default_cache_dir()));
+        assert!(dir.starts_with(cache));
     }
 
     #[test]
     fn tmp_dir_ends_with_tmp() {
-        let dir = tmp_dir();
+        let (_temp, cache) = temp_cache_dir();
+        let dir = tmp_dir_from_cache_dir(&cache);
         assert!(dir.ends_with("tmp"));
-        assert!(dir.starts_with(default_cache_dir()));
+        assert!(dir.starts_with(cache));
     }
 
     #[test]
     fn depgraph_dir_ends_with_depgraph() {
-        let dir = depgraph_dir();
+        let (_temp, cache) = temp_cache_dir();
+        let dir = depgraph_dir_from_cache_dir(&cache);
         assert!(dir.ends_with("depgraph"));
-        assert!(dir.starts_with(default_cache_dir()));
+        assert!(dir.starts_with(cache));
     }
 
     #[test]
     fn depfile_dir_under_tmp() {
-        let dir = depfile_dir();
+        let (_temp, cache) = temp_cache_dir();
+        let tmp = tmp_dir_from_cache_dir(&cache);
+        let dir = depfile_dir_from_cache_dir(&cache);
         assert!(dir.ends_with("depfiles"));
-        assert!(dir.starts_with(tmp_dir()));
+        assert!(dir.starts_with(tmp));
     }
 
     #[test]
@@ -548,8 +560,15 @@ mod tests {
 
     #[test]
     fn index_path_ends_with_redb() {
-        let p = index_path();
+        let (_temp, cache) = temp_cache_dir();
+        let p = index_path_from_cache_dir(&cache);
         assert!(p.ends_with("index.redb"));
-        assert!(p.starts_with(default_cache_dir()));
+        assert!(p.starts_with(cache));
+    }
+
+    fn temp_cache_dir() -> (tempfile::TempDir, NormalizedPath) {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = NormalizedPath::from(temp.path());
+        (temp, cache)
     }
 }
