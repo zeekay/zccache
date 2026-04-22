@@ -1,10 +1,11 @@
-//! Before/after directory scan for side-effect file detection.
+//! Before/after directory scan for link side-effect file detection.
 //!
 //! When compiler wrappers (e.g., ctc-clang++) link a binary, their post-link
-//! hooks may deploy runtime DLLs alongside the output. These "side-effect"
-//! files are not declared in linker arguments, so they cannot be discovered
-//! by parsing. Instead, we snapshot the output directory before and after
-//! the link, and treat new shared-library files as side effects to cache.
+//! hooks may deploy runtime DLLs, PDBs, Emscripten sidecars, or other files
+//! alongside the output. These "side-effect" files are not declared in linker
+//! arguments, so they cannot be discovered by parsing. Instead, we snapshot
+//! the output directory before and after the link, and treat new or changed
+//! sibling files as side effects to cache.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -60,30 +61,8 @@ pub fn snapshot_directory(dir: &Path) -> DirSnapshot {
     snap
 }
 
-/// Returns `true` if `name` has a shared-library extension (`.dll`, `.so`,
-/// `.dylib`, or versioned `.so.N.N.N`).
-fn has_shared_lib_extension(name: &OsStr) -> bool {
-    let s = name.to_string_lossy();
-    let lower = s.to_ascii_lowercase();
-
-    if lower.ends_with(".dll") || lower.ends_with(".dylib") {
-        return true;
-    }
-    // Exact `.so` or versioned `.so.1`, `.so.1.2.3`, etc.
-    if lower.ends_with(".so") {
-        return true;
-    }
-    // Versioned: contains `.so.` followed by digits/dots
-    if let Some(pos) = lower.find(".so.") {
-        let after = &lower[pos + 4..];
-        return !after.is_empty() && after.chars().all(|c| c.is_ascii_digit() || c == '.');
-    }
-    false
-}
-
 /// Re-scan `dir` and return files that are new or changed since `before`,
-/// filtering to shared-library extensions and excluding `primary_name` and
-/// anything in `already_captured`.
+/// excluding `primary_name` and anything in `already_captured`.
 pub fn detect_side_effects(
     before: &DirSnapshot,
     dir: &Path,
@@ -97,11 +76,6 @@ pub fn detect_side_effects(
 
         // Skip the primary output and already-captured secondaries.
         if name == primary_name || already_captured.contains(&name) {
-            continue;
-        }
-
-        // Only shared-library extensions.
-        if !has_shared_lib_extension(&name) {
             continue;
         }
 
@@ -212,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn non_shared_lib_excluded() {
+    fn non_shared_sibling_detected() {
         let dir = TempDir::new().unwrap();
         let snap = snapshot_directory(dir.path());
 
@@ -223,35 +197,11 @@ mod tests {
         let found =
             detect_side_effects(&snap, dir.path(), OsStr::new("app.exe"), &HashSet::new()).unwrap();
 
-        assert!(found.is_empty());
-    }
-
-    #[test]
-    fn versioned_so_detected() {
-        let dir = TempDir::new().unwrap();
-        let snap = snapshot_directory(dir.path());
-
-        fs::write(dir.path().join("libasan.so"), b"so").unwrap();
-        fs::write(dir.path().join("libasan.so.6"), b"so6").unwrap();
-        fs::write(dir.path().join("libasan.so.6.0.0"), b"so600").unwrap();
-
-        let found =
-            detect_side_effects(&snap, dir.path(), OsStr::new("app"), &HashSet::new()).unwrap();
-
         assert_eq!(found.len(), 3);
-    }
-
-    #[test]
-    fn dylib_detected() {
-        let dir = TempDir::new().unwrap();
-        let snap = snapshot_directory(dir.path());
-
-        fs::write(dir.path().join("libasan.dylib"), b"dylib").unwrap();
-
-        let found =
-            detect_side_effects(&snap, dir.path(), OsStr::new("app"), &HashSet::new()).unwrap();
-
-        assert_eq!(found.len(), 1);
+        let names: HashSet<_> = found.iter().map(|f| f.file_name.clone()).collect();
+        assert!(names.contains(OsStr::new("debug.pdb")));
+        assert!(names.contains(OsStr::new("build.log")));
+        assert!(names.contains(OsStr::new("output.obj")));
     }
 
     #[test]

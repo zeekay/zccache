@@ -3523,7 +3523,6 @@ dependencies = [
  "tracing-subscriber",
  "windows-sys 0.59.0",
  "zccache-artifact",
- "zccache-cli",
  "zccache-compiler",
  "zccache-core",
  "zccache-depgraph",

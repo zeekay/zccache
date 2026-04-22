@@ -50,5 +50,4 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 tempfile = { workspace = true }
-zccache-cli = { workspace = true }
 zccache-test-support = { workspace = true }
