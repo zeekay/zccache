@@ -31,6 +31,13 @@ inputs:
       suffixes. Set to "0" or "unlimited" to disable the size guard.
     required: false
     default: "2GiB"
+  target-snapshot-mode:
+    description: >
+      Target snapshot mode when cache-target is true. "hot" saves Cargo
+      metadata plus files read or modified during the job using atime/mtime
+      checks. "full" saves the pruned target tree.
+    required: false
+    default: "hot"
   target-snapshot-too-large:
     description: >
       Behavior when the target snapshot exceeds target-snapshot-max-size.
@@ -342,9 +349,11 @@ runs:
         echo "${{ inputs.cache-target }}" > ~/.zccache-action-state/cache-target
         echo "${{ inputs.target-dir }}" > ~/.zccache-action-state/target-dir
         echo "${{ inputs.target-snapshot-max-size }}" > ~/.zccache-action-state/target-snapshot-max-size
+        echo "${{ inputs.target-snapshot-mode }}" > ~/.zccache-action-state/target-snapshot-mode
         echo "${{ inputs.target-snapshot-too-large }}" > ~/.zccache-action-state/target-snapshot-too-large
         echo "${{ inputs.target-prune-incremental }}" > ~/.zccache-action-state/target-prune-incremental
         echo "${{ inputs.target-prune-build-script-out }}" > ~/.zccache-action-state/target-prune-build-script-out
+        date +%s > ~/.zccache-action-state/target-cache-marker-epoch
 
 branding:
   icon: "zap"

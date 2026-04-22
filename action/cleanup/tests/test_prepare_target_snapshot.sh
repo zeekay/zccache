@@ -64,6 +64,8 @@ run_prepare() {
   TARGET_SNAPSHOT_TOO_LARGE="${4:-skip}" \
   TARGET_PRUNE_INCREMENTAL="${5:-true}" \
   TARGET_PRUNE_BUILD_SCRIPT_OUT="${6:-false}" \
+  TARGET_SNAPSHOT_MODE="${8:-full}" \
+  TARGET_HOT_MARKER_EPOCH="${9:-0}" \
   GITHUB_OUTPUT="$7" \
   bash "$SCRIPT"
 }
@@ -86,7 +88,7 @@ test_prunes_incremental_and_excludes_from_tar() {
   make_file "$target/debug/incremental/foo/s-cache.bin" 64
   make_file "$target/release/incremental/bar/s-cache.bin" 32
 
-  run_prepare "$target" "$snapshot" 0 skip true false "$output"
+  run_prepare "$target" "$snapshot" 0 skip true false "$output" full
 
   assert_file_missing "$target/debug/incremental"
   assert_file_missing "$target/release/incremental"
@@ -111,7 +113,7 @@ test_optionally_prunes_build_script_out() {
   make_file "$target/debug/build/libz-sys-abc/build-script-build" 8
   make_file "$target/debug/deps/libz_sys.rlib" 8
 
-  run_prepare "$target" "$snapshot" 0 skip true true "$output"
+  run_prepare "$target" "$snapshot" 0 skip true true "$output" full
 
   assert_file_missing "$target/debug/build/libz-sys-abc/out"
   assert_file_exists "$snapshot/target-meta.tar"
@@ -131,7 +133,7 @@ test_oversize_skip_does_not_create_tar() {
 
   make_file "$target/debug/deps/libhuge.rlib" 64
 
-  run_prepare "$target" "$snapshot" 16B skip true false "$output"
+  run_prepare "$target" "$snapshot" 16B skip true false "$output" full
 
   assert_file_missing "$snapshot/target-meta.tar"
   assert_contains "$output" "snapshot-saved=false"
@@ -147,7 +149,7 @@ test_oversize_fail_returns_nonzero() {
 
   make_file "$target/debug/deps/libhuge.rlib" 64
 
-  if run_prepare "$target" "$snapshot" 16B fail true false "$output"; then
+  if run_prepare "$target" "$snapshot" 16B fail true false "$output" full; then
     fail "expected oversize fail policy to return non-zero"
   fi
 
@@ -156,10 +158,55 @@ test_oversize_fail_returns_nonzero() {
   assert_contains "$output" "snapshot-skipped-reason=target-too-large"
 }
 
+test_hot_mode_selects_metadata_and_accessed_files() {
+  local tmp target snapshot output listing marker
+  tmp="$(new_tmp)"
+  target="$tmp/target"
+  snapshot="$tmp/snapshot"
+  output="$tmp/output"
+  listing="$tmp/listing"
+  marker="$(python - <<'PY'
+import time
+print(int(time.time()) + 100000)
+PY
+)"
+
+  make_file "$target/debug/deps/libstale.rlib" 128
+  make_file "$target/debug/deps/libhot.rlib" 16
+  make_file "$target/debug/deps/libmeta.rmeta" 8
+  make_file "$target/debug/.fingerprint/pkg/hash" 8
+  make_file "$target/debug/incremental/pkg/s-cache.bin" 64
+
+  python - "$target" "$marker" <<'PY'
+import os
+import pathlib
+import sys
+
+target = pathlib.Path(sys.argv[1])
+marker = int(sys.argv[2])
+old = marker - 100
+for item in target.rglob("*"):
+    if item.is_file():
+        os.utime(item, (old, old))
+os.utime(target / "debug" / "deps" / "libhot.rlib", (old, marker + 10))
+PY
+
+  run_prepare "$target" "$snapshot" 0 skip true false "$output" hot "$marker"
+
+  assert_file_exists "$snapshot/target-meta.tar"
+  tar_listing "$snapshot/target-meta.tar" "$listing"
+  assert_contains "$listing" "debug/deps/libhot.rlib"
+  assert_contains "$listing" "debug/deps/libmeta.rmeta"
+  assert_contains "$listing" "debug/.fingerprint/pkg/hash"
+  assert_not_contains "$listing" "debug/deps/libstale.rlib"
+  assert_not_contains "$listing" "incremental"
+}
+
 test_parse_size
 test_prunes_incremental_and_excludes_from_tar
 test_optionally_prunes_build_script_out
 test_oversize_skip_does_not_create_tar
 test_oversize_fail_returns_nonzero
+test_hot_mode_selects_metadata_and_accessed_files
 
 echo "prepare-target-snapshot tests passed"
