@@ -184,7 +184,7 @@ zccache produces **two** binaries: `zccache` (CLI) and `zccache-daemon`. Maturin
 ## CI/CD Sketch
 
 ```yaml
-# .github/workflows/release.yml
+# .github/workflows/release-auto.yml
 jobs:
   build:
     strategy:
