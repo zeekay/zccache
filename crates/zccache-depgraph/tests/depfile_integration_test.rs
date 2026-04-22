@@ -1,7 +1,7 @@
 //! Integration tests for depfile parsing with real compilers.
 //!
 //! These tests require GCC or Clang to be installed. Run with:
-//! `uv run cargo test -p zccache-depgraph --test depfile_integration_test -- --ignored`
+//! `SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-depgraph --test depfile_integration_test -- --ignored`
 
 use std::process::Command;
 use tempfile::TempDir;

@@ -9,8 +9,8 @@
 //! - CARGO_* env vars in cache key
 //! - --remap-path-prefix in cache key
 //!
-//! Run all:    uv run cargo test -p zccache-daemon --test rustc_adversarial_test -- --nocapture --ignored --test-threads=1
-//! Run single: uv run cargo test -p zccache-daemon --test rustc_adversarial_test -- <test_name> --nocapture --ignored
+//! Run all:    SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test rustc_adversarial_test -- --nocapture --ignored --test-threads=1
+//! Run single: SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test rustc_adversarial_test -- <test_name> --nocapture --ignored
 
 use zccache_core::NormalizedPath;
 use zccache_daemon::DaemonServer;

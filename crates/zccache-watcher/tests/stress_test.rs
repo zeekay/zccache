@@ -1,7 +1,7 @@
 //! Adversarial and stress tests for the file watcher subsystem.
 //!
 //! These tests are `#[ignore]`d so they don't run during normal `cargo test`.
-//! Run with: `uv run cargo test -p zccache-watcher --test stress_test -- --ignored`
+//! Run with: `SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-watcher --test stress_test -- --ignored`
 
 use std::fs;
 use std::sync::Arc;

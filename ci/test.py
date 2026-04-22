@@ -12,21 +12,20 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ci.env import activate, clean_env
 from ci.release_checks import ReleaseCheckError, validate_release_metadata
+from ci.soldr import cargo_command, self_build_env
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 
 
 def main():
-    activate()
     try:
         validate_release_metadata()
     except ReleaseCheckError as e:
         print(str(e), file=sys.stderr)
         return 1
 
-    cmd = ["cargo", "test"]
+    cmd = cargo_command("test")
 
     args = sys.argv[1:]
     full = "--full" in args
@@ -62,7 +61,7 @@ def main():
         encoding="utf-8",
         errors="replace",
         cwd=str(SCRIPT_DIR),
-        env=clean_env(),
+        env=self_build_env(),
     )
     return result.returncode
 

@@ -1,6 +1,6 @@
 //! Profile the multi-file warm cache path to identify bottlenecks.
 //!
-//! Run: uv run cargo test -p zccache-daemon --test profile_multi_test -- --nocapture --ignored
+//! Run: SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test profile_multi_test -- --nocapture --ignored
 
 use std::sync::Arc;
 use std::time::Instant;

@@ -6,8 +6,8 @@
 //! covered: header edits, touch-without-change, deep directories, ephemeral
 //! file creation/deletion, and multi-session cache sharing.
 //!
-//! Run all:    uv run cargo test -p zccache-daemon --test watcher_adversarial -- --nocapture
-//! Run single: uv run cargo test -p zccache-daemon --test watcher_adversarial -- <test_name> --nocapture
+//! Run all:    SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test watcher_adversarial -- --nocapture
+//! Run single: SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test watcher_adversarial -- <test_name> --nocapture
 
 use std::path::Path;
 use std::sync::Arc;

@@ -12,7 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ci.env import clean_env, ensure_windows_msvc, require_tool_path
+from ci.env import clean_env, ensure_windows_msvc
+from ci.soldr import rust_tool_command
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 SCCACHE_BASE = PROJECT_ROOT / ".sccache"
@@ -20,10 +21,9 @@ CARGO_CONFIG = PROJECT_ROOT / ".cargo" / "config.toml"
 
 
 def get_rustc_verbose():
-    """Get `rustc --version --verbose` output via the rustup toolchain."""
-    rustc = require_tool_path("rustc")
+    """Get `rustc --version --verbose` output through soldr."""
     result = subprocess.run(
-        [str(rustc), "--version", "--verbose"],
+        rust_tool_command("rustc", "--version", "--verbose"),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -71,7 +71,7 @@ SCCACHE_DIR = "{cache_dir_str}"
 def main():
     try:
         ensure_windows_msvc()
-    except RuntimeError as exc:
+    except (FileNotFoundError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

@@ -1,7 +1,7 @@
 //! Integration, stress, and adversarial tests for zccache-depgraph.
 //!
 //! All tests are `#[ignore]` — run with `uv run test --full` or
-//! `uv run cargo test -p zccache-depgraph --test stress_test -- --ignored`.
+//! `SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-depgraph --test stress_test -- --ignored`.
 
 use std::collections::HashSet;
 use std::path::Path;

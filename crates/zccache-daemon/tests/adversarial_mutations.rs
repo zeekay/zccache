@@ -6,8 +6,8 @@
 //! (touch/delete-recreate with same content), independent file isolation,
 //! include-path differentiation, and preprocessor-flag differentiation.
 //!
-//! Run all:    uv run cargo test -p zccache-daemon --test adversarial_mutations -- --nocapture
-//! Run single: uv run cargo test -p zccache-daemon --test adversarial_mutations -- <test_name> --nocapture
+//! Run all:    SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test adversarial_mutations -- --nocapture
+//! Run single: SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test adversarial_mutations -- <test_name> --nocapture
 
 use std::path::Path;
 use zccache_core::NormalizedPath;

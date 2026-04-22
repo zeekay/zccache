@@ -14,22 +14,21 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ci.env import activate, clean_env
+from ci.soldr import cargo_command, self_build_env
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 
 
 def main():
-    activate()
-    cmd = [
-        "cargo", "test",
+    cmd = cargo_command(
+        "test",
         "-p", "zccache-daemon",
         "--test", "perf_bench_test",
         "--",
         "--nocapture",
         "--ignored",
         "--test-threads=1",
-    ]
+    )
 
     result = subprocess.run(
         cmd,
@@ -37,7 +36,7 @@ def main():
         encoding="utf-8",
         errors="replace",
         cwd=str(SCRIPT_DIR),
-        env=clean_env(),
+        env=self_build_env(),
     )
     return result.returncode
 

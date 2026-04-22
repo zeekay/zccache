@@ -1,12 +1,9 @@
 # CI & Development Tools
 
-Python scripts for development tooling. Project-root trampolines (`_cargo`, `_rustc`, `_rustfmt`) prepend the shared rustup proxy location to PATH so the pinned toolchain is always used.
+Python scripts for development tooling. Rust commands go through `soldr <tool>` so repo-local toolchain homes and the pinned rustup-managed toolchain are resolved in one place.
 
-## Top-level scripts
+## Top-Level Scripts
 
-- **`./_cargo`** - Execute cargo with the correct Rust toolchain (via trampoline PATH normalization)
-- **`./_rustc`** - Execute rustc with the correct toolchain
-- **`./_rustfmt`** - Execute rustfmt with the correct toolchain
 - **`./lint`** - Workspace linting (rustfmt + clippy), supports single-file mode
 - **`./test`** - Workspace tests, supports per-crate filtering
 - **`./perf`** - Performance benchmarks (zccache vs sccache vs bare clang)
@@ -27,6 +24,6 @@ Python scripts for development tooling. Project-root trampolines (`_cargo`, `_ru
 
 Claude Code hooks that enforce project conventions:
 
-- **tool_guard.py** - PreToolUse: blocks bare `cargo`/`rustc` and `uv run cargo`/`uv run rustc` (must use trampolines) and bare `python`/`pip` (must use `uv`)
+- **tool_guard.py** - PreToolUse: blocks bare `cargo`/`rustc`, legacy root trampolines, and `uv run cargo`/`uv run rustc` (must use `soldr`) and bare `python`/`pip` (must use `uv`)
 - **lint.py** - PostToolUse: auto-formats + runs clippy on edited `.rs` files
 - **readme_guard.py** - PostToolUse: ensures every directory has a `README.md`
