@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 parse_size_bytes() {
   local raw="${1:-0}"
   raw="${raw//[[:space:]]/}"
@@ -188,8 +190,18 @@ finish_too_large() {
 
 TARGET="${TARGET_DIR:-${TARGET:-target}}"
 SNAPSHOT_DIR="${TARGET_SNAPSHOT_DIR:-$HOME/.zccache-target-meta}"
+SNAPSHOT_MODE="$(printf '%s' "${TARGET_SNAPSHOT_MODE:-hot}" | tr '[:upper:]' '[:lower:]')"
+HOT_MARKER_EPOCH="${TARGET_HOT_MARKER_EPOCH:-0}"
 MAX_SIZE="${TARGET_SNAPSHOT_MAX_SIZE:-2GiB}"
 TOO_LARGE_POLICY="$(printf '%s' "${TARGET_SNAPSHOT_TOO_LARGE:-skip}" | tr '[:upper:]' '[:lower:]')"
+
+case "$SNAPSHOT_MODE" in
+  "hot"|"full") ;;
+  *)
+    echo "Invalid target snapshot mode: $SNAPSHOT_MODE" >&2
+    exit 2
+    ;;
+esac
 
 case "$TOO_LARGE_POLICY" in
   "skip"|"fail") ;;
@@ -228,16 +240,44 @@ if is_true "${TARGET_PRUNE_BUILD_SCRIPT_OUT:-false}"; then
 fi
 
 CANDIDATE_BYTES="$(snapshot_candidate_bytes "$TARGET")"
-if [ "$MAX_BYTES" -gt 0 ] && [ "$CANDIDATE_BYTES" -gt "$MAX_BYTES" ]; then
+if [ "$SNAPSHOT_MODE" = "full" ] && [ "$MAX_BYTES" -gt 0 ] && [ "$CANDIDATE_BYTES" -gt "$MAX_BYTES" ]; then
   finish_too_large "$CANDIDATE_BYTES"
 fi
 
-tar_excludes=(--exclude='incremental' --exclude='*/incremental')
-if is_true "${TARGET_PRUNE_BUILD_SCRIPT_OUT:-false}"; then
-  tar_excludes+=(--exclude='*/build/*/out')
+if [ "$SNAPSHOT_MODE" = "hot" ]; then
+  LIST_FILE="$SNAPSHOT_DIR/hot-target-files.list"
+  selector_args=(
+    "$SCRIPT_DIR/select-hot-target.py"
+    --target "$TARGET"
+    --marker-epoch "$HOT_MARKER_EPOCH"
+    --list-file "$LIST_FILE"
+  )
+  if is_true "${TARGET_PRUNE_BUILD_SCRIPT_OUT:-false}"; then
+    selector_args+=(--prune-build-script-out)
+  fi
+  HOT_STATS="$(python "${selector_args[@]}")"
+  CANDIDATE_BYTES="$(python - "$HOT_STATS" <<'PY'
+import json
+import sys
+print(json.loads(sys.argv[1])["selected_bytes"])
+PY
+)"
+  if [ "$MAX_BYTES" -gt 0 ] && [ "$CANDIDATE_BYTES" -gt "$MAX_BYTES" ]; then
+    finish_too_large "$CANDIDATE_BYTES"
+  fi
+  if [ ! -s "$LIST_FILE" ]; then
+    finish_skipped "no-hot-target-files"
+  fi
+  tar_command=(tar -cf "$SNAPSHOT_TAR" -C "$TARGET" --null -T "$LIST_FILE")
+else
+  tar_args=(--exclude='incremental' --exclude='*/incremental' -C "$TARGET" .)
+  if is_true "${TARGET_PRUNE_BUILD_SCRIPT_OUT:-false}"; then
+    tar_args=(--exclude='incremental' --exclude='*/incremental' --exclude='*/build/*/out' -C "$TARGET" .)
+  fi
+  tar_command=(tar -cf "$SNAPSHOT_TAR" "${tar_args[@]}")
 fi
 
-if ! tar "${tar_excludes[@]}" -cf "$SNAPSHOT_TAR" -C "$TARGET" . 2>/dev/null; then
+if ! "${tar_command[@]}" 2>/dev/null; then
   rm -f -- "$SNAPSHOT_TAR"
   finish_skipped "tar-failed"
 fi

@@ -17,10 +17,14 @@ Always call with `if: always()`:
 2. Stops the zccache daemon
 3. Saves compilation cache to GHA cache
 4. Saves cargo registry cache to GHA cache
-5. If `cache-target: true`, prunes and bounds the cargo target snapshot before saving
+5. If `cache-target: true`, selects, prunes, and bounds the cargo target snapshot before saving
 6. Cleans up temporary state files
 
 Cache keys are read from state written by the setup action (`~/.zccache-action-state/`).
+
+The default target snapshot mode is `hot`: cleanup saves Cargo metadata and
+files read or modified after setup using access and modification times. Set
+`target-snapshot-mode: full` in the main action to save the pruned target tree.
 
 ## Target Snapshot Outputs
 

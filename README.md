@@ -472,6 +472,7 @@ How it works:
 | `cache-cargo-registry` | `true` | Cache cargo registry index + crate files + git deps |
 | `cache-compilation` | `true` | Cache compilation units via zccache daemon |
 | `cache-target` | `false` | Cache target snapshot + run `zccache warm`; opt in only for workflows where target snapshots are worth the disk budget |
+| `target-snapshot-mode` | `hot` | `hot` saves Cargo metadata plus target files read or modified during the job; `full` saves the pruned target tree |
 | `target-snapshot-max-size` | `2GiB` | Skip or fail target snapshot save when the pruned snapshot exceeds this size; use `0` for unlimited |
 | `target-snapshot-too-large` | `skip` | `skip` oversized target snapshots or `fail` cleanup |
 | `target-prune-incremental` | `true` | Remove `target/**/incremental` before creating a snapshot |
@@ -489,7 +490,7 @@ The action now treats the two cache layers differently:
 
 - Compilation cache fallback stays enabled by default. That preserves fast incremental reuse across nearby commits while still letting zccache validate cache hits when `rustc` actually runs.
 - Target snapshot fallback is disabled by default. Reusing stale Cargo fingerprints and build-script outputs across different source trees can make a PR merge ref look fresh when it is not.
-- Target snapshots are disabled by default because Cargo does not garbage collect `target/`. Most CI should use the compilation and registry caches only. Enable `cache-target: true` for jobs where skipping Cargo fingerprint work matters enough to spend extra cache and runner disk.
+- Target snapshots are disabled by default because Cargo does not garbage collect `target/`. When enabled, the default `target-snapshot-mode: hot` saves Cargo freshness metadata plus target files read or modified during the job instead of archiving the whole tree. Use `target-snapshot-mode: full` only for tightly scoped jobs where the target directory is known to stay bounded.
 - Target snapshot saves prune `target/**/incremental` by default, can optionally prune `target/**/build/*/out`, and skip saving when the pruned snapshot exceeds `target-snapshot-max-size`.
 
 If you want the old fastest-possible behavior for developer CI, opt back in explicitly:

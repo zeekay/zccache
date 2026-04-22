@@ -53,9 +53,11 @@ runs:
           echo "cache-target=$(cat "$STATE_DIR/cache-target" 2>/dev/null || echo 'false')" >> "$GITHUB_OUTPUT"
           echo "target-dir=$(cat "$STATE_DIR/target-dir" 2>/dev/null || echo 'target')" >> "$GITHUB_OUTPUT"
           echo "target-snapshot-max-size=$(cat "$STATE_DIR/target-snapshot-max-size" 2>/dev/null || echo '2GiB')" >> "$GITHUB_OUTPUT"
+          echo "target-snapshot-mode=$(cat "$STATE_DIR/target-snapshot-mode" 2>/dev/null || echo 'hot')" >> "$GITHUB_OUTPUT"
           echo "target-snapshot-too-large=$(cat "$STATE_DIR/target-snapshot-too-large" 2>/dev/null || echo 'skip')" >> "$GITHUB_OUTPUT"
           echo "target-prune-incremental=$(cat "$STATE_DIR/target-prune-incremental" 2>/dev/null || echo 'true')" >> "$GITHUB_OUTPUT"
           echo "target-prune-build-script-out=$(cat "$STATE_DIR/target-prune-build-script-out" 2>/dev/null || echo 'false')" >> "$GITHUB_OUTPUT"
+          echo "target-cache-marker-epoch=$(cat "$STATE_DIR/target-cache-marker-epoch" 2>/dev/null || echo '0')" >> "$GITHUB_OUTPUT"
         else
           echo "save-cache=false" >> "$GITHUB_OUTPUT"
           echo "cache-compilation=false" >> "$GITHUB_OUTPUT"
@@ -87,9 +89,11 @@ runs:
       env:
         TARGET_DIR: ${{ steps.state.outputs.target-dir }}
         TARGET_SNAPSHOT_MAX_SIZE: ${{ steps.state.outputs.target-snapshot-max-size }}
+        TARGET_SNAPSHOT_MODE: ${{ steps.state.outputs.target-snapshot-mode }}
         TARGET_SNAPSHOT_TOO_LARGE: ${{ steps.state.outputs.target-snapshot-too-large }}
         TARGET_PRUNE_INCREMENTAL: ${{ steps.state.outputs.target-prune-incremental }}
         TARGET_PRUNE_BUILD_SCRIPT_OUT: ${{ steps.state.outputs.target-prune-build-script-out }}
+        TARGET_HOT_MARKER_EPOCH: ${{ steps.state.outputs.target-cache-marker-epoch }}
       run: |
         bash "$GITHUB_ACTION_PATH/prepare-target-snapshot.sh"
 
