@@ -436,11 +436,12 @@ The action provides three cache layers plus `zccache warm` for near-instant subs
 | **Target snapshot cache** | `target/` tarball excluding `incremental/` | (new) | Cargo sees target outputs and fingerprints together |
 | **`zccache warm`** | Backfills `target/deps/` from compilation cache | (new) | Restores missing artifacts before cargo runs |
 
-On setup, the action restores all three caches, extracts the target snapshot,
-runs `zccache warm` to backfill cached `.rlib`/`.rmeta` files, touches all
-timestamps to a single consistent value, and starts the daemon.
+On setup, the action restores the compilation and registry caches. Target
+snapshots are opt-in: when `cache-target: true` is set, the action extracts the
+target snapshot, runs `zccache warm` to backfill cached `.rlib`/`.rmeta` files,
+touches all timestamps to a single consistent value, and starts the daemon.
 
-On cleanup: stops daemon → saves all three caches.
+On cleanup: stops daemon and saves the enabled caches.
 
 ### CI benchmark results
 
@@ -454,8 +455,8 @@ Measured on `ubuntu-24.04` building `zccache-core` (14 crates):
 **15x faster than sccache on subsequent CI runs.** Zero recompilation — cargo sees all fingerprints as fresh and prints `Finished` immediately.
 
 How it works:
-1. First run: cold build, populates zccache compilation cache and saves a target snapshot.
-2. Second run: restores the target snapshot, runs `zccache warm` as a backfill, touches timestamps, then `cargo build` finishes without recompilation.
+1. First run with `cache-target: true`: cold build, populates zccache compilation cache and saves a target snapshot.
+2. Second run with `cache-target: true`: restores the target snapshot, runs `zccache warm` as a backfill, touches timestamps, then `cargo build` finishes without recompilation.
 
 `zccache warm` reads the on-disk artifact index (no daemon needed) and filters by `Cargo.lock` — only restores artifacts matching crates in your lockfile. That is a speed optimization, not a full integrity-verification pass: warmed artifacts are trusted and Cargo is expected to reject or rebuild anything incompatible.
 
@@ -465,7 +466,7 @@ How it works:
 |---|---|---|
 | `cache-cargo-registry` | `true` | Cache cargo registry index + crate files + git deps |
 | `cache-compilation` | `true` | Cache compilation units via zccache daemon |
-| `cache-target` | `true` | Cache target snapshot + run `zccache warm` |
+| `cache-target` | `false` | Cache target snapshot + run `zccache warm`; opt-in because `target/` has no bounded garbage collection yet ([zackees/zccache#65](https://github.com/zackees/zccache/issues/65)) |
 | `compilation-restore-fallback` | `true` | Allow prefix fallback for compilation cache restores |
 | `target-restore-fallback` | `false` | Allow prefix fallback for target snapshot restores |
 | `target-dir` | `target` | Path to the cargo target directory |
@@ -485,16 +486,16 @@ If you want the old fastest-possible behavior for developer CI, opt back in expl
 ```yaml
 - uses: zackees/zccache@main
   with:
+    cache-target: true
     compilation-restore-fallback: true
     target-restore-fallback: true
 ```
 
-If you want a more release-hardened setup, prefer exact restores and avoid target snapshots entirely:
+The default avoids target snapshots entirely until [zackees/zccache#65](https://github.com/zackees/zccache/issues/65) adds bounded garbage collection for accumulated profiles, test binaries, build-script outputs, and target triples. For release-hardened setup, keep the default and prefer exact compilation-cache restores:
 
 ```yaml
 - uses: zackees/zccache@main
   with:
-    cache-target: false
     compilation-restore-fallback: false
 ```
 
