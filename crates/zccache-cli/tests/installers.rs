@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
 
@@ -13,6 +13,11 @@ use tempfile::TempDir;
 use zccache_core::NormalizedPath;
 
 const VERSION: &str = "1.2.3";
+
+fn installer_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 fn workspace_root() -> NormalizedPath {
     NormalizedPath::new(
@@ -259,6 +264,7 @@ fn add_directory_to_zip(
 #[cfg(unix)]
 #[test]
 fn install_sh_installs_release_archive() {
+    let _guard = installer_test_lock().lock().expect("installer test lock");
     let temp = TempDir::new().expect("tempdir");
     let release_root = temp.path().join("release");
     fs::create_dir_all(&release_root).expect("create release root");
@@ -318,6 +324,7 @@ fn install_sh_installs_release_archive() {
 #[cfg(unix)]
 #[test]
 fn install_sh_supports_global_mode() {
+    let _guard = installer_test_lock().lock().expect("installer test lock");
     let temp = TempDir::new().expect("tempdir");
     let release_root = temp.path().join("release");
     fs::create_dir_all(&release_root).expect("create release root");
@@ -362,6 +369,7 @@ fn install_sh_supports_global_mode() {
 #[cfg(windows)]
 #[test]
 fn install_ps1_installs_release_archive() {
+    let _guard = installer_test_lock().lock().expect("installer test lock");
     let temp = TempDir::new().expect("tempdir");
     let release_root = temp.path().join("release");
     fs::create_dir_all(&release_root).expect("create release root");
@@ -425,6 +433,7 @@ fn install_ps1_installs_release_archive() {
 #[cfg(windows)]
 #[test]
 fn install_ps1_supports_global_mode() {
+    let _guard = installer_test_lock().lock().expect("installer test lock");
     let temp = TempDir::new().expect("tempdir");
     let release_root = temp.path().join("release");
     fs::create_dir_all(&release_root).expect("create release root");
