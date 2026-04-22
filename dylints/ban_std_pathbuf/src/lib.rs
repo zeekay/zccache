@@ -1,11 +1,13 @@
 #![feature(rustc_private)]
 
+extern crate rustc_errors;
 extern crate rustc_hir;
 extern crate rustc_span;
 
+use rustc_errors::DiagDecorator;
 use rustc_hir::{def::Res, AmbigArg, Expr, ExprKind, Ty, TyKind};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_span::{symbol::Symbol, FileName};
+use rustc_span::{symbol::Symbol, FileName, RemapPathScopeComponents};
 
 dylint_linting::declare_late_lint! {
     /// ### What it does
@@ -75,11 +77,15 @@ impl<'tcx> LateLintPass<'tcx> for BanStdPathbuf {
 }
 
 fn emit_lint(cx: &LateContext<'_>, span: rustc_span::Span) {
-    cx.opt_span_lint(BAN_STD_PATHBUF, span, |diag| {
-        diag.primary_message(
-            "use zccache_core::path::NormalizedPath instead of std::path::PathBuf",
-        );
-    });
+    cx.opt_span_lint(
+        BAN_STD_PATHBUF,
+        Some(span),
+        DiagDecorator(|diag| {
+            diag.primary_message(
+                "use zccache_core::path::NormalizedPath instead of std::path::PathBuf",
+            );
+        }),
+    );
 }
 
 fn is_allowlisted(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
@@ -87,8 +93,15 @@ fn is_allowlisted(cx: &LateContext<'_>, span: rustc_span::Span) -> bool {
         FileName::Real(real_filename) => real_filename
             .local_path()
             .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|| real_filename.to_string()),
-        filename => filename.to_string(),
+            .unwrap_or_else(|| {
+                real_filename
+                    .path(RemapPathScopeComponents::DIAGNOSTICS)
+                    .to_string_lossy()
+                    .into_owned()
+            }),
+        filename => filename
+            .display(RemapPathScopeComponents::DIAGNOSTICS)
+            .to_string(),
     };
     let normalized = normalize_slashes(&filename);
     ALLOWLIST
