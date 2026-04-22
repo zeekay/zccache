@@ -47,6 +47,7 @@ runs:
           echo "compilation-key=$(cat "$STATE_DIR/compilation-key" 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
           echo "registry-key=$(cat "$STATE_DIR/registry-key" 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
           echo "target-key=$(cat "$STATE_DIR/target-key" 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
+          echo "cache-backend=$(cat "$STATE_DIR/cache-backend" 2>/dev/null || echo 'actions-cache')" >> "$GITHUB_OUTPUT"
           echo "save-cache=$(cat "$STATE_DIR/save-cache" 2>/dev/null || echo 'true')" >> "$GITHUB_OUTPUT"
           echo "cache-compilation=$(cat "$STATE_DIR/cache-compilation" 2>/dev/null || echo 'true')" >> "$GITHUB_OUTPUT"
           echo "cache-registry=$(cat "$STATE_DIR/cache-registry" 2>/dev/null || echo 'true')" >> "$GITHUB_OUTPUT"
@@ -59,6 +60,7 @@ runs:
           echo "target-prune-build-script-out=$(cat "$STATE_DIR/target-prune-build-script-out" 2>/dev/null || echo 'false')" >> "$GITHUB_OUTPUT"
           echo "target-cache-marker-epoch=$(cat "$STATE_DIR/target-cache-marker-epoch" 2>/dev/null || echo '0')" >> "$GITHUB_OUTPUT"
         else
+          echo "cache-backend=actions-cache" >> "$GITHUB_OUTPUT"
           echo "save-cache=false" >> "$GITHUB_OUTPUT"
           echo "cache-compilation=false" >> "$GITHUB_OUTPUT"
           echo "cache-registry=false" >> "$GITHUB_OUTPUT"
@@ -66,14 +68,35 @@ runs:
         fi
 
     - name: Save zccache compilation cache
-      if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-compilation == 'true'
+      if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-backend == 'native' && steps.state.outputs.cache-compilation == 'true'
+      shell: bash
+      run: |
+        zccache gha-cache save \
+          --key "${{ steps.state.outputs.compilation-key }}" \
+          --path "$HOME/.zccache"
+
+    - name: Save zccache compilation cache
+      if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-backend != 'native' && steps.state.outputs.cache-compilation == 'true'
       uses: actions/cache/save@v4
       with:
         path: ~/.zccache
         key: ${{ steps.state.outputs.compilation-key }}
 
+    - name: Save cargo registry archive
+      if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-backend == 'native' && steps.state.outputs.cache-registry == 'true'
+      shell: bash
+      run: |
+        zccache cargo-registry save \
+          --key "${{ steps.state.outputs.registry-key }}" \
+          --cargo-home "$HOME/.cargo"
+        if [ -f "$HOME/.zccache/cargo-registry/${{ steps.state.outputs.registry-key }}.tar.gz" ]; then
+          zccache gha-cache save \
+            --key "${{ steps.state.outputs.registry-key }}" \
+            --path "$HOME/.zccache/cargo-registry"
+        fi
+
     - name: Save cargo registry cache
-      if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-registry == 'true'
+      if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-backend != 'native' && steps.state.outputs.cache-registry == 'true'
       uses: actions/cache/save@v4
       with:
         path: |
@@ -98,7 +121,15 @@ runs:
         bash "$GITHUB_ACTION_PATH/prepare-target-snapshot.sh"
 
     - name: Save cargo target snapshot
-      if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-target == 'true' && steps.target-snapshot.outputs.snapshot-saved == 'true'
+      if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-backend == 'native' && steps.state.outputs.cache-target == 'true' && steps.target-snapshot.outputs.snapshot-saved == 'true'
+      shell: bash
+      run: |
+        zccache gha-cache save \
+          --key "${{ steps.state.outputs.target-key }}" \
+          --path "$HOME/.zccache-target-meta"
+
+    - name: Save cargo target snapshot
+      if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-backend != 'native' && steps.state.outputs.cache-target == 'true' && steps.target-snapshot.outputs.snapshot-saved == 'true'
       uses: actions/cache/save@v4
       with:
         path: ~/.zccache-target-meta

@@ -97,13 +97,13 @@ inputs:
 outputs:
   cache-hit-compilation:
     description: "Whether the zccache compilation cache was restored"
-    value: ${{ steps.restore-zccache.outputs.cache-hit }}
+    value: ${{ steps.restore-zccache-native.outputs.cache-hit == 'true' && 'true' || steps.restore-zccache-fallback.outputs.cache-hit == 'true' && 'true' || steps.restore-zccache-cache.outputs.cache-hit == 'true' && 'true' || 'false' }}
   cache-hit-registry:
     description: "Whether the cargo registry cache was restored"
-    value: ${{ steps.restore-registry.outputs.cache-hit }}
+    value: ${{ steps.restore-registry-native.outputs.cache-hit == 'true' && 'true' || steps.restore-registry-cache.outputs.cache-hit == 'true' && 'true' || 'false' }}
   cache-hit-target:
     description: "Whether the cargo target snapshot cache was restored"
-    value: ${{ steps.restore-target.outputs.cache-hit }}
+    value: ${{ steps.restore-target-native.outputs.cache-hit == 'true' && 'true' || steps.restore-target-fallback.outputs.cache-hit == 'true' && 'true' || steps.restore-target-cache.outputs.cache-hit == 'true' && 'true' || 'false' }}
 
 runs:
   using: "composite"
@@ -158,64 +158,14 @@ runs:
           echo "target-restore=" >> "$GITHUB_OUTPUT"
         fi
 
-    # --- Layer 1: Restore zccache compilation cache ---
-    - name: Restore zccache compilation cache
-      id: restore-zccache
-      if: inputs.cache-compilation == 'true'
-      uses: actions/cache/restore@v4
-      with:
-        path: ~/.zccache
-        key: ${{ steps.keys.outputs.compilation-key }}
-        restore-keys: ${{ steps.keys.outputs.compilation-restore }}
-
-    # --- Layer 2: Restore cargo registry cache ---
-    - name: Restore cargo registry cache
-      id: restore-registry
-      if: inputs.cache-cargo-registry == 'true'
-      uses: actions/cache/restore@v4
-      with:
-        path: |
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-        key: ${{ steps.keys.outputs.registry-key }}
-        restore-keys: ${{ steps.keys.outputs.registry-restore }}
-
-    # --- Layer 3: Restore cargo target snapshot ---
-    # Restores target/ as a single tarball (excluding incremental/). `zccache warm`
-    # also fills in cached artifacts from the compilation cache when available.
-    # Opt-in until zackees/zccache#65 adds bounded target snapshot GC.
-    - name: Restore cargo target snapshot
-      id: restore-target
-      if: inputs.cache-target == 'true'
-      uses: actions/cache/restore@v4
-      with:
-        path: ~/.zccache-target-meta
-        key: ${{ steps.keys.outputs.target-key }}
-        restore-keys: ${{ steps.keys.outputs.target-restore }}
-
-    - name: Extract target snapshot
-      if: inputs.cache-target == 'true'
+    - name: Detect cache backend
+      id: cache-backend
       shell: bash
       run: |
-        TARGET="${{ inputs.target-dir }}"
-        META_TAR="$HOME/.zccache-target-meta/target-meta.tar"
-        if [ -f "$META_TAR" ]; then
-          MAX_BYTES="$(bash "${{ github.action_path }}/action/cleanup/prepare-target-snapshot.sh" --parse-size "${{ inputs.target-snapshot-max-size }}")"
-          TAR_BYTES="$(wc -c < "$META_TAR" | tr -d '[:space:]')"
-          if [ "$MAX_BYTES" -gt 0 ] && [ "$TAR_BYTES" -gt "$MAX_BYTES" ]; then
-            rm -f "$META_TAR"
-            TOO_LARGE_POLICY="$(printf '%s' "${{ inputs.target-snapshot-too-large }}" | tr '[:upper:]' '[:lower:]')"
-            if [ "$TOO_LARGE_POLICY" = "fail" ]; then
-              echo "ERROR: restored target snapshot exceeds target-snapshot-max-size ($TAR_BYTES > $MAX_BYTES)"
-              exit 1
-            fi
-            echo "Skipping oversized restored target snapshot ($TAR_BYTES > $MAX_BYTES)"
-            exit 0
-          fi
-          mkdir -p "$TARGET"
-          tar xf "$META_TAR" -C "$TARGET" 2>/dev/null || true
-          echo "Restored target snapshot ($(du -sh "$META_TAR" | cut -f1))"
+        if [ -n "${ACTIONS_CACHE_URL:-}" ] && [ -n "${ACTIONS_RUNTIME_TOKEN:-}" ]; then
+          echo "backend=native" >> "$GITHUB_OUTPUT"
+        else
+          echo "backend=actions-cache" >> "$GITHUB_OUTPUT"
         fi
 
     # --- Install zccache ---
@@ -305,6 +255,153 @@ runs:
         # Verify install
         which zccache || { echo "ERROR: zccache not found on PATH"; echo "PATH=$PATH"; exit 1; }
 
+    # --- Layer 1: Restore zccache compilation cache ---
+    - name: Restore zccache compilation cache
+      id: restore-zccache-native
+      if: steps.cache-backend.outputs.backend == 'native' && inputs.cache-compilation == 'true'
+      shell: bash
+      run: |
+        set +e
+        OUTPUT="$(zccache gha-cache restore \
+          --key "${{ steps.keys.outputs.compilation-key }}" \
+          --path "$HOME/.zccache" 2>&1)"
+        STATUS=$?
+        set -e
+        printf '%s\n' "$OUTPUT"
+        if [ "$STATUS" -eq 0 ]; then
+          echo "cache-hit=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if printf '%s\n' "$OUTPUT" | grep -qi "cache miss"; then
+          echo "cache-hit=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        exit "$STATUS"
+
+    - name: Restore zccache compilation cache fallback
+      id: restore-zccache-fallback
+      if: steps.cache-backend.outputs.backend == 'native' && inputs.cache-compilation == 'true' && inputs.compilation-restore-fallback == 'true' && steps.restore-zccache-native.outputs.cache-hit != 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.zccache
+        key: ${{ steps.keys.outputs.compilation-key }}
+        restore-keys: ${{ steps.keys.outputs.compilation-restore }}
+
+    - name: Restore zccache compilation cache
+      id: restore-zccache-cache
+      if: steps.cache-backend.outputs.backend != 'native' && inputs.cache-compilation == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.zccache
+        key: ${{ steps.keys.outputs.compilation-key }}
+        restore-keys: ${{ steps.keys.outputs.compilation-restore }}
+
+    # --- Layer 2: Restore cargo registry cache ---
+    - name: Restore cargo registry archive
+      id: restore-registry-native
+      if: steps.cache-backend.outputs.backend == 'native' && inputs.cache-cargo-registry == 'true'
+      shell: bash
+      run: |
+        set +e
+        OUTPUT="$(zccache gha-cache restore \
+          --key "${{ steps.keys.outputs.registry-key }}" \
+          --path "$HOME/.zccache/cargo-registry" 2>&1)"
+        STATUS=$?
+        set -e
+        printf '%s\n' "$OUTPUT"
+        if [ "$STATUS" -eq 0 ]; then
+          zccache cargo-registry restore \
+            --key "${{ steps.keys.outputs.registry-key }}" \
+            --cargo-home "$HOME/.cargo"
+          echo "cache-hit=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if printf '%s\n' "$OUTPUT" | grep -qi "cache miss"; then
+          echo "cache-hit=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        exit "$STATUS"
+
+    - name: Restore cargo registry cache
+      id: restore-registry-cache
+      if: steps.cache-backend.outputs.backend != 'native' && inputs.cache-cargo-registry == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: ${{ steps.keys.outputs.registry-key }}
+        restore-keys: ${{ steps.keys.outputs.registry-restore }}
+
+    # --- Layer 3: Restore cargo target snapshot ---
+    # Restores target/ as a single tarball (excluding incremental/). `zccache warm`
+    # also fills in cached artifacts from the compilation cache when available.
+    # Opt-in until zackees/zccache#65 adds bounded target snapshot GC.
+    - name: Restore cargo target snapshot
+      id: restore-target-native
+      if: steps.cache-backend.outputs.backend == 'native' && inputs.cache-target == 'true'
+      shell: bash
+      run: |
+        set +e
+        OUTPUT="$(zccache gha-cache restore \
+          --key "${{ steps.keys.outputs.target-key }}" \
+          --path "$HOME/.zccache-target-meta" 2>&1)"
+        STATUS=$?
+        set -e
+        printf '%s\n' "$OUTPUT"
+        if [ "$STATUS" -eq 0 ]; then
+          echo "cache-hit=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if printf '%s\n' "$OUTPUT" | grep -qi "cache miss"; then
+          echo "cache-hit=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        exit "$STATUS"
+
+    - name: Restore cargo target snapshot fallback
+      id: restore-target-fallback
+      if: steps.cache-backend.outputs.backend == 'native' && inputs.cache-target == 'true' && inputs.target-restore-fallback == 'true' && steps.restore-target-native.outputs.cache-hit != 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.zccache-target-meta
+        key: ${{ steps.keys.outputs.target-key }}
+        restore-keys: ${{ steps.keys.outputs.target-restore }}
+
+    - name: Restore cargo target snapshot
+      id: restore-target-cache
+      if: steps.cache-backend.outputs.backend != 'native' && inputs.cache-target == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.zccache-target-meta
+        key: ${{ steps.keys.outputs.target-key }}
+        restore-keys: ${{ steps.keys.outputs.target-restore }}
+
+    - name: Extract target snapshot
+      if: inputs.cache-target == 'true'
+      shell: bash
+      run: |
+        TARGET="${{ inputs.target-dir }}"
+        META_TAR="$HOME/.zccache-target-meta/target-meta.tar"
+        if [ -f "$META_TAR" ]; then
+          MAX_BYTES="$(bash "${{ github.action_path }}/action/cleanup/prepare-target-snapshot.sh" --parse-size "${{ inputs.target-snapshot-max-size }}")"
+          TAR_BYTES="$(wc -c < "$META_TAR" | tr -d '[:space:]')"
+          if [ "$MAX_BYTES" -gt 0 ] && [ "$TAR_BYTES" -gt "$MAX_BYTES" ]; then
+            rm -f "$META_TAR"
+            TOO_LARGE_POLICY="$(printf '%s' "${{ inputs.target-snapshot-too-large }}" | tr '[:upper:]' '[:lower:]')"
+            if [ "$TOO_LARGE_POLICY" = "fail" ]; then
+              echo "ERROR: restored target snapshot exceeds target-snapshot-max-size ($TAR_BYTES > $MAX_BYTES)"
+              exit 1
+            fi
+            echo "Skipping oversized restored target snapshot ($TAR_BYTES > $MAX_BYTES)"
+            exit 0
+          fi
+          mkdir -p "$TARGET"
+          tar xf "$META_TAR" -C "$TARGET" 2>/dev/null || true
+          echo "Restored target snapshot ($(du -sh "$META_TAR" | cut -f1))"
+        fi
+
     # --- Pre-populate target/ from zccache before daemon starts ---
     # warm reads the redb index directly (no daemon needed), fills in
     # .rlib/.rmeta from cached artifacts, and touches mtimes. This is tied to
@@ -353,6 +450,7 @@ runs:
         echo "${{ inputs.target-snapshot-too-large }}" > ~/.zccache-action-state/target-snapshot-too-large
         echo "${{ inputs.target-prune-incremental }}" > ~/.zccache-action-state/target-prune-incremental
         echo "${{ inputs.target-prune-build-script-out }}" > ~/.zccache-action-state/target-prune-build-script-out
+        echo "${{ steps.cache-backend.outputs.backend }}" > ~/.zccache-action-state/cache-backend
         date +%s > ~/.zccache-action-state/target-cache-marker-epoch
 
 branding:
