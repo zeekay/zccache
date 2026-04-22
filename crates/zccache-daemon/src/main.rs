@@ -14,6 +14,8 @@ static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use clap::Parser;
 use zccache_core::NormalizedPath;
 
+const DAEMON_MAX_BLOCKING_THREADS: usize = 16;
+
 /// zccache daemon -- local compiler cache service.
 #[derive(Debug, Parser)]
 #[command(name = "zccache-daemon", version, about)]
@@ -122,6 +124,7 @@ fn run_server(args: Args) {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .max_blocking_threads(DAEMON_MAX_BLOCKING_THREADS)
         .build()
         .expect("failed to create tokio runtime");
 
