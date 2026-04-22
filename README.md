@@ -576,6 +576,22 @@ The first build (cold cache) runs at near-bare speed. Subsequent rebuilds
 (`ninja -t clean && ninja`, or touching source files) serve cached artifacts
 via hardlinks in under a second.
 
+**Strict path validation:** Set `ZCCACHE_STRICT_PATHS` or pass
+`--strict-paths=<off|consistent|absolute>` before the compiler name to catch
+non-normalized include paths before the real compiler runs:
+
+```bash
+ZCCACHE_STRICT_PATHS=consistent ninja
+zccache --strict-paths=absolute clang++ -IC:/project/src -c main.cpp
+```
+
+`consistent` rejects include path flags that mix separator styles or spell the
+same canonical path in more than one way, for example `-IC:/repo/./src` and
+`-IC:/repo/src` in the same invocation. `absolute` also requires path flags such
+as `-I`, `-isystem`, `-include`, and `-include-pch` to be forward-slash absolute
+paths without `/./` or `/../` segments. Violations exit non-zero with the
+offending flag and full caller command.
+
 **Single-roundtrip IPC:** In drop-in mode, zccache sends a single
 `CompileEphemeral` message that combines session creation, compilation, and
 session teardown — eliminating 2 of 3 IPC roundtrips per invocation.

@@ -47,6 +47,10 @@ struct Cli {
     #[arg(long)]
     show_stats: bool,
 
+    /// Validate compiler include path flags before dispatching.
+    #[arg(long, value_name = "MODE", value_parser = ["off", "consistent", "absolute"])]
+    strict_paths: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -101,6 +105,9 @@ enum Commands {
     },
     /// Wrap a compiler invocation (explicit mode).
     Wrap {
+        /// Validate compiler include path flags before dispatching.
+        #[arg(long, value_name = "MODE", value_parser = ["off", "consistent", "absolute"])]
+        strict_paths: Option<String>,
         /// The compiler and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -327,6 +334,26 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "-V",
 ];
 
+fn split_leading_strict_paths(args: &[String]) -> (Option<String>, usize) {
+    if args.len() <= 1 {
+        return (None, 1);
+    }
+
+    let Some(arg) = args.get(1) else {
+        return (None, 1);
+    };
+    if let Some(value) = arg.strip_prefix("--strict-paths=") {
+        return (Some(value.to_string()), 2);
+    }
+    if arg == "--strict-paths" {
+        if let Some(value) = args.get(2) {
+            return (Some(value.clone()), 3);
+        }
+        return (Some(String::new()), 2);
+    }
+    (None, 1)
+}
+
 fn absolute_path(path: &str) -> NormalizedPath {
     let path = Path::new(path);
     if path.is_absolute() {
@@ -356,11 +383,12 @@ fn main() -> ExitCode {
 
     // Auto-detect: if first arg isn't a known subcommand or a --flag, enter wrap mode.
     // e.g., `zccache clang++ -c foo.cpp -o foo.o`
-    if args.len() > 1
-        && !KNOWN_SUBCOMMANDS.contains(&args[1].as_str())
-        && !args[1].starts_with("--")
+    let (auto_strict_paths, auto_wrap_start) = split_leading_strict_paths(&args);
+    if args.len() > auto_wrap_start
+        && !KNOWN_SUBCOMMANDS.contains(&args[auto_wrap_start].as_str())
+        && !args[auto_wrap_start].starts_with("--")
     {
-        return run_wrap(&args[1..]);
+        return run_wrap(&args[auto_wrap_start..], auto_strict_paths.as_deref());
     }
 
     let cli = Cli::parse();
@@ -377,6 +405,7 @@ fn main() -> ExitCode {
         return run_async(cmd_status(&endpoint));
     }
 
+    let global_strict_paths = cli.strict_paths.clone();
     let command = match cli.command {
         Some(cmd) => cmd,
         None => {
@@ -502,7 +531,10 @@ fn main() -> ExitCode {
             let endpoint = resolve_endpoint(endpoint.as_deref());
             run_async(cmd_session_stats(&endpoint, session_id))
         }
-        Commands::Wrap { args } => run_wrap(&args),
+        Commands::Wrap { strict_paths, args } => run_wrap(
+            &args,
+            strict_paths.as_deref().or(global_strict_paths.as_deref()),
+        ),
         Commands::Inspect { key } => {
             eprintln!("zccache inspect {key}: not yet implemented");
             ExitCode::FAILURE
@@ -2013,7 +2045,7 @@ fn run_tool_direct(tool: &Path, args: &[String]) -> ExitCode {
 ///
 /// If ZCCACHE_SESSION_ID is set, uses that session and sends the tool
 /// as a per-request override. If unset, auto-creates an ephemeral session.
-fn run_wrap(args: &[String]) -> ExitCode {
+fn run_wrap(args: &[String], strict_paths_arg: Option<&str>) -> ExitCode {
     if args.is_empty() {
         eprintln!("usage: zccache <compiler|tool> <args...>");
         return ExitCode::FAILURE;
@@ -2062,6 +2094,18 @@ fn run_wrap(args: &[String]) -> ExitCode {
     }
 
     // Otherwise, treat as a compiler invocation
+    let strict_mode = match resolve_strict_path_mode(strict_paths_arg) {
+        Ok(mode) => mode,
+        Err(message) => {
+            eprintln!("zccache: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(violation) = validate_compiler_paths(strict_mode, &tool_args, &cwd, args) {
+        eprintln!("{violation}");
+        return ExitCode::FAILURE;
+    }
+
     match std::env::var("ZCCACHE_SESSION_ID") {
         Ok(session_id) => {
             if session_id.is_empty() {
@@ -2088,6 +2132,47 @@ fn run_wrap(args: &[String]) -> ExitCode {
             ))
         }
     }
+}
+
+fn resolve_strict_path_mode(
+    cli_value: Option<&str>,
+) -> Result<zccache_compiler::strict_paths::StrictPathMode, String> {
+    let raw = cli_value
+        .map(ToOwned::to_owned)
+        .or_else(|| std::env::var(zccache_compiler::strict_paths::STRICT_PATHS_ENV).ok())
+        .unwrap_or_else(|| "off".to_string());
+
+    zccache_compiler::strict_paths::StrictPathMode::parse(&raw).ok_or_else(|| {
+        format!("invalid --strict-paths value `{raw}` (expected off, consistent, or absolute)")
+    })
+}
+
+fn validate_compiler_paths(
+    mode: zccache_compiler::strict_paths::StrictPathMode,
+    tool_args: &[String],
+    cwd: &Path,
+    full_args: &[String],
+) -> Result<(), String> {
+    if mode == zccache_compiler::strict_paths::StrictPathMode::Off {
+        return Ok(());
+    }
+
+    let args_for_validation =
+        zccache_compiler::response_file::expand_response_files_in(tool_args, cwd)
+            .unwrap_or_else(|_| tool_args.to_vec());
+
+    zccache_compiler::strict_paths::validate_strict_paths(&args_for_validation, cwd, mode).map_err(
+        |err| {
+            format!(
+                "zccache: {} flag `{}` violates --strict-paths={} ({}).\n         Caller: {}",
+                err.flag,
+                err.path,
+                err.mode.as_str(),
+                err.reason,
+                full_args.join(" ")
+            )
+        },
+    )
 }
 
 /// Resolve a compiler name/path to an absolute path.
@@ -2710,6 +2795,42 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_leading_strict_paths_supports_equals_form() {
+        let args = vec![
+            "zccache".to_string(),
+            "--strict-paths=absolute".to_string(),
+            "clang++".to_string(),
+        ];
+
+        let (mode, start) = split_leading_strict_paths(&args);
+
+        assert_eq!(mode.as_deref(), Some("absolute"));
+        assert_eq!(start, 2);
+    }
+
+    #[test]
+    fn split_leading_strict_paths_supports_space_form() {
+        let args = vec![
+            "zccache".to_string(),
+            "--strict-paths".to_string(),
+            "consistent".to_string(),
+            "clang++".to_string(),
+        ];
+
+        let (mode, start) = split_leading_strict_paths(&args);
+
+        assert_eq!(mode.as_deref(), Some("consistent"));
+        assert_eq!(start, 3);
+    }
+
+    #[test]
+    fn resolve_strict_path_mode_rejects_invalid_cli_value() {
+        let err = resolve_strict_path_mode(Some("sometimes")).unwrap_err();
+
+        assert!(err.contains("invalid --strict-paths value"));
+    }
 
     #[test]
     fn exit_code_zero_stays_zero() {

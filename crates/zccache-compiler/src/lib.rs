@@ -10,6 +10,7 @@ pub mod parse_archiver;
 pub mod parse_linker;
 pub mod parse_rustfmt;
 pub mod response_file;
+pub mod strict_paths;
 
 use std::sync::Arc;
 use zccache_core::NormalizedPath;
