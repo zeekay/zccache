@@ -53,6 +53,9 @@ pub(crate) struct FastHitEntry {
 /// fall through to the stat-verify slow path. Set to 60s because the watcher
 /// + journal provide real invalidation — this timer is just a safety net.
 const FAST_HIT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+const EPHEMERAL_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+const REQUEST_CACHE_MAX_ENTRIES: usize = 4096;
+const RSP_CACHE_MAX_ENTRIES: usize = 1024;
 
 #[derive(Clone)]
 struct RspDependency {
@@ -64,6 +67,7 @@ struct RspDependency {
 struct RspCacheEntry {
     expanded: Vec<String>,
     dependencies: Vec<RspDependency>,
+    cached_at: std::time::Instant,
 }
 
 #[derive(Clone)]
@@ -291,6 +295,7 @@ struct RequestCacheEntry {
     context_key: ContextKey,
     source_path: NormalizedPath,
     output_path: NormalizedPath,
+    cached_at: std::time::Instant,
 }
 
 /// The daemon server that listens for IPC connections.
@@ -314,6 +319,48 @@ pub(crate) fn trim_fast_hit_cache(
             true
         }
     });
+    removed
+}
+
+fn trim_request_cache(
+    cache: &DashMap<ContentHash, RequestCacheEntry>,
+    max_age: std::time::Duration,
+) -> usize {
+    let mut removed = 0;
+    cache.retain(|_, entry| {
+        if entry.cached_at.elapsed() > max_age {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    if cache.len() > REQUEST_CACHE_MAX_ENTRIES {
+        let remaining = cache.len();
+        cache.clear();
+        removed += remaining;
+    }
+    removed
+}
+
+fn trim_rsp_cache(
+    cache: &DashMap<NormalizedPath, RspCacheEntry>,
+    max_age: std::time::Duration,
+) -> usize {
+    let mut removed = 0;
+    cache.retain(|_, entry| {
+        if entry.cached_at.elapsed() > max_age {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    if cache.len() > RSP_CACHE_MAX_ENTRIES {
+        let remaining = cache.len();
+        cache.clear();
+        removed += remaining;
+    }
     removed
 }
 
@@ -506,6 +553,16 @@ impl DaemonServer {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                    let req_removed =
+                        trim_request_cache(&state.request_cache, EPHEMERAL_CACHE_MAX_AGE);
+                    let rsp_removed = trim_rsp_cache(&state.rsp_cache, EPHEMERAL_CACHE_MAX_AGE);
+                    if req_removed > 0 || rsp_removed > 0 {
+                        tracing::debug!(
+                            request_cache_removed = req_removed,
+                            rsp_cache_removed = rsp_removed,
+                            "trimmed ephemeral daemon caches"
+                        );
+                    }
                     let (freed, items) = crate::eviction::evict_to_budget(
                         budget,
                         &state.cache_system,
@@ -1160,6 +1217,7 @@ async fn handle_clear(state: &SharedState) -> Response {
     state.cache_system.clear();
     state.fast_hit_cache.clear();
     state.request_cache.clear();
+    state.rsp_cache.clear();
     state.watched_raw_dirs.clear();
     state.system_includes.lock().await.clear();
     state.watched_dirs.lock().await.clear();
@@ -1641,7 +1699,7 @@ async fn run_tool_passthrough(
         }
     }
 
-    match cmd.output() {
+    match crate::process::command_output(&mut cmd) {
         Ok(output) => Response::LinkResult {
             exit_code: output.status.code().unwrap_or(1),
             stdout: Arc::new(output.stdout),
@@ -1725,7 +1783,7 @@ async fn run_post_link_deploy_hook(
         "running post-link deploy hook"
     );
 
-    match cmd.output() {
+    match crate::process::command_output(&mut cmd) {
         Ok(out) if out.status.success() => {
             tracing::debug!(
                 program = %program,
@@ -2390,6 +2448,7 @@ fn expand_rsp_arg_cached(state: &SharedState, resolved: &Path) -> Result<Vec<Str
         RspCacheEntry {
             expanded: expanded.clone(),
             dependencies,
+            cached_at: std::time::Instant::now(),
         },
     );
     Ok(expanded)
@@ -2631,7 +2690,11 @@ async fn handle_compile(
         cache
             .get_or_discover(&compiler, |c| {
                 let disc_args = zccache_depgraph::discovery_args();
-                let output = std::process::Command::new(c).args(&disc_args).output();
+                let output = {
+                    let mut cmd = std::process::Command::new(c);
+                    cmd.args(&disc_args);
+                    crate::process::command_output(&mut cmd)
+                };
                 match output {
                     Ok(out) => {
                         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2815,6 +2878,7 @@ async fn handle_compile(
                                     context_key,
                                     source_path: source_path.clone(),
                                     output_path: output_path.clone(),
+                                    cached_at: std::time::Instant::now(),
                                 },
                             );
 
@@ -3076,6 +3140,7 @@ async fn handle_compile(
                                 context_key,
                                 source_path: source_path.clone(),
                                 output_path: output_path.clone(),
+                                cached_at: std::time::Instant::now(),
                             },
                         );
 
@@ -3184,7 +3249,7 @@ async fn handle_compile(
         }
     }
     apply_client_env(&mut cmd, &client_env);
-    let result = cmd.output().await;
+    let result = crate::process::tokio_command_output(&mut cmd).await;
 
     let output = match result {
         Ok(o) => o,
@@ -4041,7 +4106,7 @@ async fn handle_compile_multi(
         cmd.args(&compiler_args).current_dir(&cwd_path);
     }
     apply_client_env(&mut cmd, &client_env);
-    let result = cmd.output().await;
+    let result = crate::process::tokio_command_output(&mut cmd).await;
 
     let output = match result {
         Ok(o) => o,
@@ -4293,7 +4358,7 @@ async fn run_compiler_direct(
         cmd.args(args).current_dir(cwd);
     }
     apply_client_env(&mut cmd, client_env);
-    let result = cmd.output().await;
+    let result = crate::process::tokio_command_output(&mut cmd).await;
 
     match result {
         Ok(output) => {
@@ -4324,6 +4389,65 @@ mod tests {
             server.run(0).await.unwrap();
         });
         (endpoint, handle, shutdown)
+    }
+
+    fn test_context_key(source: &str) -> ContextKey {
+        CompileContext {
+            source_file: source.into(),
+            include_search: zccache_depgraph::IncludeSearchPaths::default(),
+            defines: Vec::new(),
+            flags: Vec::new(),
+            force_includes: Vec::new(),
+            unknown_flags: Vec::new(),
+        }
+        .context_key()
+    }
+
+    fn test_request_entry(cached_at: std::time::Instant) -> RequestCacheEntry {
+        RequestCacheEntry {
+            context_key: test_context_key("/tmp/source.c"),
+            source_path: "/tmp/source.c".into(),
+            output_path: "/tmp/source.o".into(),
+            cached_at,
+        }
+    }
+
+    #[test]
+    fn trim_request_cache_removes_old_entries() {
+        let cache = DashMap::new();
+        let now = std::time::Instant::now();
+        cache.insert(ContentHash::from_bytes([1; 32]), test_request_entry(now));
+        cache.insert(
+            ContentHash::from_bytes([2; 32]),
+            test_request_entry(now - std::time::Duration::from_secs(600)),
+        );
+
+        let removed = trim_request_cache(&cache, EPHEMERAL_CACHE_MAX_AGE);
+
+        assert_eq!(removed, 1);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&ContentHash::from_bytes([1; 32])));
+    }
+
+    #[test]
+    fn trim_rsp_cache_clears_when_over_hard_cap() {
+        let cache = DashMap::new();
+        let now = std::time::Instant::now();
+        for i in 0..=RSP_CACHE_MAX_ENTRIES {
+            cache.insert(
+                NormalizedPath::from(format!("/tmp/args{i}.rsp")),
+                RspCacheEntry {
+                    expanded: Vec::new(),
+                    dependencies: Vec::new(),
+                    cached_at: now,
+                },
+            );
+        }
+
+        let removed = trim_rsp_cache(&cache, EPHEMERAL_CACHE_MAX_AGE);
+
+        assert_eq!(removed, RSP_CACHE_MAX_ENTRIES + 1);
+        assert!(cache.is_empty());
     }
 
     #[cfg(windows)]
