@@ -7,7 +7,7 @@
 //!
 //! Each tool gets its own fresh tempdir to avoid OS page cache cross-contamination.
 //!
-//! Run with: uv run cargo test -p zccache-daemon --test perf_bench_test -- --nocapture --ignored
+//! Run with: SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test perf_bench_test -- --nocapture --ignored
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -583,7 +583,7 @@ fn fmt_ratio(baseline: Duration, test: Duration, bold: bool) -> String {
 // ── Main benchmark ──────────────────────────────────────────────────────
 
 #[tokio::test]
-#[ignore] // Run explicitly: uv run cargo test -p zccache-daemon --test perf_bench_test -- --nocapture --ignored
+#[ignore] // Run explicitly: SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test perf_bench_test -- --nocapture --ignored
 async fn perf_warm_cache_zccache_vs_sccache() {
     let compiler_path = match zccache_test_support::find_clang() {
         Some(p) => p,
@@ -915,7 +915,7 @@ async fn perf_warm_cache_zccache_vs_sccache() {
 // ── Response-file benchmark (separate test) ─────────────────────────────
 
 #[tokio::test]
-#[ignore] // Run explicitly: uv run cargo test -p zccache-daemon --test perf_bench_test -- perf_response_file --nocapture --ignored
+#[ignore] // Run explicitly: SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test perf_bench_test -- perf_response_file --nocapture --ignored
 async fn perf_response_file() {
     let compiler_path = match zccache_test_support::find_clang() {
         Some(p) => p,

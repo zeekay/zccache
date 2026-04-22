@@ -64,9 +64,9 @@ runs:
         cache-key-suffix: ${{ inputs.cache_key }}
         target-cache-paths: target/${{ inputs.target }}
 
-    - name: Activate repo-local Rust toolchain
+    - name: Disable soldr zccache wrapper for zccache self-build
       shell: bash
-      run: echo "${{ github.workspace }}/.cargo/bin" >> "$GITHUB_PATH"
+      run: echo "SOLDR_RUSTC_WRAPPER=none" >> "$GITHUB_ENV"
 
     - name: Ensure target stdlib is installed
       shell: bash
@@ -117,7 +117,7 @@ runs:
       env:
         PYO3_PYTHON: python
       run: |
-        HOST_TARGET=$(rustc -vV | awk '/^host: / { print $2 }')
+        HOST_TARGET=$(soldr --no-cache rustc -vV | awk '/^host: / { print $2 }')
         if [ "$HOST_TARGET" != "${{ inputs.target }}" ]; then
           export PYO3_CROSS=1
           export PYO3_CROSS_PYTHON_VERSION="${{ inputs.python_version }}"

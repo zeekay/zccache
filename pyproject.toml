@@ -7,12 +7,12 @@ requires-python = ">=3.10"
 dependencies = []
 
 [dependency-groups]
-dev = ["soldr>=0.7.0"]
+dev = ["soldr>=0.7.6"]
 
 [project.scripts]
-run_zccache = "ci.trampoline:run_zccache"
-run_zccache_daemon = "ci.trampoline:run_zccache_daemon"
-run_zccache_fingerprint = "ci.trampoline:run_zccache_fingerprint"
+run_zccache = "ci.soldr:run_zccache"
+run_zccache_daemon = "ci.soldr:run_zccache_daemon"
+run_zccache_fingerprint = "ci.soldr:run_zccache_fingerprint"
 zccache-python = "zccache.cli:main"
 
 [build-system]

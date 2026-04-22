@@ -5,8 +5,8 @@
 //! - Cache persistence across session boundaries
 //! - Thundering herd (concurrent same-file compilation from multiple sessions)
 //!
-//! Run all:    uv run cargo test -p zccache-daemon --test adversarial_corner_cases -- --nocapture
-//! Run single: uv run cargo test -p zccache-daemon --test adversarial_corner_cases -- <test_name> --nocapture
+//! Run all:    SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test adversarial_corner_cases -- --nocapture
+//! Run single: SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test adversarial_corner_cases -- <test_name> --nocapture
 
 use std::path::Path;
 use std::sync::Arc;

@@ -1,6 +1,6 @@
 //! Profiling stress test: drives many compilations and reports phase-level timing breakdown.
 //!
-//! Run with: uv run cargo test -p zccache-daemon --test profile_test -- --nocapture --ignored
+//! Run with: SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test profile_test -- --nocapture --ignored
 
 use zccache_daemon::DaemonServer;
 use zccache_protocol::{Request, Response};
@@ -198,7 +198,7 @@ fn print_profile(profile: &zccache_daemon::ProfileSnapshot) {
 
 /// Profiling stress test: cold + warm compilations with phase-level timing breakdown.
 ///
-/// Run with: uv run cargo test -p zccache-daemon --test profile_test -- --nocapture --ignored
+/// Run with: SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test profile_test -- --nocapture --ignored
 #[tokio::test]
 #[ignore]
 async fn profile_compile_phases() {

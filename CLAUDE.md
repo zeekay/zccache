@@ -4,7 +4,7 @@ zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md 
 
 ## Essential Rules
 
-- **Always use the project-root trampolines** (`_cargo`, `_rustc`, `_rustfmt`) or `soldr <tool>` directly to execute Rust commands. Bare cargo/rustc and `uv run cargo` are blocked by hook. Both forms dispatch through [soldr](https://github.com/zackees/soldr), which resolves each tool via `rustup which` so the rustup-managed toolchain is always used; the cargo path passes `--no-cache` so the previous bare-cargo semantics are preserved. Usage: `./_cargo check --workspace` or `soldr cargo check --workspace`.
+- **Always use `soldr <tool>` directly** to execute Rust commands. Bare cargo/rustc, legacy root trampolines, and `uv run cargo` are blocked by hook. soldr resolves repo-local `.cargo` / `.rustup` homes and the rustup-managed toolchain pinned by `rust-toolchain.toml`.
 - **Always use `uv` for Python.** Bare `python`/`pip` are blocked by hook. Use `uv run ...` or `uv pip ...`.
 - MSRV: 1.94.1 | Edition: 2021 | Toolchain: 1.94.1 (clippy + rustfmt)
 - CI: Linux, macOS, Windows. All warnings denied (`RUSTFLAGS="-D warnings"`)
@@ -17,11 +17,11 @@ zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md 
 ./test --integration        # integration tests only (need clang on PATH)
 ./test --full               # unit + integration + stress + perf tests
 ./test -p <crate> -- <test_name>
-./_cargo check --workspace --all-targets
-./_cargo clippy --workspace --all-targets -- -D warnings
-./_cargo fmt --all
-RUSTDOCFLAGS="-D warnings" ./_cargo doc --workspace --no-deps
-./_cargo bench -p zccache-hash
+SOLDR_RUSTC_WRAPPER=none soldr cargo check --workspace --all-targets
+SOLDR_RUSTC_WRAPPER=none soldr cargo clippy --workspace --all-targets -- -D warnings
+soldr cargo fmt --all
+RUSTDOCFLAGS="-D warnings" SOLDR_RUSTC_WRAPPER=none soldr cargo doc --workspace --no-deps
+SOLDR_RUSTC_WRAPPER=none soldr cargo bench -p zccache-hash
 ./perf                      # performance benchmark (zccache vs sccache vs bare clang)
 ```
 
@@ -59,16 +59,16 @@ uv run python ci/build_dist.py --skip-build
 
 Hooks are in `ci/hooks/` (Python) and `crates/zccache-ci` (Rust):
 
-- **PreToolUse**: `ci/hooks/tool_guard.py` blocks bare Rust commands (must use `uv run`) and bare `python`/`pip` (must use `uv`)
+- **PreToolUse**: `ci/hooks/tool_guard.py` blocks bare Rust commands (must use `soldr`) and bare `python`/`pip` (must use `uv`)
 - **PostToolUse**: `ci/hooks/lint.py` auto-formats + runs clippy on edited `.rs` files
 - **PostToolUse**: `ci/hooks/readme_guard.py` errors if directory lacks README.md
 - **SessionStart**: `ci/hooks/check-on-start.py` captures git fingerprint
-- **Stop**: `cargo run -p zccache-ci` runs lint + unit tests in parallel (skips if no changes)
+- **Stop**: `SOLDR_RUSTC_WRAPPER=none soldr cargo run -p zccache-ci` runs lint + unit tests in parallel (skips if no changes)
 
 ## Language Policy
 
 - **Python is only for CI scripts, packaging, and hooks.** All tests, benchmarks, and application logic must be written in Rust.
-- Trampolines (`_cargo`, `_rustc`, `_rustfmt`) are required for Rust commands because hooks enforce it - they prepend the shared rustup proxy location to PATH ensuring the pinned toolchain. This is not an endorsement of Python for project code.
+- soldr is required for Rust commands because hooks enforce it and soldr owns toolchain discovery. This is not an endorsement of Python for project code.
 - When in doubt, write it in Rust.
 
 ## Development Philosophy: TDD

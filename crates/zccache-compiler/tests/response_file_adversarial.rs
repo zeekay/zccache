@@ -10,8 +10,8 @@
 //! - File content edge cases (empty, whitespace-only, BOM, CRLF)
 //! - Integration with `parse_invocation` through response files
 //!
-//! Run all:    uv run cargo test -p zccache-compiler --test response_file_adversarial -- --nocapture
-//! Run single: uv run cargo test -p zccache-compiler --test response_file_adversarial -- <test_name> --nocapture
+//! Run all:    SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-compiler --test response_file_adversarial -- --nocapture
+//! Run single: SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-compiler --test response_file_adversarial -- <test_name> --nocapture
 
 use std::path::Path;
 use zccache_compiler::response_file::{

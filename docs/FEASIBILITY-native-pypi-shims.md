@@ -105,30 +105,29 @@ All wheels use the `py3-none-{platform}` tag since there's no Python ABI depende
 
 | Component | Current | After |
 |-----------|---------|-------|
-| `pyproject.toml` | setuptools + console_scripts for toolchain trampolines | maturin `bindings = "bin"` for distribution |
+| `pyproject.toml` | setuptools + console_scripts for dev helpers | maturin `bindings = "bin"` for distribution |
 | Build backend | setuptools | maturin |
 | CI | cargo check/test/clippy | + maturin build per platform |
-| `ci/trampoline.py` | Used for `uv run cargo` shims | **Kept** — development-only, not shipped |
+| `ci/soldr.py` | Used for `run_zccache*` dev entry points | Kept - development-only, not shipped |
 | Distribution | None | PyPI wheels with native binaries |
 
 ### What Stays the Same
 
-- All 11 Rust crates — no changes
-- `uv run cargo` development workflow — no changes
-- CI hooks (tool_guard, lint, readme_guard) — no changes
-- Cargo.toml workspace — no changes
+- All 11 Rust crates - no changes
+- `SOLDR_RUSTC_WRAPPER=none soldr cargo` development workflow - no changes
+- CI hooks (tool_guard, lint, readme_guard) - no changes
+- Cargo.toml workspace - no changes
 
-### The Trampoline Question
+### The Development Entry Point Question
 
-The existing `ci/trampoline.py` serves a **different purpose** — it ensures the correct Rust toolchain is on PATH during development. It is NOT the distribution shim. These two concerns are orthogonal:
+The existing `ci/soldr.py` dev helpers serve a **different purpose** - they run local zccache binaries through `soldr cargo run`. They are NOT distribution shims. These two concerns are orthogonal:
 
-- **Development**: `uv run cargo build` → trampoline ensures rustup toolchain
-- **Distribution**: `pip install zccache` → maturin wheel installs native binary
+- **Development**: `SOLDR_RUSTC_WRAPPER=none soldr cargo build` uses soldr for toolchain resolution
+- **Distribution**: `pip install zccache` installs the native binary from the maturin-built wheel
 
-The trampolines stay as development infrastructure. They don't ship in the wheel.
+The dev helpers stay as development infrastructure. They don't ship in the wheel.
 
 ---
-
 ## Two-Binary Problem
 
 zccache produces **two** binaries: `zccache` (CLI) and `zccache-daemon`. Maturin's `bindings = "bin"` mode can only target one `Cargo.toml` manifest at a time.

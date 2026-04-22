@@ -9,38 +9,49 @@ Usage:
 import os
 import subprocess
 import sys
-from shutil import which
 from pathlib import Path
+from shutil import which
 
-from ci.env import activate, clean_env
+from ci.env import clean_env
 from ci.release_checks import ReleaseCheckError, validate_release_metadata
+from ci.soldr import cargo_command, rust_tool_command, self_build_env
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
 DYLINT_TOOLCHAIN = "nightly-2025-09-18"
 DYLINT_COMPONENTS = ["llvm-tools-preview", "rust-src", "rustc-dev"]
 
 
+def is_soldr_cargo_command(cmd):
+    return (
+        len(cmd) >= 2
+        and Path(cmd[0]).name.startswith("soldr")
+        and cmd[1] == "cargo"
+    )
+
+
 def run_cmd(cmd):
     """Run a command rooted at the project directory."""
+    env = self_build_env() if is_soldr_cargo_command(cmd) else clean_env()
     return subprocess.run(
         cmd,
         text=True,
         encoding="utf-8",
         errors="replace",
         cwd=str(SCRIPT_DIR),
-        env=clean_env(),
+        env=env,
     )
 
 
 def run_cmd_capture(cmd):
     """Run a command rooted at the project directory and capture output."""
+    env = self_build_env() if is_soldr_cargo_command(cmd) else clean_env()
     return subprocess.run(
         cmd,
         text=True,
         encoding="utf-8",
         errors="replace",
         cwd=str(SCRIPT_DIR),
-        env=clean_env(),
+        env=env,
         capture_output=True,
     )
 
@@ -130,9 +141,7 @@ def lint_dylint_only():
     if result != 0:
         return result
 
-    dylint_cmd = [
-        "cargo", f"+{DYLINT_TOOLCHAIN}", "dylint", "--all", "--workspace",
-    ]
+    dylint_cmd = cargo_command(f"+{DYLINT_TOOLCHAIN}", "dylint", "--all", "--workspace")
     result = run_cmd_capture(dylint_cmd)
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
@@ -165,12 +174,12 @@ def lint_single_file(file_path):
         print(f"File not found: {file_path}", file=sys.stderr)
         return 1
 
-    result = run_cmd(["rustfmt", file_path])
+    result = run_cmd(rust_tool_command("rustfmt", file_path))
     if result.returncode != 0:
         return result.returncode
 
     crate = detect_crate(file_path)
-    cmd = ["cargo", "clippy"]
+    cmd = cargo_command("clippy")
     if crate:
         cmd += ["-p", crate]
     else:
@@ -183,24 +192,24 @@ def lint_single_file(file_path):
 
 def lint_workspace():
     """Full workspace lint: fmt check + clippy + doc check."""
-    result = run_cmd(["cargo", "fmt", "--all", "--check"])
+    result = run_cmd(cargo_command("fmt", "--all", "--check"))
     if result.returncode != 0:
         print("Formatting issues found. Run './lint --fix' to auto-fix.", file=sys.stderr)
         return result.returncode
 
-    result = run_cmd([
-        "cargo", "fmt",
+    result = run_cmd(cargo_command(
+        "fmt",
         "--manifest-path", "dylints/ban_std_pathbuf/Cargo.toml",
         "--all", "--check",
-    ])
+    ))
     if result.returncode != 0:
         print("Dylint library formatting issues found.", file=sys.stderr)
         return result.returncode
 
-    result = run_cmd([
-        "cargo", "clippy", "--workspace", "--all-targets",
+    result = run_cmd(cargo_command(
+        "clippy", "--workspace", "--all-targets",
         "--", "-D", "warnings",
-    ])
+    ))
     if result.returncode != 0:
         return result.returncode
 
@@ -214,10 +223,10 @@ def lint_workspace():
         if result != 0:
             return result
 
-    env = clean_env()
+    env = self_build_env()
     env["RUSTDOCFLAGS"] = "-D warnings"
     result = subprocess.run(
-        ["cargo", "doc", "--workspace", "--no-deps"],
+        cargo_command("doc", "--workspace", "--no-deps"),
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -228,7 +237,6 @@ def lint_workspace():
 
 
 def main():
-    activate()
     try:
         validate_release_metadata()
     except ReleaseCheckError as e:
@@ -239,14 +247,14 @@ def main():
 
     if "--fix" in args:
         args.remove("--fix")
-        result = run_cmd(["cargo", "fmt", "--all"])
+        result = run_cmd(cargo_command("fmt", "--all"))
         if result.returncode != 0:
             return result.returncode
         if not args:
-            result = run_cmd([
-                "cargo", "clippy", "--workspace", "--all-targets",
+            result = run_cmd(cargo_command(
+                "clippy", "--workspace", "--all-targets",
                 "--", "-D", "warnings",
-            ])
+            ))
             return result.returncode
 
     if args and args[0].endswith(".rs"):
