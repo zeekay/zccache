@@ -10,7 +10,7 @@ inputs:
     required: false
     default: ""
   cache_key:
-    description: Cache key suffix for Swatinem/rust-cache.
+    description: Cache key suffix for setup-soldr caches.
     required: true
   include_python:
     description: Build and stage Python extension artifacts.
@@ -56,12 +56,13 @@ runs:
       with:
         python-version: ${{ inputs.python_version }}
 
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+    - name: Setup Soldr
+      uses: zackees/setup-soldr@v0
       with:
         toolchain: 1.85.1
-        components: rustfmt,clippy
-        targets: ${{ inputs.target }}
+        cache: true
+        cache-key-suffix: ${{ inputs.cache_key }}
+        target-cache-paths: target/${{ inputs.target }}
 
     - name: Activate repo-local Rust toolchain
       shell: bash
@@ -70,11 +71,6 @@ runs:
     - name: Ensure target stdlib is installed
       shell: bash
       run: rustup target add ${{ inputs.target }}
-
-    - name: Restore Rust cache
-      uses: Swatinem/rust-cache@v2
-      with:
-        key: ${{ inputs.cache_key }}
 
     - name: Install musl tools
       if: inputs.target == 'x86_64-unknown-linux-musl'
@@ -111,9 +107,9 @@ runs:
       env:
         PYO3_PYTHON: python
       run: |
-        cargo build --release --target ${{ inputs.target }} -p zccache-cli
-        cargo build --release --target ${{ inputs.target }} -p zccache-daemon
-        cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint
+        soldr cargo build --release --target ${{ inputs.target }} -p zccache-cli
+        soldr cargo build --release --target ${{ inputs.target }} -p zccache-daemon
+        soldr cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint
 
     - name: Build Python extension artifacts
       if: inputs.include_python == 'true'
@@ -128,9 +124,9 @@ runs:
           export PYO3_CROSS_PYTHON_IMPLEMENTATION=CPython
         fi
 
-        cargo build --release --target ${{ inputs.target }} -p zccache-cli --features python --lib
-        cargo build --release --target ${{ inputs.target }} -p zccache-watcher --features python --lib
-        cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint --features python --lib
+        soldr cargo build --release --target ${{ inputs.target }} -p zccache-cli --features python --lib
+        soldr cargo build --release --target ${{ inputs.target }} -p zccache-watcher --features python --lib
+        soldr cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint --features python --lib
 
     - name: Stage artifacts
       shell: bash

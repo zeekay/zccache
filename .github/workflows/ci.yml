@@ -16,31 +16,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: zackees/setup-soldr@v0
         with:
-          components: rustfmt
+          cache: true
+          build-cache: false
+          target-cache: false
+      - name: Install Rust components
+        run: rustup component add rustfmt
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: soldr cargo fmt --all -- --check
 
   dylint:
     name: Dylint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: zackees/setup-soldr@v0
         with:
-          toolchain: nightly-2025-09-18
-          components: llvm-tools-preview, rust-src, rustc-dev
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: dylint
+          cache: true
+          cache-key-suffix: dylint
+      - name: Install Dylint nightly toolchain
+        run: rustup toolchain install nightly-2025-09-18 --component llvm-tools-preview --component rust-src --component rustc-dev --profile minimal
+      - name: Install stable Rust components
+        run: rustup component add rustfmt
       - name: Install Dylint
-        run: cargo install cargo-dylint dylint-link --version 5.0.0
+        run: soldr cargo install cargo-dylint dylint-link --version 5.0.0
       - name: Check Dylint Library Formatting
-        run: cargo fmt --manifest-path dylints/ban_std_pathbuf/Cargo.toml --all -- --check
+        run: soldr cargo fmt --manifest-path dylints/ban_std_pathbuf/Cargo.toml --all -- --check
       - name: Test Dylint Library
-        run: cargo +nightly-2025-09-18 test --manifest-path dylints/ban_std_pathbuf/Cargo.toml
+        run: soldr cargo +nightly-2025-09-18 test --manifest-path dylints/ban_std_pathbuf/Cargo.toml
       - name: Run Dylint
         run: python3 -m ci.lint --dylint-only
 
@@ -49,10 +53,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.75.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: zackees/setup-soldr@v0
+        with:
+          cache: true
+          toolchain: 1.75.0
+          cache-key-suffix: msrv
       - name: Check MSRV
-        run: cargo check --workspace
+        run: soldr cargo check --workspace
 
   docs:
     name: Documentation
@@ -61,7 +68,9 @@ jobs:
       RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: zackees/setup-soldr@v0
+        with:
+          cache: true
+          cache-key-suffix: docs
       - name: Build docs
-        run: cargo doc --workspace --no-deps
+        run: soldr cargo doc --workspace --no-deps

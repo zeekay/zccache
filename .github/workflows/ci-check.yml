@@ -17,19 +17,20 @@ jobs:
     runs-on: ${{ inputs.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: zackees/setup-soldr@v0
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+          cache: true
+      - name: Install Rust components
+        run: rustup component add clippy rustfmt
       - name: Check
-        run: cargo check --workspace --all-targets
+        run: soldr cargo check --workspace --all-targets
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: soldr cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         shell: bash
         run: |
           set +e
-          cargo test --workspace --no-fail-fast 2>&1 | tee test-output.txt
+          soldr cargo test --workspace --no-fail-fast 2>&1 | tee test-output.txt
           status=${PIPESTATUS[0]}
           if [ $status -ne 0 ]; then
             {
