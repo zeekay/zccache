@@ -126,6 +126,20 @@ The difference comes from **architecture**, not better caching:
 | **clippy** | Lint results cached |
 | **Rust check & build** | `cargo check` and `cargo build` with extern crate content hashing |
 
+### Link-Time Side Effects
+
+Linker drivers sometimes create more than the named `-o` output. Windows and
+MinGW toolchains may deploy runtime DLLs next to an executable, MSVC links may
+emit PDB files, and Emscripten links may create `.wasm`, `.map`, or `.js`
+sidecars. If a cache hit restored only the primary binary, those sibling files
+could be missing even though the cached binary itself was correct.
+
+For link invocations, zccache snapshots the output directory before running the
+real linker, records sibling files created or changed by a successful link, and
+stores them with the primary link artifact. Later cache hits restore the full
+artifact set to the output directory, so tools such as `clang-tool-chain` runtime
+deployment work without per-build-system post-link hooks.
+
 ## Install
 
 ```bash
