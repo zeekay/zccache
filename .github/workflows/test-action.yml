@@ -95,9 +95,29 @@ jobs:
         shell: bash
         run: cargo build -p zccache-core --target ${{ matrix.target }}
 
-      - name: Check zccache stats after cold build
+      - name: Record zccache stats after cold build
         shell: bash
-        run: zccache status
+        run: |
+          STATUS_OUTPUT="$(zccache status)"
+          printf '%s\n' "$STATUS_OUTPUT"
+
+          CACHE_HITS="$(printf '%s\n' "$STATUS_OUTPUT" | awk '
+            /Compilations:/ {
+              for (i = 1; i <= NF; i++) {
+                if ($i == "cached," || $i == "cached") {
+                  cached = $(i - 1)
+                  gsub(/[^0-9]/, "", cached)
+                  print cached
+                  exit
+                }
+              }
+            }
+          ')"
+          if [[ ! "$CACHE_HITS" =~ ^[0-9]+$ ]]; then
+            echo "FAIL: unable to parse cached compilation count from zccache status"
+            exit 1
+          fi
+          echo "COLD_CACHE_HITS=$CACHE_HITS" >> "$GITHUB_ENV"
 
       # --- Warm build (clean target, rebuild from zccache) ---
       - name: Clean target directory
@@ -108,9 +128,37 @@ jobs:
         shell: bash
         run: cargo build -p zccache-core --target ${{ matrix.target }}
 
-      - name: Check zccache stats after warm build
+      - name: Verify zccache cache hits after warm build
         shell: bash
-        run: zccache status
+        run: |
+          STATUS_OUTPUT="$(zccache status)"
+          printf '%s\n' "$STATUS_OUTPUT"
+
+          WARM_CACHE_HITS="$(printf '%s\n' "$STATUS_OUTPUT" | awk '
+            /Compilations:/ {
+              for (i = 1; i <= NF; i++) {
+                if ($i == "cached," || $i == "cached") {
+                  cached = $(i - 1)
+                  gsub(/[^0-9]/, "", cached)
+                  print cached
+                  exit
+                }
+              }
+            }
+          ')"
+          if [[ ! "$WARM_CACHE_HITS" =~ ^[0-9]+$ ]]; then
+            echo "FAIL: unable to parse cached compilation count from zccache status"
+            exit 1
+          fi
+
+          COLD_CACHE_HITS="${COLD_CACHE_HITS:-0}"
+          if (( WARM_CACHE_HITS <= COLD_CACHE_HITS )); then
+            echo "FAIL: warm rebuild did not produce additional zccache hits"
+            echo "Cold cached compilations: $COLD_CACHE_HITS"
+            echo "Warm cached compilations: $WARM_CACHE_HITS"
+            exit 1
+          fi
+          echo "OK: warm rebuild added zccache hits ($COLD_CACHE_HITS -> $WARM_CACHE_HITS)"
 
       # --- Test the cleanup action ---
       - name: Cleanup (action under test)
