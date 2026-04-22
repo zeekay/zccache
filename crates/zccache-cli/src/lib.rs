@@ -874,7 +874,7 @@ mod tests {
             dep_graph_files: 0,
             sessions_total: 0,
             sessions_active: 0,
-            cache_dir: zccache_core::config::default_cache_dir().into(),
+            cache_dir: zccache_core::config::default_cache_dir(),
             dep_graph_version: 0,
             dep_graph_disk_size: 0,
         }
