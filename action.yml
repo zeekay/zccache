@@ -21,9 +21,13 @@ inputs:
   cache-target:
     description: >
       Cache a target/ snapshot (excluding incremental/) and run zccache warm.
-      Allows cargo to skip invoking rustc entirely on warm builds.
+      Allows cargo to skip invoking rustc entirely on warm builds. Disabled by
+      default because Cargo target directories do not garbage collect
+      themselves and can grow to multi-GB snapshots that exhaust hosted
+      runners. Enable only for bounded workflows until zackees/zccache#65 is
+      resolved.
     required: false
-    default: "true"
+    default: "false"
   compilation-restore-fallback:
     description: >
       Whether restore-key fallback is allowed for the zccache compilation cache.
@@ -153,6 +157,7 @@ runs:
     # --- Layer 3: Restore cargo target snapshot ---
     # Restores target/ as a single tarball (excluding incremental/). `zccache warm`
     # also fills in cached artifacts from the compilation cache when available.
+    # Opt-in until zackees/zccache#65 adds bounded target snapshot GC.
     - name: Restore cargo target snapshot
       id: restore-target
       if: inputs.cache-target == 'true'
@@ -263,7 +268,8 @@ runs:
 
     # --- Pre-populate target/ from zccache before daemon starts ---
     # warm reads the redb index directly (no daemon needed), fills in
-    # .rlib/.rmeta from cached artifacts, and touches mtimes.
+    # .rlib/.rmeta from cached artifacts, and touches mtimes. This is tied to
+    # target snapshot caching, which stays opt-in until zackees/zccache#65.
     - name: Warm target from zccache
       if: inputs.cache-target == 'true'
       shell: bash

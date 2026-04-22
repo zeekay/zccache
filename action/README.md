@@ -32,7 +32,7 @@ steps:
 |---|---|---|
 | `cache-cargo-registry` | `true` | Cache `~/.cargo/registry/` and `~/.cargo/git/` |
 | `cache-compilation` | `true` | Cache compilation units via zccache daemon |
-| `cache-target` | `true` | Cache target snapshot + run `zccache warm` |
+| `cache-target` | `false` | Cache target snapshot + run `zccache warm`; opt-in until [zackees/zccache#65](https://github.com/zackees/zccache/issues/65) adds bounded target snapshot GC |
 | `compilation-restore-fallback` | `true` | Allow prefix fallback for compilation cache restores |
 | `target-restore-fallback` | `false` | Allow prefix fallback for target snapshot restores |
 | `target-dir` | `target` | Path to the cargo target directory |
@@ -52,7 +52,7 @@ steps:
 
 The action has two parts because composite actions lack `post` steps:
 
-1. **`zackees/zccache`** (setup) restores caches, installs zccache, restores the target snapshot, runs `zccache warm`, and starts the daemon.
+1. **`zackees/zccache`** (setup) restores caches, installs zccache, and starts the daemon. When `cache-target: true` is set, it also restores the target snapshot and runs `zccache warm`.
 2. **`zackees/zccache/action/cleanup`** (teardown) stops the daemon and saves caches.
 
 The cleanup action must be called with `if: always()` to ensure caches are saved even on failure.
@@ -71,4 +71,5 @@ State is passed from setup to cleanup via `~/.zccache-action-state/`.
 
 - `compilation-restore-fallback: true` keeps the speed-first behavior for incremental CI.
 - `target-restore-fallback: false` is the default because stale Cargo target snapshots are not safe to prefix-restore across different source trees.
-- For release-hardened builds, prefer `cache-target: false` and exact-key-only restores.
+- `cache-target: false` is the default because Cargo target directories can accumulate stale outputs without bounded cleanup; see [zackees/zccache#65](https://github.com/zackees/zccache/issues/65).
+- For release-hardened builds, keep target snapshots disabled and use exact-key-only restores.
