@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import tomllib
 from pathlib import Path
@@ -35,6 +36,11 @@ DYNAMIC_VERSION_PYPROJECTS = (
     ROOT / "crates" / "zccache-watcher" / "pyproject.toml",
     ROOT / "crates" / "zccache-fingerprint" / "pyproject.toml",
 )
+INTERNAL_CRATE_PREFIX = "zccache-"
+WORKSPACE_DEPENDENCY_RE = re.compile(
+    r"^(?P<name>zccache-[A-Za-z0-9_-]+)\s*=\s*\{\s*(?P<body>[^{}\n]*)\s*\}\s*$",
+    re.MULTILINE,
+)
 
 
 class ReleaseCheckError(RuntimeError):
@@ -62,6 +68,79 @@ def read_workspace_metadata() -> dict[str, Any]:
     return json.loads(result.stdout)
 
 
+def _internal_workspace_dependencies(
+    workspace_data: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    workspace_deps = workspace_data["workspace"].get("dependencies", {})
+    return {
+        name: spec
+        for name, spec in workspace_deps.items()
+        if name.startswith(INTERNAL_CRATE_PREFIX)
+        and isinstance(spec, dict)
+        and "path" in spec
+    }
+
+
+def stamp_internal_dependency_versions(manifest_path: Path | None = None) -> list[str]:
+    """Add exact internal dependency pins for crates.io publishing.
+
+    Cargo cannot inherit `[workspace.package].version` inside dependency specs.
+    The checked-in manifest omits those copied literals; release publishing calls
+    this helper in its disposable checkout before `cargo package`/`publish`.
+    """
+
+    manifest_path = manifest_path or ROOT / "Cargo.toml"
+    workspace_data = _read_toml(manifest_path)
+    version = workspace_data["workspace"]["package"]["version"]
+    expected_dependency_version = f"={version}"
+    internal_deps = _internal_workspace_dependencies(workspace_data)
+    pending = set(internal_deps)
+
+    def stamp_line(match: re.Match[str]) -> str:
+        name = match.group("name")
+        if name not in internal_deps:
+            return match.group(0)
+        pending.discard(name)
+        body = match.group("body").strip()
+        if re.search(r"\bversion\s*=", body):
+            body = re.sub(
+                r'\bversion\s*=\s*"[^"]*"',
+                f'version = "{expected_dependency_version}"',
+                body,
+                count=1,
+            )
+        else:
+            body = f'version = "{expected_dependency_version}", {body}'
+        return f"{name} = {{ {body} }}"
+
+    text = manifest_path.read_text(encoding="utf-8")
+    text = WORKSPACE_DEPENDENCY_RE.sub(stamp_line, text)
+    if pending:
+        raise ReleaseCheckError(
+            "Could not stamp internal dependency version(s): "
+            + ", ".join(sorted(pending))
+        )
+
+    manifest_path.write_text(text, encoding="utf-8")
+
+    stamped_data = _read_toml(manifest_path)
+    errors = []
+    for name, spec in _internal_workspace_dependencies(stamped_data).items():
+        actual = spec.get("version")
+        if actual != expected_dependency_version:
+            errors.append(
+                f"workspace dependency {name} has version {actual}, "
+                f"expected {expected_dependency_version}"
+            )
+
+    if errors:
+        raise ReleaseCheckError(
+            "Stamped dependency version checks failed:\n  - "
+            + "\n  - ".join(errors)
+        )
+    return sorted(internal_deps)
+
+
 def validate_release_versions() -> None:
     workspace_data = _read_toml(ROOT / "Cargo.toml")
     workspace_version = workspace_data["workspace"]["package"]["version"]
@@ -82,18 +161,11 @@ def validate_release_versions() -> None:
                 f"{rel_path} has no version and does not declare it as dynamic"
             )
 
-    expected_dependency_version = f"={workspace_version}"
-    workspace_deps = workspace_data["workspace"].get("dependencies", {})
-    for name, spec in workspace_deps.items():
-        if not name.startswith("zccache-"):
-            continue
-        if not isinstance(spec, dict) or "path" not in spec:
-            continue
-        actual = spec.get("version")
-        if actual != expected_dependency_version:
+    for name, spec in _internal_workspace_dependencies(workspace_data).items():
+        if "version" in spec:
             errors.append(
-                f"workspace dependency {name} has version {actual}, "
-                f"expected {expected_dependency_version}"
+                f"workspace dependency {name} duplicates version {spec['version']}; "
+                "omit it and let the release publish flow stamp exact pins"
             )
 
     if errors:
