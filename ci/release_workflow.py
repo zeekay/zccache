@@ -373,7 +373,37 @@ def build_wheel(
         writer.writerow((f"{dist_info}/RECORD", "", ""))
         whl.writestr(f"{dist_info}/RECORD", buf.getvalue().encode())
 
+    assert_wheel_script_metadata(wheel_path)
     return wheel_path
+
+
+def assert_wheel_script_metadata(wheel_path: Path) -> None:
+    """Reopen a built wheel and validate executable script metadata."""
+
+    exec_mask = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    script_entries: list[str] = []
+
+    with zipfile.ZipFile(wheel_path) as whl:
+        for info in whl.infolist():
+            if ".data/scripts/" not in info.filename:
+                continue
+
+            script_entries.append(info.filename)
+            mode = info.external_attr >> 16
+            has_exec_bit = bool(mode & exec_mask)
+            is_regular_file = stat.S_ISREG(mode)
+            if info.create_system != 3 or not is_regular_file or not has_exec_bit:
+                raise SystemExit(
+                    "ERROR: invalid wheel script metadata for "
+                    f"{wheel_path.name}:{info.filename} "
+                    f"(create_system={info.create_system}, mode={oct(mode)}, "
+                    f"is_regular_file={is_regular_file}, has_exec_bit={has_exec_bit})"
+                )
+
+    if not script_entries:
+        raise SystemExit(
+            f"ERROR: no wheel script entries found in {wheel_path.name}"
+        )
 
 
 def build_all_wheels(
