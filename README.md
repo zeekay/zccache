@@ -8,7 +8,7 @@
 [![crates.io: zccache-core](https://img.shields.io/crates/v/zccache-core)](https://crates.io/crates/zccache-core)
 [![crates.io: zccache-cli](https://img.shields.io/crates/v/zccache-cli)](https://crates.io/crates/zccache-cli)
 [![crates.io: zccache-daemon](https://img.shields.io/crates/v/zccache-daemon)](https://crates.io/crates/zccache-daemon)
-[![Rust Workspace Version](https://img.shields.io/badge/rust%20workspace-1.3.6-orange)](https://crates.io/search?q=zccache)
+[![Rust Workspace Version](https://img.shields.io/badge/rust%20workspace-1.3.7-orange)](https://crates.io/search?q=zccache)
 [![GitHub Action](https://github.com/zackees/zccache/actions/workflows/test-action.yml/badge.svg)](https://github.com/zackees/zccache/actions/workflows/test-action.yml)
 
 ![C/C++](https://img.shields.io/badge/C%2FC%2B%2B-555?logo=c%2B%2B&logoColor=white)
@@ -374,6 +374,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
 
       - uses: zackees/zccache@main
         with:
@@ -411,6 +413,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94.1
           targets: ${{ matrix.target }}
 
       # One action replaces sccache + rust-cache

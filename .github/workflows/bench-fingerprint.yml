@@ -23,6 +23,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
 
       - name: "Build 1: cold"
         run: cargo build -p $BUILD_TARGET
@@ -57,6 +59,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
       - uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: "Build 1: cold (populates sccache)"
@@ -89,6 +93,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
       - uses: ./
         with:
           shared-key: h1
@@ -141,6 +147,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
       - uses: ./
         with:
           shared-key: h2
@@ -180,6 +188,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
       - uses: ./
         with:
           shared-key: h3
@@ -227,6 +237,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
       - uses: ./
         with:
           shared-key: h4
@@ -270,6 +282,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
       - uses: ./
         with:
           shared-key: h5
@@ -315,6 +329,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
       - uses: ./
         with:
           shared-key: h6
@@ -363,6 +379,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
       - uses: ./
         with:
           shared-key: h7
