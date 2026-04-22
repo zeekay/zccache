@@ -9,7 +9,13 @@ sccache-compatible flags that work without a subcommand:
 ```bash
 zccache --clear       # Clear the entire artifact cache (same as `zccache clear`)
 zccache --show-stats  # Show daemon and cache statistics (same as `zccache status`)
+zccache --strict-paths=absolute clang++ -c foo.cpp -IC:/repo/include
 ```
+
+`--strict-paths=<off|consistent|absolute>` validates compiler path flags before
+dispatch. `consistent` rejects mixed separator styles; `absolute` additionally
+requires forward-slash absolute paths with no `/./` or `/../` components. The
+same mode can be set for a build with `ZCCACHE_STRICT_PATHS`.
 
 ## Session Commands
 

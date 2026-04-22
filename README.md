@@ -288,6 +288,30 @@ daemon state, and the default daemon endpoint. Separate cache roots therefore
 use separate daemon instances unless `ZCCACHE_ENDPOINT` is explicitly set.
 Relative override paths are normalized against the current working directory.
 
+### Strict path validation
+
+Use `--strict-paths` or `ZCCACHE_STRICT_PATHS` to fail fast when compiler path
+flags are spelled in ways that can confuse `#pragma once` on Windows.
+
+```bash
+zccache --strict-paths=absolute clang++ -c src/main.cpp -IC:/work/project/include
+ZCCACHE_STRICT_PATHS=consistent ninja
+```
+
+Modes:
+
+- `off` disables validation.
+- `consistent` allows relative or absolute paths, but rejects mixed `/` and `\`
+  separators within one path or across checked path flags in the same
+  invocation.
+- `absolute` requires checked path flags to be forward-slash absolute paths
+  with no `/./` or `/../` components. `ZCCACHE_STRICT_PATHS=1` maps to this
+  mode.
+
+Checked flags include `-I`, `-isystem`, `-iquote`, `-idirafter`, `-include`,
+`-include-pch`, `-imacros`, `-F`, `-iframework`, `-imsvc`, and MSVC `/I`.
+Response-file arguments are checked after expansion by the daemon.
+
 <details>
 <summary>Bash integration</summary>
 
@@ -593,10 +617,9 @@ ZCCACHE_STRICT_PATHS=consistent ninja
 zccache --strict-paths=absolute clang++ -IC:/project/src -c main.cpp
 ```
 
-`consistent` rejects include path flags that mix separator styles or spell the
-same canonical path in more than one way, for example `-IC:/repo/./src` and
-`-IC:/repo/src` in the same invocation. `absolute` also requires path flags such
-as `-I`, `-isystem`, `-include`, and `-include-pch` to be forward-slash absolute
+`consistent` rejects checked path flags that mix separator styles within one
+path or across the same invocation. `absolute` also requires path flags such as
+`-I`, `-isystem`, `-include`, and `-include-pch` to be forward-slash absolute
 paths without `/./` or `/../` segments. Violations exit non-zero with the
 offending flag and full caller command.
 

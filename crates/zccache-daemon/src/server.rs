@@ -2590,6 +2590,30 @@ fn request_fingerprint(compiler: &Path, args: &[String], cwd: &Path) -> ContentH
     h.finalize()
 }
 
+fn strict_paths_mode_from_client_env(
+    client_env: Option<&[(String, String)]>,
+) -> Result<zccache_compiler::strict_paths::StrictPathsMode, String> {
+    let Some(env) = client_env else {
+        return Ok(zccache_compiler::strict_paths::StrictPathsMode::Off);
+    };
+    zccache_compiler::strict_paths::StrictPathsMode::from_env_vars(
+        env.iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn compile_failure_stderr(message: String) -> Response {
+    let mut stderr = message.into_bytes();
+    stderr.push(b'\n');
+    Response::CompileResult {
+        exit_code: 1,
+        stdout: Arc::new(Vec::new()),
+        stderr: Arc::new(stderr),
+        cached: false,
+    }
+}
+
 /// Handle a Compile request: parse args, check depgraph, run compiler or return cached.
 async fn handle_compile(
     state_arc: &Arc<SharedState>,
@@ -2612,6 +2636,17 @@ async fn handle_compile(
     // Expand response files before request-level caching so `@file` mutations
     // can't reuse stale fast-hit entries keyed only by raw argv.
     let expanded_args = expand_args_cached(state, args, cwd);
+
+    let strict_paths_mode = match strict_paths_mode_from_client_env(client_env.as_deref()) {
+        Ok(mode) => mode,
+        Err(err) => return compile_failure_stderr(format!("zccache: {err}")),
+    };
+    if let Err(err) =
+        zccache_compiler::strict_paths::validate_args(&expanded_args, strict_paths_mode)
+    {
+        let compiler = compiler_path.display().to_string();
+        return compile_failure_stderr(err.diagnostic(&compiler, &expanded_args));
+    }
 
     // ── Ultra-fast request-level cache ────────────────────────────────
     // If we've seen this exact (compiler, args, cwd) before AND the fast-hit

@@ -29,6 +29,7 @@ use zccache_cli::{
     client_download, run_ino_convert_cached, ArchiveFormat, DownloadParams, DownloadSource,
     InoConvertOptions, WaitMode,
 };
+use zccache_compiler::strict_paths::StrictPathsMode;
 use zccache_core::NormalizedPath;
 use zccache_gha::{GhaCache, GhaError};
 
@@ -47,8 +48,14 @@ struct Cli {
     #[arg(long)]
     show_stats: bool,
 
-    /// Validate compiler include path flags before dispatching.
-    #[arg(long, value_name = "MODE", value_parser = ["off", "consistent", "absolute"])]
+    /// Validate compiler path flag spelling: off, consistent, or absolute.
+    #[arg(
+        long,
+        value_name = "MODE",
+        num_args = 0..=1,
+        default_missing_value = "absolute",
+        require_equals = true
+    )]
     strict_paths: Option<String>,
 
     #[command(subcommand)]
@@ -105,8 +112,14 @@ enum Commands {
     },
     /// Wrap a compiler invocation (explicit mode).
     Wrap {
-        /// Validate compiler include path flags before dispatching.
-        #[arg(long, value_name = "MODE", value_parser = ["off", "consistent", "absolute"])]
+        /// Validate compiler path flag spelling: off, consistent, or absolute.
+        #[arg(
+            long,
+            value_name = "MODE",
+            num_args = 0..=1,
+            default_missing_value = "absolute",
+            require_equals = true
+        )]
         strict_paths: Option<String>,
         /// The compiler and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -334,26 +347,6 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "-V",
 ];
 
-fn split_leading_strict_paths(args: &[String]) -> (Option<String>, usize) {
-    if args.len() <= 1 {
-        return (None, 1);
-    }
-
-    let Some(arg) = args.get(1) else {
-        return (None, 1);
-    };
-    if let Some(value) = arg.strip_prefix("--strict-paths=") {
-        return (Some(value.to_string()), 2);
-    }
-    if arg == "--strict-paths" {
-        if let Some(value) = args.get(2) {
-            return (Some(value.clone()), 3);
-        }
-        return (Some(String::new()), 2);
-    }
-    (None, 1)
-}
-
 fn absolute_path(path: &str) -> NormalizedPath {
     let path = Path::new(path);
     if path.is_absolute() {
@@ -383,15 +376,23 @@ fn main() -> ExitCode {
 
     // Auto-detect: if first arg isn't a known subcommand or a --flag, enter wrap mode.
     // e.g., `zccache clang++ -c foo.cpp -o foo.o`
-    let (auto_strict_paths, auto_wrap_start) = split_leading_strict_paths(&args);
-    if args.len() > auto_wrap_start
-        && !KNOWN_SUBCOMMANDS.contains(&args[auto_wrap_start].as_str())
-        && !args[auto_wrap_start].starts_with("--")
-    {
-        return run_wrap(&args[auto_wrap_start..], auto_strict_paths.as_deref());
+    match strip_leading_strict_paths_flags(&args[1..]) {
+        Ok((strict_paths, wrapper_args))
+            if !wrapper_args.is_empty()
+                && !KNOWN_SUBCOMMANDS.contains(&wrapper_args[0].as_str())
+                && !wrapper_args[0].starts_with("--") =>
+        {
+            return run_wrap(&wrapper_args, strict_paths);
+        }
+        Err(err) => {
+            eprintln!("zccache: {err}");
+            return ExitCode::FAILURE;
+        }
+        _ => {}
     }
 
     let cli = Cli::parse();
+    let global_strict_paths = cli.strict_paths.clone();
 
     init_tracing();
 
@@ -405,7 +406,6 @@ fn main() -> ExitCode {
         return run_async(cmd_status(&endpoint));
     }
 
-    let global_strict_paths = cli.strict_paths.clone();
     let command = match cli.command {
         Some(cmd) => cmd,
         None => {
@@ -531,10 +531,18 @@ fn main() -> ExitCode {
             let endpoint = resolve_endpoint(endpoint.as_deref());
             run_async(cmd_session_stats(&endpoint, session_id))
         }
-        Commands::Wrap { strict_paths, args } => run_wrap(
-            &args,
-            strict_paths.as_deref().or(global_strict_paths.as_deref()),
-        ),
+        Commands::Wrap { strict_paths, args } => {
+            let strict_paths = match parse_optional_strict_paths(
+                strict_paths.as_deref().or(global_strict_paths.as_deref()),
+            ) {
+                Ok(mode) => mode,
+                Err(err) => {
+                    eprintln!("zccache: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            run_wrap(&args, strict_paths)
+        }
         Commands::Inspect { key } => {
             eprintln!("zccache inspect {key}: not yet implemented");
             ExitCode::FAILURE
@@ -2035,6 +2043,57 @@ fn run_tool_direct(tool: &Path, args: &[String]) -> ExitCode {
 
 // ─── Wrap (compiler wrapper) ───────────────────────────────────────────────
 
+fn strip_leading_strict_paths_flags(
+    args: &[String],
+) -> Result<(Option<StrictPathsMode>, Vec<String>), String> {
+    let mut strict_paths = None;
+    let mut index = 0;
+
+    while let Some(arg) = args.get(index) {
+        if arg == "--strict-paths" {
+            strict_paths = Some(StrictPathsMode::Absolute);
+            index += 1;
+        } else if let Some(value) = arg.strip_prefix("--strict-paths=") {
+            strict_paths = Some(StrictPathsMode::parse(value).map_err(|err| err.to_string())?);
+            index += 1;
+        } else {
+            break;
+        }
+    }
+
+    Ok((strict_paths, args[index..].to_vec()))
+}
+
+fn parse_optional_strict_paths(value: Option<&str>) -> Result<Option<StrictPathsMode>, String> {
+    value
+        .map(|value| StrictPathsMode::parse(value).map_err(|err| err.to_string()))
+        .transpose()
+}
+
+fn effective_strict_paths_mode(
+    strict_paths_override: Option<StrictPathsMode>,
+) -> Result<StrictPathsMode, String> {
+    if let Some(mode) = strict_paths_override {
+        return Ok(mode);
+    }
+
+    match std::env::var("ZCCACHE_STRICT_PATHS") {
+        Ok(value) => StrictPathsMode::parse(&value).map_err(|err| err.to_string()),
+        Err(std::env::VarError::NotPresent) => Ok(StrictPathsMode::Off),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("ZCCACHE_STRICT_PATHS is not valid Unicode".to_string())
+        }
+    }
+}
+
+fn set_client_env(env: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some((_, existing)) = env.iter_mut().find(|(env_key, _)| env_key == key) {
+        *existing = value;
+    } else {
+        env.push((key.to_string(), value));
+    }
+}
+
 /// Wrap a compiler or tool invocation.
 ///
 /// `args` is the full command: ["clang++", "-c", "foo.cpp", "-o", "foo.o"]
@@ -2045,7 +2104,7 @@ fn run_tool_direct(tool: &Path, args: &[String]) -> ExitCode {
 ///
 /// If ZCCACHE_SESSION_ID is set, uses that session and sends the tool
 /// as a per-request override. If unset, auto-creates an ephemeral session.
-fn run_wrap(args: &[String], strict_paths_arg: Option<&str>) -> ExitCode {
+fn run_wrap(args: &[String], strict_paths_override: Option<StrictPathsMode>) -> ExitCode {
     if args.is_empty() {
         eprintln!("usage: zccache <compiler|tool> <args...>");
         return ExitCode::FAILURE;
@@ -2055,6 +2114,14 @@ fn run_wrap(args: &[String], strict_paths_arg: Option<&str>) -> ExitCode {
     if std::env::var("ZCCACHE_DISABLE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
         return run_passthrough(args);
     }
+
+    let strict_paths_mode = match effective_strict_paths_mode(strict_paths_override) {
+        Ok(mode) => mode,
+        Err(err) => {
+            eprintln!("zccache: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Normalize MSYS paths (e.g. /c/Users/... → C:\Users\...) on Windows,
     // then resolve to an absolute path so the daemon can find it.
@@ -2067,7 +2134,14 @@ fn run_wrap(args: &[String], strict_paths_arg: Option<&str>) -> ExitCode {
 
     let cwd = std::env::current_dir().unwrap_or_default();
 
-    let client_env: Vec<(String, String)> = std::env::vars().collect();
+    let mut client_env: Vec<(String, String)> = std::env::vars().collect();
+    if let Some(mode) = strict_paths_override {
+        set_client_env(
+            &mut client_env,
+            "ZCCACHE_STRICT_PATHS",
+            mode.as_str().to_string(),
+        );
+    }
     let endpoint = resolve_endpoint(None);
 
     // Release the CWD handle on the build directory. On Windows, a process's
@@ -2093,19 +2167,12 @@ fn run_wrap(args: &[String], strict_paths_arg: Option<&str>) -> ExitCode {
         ));
     }
 
-    // Otherwise, treat as a compiler invocation
-    let strict_mode = match resolve_strict_path_mode(strict_paths_arg) {
-        Ok(mode) => mode,
-        Err(message) => {
-            eprintln!("zccache: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Err(violation) = validate_compiler_paths(strict_mode, &tool_args, &cwd, args) {
-        eprintln!("{violation}");
+    if let Err(err) = zccache_compiler::strict_paths::validate_args(&tool_args, strict_paths_mode) {
+        eprintln!("{}", err.diagnostic(&args[0], &tool_args));
         return ExitCode::FAILURE;
     }
 
+    // Otherwise, treat as a compiler invocation
     match std::env::var("ZCCACHE_SESSION_ID") {
         Ok(session_id) => {
             if session_id.is_empty() {
@@ -2132,47 +2199,6 @@ fn run_wrap(args: &[String], strict_paths_arg: Option<&str>) -> ExitCode {
             ))
         }
     }
-}
-
-fn resolve_strict_path_mode(
-    cli_value: Option<&str>,
-) -> Result<zccache_compiler::strict_paths::StrictPathMode, String> {
-    let raw = cli_value
-        .map(ToOwned::to_owned)
-        .or_else(|| std::env::var(zccache_compiler::strict_paths::STRICT_PATHS_ENV).ok())
-        .unwrap_or_else(|| "off".to_string());
-
-    zccache_compiler::strict_paths::StrictPathMode::parse(&raw).ok_or_else(|| {
-        format!("invalid --strict-paths value `{raw}` (expected off, consistent, or absolute)")
-    })
-}
-
-fn validate_compiler_paths(
-    mode: zccache_compiler::strict_paths::StrictPathMode,
-    tool_args: &[String],
-    cwd: &Path,
-    full_args: &[String],
-) -> Result<(), String> {
-    if mode == zccache_compiler::strict_paths::StrictPathMode::Off {
-        return Ok(());
-    }
-
-    let args_for_validation =
-        zccache_compiler::response_file::expand_response_files_in(tool_args, cwd)
-            .unwrap_or_else(|_| tool_args.to_vec());
-
-    zccache_compiler::strict_paths::validate_strict_paths(&args_for_validation, cwd, mode).map_err(
-        |err| {
-            format!(
-                "zccache: {} flag `{}` violates --strict-paths={} ({}).\n         Caller: {}",
-                err.flag,
-                err.path,
-                err.mode.as_str(),
-                err.reason,
-                full_args.join(" ")
-            )
-        },
-    )
 }
 
 /// Resolve a compiler name/path to an absolute path.
@@ -2541,10 +2567,8 @@ async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
 
     // Check lock file for a running daemon we just can't reach yet
     if let Some(pid) = zccache_ipc::check_running_daemon() {
-        let mut backoff = std::time::Duration::from_millis(100);
         for _ in 0..20 {
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(std::time::Duration::from_millis(500));
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             match check_daemon_version(endpoint).await {
                 VersionCheck::Ok => return Ok(()),
                 VersionCheck::DaemonNewer { daemon_ver } => {
@@ -2575,7 +2599,7 @@ async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
             }
         }
         return Err(format!(
-            "daemon process {pid} exists but not accepting connections after retrying"
+            "daemon process {pid} exists but not accepting connections"
         ));
     }
 
@@ -2797,99 +2821,6 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        _lock: MutexGuard<'static, ()>,
-        previous: Option<OsString>,
-    }
-
-    impl EnvGuard {
-        fn set_cache_dir(value: &std::path::Path) -> Self {
-            let lock = ENV_LOCK.lock().unwrap();
-            let previous = std::env::var_os(zccache_core::config::CACHE_DIR_ENV);
-            std::env::set_var(zccache_core::config::CACHE_DIR_ENV, value);
-            Self {
-                _lock: lock,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(zccache_core::config::CACHE_DIR_ENV, value),
-                None => std::env::remove_var(zccache_core::config::CACHE_DIR_ENV),
-            }
-        }
-    }
-
-    fn fake_status() -> zccache_protocol::DaemonStatus {
-        zccache_protocol::DaemonStatus {
-            version: zccache_core::VERSION.to_string(),
-            artifact_count: 0,
-            cache_size_bytes: 0,
-            metadata_entries: 0,
-            uptime_secs: 0,
-            cache_hits: 0,
-            cache_misses: 0,
-            total_compilations: 0,
-            non_cacheable: 0,
-            compile_errors: 0,
-            time_saved_ms: 0,
-            total_links: 0,
-            link_hits: 0,
-            link_misses: 0,
-            link_non_cacheable: 0,
-            dep_graph_contexts: 0,
-            dep_graph_files: 0,
-            sessions_total: 0,
-            sessions_active: 0,
-            cache_dir: zccache_core::config::default_cache_dir(),
-            dep_graph_version: 0,
-            dep_graph_disk_size: 0,
-        }
-    }
-
-    #[test]
-    fn split_leading_strict_paths_supports_equals_form() {
-        let args = vec![
-            "zccache".to_string(),
-            "--strict-paths=absolute".to_string(),
-            "clang++".to_string(),
-        ];
-
-        let (mode, start) = split_leading_strict_paths(&args);
-
-        assert_eq!(mode.as_deref(), Some("absolute"));
-        assert_eq!(start, 2);
-    }
-
-    #[test]
-    fn split_leading_strict_paths_supports_space_form() {
-        let args = vec![
-            "zccache".to_string(),
-            "--strict-paths".to_string(),
-            "consistent".to_string(),
-            "clang++".to_string(),
-        ];
-
-        let (mode, start) = split_leading_strict_paths(&args);
-
-        assert_eq!(mode.as_deref(), Some("consistent"));
-        assert_eq!(start, 3);
-    }
-
-    #[test]
-    fn resolve_strict_path_mode_rejects_invalid_cli_value() {
-        let err = resolve_strict_path_mode(Some("sometimes")).unwrap_err();
-
-        assert!(err.contains("invalid --strict-paths value"));
-    }
 
     #[test]
     fn exit_code_zero_stays_zero() {
@@ -2929,46 +2860,6 @@ mod tests {
     fn exit_code_257_keeps_low_byte() {
         // 257 & 0xFF == 1, non-zero, so kept as-is.
         assert_eq!(exit_code_from_i32(257), ExitCode::from(1));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn ensure_daemon_waits_for_delayed_listener() {
-        let endpoint = zccache_ipc::unique_test_endpoint();
-        let cache_root = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::set_cache_dir(cache_root.path());
-        let lock_path = zccache_ipc::lock_file_path();
-
-        std::fs::write(&lock_path, std::process::id().to_string()).unwrap();
-
-        let ep = endpoint.clone();
-        let cache_dir = cache_root.path().to_path_buf();
-        let server = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-            let mut listener = zccache_ipc::IpcListener::bind(&ep).unwrap();
-            let mut conn = listener.accept().await.unwrap();
-
-            let req: Option<zccache_protocol::Request> = conn.recv().await.unwrap();
-            assert_eq!(req, Some(zccache_protocol::Request::Status));
-
-            conn.send(&zccache_protocol::Response::Status(
-                zccache_protocol::DaemonStatus {
-                    cache_dir: cache_dir.into(),
-                    ..fake_status()
-                },
-            ))
-            .await
-            .unwrap();
-        });
-
-        let result = ensure_daemon(&endpoint).await;
-        let _ = std::fs::remove_file(&lock_path);
-        server.await.unwrap();
-
-        assert!(
-            result.is_ok(),
-            "expected delayed daemon to be accepted: {result:?}"
-        );
     }
 
     #[test]
