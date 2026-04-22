@@ -56,8 +56,8 @@ steps:
 
 The action has two parts because composite actions lack `post` steps:
 
-1. **`zackees/zccache`** (setup) restores caches, installs zccache, and starts the daemon. When `cache-target: true` is set, it also restores the target snapshot and runs `zccache warm`.
-2. **`zackees/zccache/action/cleanup`** (teardown) stops the daemon and saves caches.
+1. **`zackees/zccache`** (setup) installs zccache, restores caches through the native GHA cache backend when available, and starts the daemon. When `cache-target: true` is set, it also restores the target snapshot and runs `zccache warm`.
+2. **`zackees/zccache/action/cleanup`** (teardown) stops the daemon and saves caches through the same backend.
 
 The cleanup action must be called with `if: always()` to ensure caches are saved even on failure.
 
@@ -70,6 +70,11 @@ The cleanup action must be called with `if: always()` to ensure caches are saved
 | Target snapshot | `target/` tarball excluding `incremental/` | Cargo fingerprint recomputation |
 
 State is passed from setup to cleanup via `~/.zccache-action-state/`.
+On GitHub Actions, the action prefers `zccache gha-cache restore/save` so users do
+not need to add `actions/cache` steps themselves. It falls back to
+`actions/cache` when the runner does not expose the GHA cache runtime, and it
+still uses `actions/cache` for prefix restore-key fallback when those inputs are
+enabled.
 
 Target snapshots are disabled by default because Cargo does not garbage collect
 `target/`. Most CI should keep the compilation and registry caches enabled and

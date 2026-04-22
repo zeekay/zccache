@@ -441,13 +441,18 @@ and `zccache warm` for near-instant subsequent builds:
 | **Target snapshot cache** | `target/` tarball excluding `incremental/` | (new) | Cargo sees target outputs and fingerprints together |
 | **`zccache warm`** | Backfills `target/deps/` from compilation cache | (new) | Restores missing artifacts before cargo runs |
 
-On setup, the action restores the compilation and registry caches, installs
-zccache, and starts the daemon. When `cache-target: true` is set, it also
-extracts the target snapshot, runs `zccache warm` to backfill cached
-`.rlib`/`.rmeta` files, and touches all timestamps to a single consistent value.
+On setup, the action installs zccache, then restores caches through the native
+`zccache gha-cache` backend when the GitHub Actions cache runtime is available.
+When that runtime is missing, it falls back to `actions/cache`. When
+`cache-target: true` is set, it also extracts the target snapshot, runs
+`zccache warm` to backfill cached `.rlib`/`.rmeta` files, and touches all
+timestamps to a single consistent value.
 
-On cleanup: stops daemon and saves the enabled caches. Target snapshots are
-pruned and size-checked before save.
+On cleanup: stops daemon and saves the enabled caches. The native backend saves
+the compilation cache, the cargo registry archive, and the optional target
+snapshot without requiring manual cache steps in the workflow. When prefix
+restore-fallback is enabled, the action still uses `actions/cache` for that
+fallback path. Target snapshots are pruned and size-checked before save.
 
 ### CI benchmark results
 
@@ -526,8 +531,8 @@ This project is optimized for developer speed, not full artifact attestation. `z
 
 Composite GitHub Actions don't support `post` steps (automatic cleanup). The action is split into:
 
-1. **`zackees/zccache`** — setup: restore caches, install zccache, optionally warm target, start daemon, set `RUSTC_WRAPPER`
-2. **`zackees/zccache/action/cleanup`** — teardown: print stats, stop daemon, prune and save enabled caches
+1. **`zackees/zccache`** — setup: install zccache, restore caches through the native GHA cache backend when available, optionally warm target, start daemon, set `RUSTC_WRAPPER`
+2. **`zackees/zccache/action/cleanup`** — teardown: print stats, stop daemon, prune and save enabled caches through the same backend
 
 The cleanup action **must** be called with `if: always()` to ensure caches are saved even on failure.
 
