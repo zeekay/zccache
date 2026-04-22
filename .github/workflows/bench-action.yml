@@ -43,6 +43,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
 
       - name: "Cold build"
         id: cold
@@ -106,6 +108,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
       - uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: "Cold build"
@@ -168,10 +172,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
 
       - uses: ./
         with:
           shared-key: bench
+          cache-target: "true"
 
       - name: "Cold build"
         id: cold
@@ -234,11 +241,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
 
       # Setup zccache — this should restore target/ from the previous job's save
       - uses: ./
         with:
           shared-key: bench
+          cache-target: "true"
 
       - name: "Diagnostics: target restore status"
         shell: bash

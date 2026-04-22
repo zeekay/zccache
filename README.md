@@ -8,7 +8,7 @@
 [![crates.io: zccache-core](https://img.shields.io/crates/v/zccache-core)](https://crates.io/crates/zccache-core)
 [![crates.io: zccache-cli](https://img.shields.io/crates/v/zccache-cli)](https://crates.io/crates/zccache-cli)
 [![crates.io: zccache-daemon](https://img.shields.io/crates/v/zccache-daemon)](https://crates.io/crates/zccache-daemon)
-[![Rust Workspace Version](https://img.shields.io/badge/rust%20workspace-1.3.6-orange)](https://crates.io/search?q=zccache)
+[![Rust Workspace Version](https://img.shields.io/badge/rust%20workspace-1.3.7-orange)](https://crates.io/search?q=zccache)
 [![GitHub Action](https://github.com/zackees/zccache/actions/workflows/test-action.yml/badge.svg)](https://github.com/zackees/zccache/actions/workflows/test-action.yml)
 
 ![C/C++](https://img.shields.io/badge/C%2FC%2B%2B-555?logo=c%2B%2B&logoColor=white)
@@ -374,6 +374,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
 
       - uses: zackees/zccache@main
         with:
@@ -411,6 +413,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94.1
           targets: ${{ matrix.target }}
 
       # One action replaces sccache + rust-cache
@@ -427,7 +430,8 @@ jobs:
 
 ### What it does
 
-The action provides three cache layers plus `zccache warm` for near-instant subsequent builds:
+The action provides two default cache layers, plus an opt-in target snapshot layer
+and `zccache warm` for near-instant subsequent builds:
 
 | Layer | What | Replaces | Effect |
 |---|---|---|---|
@@ -436,12 +440,13 @@ The action provides three cache layers plus `zccache warm` for near-instant subs
 | **Target snapshot cache** | `target/` tarball excluding `incremental/` | (new) | Cargo sees target outputs and fingerprints together |
 | **`zccache warm`** | Backfills `target/deps/` from compilation cache | (new) | Restores missing artifacts before cargo runs |
 
-On setup, the action restores the compilation and registry caches. Target
-snapshots are opt-in: when `cache-target: true` is set, the action extracts the
-target snapshot, runs `zccache warm` to backfill cached `.rlib`/`.rmeta` files,
-touches all timestamps to a single consistent value, and starts the daemon.
+On setup, the action restores the compilation and registry caches, installs
+zccache, and starts the daemon. When `cache-target: true` is set, it also
+extracts the target snapshot, runs `zccache warm` to backfill cached
+`.rlib`/`.rmeta` files, and touches all timestamps to a single consistent value.
 
-On cleanup: stops daemon and saves the enabled caches.
+On cleanup: stops daemon and saves the enabled caches. Target snapshots are
+pruned and size-checked before save.
 
 ### CI benchmark results
 
@@ -455,7 +460,7 @@ Measured on `ubuntu-24.04` building `zccache-core` (14 crates):
 **15x faster than sccache on subsequent CI runs.** Zero recompilation — cargo sees all fingerprints as fresh and prints `Finished` immediately.
 
 How it works:
-1. First run with `cache-target: true`: cold build, populates zccache compilation cache and saves a target snapshot.
+1. First run with `cache-target: true`: cold build, populates zccache compilation cache and saves a bounded target snapshot.
 2. Second run with `cache-target: true`: restores the target snapshot, runs `zccache warm` as a backfill, touches timestamps, then `cargo build` finishes without recompilation.
 
 `zccache warm` reads the on-disk artifact index (no daemon needed) and filters by `Cargo.lock` — only restores artifacts matching crates in your lockfile. That is a speed optimization, not a full integrity-verification pass: warmed artifacts are trusted and Cargo is expected to reject or rebuild anything incompatible.
@@ -466,7 +471,11 @@ How it works:
 |---|---|---|
 | `cache-cargo-registry` | `true` | Cache cargo registry index + crate files + git deps |
 | `cache-compilation` | `true` | Cache compilation units via zccache daemon |
-| `cache-target` | `false` | Cache target snapshot + run `zccache warm`; opt-in because `target/` has no bounded garbage collection yet ([zackees/zccache#65](https://github.com/zackees/zccache/issues/65)) |
+| `cache-target` | `false` | Cache target snapshot + run `zccache warm`; opt in only for workflows where target snapshots are worth the disk budget |
+| `target-snapshot-max-size` | `2GiB` | Skip or fail target snapshot save when the pruned snapshot exceeds this size; use `0` for unlimited |
+| `target-snapshot-too-large` | `skip` | `skip` oversized target snapshots or `fail` cleanup |
+| `target-prune-incremental` | `true` | Remove `target/**/incremental` before creating a snapshot |
+| `target-prune-build-script-out` | `false` | Remove `target/**/build/*/out` before creating a snapshot |
 | `compilation-restore-fallback` | `true` | Allow prefix fallback for compilation cache restores |
 | `target-restore-fallback` | `false` | Allow prefix fallback for target snapshot restores |
 | `target-dir` | `target` | Path to the cargo target directory |
@@ -480,6 +489,8 @@ The action now treats the two cache layers differently:
 
 - Compilation cache fallback stays enabled by default. That preserves fast incremental reuse across nearby commits while still letting zccache validate cache hits when `rustc` actually runs.
 - Target snapshot fallback is disabled by default. Reusing stale Cargo fingerprints and build-script outputs across different source trees can make a PR merge ref look fresh when it is not.
+- Target snapshots are disabled by default because Cargo does not garbage collect `target/`. Most CI should use the compilation and registry caches only. Enable `cache-target: true` for jobs where skipping Cargo fingerprint work matters enough to spend extra cache and runner disk.
+- Target snapshot saves prune `target/**/incremental` by default, can optionally prune `target/**/build/*/out`, and skip saving when the pruned snapshot exceeds `target-snapshot-max-size`.
 
 If you want the old fastest-possible behavior for developer CI, opt back in explicitly:
 
@@ -491,7 +502,7 @@ If you want the old fastest-possible behavior for developer CI, opt back in expl
     target-restore-fallback: true
 ```
 
-The default avoids target snapshots entirely until [zackees/zccache#65](https://github.com/zackees/zccache/issues/65) adds bounded garbage collection for accumulated profiles, test binaries, build-script outputs, and target triples. For release-hardened setup, keep the default and prefer exact compilation-cache restores:
+If you want a more release-hardened setup, keep target snapshots disabled and prefer exact restores:
 
 ```yaml
 - uses: zackees/zccache@main
@@ -513,8 +524,8 @@ This project is optimized for developer speed, not full artifact attestation. `z
 
 Composite GitHub Actions don't support `post` steps (automatic cleanup). The action is split into:
 
-1. **`zackees/zccache`** — setup: restore caches, install zccache, warm target, start daemon, set `RUSTC_WRAPPER`
-2. **`zackees/zccache/action/cleanup`** — teardown: print stats, stop daemon, save caches
+1. **`zackees/zccache`** — setup: restore caches, install zccache, optionally warm target, start daemon, set `RUSTC_WRAPPER`
+2. **`zackees/zccache/action/cleanup`** — teardown: print stats, stop daemon, prune and save enabled caches
 
 The cleanup action **must** be called with `if: always()` to ensure caches are saved even on failure.
 
