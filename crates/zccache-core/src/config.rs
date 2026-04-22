@@ -2,7 +2,6 @@
 
 use crate::NormalizedPath;
 use std::ffi::OsString;
-use std::path::PathBuf;
 
 /// Environment variable used to override the zccache cache root.
 pub const CACHE_DIR_ENV: &str = "ZCCACHE_CACHE_DIR";
@@ -171,10 +170,10 @@ fn cache_dir_from_env_value(value: Option<OsString>) -> Option<NormalizedPath> {
     if value.is_empty() {
         return None;
     }
-    Some(normalize_cache_dir_override(PathBuf::from(value)))
+    Some(normalize_cache_dir_override(std::path::Path::new(&value)))
 }
 
-fn normalize_cache_dir_override(path: PathBuf) -> NormalizedPath {
+fn normalize_cache_dir_override(path: &std::path::Path) -> NormalizedPath {
     if path.is_absolute() {
         path.into()
     } else {
