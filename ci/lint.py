@@ -56,6 +56,13 @@ def run_cmd_capture(cmd):
     )
 
 
+def dylint_env():
+    """Run cargo-dylint under the nightly toolchain without using +toolchain syntax."""
+    env = self_build_env()
+    env["RUSTUP_TOOLCHAIN"] = DYLINT_TOOLCHAIN
+    return env
+
+
 def ensure_dylint_aliases():
     """Create cargo-dylint's expected `name@toolchain` aliases when missing."""
     libraries_root = SCRIPT_DIR / "target" / "dylint" / "libraries"
@@ -141,13 +148,27 @@ def lint_dylint_only():
     if result != 0:
         return result
 
-    # Dylint needs rustup's cargo shim so its nested rust-toolchain files are honored.
-    dylint_cmd = ["cargo", f"+{DYLINT_TOOLCHAIN}", "dylint", "--all", "--workspace"]
-    result = run_cmd_capture(dylint_cmd)
+    dylint_cmd = cargo_command("dylint", "--all", "--workspace")
+    result = subprocess.run(
+        dylint_cmd,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(SCRIPT_DIR),
+        env=dylint_env(),
+        capture_output=True,
+    )
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
     if result.returncode != 0 and ensure_dylint_aliases():
-        result = run_cmd(dylint_cmd)
+        result = subprocess.run(
+            dylint_cmd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(SCRIPT_DIR),
+            env=dylint_env(),
+        )
     return result.returncode
 
 
