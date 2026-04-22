@@ -1,35 +1,48 @@
-//! Strict validation for compiler path flags.
+//! Strict compiler path flag validation.
+//!
+//! This catches include/force-include path spellings that can make compilers
+//! see one physical header through multiple raw path strings.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::fmt;
 
-/// Environment variable used by the CLI to enable strict path validation.
-pub const STRICT_PATHS_ENV: &str = "ZCCACHE_STRICT_PATHS";
-
-/// Strict path validation policy.
+/// Validation policy for compiler path flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StrictPathMode {
-    /// Disable validation.
+pub enum StrictPathsMode {
+    /// Do not validate path spellings.
     Off,
-    /// Reject inconsistent include path spellings that can defeat `#pragma once`.
+    /// Require all checked path flags to use one separator style.
     Consistent,
-    /// Require forward-slash absolute include paths with no `.` or `..` segments.
+    /// Require forward-slash absolute paths with no `.` or `..` components.
     Absolute,
 }
 
-impl StrictPathMode {
-    /// Parse a mode string.
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "" | "off" | "0" | "false" | "no" => Some(Self::Off),
-            "consistent" => Some(Self::Consistent),
-            "absolute" | "strict" | "1" | "true" | "yes" => Some(Self::Absolute),
-            _ => None,
+impl StrictPathsMode {
+    /// Parse a `--strict-paths` / `ZCCACHE_STRICT_PATHS` value.
+    pub fn parse(value: &str) -> Result<Self, StrictPathsParseError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(Self::Absolute),
+            "0" | "false" | "no" | "off" => Ok(Self::Off),
+            "consistent" => Ok(Self::Consistent),
+            "absolute" | "strict" => Ok(Self::Absolute),
+            other => Err(StrictPathsParseError {
+                value: other.to_string(),
+            }),
         }
     }
 
-    /// Return the canonical CLI spelling.
+    /// Read a mode from an environment-like key/value list.
+    pub fn from_env_vars<'a>(
+        vars: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<Self, StrictPathsParseError> {
+        for (key, value) in vars {
+            if key == "ZCCACHE_STRICT_PATHS" {
+                return Self::parse(value);
+            }
+        }
+        Ok(Self::Off)
+    }
+
+    /// Canonical command-line spelling for diagnostics and env forwarding.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -40,41 +53,102 @@ impl StrictPathMode {
     }
 }
 
-/// A strict path validation failure.
+/// Invalid strict-path mode value.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StrictPathViolation {
-    /// Flag that introduced the offending path.
-    pub flag: String,
-    /// Offending path value.
-    pub path: String,
-    /// Active validation mode.
-    pub mode: StrictPathMode,
-    /// Human-readable reason.
-    pub reason: String,
+pub struct StrictPathsParseError {
+    value: String,
 }
 
-/// Validate compiler path flags according to `mode`.
-pub fn validate_strict_paths(
-    args: &[String],
-    cwd: &Path,
-    mode: StrictPathMode,
-) -> Result<(), StrictPathViolation> {
-    if mode == StrictPathMode::Off {
+impl fmt::Display for StrictPathsParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid strict paths mode '{}'; expected off, consistent, or absolute",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for StrictPathsParseError {}
+
+/// A strict-path validation failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictPathsViolation {
+    /// Mode that rejected the flag.
+    pub mode: StrictPathsMode,
+    /// Offending compiler flag as it appeared in argv.
+    pub flag: String,
+    /// Path value extracted from the flag.
+    pub path: String,
+    reason: String,
+}
+
+impl StrictPathsViolation {
+    /// Render a user-facing diagnostic with the wrapped compiler invocation.
+    #[must_use]
+    pub fn diagnostic(&self, compiler: &str, args: &[String]) -> String {
+        let mut caller_parts = Vec::with_capacity(args.len() + 1);
+        caller_parts.push(shell_quote(compiler));
+        caller_parts.extend(args.iter().map(|arg| shell_quote(arg)));
+        format!(
+            "zccache: {} flag `{}` violates --strict-paths={} ({}).\n         Caller: {}",
+            self.flag_name(),
+            self.flag,
+            self.mode.as_str(),
+            self.reason,
+            caller_parts.join(" ")
+        )
+    }
+
+    fn flag_name(&self) -> &str {
+        const FLAG_NAMES: &[&str] = &[
+            "-include-pch",
+            "-include",
+            "-idirafter",
+            "-iframework",
+            "-isystem",
+            "-iquote",
+            "-imacros",
+            "-imsvc",
+            "-I",
+            "-F",
+            "/I",
+        ];
+        FLAG_NAMES
+            .iter()
+            .copied()
+            .find(|name| self.flag == *name || self.flag.starts_with(&format!("{name} ")))
+            .or_else(|| {
+                FLAG_NAMES
+                    .iter()
+                    .copied()
+                    .find(|name| self.flag.starts_with(*name))
+            })
+            .unwrap_or(self.flag.as_str())
+    }
+}
+
+/// Validate path-bearing compiler flags in `args`.
+pub fn validate_args(args: &[String], mode: StrictPathsMode) -> Result<(), StrictPathsViolation> {
+    if mode == StrictPathsMode::Off {
         return Ok(());
     }
 
-    let paths = collect_path_flags(args);
-    if mode == StrictPathMode::Absolute {
-        for path_flag in &paths {
-            validate_absolute(path_flag, mode)?;
+    let mut style: Option<SeparatorStyle> = None;
+    for flag in collect_path_flags(args) {
+        match mode {
+            StrictPathsMode::Off => {}
+            StrictPathsMode::Consistent => validate_consistent(&flag, &mut style)?,
+            StrictPathsMode::Absolute => validate_absolute(&flag)?,
         }
     }
-
-    if mode == StrictPathMode::Consistent || mode == StrictPathMode::Absolute {
-        validate_consistent(&paths, cwd, mode)?;
-    }
-
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeparatorStyle {
+    Forward,
+    Backslash,
 }
 
 #[derive(Debug)]
@@ -83,16 +157,108 @@ struct PathFlag {
     path: String,
 }
 
+fn validate_consistent(
+    flag: &PathFlag,
+    style: &mut Option<SeparatorStyle>,
+) -> Result<(), StrictPathsViolation> {
+    let has_forward = flag.path.contains('/');
+    let has_backslash = flag.path.contains('\\');
+
+    if has_forward && has_backslash {
+        return Err(StrictPathsViolation {
+            mode: StrictPathsMode::Consistent,
+            flag: flag.flag.clone(),
+            path: flag.path.clone(),
+            reason: "expected one separator style per path".to_string(),
+        });
+    }
+
+    let Some(current) = separator_style(&flag.path) else {
+        return Ok(());
+    };
+    match *style {
+        Some(expected) if expected != current => Err(StrictPathsViolation {
+            mode: StrictPathsMode::Consistent,
+            flag: flag.flag.clone(),
+            path: flag.path.clone(),
+            reason: "expected all checked paths to use the same separator style".to_string(),
+        }),
+        Some(_) => Ok(()),
+        None => {
+            *style = Some(current);
+            Ok(())
+        }
+    }
+}
+
+fn validate_absolute(flag: &PathFlag) -> Result<(), StrictPathsViolation> {
+    let reason = if flag.path.contains('\\') {
+        Some("expected forward-slash absolute path")
+    } else if !is_forward_absolute(&flag.path) {
+        Some("expected forward-slash absolute path")
+    } else if has_dot_component(&flag.path) {
+        Some("expected normalized path without /./ or /../ components")
+    } else {
+        None
+    };
+
+    match reason {
+        Some(reason) => Err(StrictPathsViolation {
+            mode: StrictPathsMode::Absolute,
+            flag: flag.flag.clone(),
+            path: flag.path.clone(),
+            reason: reason.to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
+fn separator_style(path: &str) -> Option<SeparatorStyle> {
+    if path.contains('/') {
+        Some(SeparatorStyle::Forward)
+    } else if path.contains('\\') {
+        Some(SeparatorStyle::Backslash)
+    } else {
+        None
+    }
+}
+
+fn is_forward_absolute(path: &str) -> bool {
+    if path.starts_with('/') {
+        return true;
+    }
+
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
+}
+
+fn has_dot_component(path: &str) -> bool {
+    path.split('/')
+        .any(|component| component == "." || component == "..")
+}
+
 fn collect_path_flags(args: &[String]) -> Vec<PathFlag> {
-    let mut result = Vec::new();
+    let mut flags = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
 
-        if takes_next_path(arg) {
+        if matches!(
+            arg.as_str(),
+            "-I" | "-F"
+                | "-isystem"
+                | "-iquote"
+                | "-idirafter"
+                | "-iframework"
+                | "-imsvc"
+                | "-include"
+                | "-include-pch"
+                | "-imacros"
+                | "/I"
+        ) {
             if let Some(path) = args.get(i + 1) {
-                result.push(PathFlag {
-                    flag: arg.clone(),
+                flags.push(PathFlag {
+                    flag: format!("{arg} {path}"),
                     path: path.clone(),
                 });
                 i += 2;
@@ -100,358 +266,190 @@ fn collect_path_flags(args: &[String]) -> Vec<PathFlag> {
             }
         }
 
-        if let Some((flag, path)) = split_joined_path_flag(arg) {
-            result.push(PathFlag {
-                flag: flag.to_string(),
+        if let Some(path) = arg.strip_prefix("-I").filter(|path| !path.is_empty()) {
+            flags.push(PathFlag {
+                flag: arg.clone(),
                 path: path.to_string(),
+            });
+        } else if let Some(path) = arg.strip_prefix("-F").filter(|path| !path.is_empty()) {
+            flags.push(PathFlag {
+                flag: arg.clone(),
+                path: path.to_string(),
+            });
+        } else if let Some(path) = arg
+            .strip_prefix("/I")
+            .filter(|path| !path.is_empty() && !path.starts_with(':'))
+        {
+            flags.push(PathFlag {
+                flag: arg.clone(),
+                path: path.to_string(),
+            });
+        } else if let Some(path) = joined_path_flag(arg) {
+            flags.push(PathFlag {
+                flag: arg.clone(),
+                path,
             });
         }
 
         i += 1;
     }
-    result
+    flags
 }
 
-fn takes_next_path(arg: &str) -> bool {
-    matches!(
-        arg,
-        "-I" | "/I"
-            | "-isystem"
-            | "-iquote"
-            | "-idirafter"
-            | "-include"
-            | "-include-pch"
-            | "-isysroot"
-            | "-imsvc"
-            | "/imsvc"
-            | "-F"
-            | "-iframework"
-    )
-}
+fn joined_path_flag(arg: &str) -> Option<String> {
+    const PREFIXES: &[&str] = &[
+        "-isystem",
+        "-iquote",
+        "-idirafter",
+        "-iframework",
+        "-imsvc",
+        "/imsvc",
+    ];
 
-fn split_joined_path_flag(arg: &str) -> Option<(&'static str, &str)> {
-    for prefix in ["-isystem", "-iquote", "-idirafter", "-imsvc", "/imsvc"] {
-        if let Some(path) = arg.strip_prefix(prefix) {
-            if !path.is_empty() {
-                return Some((prefix, path));
-            }
+    for prefix in PREFIXES {
+        if let Some(path) = arg.strip_prefix(prefix).filter(|path| !path.is_empty()) {
+            return Some(path.strip_prefix('=').unwrap_or(path).to_string());
         }
     }
-
-    if let Some(path) = arg.strip_prefix("--include-directory=") {
-        if !path.is_empty() {
-            return Some(("--include-directory", path));
-        }
-    }
-
-    if let Some(path) = arg.strip_prefix("/I") {
-        if !path.is_empty() {
-            return Some(("/I", path));
-        }
-    }
-
-    if let Some(path) = arg.strip_prefix("-I") {
-        if !path.is_empty() {
-            return Some(("-I", path));
-        }
-    }
-
-    if let Some(path) = arg.strip_prefix("-F") {
-        if !path.is_empty() {
-            return Some(("-F", path));
-        }
-    }
-
     None
 }
 
-fn validate_absolute(
-    path_flag: &PathFlag,
-    mode: StrictPathMode,
-) -> Result<(), StrictPathViolation> {
-    if path_flag.path.contains('\\') {
-        return Err(violation(
-            path_flag,
-            mode,
-            "expected forward-slash absolute path",
-        ));
-    }
-    if !is_absolute_like(&path_flag.path) {
-        return Err(violation(
-            path_flag,
-            mode,
-            "expected forward-slash absolute path",
-        ));
-    }
-    if has_dot_segment(&path_flag.path) {
-        return Err(violation(
-            path_flag,
-            mode,
-            "expected normalized path without /./ or /../ segments",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_consistent(
-    paths: &[PathFlag],
-    cwd: &Path,
-    mode: StrictPathMode,
-) -> Result<(), StrictPathViolation> {
-    let mut style: Option<SeparatorStyle> = None;
-    let mut seen: HashMap<String, &PathFlag> = HashMap::new();
-
-    for path_flag in paths {
-        match separator_style(&path_flag.path) {
-            SeparatorStyle::Mixed => {
-                return Err(violation(
-                    path_flag,
-                    mode,
-                    "mixed forward-slash and backslash separators",
-                ));
-            }
-            SeparatorStyle::Forward | SeparatorStyle::Backslash => {
-                let current = separator_style(&path_flag.path);
-                if let Some(expected) = style {
-                    if current != expected {
-                        return Err(violation(
-                            path_flag,
-                            mode,
-                            "include path separator style differs from earlier path flags",
-                        ));
-                    }
-                } else {
-                    style = Some(current);
-                }
-            }
-            SeparatorStyle::None => {}
-        }
-
-        let key = canonical_key(&path_flag.path, cwd);
-        if let Some(previous) = seen.get(&key) {
-            if previous.path != path_flag.path {
-                return Err(StrictPathViolation {
-                    flag: path_flag.flag.clone(),
-                    path: path_flag.path.clone(),
-                    mode,
-                    reason: format!(
-                        "same canonical path was already passed as `{}` via {}",
-                        previous.path, previous.flag
-                    ),
-                });
-            }
-        } else {
-            seen.insert(key, path_flag);
-        }
-    }
-
-    Ok(())
-}
-
-fn violation(path_flag: &PathFlag, mode: StrictPathMode, reason: &str) -> StrictPathViolation {
-    StrictPathViolation {
-        flag: path_flag.flag.clone(),
-        path: path_flag.path.clone(),
-        mode,
-        reason: reason.to_string(),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SeparatorStyle {
-    None,
-    Forward,
-    Backslash,
-    Mixed,
-}
-
-fn separator_style(path: &str) -> SeparatorStyle {
-    match (path.contains('/'), path.contains('\\')) {
-        (false, false) => SeparatorStyle::None,
-        (true, false) => SeparatorStyle::Forward,
-        (false, true) => SeparatorStyle::Backslash,
-        (true, true) => SeparatorStyle::Mixed,
-    }
-}
-
-fn is_absolute_like(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    path.starts_with('/')
-        || path.starts_with("//")
-        || (bytes.len() >= 3
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && (bytes[2] == b'/' || bytes[2] == b'\\'))
-}
-
-fn has_dot_segment(path: &str) -> bool {
-    path.split(['/', '\\'])
-        .any(|segment| segment == "." || segment == "..")
-}
-
-fn canonical_key(path: &str, cwd: &Path) -> String {
-    let mut value = path.replace('\\', "/");
-    let windows_like = has_drive_prefix(&value) || path.contains('\\');
-    if !is_absolute_like(&value) {
-        let cwd = cwd.to_string_lossy().replace('\\', "/");
-        value = format!("{cwd}/{value}");
-    }
-
-    let mut prefix = String::new();
-    let mut rest = value.as_str();
-    if has_drive_prefix(rest) {
-        prefix = rest[..2].to_ascii_lowercase();
-        rest = &rest[2..];
-    } else if rest.starts_with("//") {
-        prefix = "//".to_string();
-        rest = rest.trim_start_matches('/');
-    } else if rest.starts_with('/') {
-        prefix = "/".to_string();
-        rest = rest.trim_start_matches('/');
-    }
-
-    let mut segments: Vec<&str> = Vec::new();
-    for segment in rest.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
-            }
-            _ => segments.push(segment),
-        }
-    }
-
-    let mut key = if prefix.is_empty() {
-        segments.join("/")
-    } else if prefix == "/" || prefix == "//" {
-        format!("{prefix}{}", segments.join("/"))
+fn shell_quote(value: &str) -> String {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '$'))
+    {
+        format!("\"{}\"", value.replace('"', "\\\""))
     } else {
-        format!("{prefix}/{}", segments.join("/"))
-    };
-    if windows_like {
-        key.make_ascii_lowercase();
+        value.to_string()
     }
-    key
-}
-
-fn has_drive_prefix(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
-    fn args(values: &[&str]) -> Vec<String> {
-        values.iter().map(ToString::to_string).collect()
+    fn args(s: &[&str]) -> Vec<String> {
+        s.iter().map(|arg| (*arg).to_string()).collect()
     }
 
     #[test]
     fn absolute_rejects_relative_include() {
-        let err = validate_strict_paths(
-            &args(&["-c", "main.cpp", "-Iinclude"]),
-            Path::new("/work"),
-            StrictPathMode::Absolute,
+        let err = validate_args(
+            &args(&["-c", "foo.cpp", "-Iinclude"]),
+            StrictPathsMode::Absolute,
         )
         .unwrap_err();
-        assert_eq!(err.flag, "-I");
-        assert_eq!(err.path, "include");
+        assert_eq!(err.flag, "-Iinclude");
         assert!(err.reason.contains("absolute"));
     }
 
     #[test]
-    fn absolute_rejects_dot_segments() {
-        let err = validate_strict_paths(
-            &args(&["-IC:/Users/me/project/./src", "main.cpp"]),
-            Path::new("C:/Users/me/project"),
-            StrictPathMode::Absolute,
+    fn absolute_rejects_backslash_include() {
+        let err = validate_args(
+            &args(&["-c", "foo.cpp", r"-IC:\work\project\include"]),
+            StrictPathsMode::Absolute,
         )
         .unwrap_err();
-        assert_eq!(err.path, "C:/Users/me/project/./src");
-        assert!(err.reason.contains("normalized"));
+        assert_eq!(err.flag, r"-IC:\work\project\include");
     }
 
     #[test]
-    fn absolute_rejects_backslashes() {
-        let err = validate_strict_paths(
-            &args(&["-I", r"C:\Users\me\project\src", "main.cpp"]),
-            Path::new("C:/Users/me/project"),
-            StrictPathMode::Absolute,
+    fn absolute_rejects_dot_component() {
+        let err = validate_args(
+            &args(&["-c", "foo.cpp", "-IC:/work/project/./include"]),
+            StrictPathsMode::Absolute,
         )
         .unwrap_err();
-        assert_eq!(err.flag, "-I");
-        assert!(err.reason.contains("forward-slash"));
+        assert_eq!(err.path, "C:/work/project/./include");
+        assert!(err.reason.contains("/./"));
     }
 
     #[test]
-    fn consistent_rejects_mixed_separators_in_one_path() {
-        let err = validate_strict_paths(
-            &args(&["-Ici/meson/native\\fastled.dll.p", "main.cpp"]),
-            Path::new("C:/Users/me/project"),
-            StrictPathMode::Consistent,
-        )
-        .unwrap_err();
-        assert_eq!(err.flag, "-I");
-        assert!(err.reason.contains("mixed"));
-    }
-
-    #[test]
-    fn consistent_rejects_same_path_with_different_spellings() {
-        let err = validate_strict_paths(
+    fn absolute_accepts_forward_windows_and_unix_paths() {
+        validate_args(
             &args(&[
-                "-IC:/Users/me/fastled6/./src",
-                "-I",
-                "C:/Users/me/fastled6/src",
-                "main.cpp",
+                "-IC:/work/project/include",
+                "-isystem",
+                "/opt/sdk/include",
+                "-include-pch",
+                "C:/work/project/pch.h.pch",
             ]),
-            Path::new("C:/Users/me/fastled6"),
-            StrictPathMode::Consistent,
+            StrictPathsMode::Absolute,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn consistent_rejects_mixed_separators_within_one_path() {
+        let err = validate_args(
+            &args(&["-c", "foo.cpp", r"-Ici/meson/native\fastled.dll.p"]),
+            StrictPathsMode::Consistent,
         )
         .unwrap_err();
-        assert_eq!(err.flag, "-I");
-        assert_eq!(err.path, "C:/Users/me/fastled6/src");
-        assert!(err.reason.contains("same canonical path"));
+        assert!(err.reason.contains("one separator style"));
     }
 
     #[test]
-    fn consistent_accepts_repeated_identical_path() {
-        validate_strict_paths(
-            &args(&["-I", "src", "-I", "src", "main.cpp"]),
-            Path::new("/work"),
-            StrictPathMode::Consistent,
+    fn consistent_rejects_different_styles_across_flags() {
+        let err = validate_args(
+            &args(&["-IC:/work/project/include", r"-IC:\work\project\generated"]),
+            StrictPathsMode::Consistent,
+        )
+        .unwrap_err();
+        assert!(err.reason.contains("same separator style"));
+    }
+
+    #[test]
+    fn validates_joined_path_flags() {
+        for flag in [
+            "-isysteminclude",
+            "-isystem=include",
+            "-iquoteinclude",
+            "-idirafterinclude",
+            "-iframeworkinclude",
+            "-imsvcinclude",
+        ] {
+            let err = validate_args(&args(&["-c", "foo.cpp", flag]), StrictPathsMode::Absolute)
+                .unwrap_err();
+            assert_eq!(err.flag, flag);
+            assert_eq!(err.path, "include");
+        }
+    }
+
+    #[test]
+    fn consistent_allows_styleless_relative_paths() {
+        validate_args(
+            &args(&["-Iinclude", "-isystem", "generated"]),
+            StrictPathsMode::Consistent,
         )
         .unwrap();
     }
 
     #[test]
-    fn strict_paths_catches_paths_inside_response_file() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("flags.rsp"),
-            "-IC:/Users/me/fastled6/./src -IC:/Users/me/fastled6/src",
+    fn diagnostic_includes_caller() {
+        let err = validate_args(
+            &args(&["-c", "foo.cpp", "-Irelative"]),
+            StrictPathsMode::Absolute,
         )
-        .unwrap();
-        let expanded =
-            crate::response_file::expand_response_files_in(&args(&["@flags.rsp"]), dir.path())
-                .unwrap();
-
-        let err =
-            validate_strict_paths(&expanded, dir.path(), StrictPathMode::Consistent).unwrap_err();
-
-        assert_eq!(err.flag, "-I");
-        assert_eq!(err.path, "C:/Users/me/fastled6/src");
-        assert!(err.reason.contains("same canonical path"));
+        .unwrap_err();
+        let diagnostic = err.diagnostic("clang++", &args(&["-c", "foo.cpp", "-Irelative"]));
+        assert!(diagnostic.contains("violates --strict-paths=absolute"));
+        assert!(diagnostic.contains("Caller: clang++ -c foo.cpp -Irelative"));
     }
 
     #[test]
-    fn off_ignores_violations() {
-        validate_strict_paths(
-            &args(&["-Ici/meson/native\\fastled.dll.p", "main.cpp"]),
-            Path::new("/work"),
-            StrictPathMode::Off,
-        )
-        .unwrap();
+    fn parse_env_aliases() {
+        assert_eq!(
+            StrictPathsMode::parse("1").unwrap(),
+            StrictPathsMode::Absolute
+        );
+        assert_eq!(
+            StrictPathsMode::parse("consistent").unwrap(),
+            StrictPathsMode::Consistent
+        );
+        assert_eq!(StrictPathsMode::parse("off").unwrap(), StrictPathsMode::Off);
+        assert!(StrictPathsMode::parse("sometimes").is_err());
     }
 }
