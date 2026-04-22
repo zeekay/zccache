@@ -17,7 +17,7 @@ from ci.release_checks import ReleaseCheckError, validate_release_metadata
 from ci.soldr import cargo_command, rust_tool_command, self_build_env
 
 SCRIPT_DIR = Path(__file__).parent.parent.resolve()
-DYLINT_TOOLCHAIN = "nightly-2025-09-18"
+DYLINT_TOOLCHAIN = "nightly-2026-03-26"
 DYLINT_COMPONENTS = ["llvm-tools-preview", "rust-src", "rustc-dev"]
 
 
@@ -141,7 +141,8 @@ def lint_dylint_only():
     if result != 0:
         return result
 
-    dylint_cmd = cargo_command(f"+{DYLINT_TOOLCHAIN}", "dylint", "--all", "--workspace")
+    # Dylint needs rustup's cargo shim so its nested rust-toolchain files are honored.
+    dylint_cmd = ["cargo", f"+{DYLINT_TOOLCHAIN}", "dylint", "--all", "--workspace"]
     result = run_cmd_capture(dylint_cmd)
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
