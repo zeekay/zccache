@@ -674,10 +674,38 @@ v1 is deliberately minimal. The goal is a correct, useful tool for the most comm
 - `~/.zccache/` is visible and unambiguous on all platforms, consistent with tools like `.cargo/`, `.rustup/`, `.npm/`.
 - Centralizing path accessors prevents ad-hoc `.join("artifacts")` scattered across crates.
 
-**What does NOT change:**
-- IPC endpoints (`default_endpoint()`): socket paths and named pipes stay as-is (they are runtime IPC, not cache storage).
-- Unix lock file: stays adjacent to socket, not in cache dir.
+**What does NOT change by default:**
+- IPC endpoints (`default_endpoint()`): socket paths and named pipes stay as-is unless `ZCCACHE_CACHE_DIR` is set.
+- Unix lock file: stays adjacent to the default socket unless `ZCCACHE_CACHE_DIR` is set.
 
 **Consequences:**
 - Existing caches at old platform-specific locations are orphaned. Users must manually delete them or re-warm.
 - `~` on Windows resolves via `%USERPROFILE%` (typically `C:\Users\<name>`), which always exists.
+
+---
+
+## DD-021: Supported `ZCCACHE_CACHE_DIR` Cache Root Override
+
+**Context:** Managed build wrappers need to isolate their zccache artifacts and
+daemon state from a user's direct zccache usage. Rewriting `HOME` or
+`USERPROFILE` is too broad because it can affect compiler child processes and
+still only redirects zccache indirectly.
+
+**Decision:** `ZCCACHE_CACHE_DIR` is the supported cache-root override. When set
+and non-empty, all paths derived from `zccache_core::config::default_cache_dir()`
+use that root directly, including artifacts, temp files, depgraph state,
+`index.redb`, crash dumps, logs, cargo/download helper state, and lock files.
+Relative values are normalized against the current working directory.
+
+Default daemon endpoints also derive from the override. On Unix, zccache uses a
+socket under the cache root; on Windows, named pipe names include a stable path
+identifier derived from the cache root. This gives separate cache roots separate
+daemon instances unless an explicit endpoint is supplied.
+
+**Consequences:**
+- Existing users with no override keep the same `~/.zccache` cache root and
+  default runtime endpoints.
+- Managed wrappers can set one environment variable for CLI, wrapper, daemon,
+  status, clear, warm, and download helper commands.
+- Explicit `ZCCACHE_ENDPOINT` and `ZCCACHE_DOWNLOAD_ENDPOINT` still take
+  precedence for callers that need custom IPC routing.

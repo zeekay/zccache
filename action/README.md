@@ -32,9 +32,9 @@ steps:
 |---|---|---|
 | `cache-cargo-registry` | `true` | Cache `~/.cargo/registry/` and `~/.cargo/git/` |
 | `cache-compilation` | `true` | Cache compilation units via zccache daemon |
-| `cache-target` | `true` | Cache target metadata + run `zccache warm` |
+| `cache-target` | `true` | Cache target snapshot + run `zccache warm` |
 | `compilation-restore-fallback` | `true` | Allow prefix fallback for compilation cache restores |
-| `target-restore-fallback` | `false` | Allow prefix fallback for target metadata restores |
+| `target-restore-fallback` | `false` | Allow prefix fallback for target snapshot restores |
 | `target-dir` | `target` | Path to the cargo target directory |
 | `shared-key` | `""` | Extra cache key for matrix isolation |
 | `zccache-version` | `latest` | PyPI version to install |
@@ -46,13 +46,13 @@ steps:
 |---|---|
 | `cache-hit-compilation` | Whether zccache cache was restored |
 | `cache-hit-registry` | Whether cargo registry cache was restored |
-| `cache-hit-target` | Whether target metadata cache was restored |
+| `cache-hit-target` | Whether target snapshot cache was restored |
 
 ## Architecture
 
 The action has two parts because composite actions lack `post` steps:
 
-1. **`zackees/zccache`** (setup) restores caches, installs zccache, warms target metadata, and starts the daemon.
+1. **`zackees/zccache`** (setup) restores caches, installs zccache, restores the target snapshot, runs `zccache warm`, and starts the daemon.
 2. **`zackees/zccache/action/cleanup`** (teardown) stops the daemon and saves caches.
 
 The cleanup action must be called with `if: always()` to ensure caches are saved even on failure.
@@ -63,12 +63,12 @@ The cleanup action must be called with `if: always()` to ensure caches are saved
 |---|---|---|
 | zccache compilation | Per-unit `.o`/`.rlib` files (~1ms hit) | sccache (~170ms hit) |
 | Cargo registry | `~/.cargo/registry/` + `~/.cargo/git/` | Swatinem/rust-cache |
-| Target metadata | `target/` fingerprints, dep-info, build outputs | Cargo fingerprint recomputation |
+| Target snapshot | `target/` tarball excluding `incremental/` | Cargo fingerprint recomputation |
 
 State is passed from setup to cleanup via `~/.zccache-action-state/`.
 
 ### Restore policy
 
 - `compilation-restore-fallback: true` keeps the speed-first behavior for incremental CI.
-- `target-restore-fallback: false` is the default because stale Cargo metadata is not safe to prefix-restore across different source trees.
+- `target-restore-fallback: false` is the default because stale Cargo target snapshots are not safe to prefix-restore across different source trees.
 - For release-hardened builds, prefer `cache-target: false` and exact-key-only restores.

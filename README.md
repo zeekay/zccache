@@ -230,7 +230,7 @@ Recommended project-local config:
 rustc-wrapper = "zccache"
 
 [env]
-ZCCACHE_DIR = { value = "/tmp/.zccache", force = false }
+ZCCACHE_CACHE_DIR = { value = "/tmp/.zccache", force = false }
 ```
 
 Supports `--emit=metadata` (`cargo check`), `--emit=dep-info,metadata,link` (`cargo build`),
@@ -254,6 +254,23 @@ zccache status
 ```
 
 </details>
+
+### Cache root override
+
+Set `ZCCACHE_CACHE_DIR` to isolate every zccache cache and state path under a
+specific root:
+
+```bash
+export ZCCACHE_CACHE_DIR="$HOME/.soldr/cache/zccache"
+zccache start
+zccache status
+```
+
+When set and non-empty, the override is used for `artifacts/`, `tmp/`,
+`depgraph/`, `index.redb`, `crashes/`, `logs/`, daemon lock files, download
+daemon state, and the default daemon endpoint. Separate cache roots therefore
+use separate daemon instances unless `ZCCACHE_ENDPOINT` is explicitly set.
+Relative override paths are normalized against the current working directory.
 
 <details>
 <summary>Bash integration</summary>
@@ -402,10 +419,12 @@ The action provides three cache layers plus `zccache warm` for near-instant subs
 |---|---|---|---|
 | **Compilation cache** | Per-unit `.o`/`.rlib` files via zccache daemon | sccache | ~1ms per cache hit vs ~170ms for sccache |
 | **Cargo registry cache** | `~/.cargo/registry/` + `~/.cargo/git/` | Swatinem/rust-cache | Avoids re-downloading crates |
-| **Target metadata cache** | `target/` fingerprints, build script outputs, dep-info | (new) | Cargo skips fingerprint recomputation |
-| **`zccache warm`** | Pre-populates `target/deps/` from compilation cache | (new) | Cargo sees all artifacts as fresh |
+| **Target snapshot cache** | `target/` tarball excluding `incremental/` | (new) | Cargo sees target outputs and fingerprints together |
+| **`zccache warm`** | Backfills `target/deps/` from compilation cache | (new) | Restores missing artifacts before cargo runs |
 
-On setup, the action: restores all three caches → runs `zccache warm` to fill in `.rlib`/`.rmeta` files → touches all timestamps to a single consistent value → starts the daemon.
+On setup, the action restores all three caches, extracts the target snapshot,
+runs `zccache warm` to backfill cached `.rlib`/`.rmeta` files, touches all
+timestamps to a single consistent value, and starts the daemon.
 
 On cleanup: stops daemon → saves all three caches.
 
@@ -421,8 +440,8 @@ Measured on `ubuntu-24.04` building `zccache-core` (14 crates):
 **15x faster than sccache on subsequent CI runs.** Zero recompilation — cargo sees all fingerprints as fresh and prints `Finished` immediately.
 
 How it works:
-1. First run: cold build, populates zccache compilation cache + saves target metadata
-2. Second run: restores target metadata → `zccache warm` fills in `.rlib` files from compilation cache → touches timestamps → `cargo build` → `Finished in 0.18s`
+1. First run: cold build, populates zccache compilation cache and saves a target snapshot.
+2. Second run: restores the target snapshot, runs `zccache warm` as a backfill, touches timestamps, then `cargo build` finishes without recompilation.
 
 `zccache warm` reads the on-disk artifact index (no daemon needed) and filters by `Cargo.lock` — only restores artifacts matching crates in your lockfile. That is a speed optimization, not a full integrity-verification pass: warmed artifacts are trusted and Cargo is expected to reject or rebuild anything incompatible.
 
@@ -432,9 +451,9 @@ How it works:
 |---|---|---|
 | `cache-cargo-registry` | `true` | Cache cargo registry index + crate files + git deps |
 | `cache-compilation` | `true` | Cache compilation units via zccache daemon |
-| `cache-target` | `true` | Cache target metadata + run `zccache warm` |
+| `cache-target` | `true` | Cache target snapshot + run `zccache warm` |
 | `compilation-restore-fallback` | `true` | Allow prefix fallback for compilation cache restores |
-| `target-restore-fallback` | `false` | Allow prefix fallback for target metadata restores |
+| `target-restore-fallback` | `false` | Allow prefix fallback for target snapshot restores |
 | `target-dir` | `target` | Path to the cargo target directory |
 | `shared-key` | `""` | Extra key for matrix isolation (typically the target triple) |
 | `zccache-version` | `latest` | Version to install |
@@ -445,7 +464,7 @@ How it works:
 The action now treats the two cache layers differently:
 
 - Compilation cache fallback stays enabled by default. That preserves fast incremental reuse across nearby commits while still letting zccache validate cache hits when `rustc` actually runs.
-- Target metadata fallback is disabled by default. Reusing stale Cargo fingerprints and build-script outputs across different source trees can make a PR merge ref look fresh when it is not.
+- Target snapshot fallback is disabled by default. Reusing stale Cargo fingerprints and build-script outputs across different source trees can make a PR merge ref look fresh when it is not.
 
 If you want the old fastest-possible behavior for developer CI, opt back in explicitly:
 
@@ -456,7 +475,7 @@ If you want the old fastest-possible behavior for developer CI, opt back in expl
     target-restore-fallback: true
 ```
 
-If you want a more release-hardened setup, prefer exact restores and avoid target metadata entirely:
+If you want a more release-hardened setup, prefer exact restores and avoid target snapshots entirely:
 
 ```yaml
 - uses: zackees/zccache@main
@@ -473,7 +492,7 @@ This project is optimized for developer speed, not full artifact attestation. `z
 |---|---|
 | `cache-hit-compilation` | Whether the zccache compilation cache was restored |
 | `cache-hit-registry` | Whether the cargo registry cache was restored |
-| `cache-hit-target` | Whether the target metadata cache was restored |
+| `cache-hit-target` | Whether the target snapshot cache was restored |
 
 ### Why two parts?
 

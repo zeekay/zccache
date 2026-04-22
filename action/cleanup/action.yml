@@ -56,7 +56,7 @@ runs:
           ~/.cargo/git/db/
         key: ${{ steps.state.outputs.registry-key }}
 
-    - name: Create target metadata snapshot
+    - name: Create target snapshot
       if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-target == 'true'
       shell: bash
       run: |
@@ -66,17 +66,17 @@ runs:
         mkdir -p "$SNAPSHOT_DIR"
         if [ -d "$TARGET" ]; then
           # Tar target/ excluding only incremental compilation data.
-          # zccache warm restores .rlib/.rmeta from its artifact cache,
-          # but we keep them in the tar too as a fallback. The tar
-          # includes proc-macro .so/.dll which warm also restores.
+          # zccache warm restores .rlib/.rmeta from its artifact cache
+          # when available, but the tar keeps them too as a fallback.
+          # The tar includes proc-macro .so/.dll files as well.
           tar cf "$SNAPSHOT_DIR/target-meta.tar" -C "$TARGET" \
             --exclude='incremental' \
             . 2>/dev/null || true
           SIZE=$(du -sh "$SNAPSHOT_DIR/target-meta.tar" 2>/dev/null | cut -f1 || echo "?")
-          echo "Saved target metadata snapshot ($SIZE)"
+          echo "Saved target snapshot ($SIZE)"
         fi
 
-    - name: Save cargo target metadata
+    - name: Save cargo target snapshot
       if: always() && steps.state.outputs.save-cache == 'true' && steps.state.outputs.cache-target == 'true'
       uses: actions/cache/save@v4
       with:
