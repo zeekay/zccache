@@ -6,8 +6,8 @@ Adversarial and stress tests for the file watcher subsystem (fscache + watcher).
 
 ```bash
 # Run all stress/adversarial tests
-SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-watcher --test stress_test -- --ignored
+soldr cargo test -p zccache-watcher --test stress_test -- --ignored
 
 # Run a specific test
-SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-watcher --test stress_test -- --ignored stress_concurrent_lookups
+soldr cargo test -p zccache-watcher --test stress_test -- --ignored stress_concurrent_lookups
 ```

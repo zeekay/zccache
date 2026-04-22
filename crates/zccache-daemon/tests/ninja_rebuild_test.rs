@@ -10,8 +10,8 @@
 //! Each invocation goes through the real CLI binary in drop-in wrapper mode,
 //! exercising the full `CompileEphemeral` single-roundtrip IPC path.
 //!
-//! Run all:    SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test ninja_rebuild_test -- --nocapture
-//! Run stress: SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test ninja_rebuild_test -- --ignored --nocapture
+//! Run all:    soldr cargo test -p zccache-daemon --test ninja_rebuild_test -- --nocapture
+//! Run stress: soldr cargo test -p zccache-daemon --test ninja_rebuild_test -- --ignored --nocapture
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -707,7 +707,7 @@ async fn ninja_clear_forces_cold_rebuild() {
 
 /// Stress test: 250 files with heavy bodies, cold + warm + warm.
 ///
-/// Run:  SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test ninja_rebuild_test -- stress_large_project --ignored --nocapture
+/// Run:  soldr cargo test -p zccache-daemon --test ninja_rebuild_test -- stress_large_project --ignored --nocapture
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn stress_large_project_cold_warm() {
@@ -798,7 +798,7 @@ async fn stress_large_project_cold_warm() {
 /// Benchmark: 100 files, medium bodies, cold + 5 warm iterations.
 /// Prints per-iteration timing for trend analysis.
 ///
-/// Run:  SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test ninja_rebuild_test -- bench_medium --ignored --nocapture
+/// Run:  soldr cargo test -p zccache-daemon --test ninja_rebuild_test -- bench_medium --ignored --nocapture
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn bench_medium_project_warm_iterations() {
@@ -911,7 +911,7 @@ fn find_ninja() -> Option<NormalizedPath> {
 ///   4. `ninja -t clean` + `ninja` warm rebuild (all cache hits)
 ///   5. Verify warm is significantly faster than cold
 ///
-/// Run:  SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test ninja_rebuild_test -- meson_ninja_cold --ignored --nocapture
+/// Run:  soldr cargo test -p zccache-daemon --test ninja_rebuild_test -- meson_ninja_cold --ignored --nocapture
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn meson_ninja_cold_then_warm_rebuild() {
@@ -1026,7 +1026,7 @@ async fn meson_ninja_cold_then_warm_rebuild() {
 
 /// Meson+ninja benchmark: larger project, cold + 3 warm iterations.
 ///
-/// Run:  SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test ninja_rebuild_test -- meson_ninja_bench --ignored --nocapture
+/// Run:  soldr cargo test -p zccache-daemon --test ninja_rebuild_test -- meson_ninja_bench --ignored --nocapture
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn meson_ninja_bench_warm_iterations() {

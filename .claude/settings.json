@@ -50,7 +50,7 @@
           },
           {
             "type": "command",
-            "command": "SOLDR_RUSTC_WRAPPER=none soldr cargo run -p zccache-ci",
+            "command": "soldr cargo run -p zccache-ci",
             "timeout": 600
           }
         ]

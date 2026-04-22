@@ -325,7 +325,7 @@ def verify() -> bool:
         warn('  export PATH="$CARGO_HOME/bin:$PATH"')
 
     log("")
-    log("Done. Run: SOLDR_RUSTC_WRAPPER=none soldr cargo check --workspace")
+    log("Done. Run: soldr cargo check --workspace")
     return True
 
 
@@ -346,7 +346,7 @@ def main() -> None:
         warn("")
         warn("Restart your terminal, then run:")
         warn("  rustc --version")
-        warn("  SOLDR_RUSTC_WRAPPER=none soldr cargo check --workspace")
+        warn("  soldr cargo check --workspace")
 
 
 if __name__ == "__main__":
