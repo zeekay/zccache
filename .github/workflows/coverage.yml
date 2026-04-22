@@ -20,8 +20,6 @@ jobs:
           toolchain: 1.94.1
           cache: true
           cache-key-suffix: coverage
-      - name: Disable soldr zccache wrapper for zccache self-build
-        run: echo "SOLDR_RUSTC_WRAPPER=none" >> "$GITHUB_ENV"
       - name: Install Rust coverage component
         run: rustup component add llvm-tools-preview
       - name: Install cargo-llvm-cov

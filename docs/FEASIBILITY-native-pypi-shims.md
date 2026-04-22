@@ -114,7 +114,7 @@ All wheels use the `py3-none-{platform}` tag since there's no Python ABI depende
 ### What Stays the Same
 
 - All 11 Rust crates - no changes
-- `SOLDR_RUSTC_WRAPPER=none soldr cargo` development workflow - no changes
+- `soldr cargo` development workflow - no changes
 - CI hooks (tool_guard, lint, readme_guard) - no changes
 - Cargo.toml workspace - no changes
 
@@ -122,7 +122,7 @@ All wheels use the `py3-none-{platform}` tag since there's no Python ABI depende
 
 The existing `ci/soldr.py` dev helpers serve a **different purpose** - they run local zccache binaries through `soldr cargo run`. They are NOT distribution shims. These two concerns are orthogonal:
 
-- **Development**: `SOLDR_RUSTC_WRAPPER=none soldr cargo build` uses soldr for toolchain resolution
+- **Development**: `soldr cargo build` uses soldr for toolchain resolution and the default soldr-managed compiler wrapper
 - **Distribution**: `pip install zccache` installs the native binary from the maturin-built wheel
 
 The dev helpers stay as development infrastructure. They don't ship in the wheel.

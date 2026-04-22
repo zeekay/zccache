@@ -64,10 +64,6 @@ runs:
         cache-key-suffix: ${{ inputs.cache_key }}
         target-cache-paths: target/${{ inputs.target }}
 
-    - name: Disable soldr zccache wrapper for zccache self-build
-      shell: bash
-      run: echo "SOLDR_RUSTC_WRAPPER=none" >> "$GITHUB_ENV"
-
     - name: Ensure target stdlib is installed
       shell: bash
       run: rustup target add ${{ inputs.target }}

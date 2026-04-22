@@ -11,7 +11,6 @@ from pathlib import Path
 from ci.env import clean_env
 
 REPO_ROOT = Path(__file__).parent.parent.resolve()
-SELF_BUILD_WRAPPER = "none"
 
 
 def soldr_executable() -> str:
@@ -27,9 +26,7 @@ def soldr_executable() -> str:
 
 
 def self_build_env() -> dict[str, str]:
-    env = clean_env()
-    env.setdefault("SOLDR_RUSTC_WRAPPER", SELF_BUILD_WRAPPER)
-    return env
+    return clean_env()
 
 
 def cargo_command(*args: str) -> list[str]:

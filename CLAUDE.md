@@ -17,11 +17,11 @@ zccache is a local-first compiler cache daemon (11 crates). See @docs/CLAUDE.md 
 ./test --integration        # integration tests only (need clang on PATH)
 ./test --full               # unit + integration + stress + perf tests
 ./test -p <crate> -- <test_name>
-SOLDR_RUSTC_WRAPPER=none soldr cargo check --workspace --all-targets
-SOLDR_RUSTC_WRAPPER=none soldr cargo clippy --workspace --all-targets -- -D warnings
+soldr cargo check --workspace --all-targets
+soldr cargo clippy --workspace --all-targets -- -D warnings
 soldr cargo fmt --all
-RUSTDOCFLAGS="-D warnings" SOLDR_RUSTC_WRAPPER=none soldr cargo doc --workspace --no-deps
-SOLDR_RUSTC_WRAPPER=none soldr cargo bench -p zccache-hash
+RUSTDOCFLAGS="-D warnings" soldr cargo doc --workspace --no-deps
+soldr cargo bench -p zccache-hash
 ./perf                      # performance benchmark (zccache vs sccache vs bare clang)
 ```
 
@@ -63,7 +63,7 @@ Hooks are in `ci/hooks/` (Python) and `crates/zccache-ci` (Rust):
 - **PostToolUse**: `ci/hooks/lint.py` auto-formats + runs clippy on edited `.rs` files
 - **PostToolUse**: `ci/hooks/readme_guard.py` errors if directory lacks README.md
 - **SessionStart**: `ci/hooks/check-on-start.py` captures git fingerprint
-- **Stop**: `SOLDR_RUSTC_WRAPPER=none soldr cargo run -p zccache-ci` runs lint + unit tests in parallel (skips if no changes)
+- **Stop**: `soldr cargo run -p zccache-ci` runs lint + unit tests in parallel (skips if no changes)
 
 ## Language Policy
 

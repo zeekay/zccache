@@ -5,22 +5,22 @@ Read [CLAUDE.md](./CLAUDE.md) first. The following conventions are mandatory in 
 - Do not run bare `cargo`, `rustc`, or `rustfmt`.
 - Always use `soldr <tool>` directly. soldr resolves repo-local `.cargo` / `.rustup` homes and the rustup-managed toolchain pinned by `rust-toolchain.toml`.
 - In this Windows environment, the repo is using the rustup-managed `x86_64-pc-windows-msvc` toolchain pinned by `rust-toolchain.toml`. Do not assume GNU or try to find `gcc`. soldr also enforces MSVC on Windows by default.
-- zccache self-builds should set `SOLDR_RUSTC_WRAPPER=none` when invoking `soldr cargo ...` so soldr does not wrap the current zccache build in a previous zccache release.
+- Keep soldr's default Rust compiler wrapper enabled for normal `soldr cargo ...` commands. Set `SOLDR_RUSTC_WRAPPER=none` only as an explicit diagnostic escape hatch when debugging wrapper behavior.
 
 Examples:
 
 ```bash
-SOLDR_RUSTC_WRAPPER=none soldr cargo check --workspace --all-targets
-SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-download
-SOLDR_RUSTC_WRAPPER=none soldr cargo build -p zccache-cli
+soldr cargo check --workspace --all-targets
+soldr cargo test -p zccache-download
+soldr cargo build -p zccache-cli
 soldr cargo fmt --all
 ```
 
 PowerShell example:
 
 ```powershell
-$env:SOLDR_RUSTC_WRAPPER = "none"; soldr cargo check -p zccache-download-client
-$env:SOLDR_RUSTC_WRAPPER = "none"; soldr cargo test -p zccache-download
+soldr cargo check -p zccache-download-client
+soldr cargo test -p zccache-download
 ```
 
 ## Python Commands
@@ -34,7 +34,7 @@ $env:SOLDR_RUSTC_WRAPPER = "none"; soldr cargo test -p zccache-download
 - Prefer `./test` for repo-standard test execution.
 - Use `./test --integration` for ignored integration tests.
 - Use `./test --full` for the larger suite.
-- Use `SOLDR_RUSTC_WRAPPER=none soldr cargo test ...` when you need targeted crate/test execution.
+- Use `soldr cargo test ...` when you need targeted crate/test execution.
 
 ## Practical Rule
 
