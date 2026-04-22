@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 use zccache_artifact::{ArtifactIndex, ArtifactStore};
 use zccache_core::NormalizedPath;
@@ -308,11 +309,31 @@ pub struct DaemonServer {
 /// Remove fast-hit cache entries older than `max_age`. Returns entries removed.
 pub(crate) fn trim_fast_hit_cache(
     cache: &DashMap<ContextKey, FastHitEntry>,
-    max_age: std::time::Duration,
+    max_age: Duration,
+) -> usize {
+    trim_fast_hit_cache_at(cache, max_age, Instant::now())
+}
+
+fn cache_age_at(now: Instant, cached_at: Instant) -> Duration {
+    now.saturating_duration_since(cached_at)
+}
+
+fn cache_entry_expired_at(now: Instant, cached_at: Instant, max_age: Duration) -> bool {
+    cache_age_at(now, cached_at) > max_age
+}
+
+fn cache_entry_fresh_at(now: Instant, cached_at: Instant, max_age: Duration) -> bool {
+    cache_age_at(now, cached_at) < max_age
+}
+
+fn trim_fast_hit_cache_at(
+    cache: &DashMap<ContextKey, FastHitEntry>,
+    max_age: Duration,
+    now: Instant,
 ) -> usize {
     let mut removed = 0;
     cache.retain(|_, entry| {
-        if entry.cached_at.elapsed() > max_age {
+        if cache_entry_expired_at(now, entry.cached_at, max_age) {
             removed += 1;
             false
         } else {
@@ -322,13 +343,18 @@ pub(crate) fn trim_fast_hit_cache(
     removed
 }
 
-fn trim_request_cache(
+fn trim_request_cache(cache: &DashMap<ContentHash, RequestCacheEntry>, max_age: Duration) -> usize {
+    trim_request_cache_at(cache, max_age, Instant::now())
+}
+
+fn trim_request_cache_at(
     cache: &DashMap<ContentHash, RequestCacheEntry>,
-    max_age: std::time::Duration,
+    max_age: Duration,
+    now: Instant,
 ) -> usize {
     let mut removed = 0;
     cache.retain(|_, entry| {
-        if entry.cached_at.elapsed() > max_age {
+        if cache_entry_expired_at(now, entry.cached_at, max_age) {
             removed += 1;
             false
         } else {
@@ -343,13 +369,18 @@ fn trim_request_cache(
     removed
 }
 
-fn trim_rsp_cache(
+fn trim_rsp_cache(cache: &DashMap<NormalizedPath, RspCacheEntry>, max_age: Duration) -> usize {
+    trim_rsp_cache_at(cache, max_age, Instant::now())
+}
+
+fn trim_rsp_cache_at(
     cache: &DashMap<NormalizedPath, RspCacheEntry>,
-    max_age: std::time::Duration,
+    max_age: Duration,
+    now: Instant,
 ) -> usize {
     let mut removed = 0;
     cache.retain(|_, entry| {
-        if entry.cached_at.elapsed() > max_age {
+        if cache_entry_expired_at(now, entry.cached_at, max_age) {
             removed += 1;
             false
         } else {
@@ -2619,10 +2650,11 @@ async fn handle_compile(
     // discovery, watch_directories, response file expansion, arg parsing,
     // context building, and dep_graph registration.
     if state.watcher_active.load(Ordering::Acquire) {
+        let cache_now = Instant::now();
         let request_fp = request_fingerprint(compiler_path, &expanded_args, cwd);
         if let Some(req_entry) = state.request_cache.get(&request_fp) {
             if let Some(fh_entry) = state.fast_hit_cache.get(&req_entry.context_key) {
-                if fh_entry.cached_at.elapsed() < FAST_HIT_MAX_AGE
+                if cache_entry_fresh_at(cache_now, fh_entry.cached_at, FAST_HIT_MAX_AGE)
                     && context_files_fresh(
                         state,
                         &req_entry.context_key,
@@ -2810,8 +2842,9 @@ async fn handle_compile(
     // Uses per-file journal checks instead of global clock comparison so
     // output file writes don't invalidate unrelated fast-hit entries.
     if state.watcher_active.load(Ordering::Acquire) {
+        let cache_now = Instant::now();
         if let Some(entry) = state.fast_hit_cache.get(&context_key) {
-            if entry.cached_at.elapsed() < FAST_HIT_MAX_AGE
+            if cache_entry_fresh_at(cache_now, entry.cached_at, FAST_HIT_MAX_AGE)
                 && context_files_fresh(state, &context_key, &source_path, entry.clock)
             {
                 let artifact_key_hex = &entry.artifact_key_hex;
@@ -3710,8 +3743,9 @@ fn check_unit_cache(
     // If the watcher is active and none of the source/header files have
     // changed since the last verified hit, skip ALL hash/depgraph work.
     if state.watcher_active.load(Ordering::Acquire) {
+        let cache_now = Instant::now();
         if let Some(entry) = state.fast_hit_cache.get(&context_key) {
-            if entry.cached_at.elapsed() < FAST_HIT_MAX_AGE
+            if cache_entry_fresh_at(cache_now, entry.cached_at, FAST_HIT_MAX_AGE)
                 && context_files_fresh(state, &context_key, &source_path, entry.clock)
             {
                 let artifact_key_hex = &entry.artifact_key_hex;
@@ -4427,25 +4461,103 @@ mod tests {
         }
     }
 
+    fn test_rsp_entry(cached_at: std::time::Instant) -> RspCacheEntry {
+        RspCacheEntry {
+            expanded: Vec::new(),
+            dependencies: Vec::new(),
+            cached_at,
+        }
+    }
+
+    fn test_fast_hit_entry(cached_at: std::time::Instant) -> FastHitEntry {
+        FastHitEntry {
+            clock: Clock::ZERO,
+            artifact_key_hex: "artifact".to_string(),
+            cached_at,
+        }
+    }
+
+    fn test_content_hash(index: usize) -> ContentHash {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        ContentHash::from_bytes(bytes)
+    }
+
     #[test]
     fn trim_request_cache_removes_old_entries() {
         let cache = DashMap::new();
-        let max_age = std::time::Duration::from_millis(1);
-        cache.insert(
-            ContentHash::from_bytes([2; 32]),
-            test_request_entry(std::time::Instant::now()),
-        );
-        std::thread::sleep(max_age * 2);
-        cache.insert(
-            ContentHash::from_bytes([1; 32]),
-            test_request_entry(std::time::Instant::now()),
-        );
+        let max_age = std::time::Duration::from_millis(10);
+        let old_at = std::time::Instant::now();
+        let now = old_at.checked_add(max_age * 2).unwrap();
+        cache.insert(ContentHash::from_bytes([2; 32]), test_request_entry(old_at));
+        cache.insert(ContentHash::from_bytes([1; 32]), test_request_entry(now));
 
-        let removed = trim_request_cache(&cache, max_age);
+        let removed = trim_request_cache_at(&cache, max_age, now);
 
         assert_eq!(removed, 1);
         assert_eq!(cache.len(), 1);
         assert!(cache.contains_key(&ContentHash::from_bytes([1; 32])));
+    }
+
+    #[test]
+    fn trim_request_cache_keeps_future_entries() {
+        let cache = DashMap::new();
+        let max_age = std::time::Duration::from_millis(10);
+        let now = std::time::Instant::now();
+        let future = now.checked_add(max_age * 2).unwrap();
+        cache.insert(ContentHash::from_bytes([1; 32]), test_request_entry(future));
+
+        let removed = trim_request_cache_at(&cache, max_age, now);
+
+        assert_eq!(removed, 0);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn trim_request_cache_clears_when_over_hard_cap() {
+        let cache = DashMap::new();
+        let now = std::time::Instant::now();
+        for i in 0..=REQUEST_CACHE_MAX_ENTRIES {
+            cache.insert(test_content_hash(i), test_request_entry(now));
+        }
+
+        let removed = trim_request_cache_at(&cache, EPHEMERAL_CACHE_MAX_AGE, now);
+
+        assert_eq!(removed, REQUEST_CACHE_MAX_ENTRIES + 1);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn trim_rsp_cache_removes_old_entries() {
+        let cache = DashMap::new();
+        let max_age = std::time::Duration::from_millis(10);
+        let old_at = std::time::Instant::now();
+        let now = old_at.checked_add(max_age * 2).unwrap();
+        cache.insert(NormalizedPath::from("/tmp/old.rsp"), test_rsp_entry(old_at));
+        cache.insert(NormalizedPath::from("/tmp/fresh.rsp"), test_rsp_entry(now));
+
+        let removed = trim_rsp_cache_at(&cache, max_age, now);
+
+        assert_eq!(removed, 1);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&NormalizedPath::from("/tmp/fresh.rsp")));
+    }
+
+    #[test]
+    fn trim_rsp_cache_keeps_future_entries() {
+        let cache = DashMap::new();
+        let max_age = std::time::Duration::from_millis(10);
+        let now = std::time::Instant::now();
+        let future = now.checked_add(max_age * 2).unwrap();
+        cache.insert(
+            NormalizedPath::from("/tmp/future.rsp"),
+            test_rsp_entry(future),
+        );
+
+        let removed = trim_rsp_cache_at(&cache, max_age, now);
+
+        assert_eq!(removed, 0);
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
@@ -4455,18 +4567,47 @@ mod tests {
         for i in 0..=RSP_CACHE_MAX_ENTRIES {
             cache.insert(
                 NormalizedPath::from(format!("/tmp/args{i}.rsp")),
-                RspCacheEntry {
-                    expanded: Vec::new(),
-                    dependencies: Vec::new(),
-                    cached_at: now,
-                },
+                test_rsp_entry(now),
             );
         }
 
-        let removed = trim_rsp_cache(&cache, EPHEMERAL_CACHE_MAX_AGE);
+        let removed = trim_rsp_cache_at(&cache, EPHEMERAL_CACHE_MAX_AGE, now);
 
         assert_eq!(removed, RSP_CACHE_MAX_ENTRIES + 1);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn trim_fast_hit_cache_removes_old_entries() {
+        let cache = DashMap::new();
+        let max_age = std::time::Duration::from_millis(10);
+        let old_at = std::time::Instant::now();
+        let now = old_at.checked_add(max_age * 2).unwrap();
+        let old_key = test_context_key("/tmp/old.c");
+        let fresh_key = test_context_key("/tmp/fresh.c");
+        cache.insert(old_key, test_fast_hit_entry(old_at));
+        cache.insert(fresh_key, test_fast_hit_entry(now));
+
+        let removed = trim_fast_hit_cache_at(&cache, max_age, now);
+
+        assert_eq!(removed, 1);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&fresh_key));
+    }
+
+    #[test]
+    fn trim_fast_hit_cache_keeps_future_entries() {
+        let cache = DashMap::new();
+        let max_age = std::time::Duration::from_millis(10);
+        let now = std::time::Instant::now();
+        let future = now.checked_add(max_age * 2).unwrap();
+        let key = test_context_key("/tmp/future.c");
+        cache.insert(key, test_fast_hit_entry(future));
+
+        let removed = trim_fast_hit_cache_at(&cache, max_age, now);
+
+        assert_eq!(removed, 0);
+        assert_eq!(cache.len(), 1);
     }
 
     struct CacheDirEnvGuard {
