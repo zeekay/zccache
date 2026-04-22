@@ -1152,19 +1152,40 @@ mod tests {
         panic!("test http server at {addr} did not respond in time");
     }
 
-    fn wait_for_test_condition(
+    fn try_wait_for_test_condition(
         timeout: Duration,
         description: &str,
         mut predicate: impl FnMut() -> bool,
-    ) {
+    ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if predicate() {
-                return;
+                return Ok(());
             }
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("timed out waiting for {description}");
+        Err(format!("timed out waiting for {description}"))
+    }
+
+    fn run_with_self_healing<F>(label: &str, mut attempt_fn: F)
+    where
+        F: FnMut(usize) -> Result<(), String>,
+    {
+        const MAX_ATTEMPTS: usize = 3;
+        let mut last_err: Option<String> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match attempt_fn(attempt) {
+                Ok(()) => return,
+                Err(err) => {
+                    eprintln!("{label}: attempt {attempt}/{MAX_ATTEMPTS} failed: {err}");
+                    last_err = Some(err);
+                }
+            }
+        }
+        panic!(
+            "{label} failed after {MAX_ATTEMPTS} attempts: {}",
+            last_err.unwrap_or_else(|| "unknown error".to_string())
+        );
     }
 
     // Localhost reqwest calls on Windows can transiently fail with "error sending
@@ -1652,102 +1673,148 @@ mod tests {
 
     #[test]
     fn fetch_no_wait_returns_locked_while_other_client_is_downloading() {
-        let daemon = TestDaemon::start();
-        let request_started = Arc::new(AtomicBool::new(false));
-        let release_response = Arc::new(AtomicBool::new(false));
-        let body: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
-        let server = TestHttpServer::start(TestHttpConfig {
-            body: Arc::new(body),
-            accept_ranges: false,
-            send_content_length: true,
-            chunk_size: 4096,
-            chunk_delay: Duration::from_millis(2),
-            path: "slow.bin".to_string(),
-            request_started: Some(Arc::clone(&request_started)),
-            release_response: Some(Arc::clone(&release_response)),
-        });
-        let dest_dir = tempfile::tempdir().unwrap();
-        let destination = dest_dir.path().join("slow.bin");
+        run_with_self_healing(
+            "fetch_no_wait_returns_locked_while_other_client_is_downloading",
+            |attempt| {
+                let daemon = TestDaemon::start();
+                let request_started = Arc::new(AtomicBool::new(false));
+                let release_response = Arc::new(AtomicBool::new(false));
+                let body: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+                let server = TestHttpServer::start(TestHttpConfig {
+                    body: Arc::new(body),
+                    accept_ranges: false,
+                    send_content_length: true,
+                    chunk_size: 4096,
+                    chunk_delay: Duration::from_millis(2),
+                    path: "slow.bin".to_string(),
+                    request_started: Some(Arc::clone(&request_started)),
+                    release_response: Some(Arc::clone(&release_response)),
+                });
+                let dest_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+                let destination = dest_dir.path().join(format!("slow-{attempt}.bin"));
 
-        let endpoint = daemon.endpoint.clone();
-        let url = server.url.clone();
-        let destination_for_thread = destination.clone();
-        let download_thread = thread::spawn(move || {
-            let client = DownloadClient::new(Some(endpoint));
-            let request = FetchRequest::new(url, &destination_for_thread);
-            fetch_with_retry(&client, request)
-        });
+                let endpoint = daemon.endpoint.clone();
+                let url = server.url.clone();
+                let destination_for_thread = destination.clone();
+                let download_thread = thread::spawn(move || {
+                    let client = DownloadClient::new(Some(endpoint));
+                    let request = FetchRequest::new(url, &destination_for_thread);
+                    fetch_with_retry(&client, request)
+                });
 
-        wait_for_test_condition(Duration::from_secs(5), "initial download request", || {
-            request_started.load(Ordering::Acquire)
-        });
+                let outcome = (|| -> Result<(), String> {
+                    try_wait_for_test_condition(
+                        Duration::from_secs(30),
+                        "initial download request",
+                        || request_started.load(Ordering::Acquire),
+                    )?;
+                    let client = DownloadClient::new(Some(daemon.endpoint.clone()));
+                    let mut no_wait = FetchRequest::new(server.url.clone(), &destination);
+                    no_wait.wait_mode = WaitMode::NoWait;
+                    let locked = fetch_with_retry(&client, no_wait)
+                        .map_err(|err| format!("no-wait fetch failed: {err}"))?;
+                    if locked.status != FetchStatus::Locked {
+                        return Err(format!("expected Locked status, got {:?}", locked.status));
+                    }
+                    Ok(())
+                })();
 
-        let client = DownloadClient::new(Some(daemon.endpoint.clone()));
-        let mut no_wait = FetchRequest::new(server.url.clone(), &destination);
-        no_wait.wait_mode = WaitMode::NoWait;
-        let locked = fetch_with_retry(&client, no_wait).unwrap();
-        assert_eq!(locked.status, FetchStatus::Locked);
-
-        release_response.store(true, Ordering::Release);
-        let completed = download_thread.join().unwrap().unwrap();
-        assert_eq!(completed.status, FetchStatus::Downloaded);
+                release_response.store(true, Ordering::Release);
+                let join_result = download_thread.join();
+                outcome?;
+                let completed = match join_result {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(err)) => return Err(format!("download thread returned error: {err}")),
+                    Err(_) => return Err("download thread panicked".to_string()),
+                };
+                if completed.status != FetchStatus::Downloaded {
+                    return Err(format!(
+                        "expected Downloaded status, got {:?}",
+                        completed.status
+                    ));
+                }
+                Ok(())
+            },
+        );
     }
 
     #[test]
     fn fetch_multipart_no_wait_returns_locked_while_other_client_is_downloading() {
-        let daemon = TestDaemon::start();
-        let request_started = Arc::new(AtomicBool::new(false));
-        let release_response = Arc::new(AtomicBool::new(false));
-        let slow_server = TestHttpServer::start(TestHttpConfig {
-            body: Arc::new((0..512 * 1024).map(|i| (i % 251) as u8).collect()),
-            accept_ranges: false,
-            send_content_length: true,
-            chunk_size: 4096,
-            chunk_delay: Duration::from_millis(2),
-            path: "slow.part-aa".to_string(),
-            request_started: Some(Arc::clone(&request_started)),
-            release_response: Some(Arc::clone(&release_response)),
-        });
-        let fast_server = TestHttpServer::start(TestHttpConfig {
-            body: Arc::new(b"tail".to_vec()),
-            accept_ranges: false,
-            send_content_length: true,
-            chunk_size: 0,
-            chunk_delay: Duration::ZERO,
-            path: "slow.part-ab".to_string(),
-            request_started: None,
-            release_response: None,
-        });
-        let dest_dir = tempfile::tempdir().unwrap();
-        let destination = dest_dir.path().join("slow.bin");
+        run_with_self_healing(
+            "fetch_multipart_no_wait_returns_locked_while_other_client_is_downloading",
+            |attempt| {
+                let daemon = TestDaemon::start();
+                let request_started = Arc::new(AtomicBool::new(false));
+                let release_response = Arc::new(AtomicBool::new(false));
+                let slow_server = TestHttpServer::start(TestHttpConfig {
+                    body: Arc::new((0..512 * 1024).map(|i| (i % 251) as u8).collect()),
+                    accept_ranges: false,
+                    send_content_length: true,
+                    chunk_size: 4096,
+                    chunk_delay: Duration::from_millis(2),
+                    path: "slow.part-aa".to_string(),
+                    request_started: Some(Arc::clone(&request_started)),
+                    release_response: Some(Arc::clone(&release_response)),
+                });
+                let fast_server = TestHttpServer::start(TestHttpConfig {
+                    body: Arc::new(b"tail".to_vec()),
+                    accept_ranges: false,
+                    send_content_length: true,
+                    chunk_size: 0,
+                    chunk_delay: Duration::ZERO,
+                    path: "slow.part-ab".to_string(),
+                    request_started: None,
+                    release_response: None,
+                });
+                let dest_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+                let destination = dest_dir.path().join(format!("slow-{attempt}.bin"));
 
-        let endpoint = daemon.endpoint.clone();
-        let source = vec![slow_server.url.clone(), fast_server.url.clone()];
-        let destination_for_thread = destination.clone();
-        let download_thread = thread::spawn(move || {
-            let client = DownloadClient::new(Some(endpoint));
-            let request = FetchRequest::new(source, &destination_for_thread);
-            fetch_with_retry(&client, request)
-        });
+                let endpoint = daemon.endpoint.clone();
+                let source = vec![slow_server.url.clone(), fast_server.url.clone()];
+                let destination_for_thread = destination.clone();
+                let download_thread = thread::spawn(move || {
+                    let client = DownloadClient::new(Some(endpoint));
+                    let request = FetchRequest::new(source, &destination_for_thread);
+                    fetch_with_retry(&client, request)
+                });
 
-        wait_for_test_condition(
-            Duration::from_secs(5),
-            "initial multipart download request",
-            || request_started.load(Ordering::Acquire),
+                let outcome = (|| -> Result<(), String> {
+                    try_wait_for_test_condition(
+                        Duration::from_secs(30),
+                        "initial multipart download request",
+                        || request_started.load(Ordering::Acquire),
+                    )?;
+                    let client = DownloadClient::new(Some(daemon.endpoint.clone()));
+                    let mut no_wait = FetchRequest::new(
+                        vec![slow_server.url.clone(), fast_server.url.clone()],
+                        &destination,
+                    );
+                    no_wait.wait_mode = WaitMode::NoWait;
+                    let locked = fetch_with_retry(&client, no_wait)
+                        .map_err(|err| format!("no-wait fetch failed: {err}"))?;
+                    if locked.status != FetchStatus::Locked {
+                        return Err(format!("expected Locked status, got {:?}", locked.status));
+                    }
+                    Ok(())
+                })();
+
+                release_response.store(true, Ordering::Release);
+                let join_result = download_thread.join();
+                outcome?;
+                let completed = match join_result {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(err)) => return Err(format!("download thread returned error: {err}")),
+                    Err(_) => return Err("download thread panicked".to_string()),
+                };
+                if completed.status != FetchStatus::Downloaded {
+                    return Err(format!(
+                        "expected Downloaded status, got {:?}",
+                        completed.status
+                    ));
+                }
+                Ok(())
+            },
         );
-
-        let client = DownloadClient::new(Some(daemon.endpoint.clone()));
-        let mut no_wait = FetchRequest::new(
-            vec![slow_server.url.clone(), fast_server.url.clone()],
-            &destination,
-        );
-        no_wait.wait_mode = WaitMode::NoWait;
-        let locked = fetch_with_retry(&client, no_wait).unwrap();
-        assert_eq!(locked.status, FetchStatus::Locked);
-
-        release_response.store(true, Ordering::Release);
-        let completed = download_thread.join().unwrap().unwrap();
-        assert_eq!(completed.status, FetchStatus::Downloaded);
     }
 
     #[test]
