@@ -597,9 +597,9 @@ async fn perf_full_benchmark() {
         }
     };
 
-    let bare_dir = tempfile::tempdir().unwrap();
-    let sccache_dir = tempfile::tempdir().unwrap();
-    let zccache_dir = tempfile::tempdir().unwrap();
+    let bare_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let sccache_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let zccache_dir = zccache_test_support::temp_cache_dir().unwrap();
 
     generate_test_files(bare_dir.path(), FILE_COUNT);
     generate_test_files(sccache_dir.path(), FILE_COUNT);
@@ -652,7 +652,7 @@ async fn perf_sanity_check() {
         }
     };
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = zccache_test_support::temp_cache_dir().unwrap();
     generate_test_files(tmp.path(), 1);
     let cwd = tmp.path().to_string_lossy().into_owned();
 
@@ -689,7 +689,7 @@ async fn perf_sanity_check() {
     println!("sccache stats:\n{stats_text}");
 
     // zccache: cold then warm
-    let zcc_tmp = tempfile::tempdir().unwrap();
+    let zcc_tmp = zccache_test_support::temp_cache_dir().unwrap();
     generate_test_files(zcc_tmp.path(), 1);
     let zcc_cwd = zcc_tmp.path().to_string_lossy().into_owned();
     let log = zcc_tmp.path().join("log.txt");
