@@ -1,6 +1,11 @@
 //! Configuration types for zccache.
 
 use crate::NormalizedPath;
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+/// Environment variable used to override the zccache cache root.
+pub const CACHE_DIR_ENV: &str = "ZCCACHE_CACHE_DIR";
 
 /// Top-level configuration for zccache.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -42,10 +47,24 @@ impl Default for Config {
     }
 }
 
-/// Returns the default cache directory path: `~/.zccache` on all platforms.
+/// Returns the configured cache directory path.
+///
+/// If `ZCCACHE_CACHE_DIR` is set and non-empty, it is used as the cache root.
+/// Relative override paths are made absolute against the current working
+/// directory so the daemon and CLI derive the same subpaths when spawned
+/// together. If unset, this falls back to `~/.zccache` on all platforms.
 #[must_use]
 pub fn default_cache_dir() -> NormalizedPath {
+    if let Some(cache_dir) = cache_dir_override() {
+        return cache_dir;
+    }
     dirs_fallback().join(".zccache")
+}
+
+/// Returns the cache directory override from `ZCCACHE_CACHE_DIR`, if set.
+#[must_use]
+pub fn cache_dir_override() -> Option<NormalizedPath> {
+    cache_dir_from_env_value(std::env::var_os(CACHE_DIR_ENV))
 }
 
 /// Returns the directory for content-addressed compiled outputs.
@@ -147,14 +166,100 @@ fn dirs_fallback() -> NormalizedPath {
         .unwrap_or_else(|_| ".".into())
 }
 
+fn cache_dir_from_env_value(value: Option<OsString>) -> Option<NormalizedPath> {
+    let value = value?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(normalize_cache_dir_override(PathBuf::from(value)))
+}
+
+fn normalize_cache_dir_override(path: PathBuf) -> NormalizedPath {
+    if path.is_absolute() {
+        path.into()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(path)
+            .into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set_cache_dir(value: &std::path::Path) -> Self {
+            let lock = ENV_LOCK.lock().unwrap();
+            let previous = std::env::var_os(CACHE_DIR_ENV);
+            std::env::set_var(CACHE_DIR_ENV, value);
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+
+        fn remove_cache_dir() -> Self {
+            let lock = ENV_LOCK.lock().unwrap();
+            let previous = std::env::var_os(CACHE_DIR_ENV);
+            std::env::remove_var(CACHE_DIR_ENV);
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(CACHE_DIR_ENV, value),
+                None => std::env::remove_var(CACHE_DIR_ENV),
+            }
+        }
+    }
 
     #[test]
     fn default_cache_dir_ends_with_zccache() {
+        let _env = EnvGuard::remove_cache_dir();
         let dir = default_cache_dir();
         assert!(dir.ends_with(".zccache"));
+    }
+
+    #[test]
+    fn cache_dir_override_uses_non_empty_env_value() {
+        let root = tempfile::tempdir().unwrap();
+        let override_dir = root.path().join("zc");
+        let _env = EnvGuard::set_cache_dir(&override_dir);
+
+        assert_eq!(default_cache_dir(), override_dir);
+        assert_eq!(artifacts_dir(), override_dir.join("artifacts"));
+        assert_eq!(tmp_dir(), override_dir.join("tmp"));
+        assert_eq!(depgraph_dir(), override_dir.join("depgraph"));
+        assert_eq!(index_path(), override_dir.join("index.redb"));
+        assert_eq!(crash_dump_dir(), override_dir.join("crashes"));
+        assert_eq!(log_dir(), override_dir.join("logs"));
+    }
+
+    #[test]
+    fn cache_dir_override_ignores_empty_env_value() {
+        assert!(cache_dir_from_env_value(Some(OsString::new())).is_none());
+    }
+
+    #[test]
+    fn relative_cache_dir_override_is_made_absolute() {
+        let override_dir = cache_dir_from_env_value(Some(OsString::from("target/../zc"))).unwrap();
+        assert!(override_dir.is_absolute());
+        assert!(override_dir.ends_with("zc"));
     }
 
     #[test]

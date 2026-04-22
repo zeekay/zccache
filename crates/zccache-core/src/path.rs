@@ -259,6 +259,25 @@ pub fn normalize_for_key(path: &Path) -> String {
     }
 }
 
+/// Return a compact, stable identifier for a path.
+///
+/// This is intended for filesystem-derived runtime names such as Windows named
+/// pipes where the full normalized path may be too long or contain invalid
+/// characters. It is not a cryptographic digest.
+#[must_use]
+pub fn stable_path_id(path: &Path) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let key = normalize_for_key(path);
+    let mut hash = FNV_OFFSET;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
 /// Convert an MSYS2/Git Bash style path to a native Windows path.
 ///
 /// `/c/Users/foo` → `C:\Users\foo`
@@ -363,5 +382,12 @@ mod tests {
         // /usr/bin/gcc — bytes[2] is 's', not '/', so NOT a drive letter path
         let result = normalize_msys_path("/usr/bin/gcc");
         assert_eq!(result, "/usr/bin/gcc");
+    }
+
+    #[test]
+    fn stable_path_id_is_compact_and_deterministic() {
+        let path = Path::new("a/./b/../cache");
+        assert_eq!(stable_path_id(path), stable_path_id(path));
+        assert_eq!(stable_path_id(path).len(), 16);
     }
 }

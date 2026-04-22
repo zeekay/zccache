@@ -18,3 +18,6 @@ bytes = { workspace = true }
 serde = { workspace = true }
 zccache-protocol = { workspace = true }
 zccache-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

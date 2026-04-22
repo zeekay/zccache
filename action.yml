@@ -20,9 +20,8 @@ inputs:
     default: "true"
   cache-target:
     description: >
-      Cache cargo target/ metadata (fingerprints, dep-info, build script outputs).
+      Cache a target/ snapshot (excluding incremental/) and run zccache warm.
       Allows cargo to skip invoking rustc entirely on warm builds.
-      Only caches lightweight metadata, not full .rlib files.
     required: false
     default: "true"
   compilation-restore-fallback:
@@ -34,9 +33,9 @@ inputs:
     default: "true"
   target-restore-fallback:
     description: >
-      Whether restore-key fallback is allowed for cargo target metadata.
-      Default "false" because fallback metadata can be stale for changed source
-      trees, especially on pull_request merge refs.
+      Whether restore-key fallback is allowed for cargo target snapshots.
+      Default "false" because fallback snapshots can be stale for changed
+      source trees, especially on pull_request merge refs.
     required: false
     default: "false"
   target-dir:
@@ -72,7 +71,7 @@ outputs:
     description: "Whether the cargo registry cache was restored"
     value: ${{ steps.restore-registry.outputs.cache-hit }}
   cache-hit-target:
-    description: "Whether the cargo target metadata cache was restored"
+    description: "Whether the cargo target snapshot cache was restored"
     value: ${{ steps.restore-target.outputs.cache-hit }}
 
 runs:
@@ -151,10 +150,10 @@ runs:
         key: ${{ steps.keys.outputs.registry-key }}
         restore-keys: ${{ steps.keys.outputs.registry-restore }}
 
-    # --- Layer 3: Restore cargo target metadata ---
-    # Restores lightweight target metadata (fingerprints, build script outputs,
-    # dep-info). The heavy .rlib/.rmeta files are filled in by `zccache warm`.
-    - name: Restore cargo target metadata
+    # --- Layer 3: Restore cargo target snapshot ---
+    # Restores target/ as a single tarball (excluding incremental/). `zccache warm`
+    # also fills in cached artifacts from the compilation cache when available.
+    - name: Restore cargo target snapshot
       id: restore-target
       if: inputs.cache-target == 'true'
       uses: actions/cache/restore@v4
@@ -163,7 +162,7 @@ runs:
         key: ${{ steps.keys.outputs.target-key }}
         restore-keys: ${{ steps.keys.outputs.target-restore }}
 
-    - name: Extract target metadata
+    - name: Extract target snapshot
       if: inputs.cache-target == 'true'
       shell: bash
       run: |
@@ -172,7 +171,7 @@ runs:
         if [ -f "$META_TAR" ]; then
           mkdir -p "$TARGET"
           tar xf "$META_TAR" -C "$TARGET" 2>/dev/null || true
-          echo "Restored target metadata ($(du -sh "$META_TAR" | cut -f1))"
+          echo "Restored target snapshot ($(du -sh "$META_TAR" | cut -f1))"
         fi
 
     # --- Install zccache ---
