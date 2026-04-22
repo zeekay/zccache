@@ -5,7 +5,7 @@
 //!   - `perf_response_file`: C++ same workload but args passed via large nested response files
 //!   - `perf_rustc_zccache_vs_sccache`: Rust single-file compilation (lib crates)
 //!
-//! Each tool gets its own fresh tempdir to avoid OS page cache cross-contamination.
+//! Each tool gets its own fresh zccache-prefixed tempdir to avoid OS page cache cross-contamination.
 //!
 //! Run with: SOLDR_RUSTC_WRAPPER=none soldr cargo test -p zccache-daemon --test perf_bench_test -- --nocapture --ignored
 
@@ -604,7 +604,7 @@ async fn perf_warm_cache_zccache_vs_sccache() {
     eprintln!();
 
     // ── Baseline (fresh dir) ──────────────────────────────────────────
-    let bl_dir = tempfile::tempdir().unwrap();
+    let bl_dir = zccache_test_support::temp_cache_dir().unwrap();
     generate_project(bl_dir.path());
 
     eprintln!("  [1/3] Bare clang (baseline)");
@@ -635,11 +635,11 @@ async fn perf_warm_cache_zccache_vs_sccache() {
     let sccache_multi_times;
 
     if let Some(sccache_bin) = find_sccache() {
-        let sc_dir = tempfile::tempdir().unwrap();
+        let sc_dir = zccache_test_support::temp_cache_dir().unwrap();
         generate_project(sc_dir.path());
 
         // Use a fresh cache dir so previous sccache usage doesn't pollute results.
-        let sc_cache_dir = tempfile::tempdir().unwrap();
+        let sc_cache_dir = zccache_test_support::temp_cache_dir().unwrap();
         let sc_cache_str = sc_cache_dir.path().to_string_lossy().into_owned();
 
         // Set SCCACHE_DIR for this process so both server and client see it.
@@ -734,7 +734,7 @@ async fn perf_warm_cache_zccache_vs_sccache() {
     }
 
     // ── zccache (fresh dir, in-process daemon) ────────────────────────
-    let zc_dir = tempfile::tempdir().unwrap();
+    let zc_dir = zccache_test_support::temp_cache_dir().unwrap();
     generate_project(zc_dir.path());
     let zc_cwd = zc_dir.path().to_string_lossy().into_owned();
 
@@ -939,7 +939,7 @@ async fn perf_response_file() {
     eprintln!();
 
     // ── Baseline RSP (fresh dir) ─────────────────────────────────────
-    let bl_dir = tempfile::tempdir().unwrap();
+    let bl_dir = zccache_test_support::temp_cache_dir().unwrap();
     generate_project(bl_dir.path());
     generate_response_files(bl_dir.path());
 
@@ -970,11 +970,11 @@ async fn perf_response_file() {
     let sccache_multi_times;
 
     if let Some(sccache_bin) = find_sccache() {
-        let sc_dir = tempfile::tempdir().unwrap();
+        let sc_dir = zccache_test_support::temp_cache_dir().unwrap();
         generate_project(sc_dir.path());
         generate_response_files(sc_dir.path());
 
-        let sc_cache_dir = tempfile::tempdir().unwrap();
+        let sc_cache_dir = zccache_test_support::temp_cache_dir().unwrap();
         let sc_cache_str = sc_cache_dir.path().to_string_lossy().into_owned();
         std::env::set_var("SCCACHE_DIR", &sc_cache_str);
 
@@ -1060,7 +1060,7 @@ async fn perf_response_file() {
     }
 
     // ── zccache RSP (fresh dir, in-process daemon) ───────────────────
-    let zc_dir = tempfile::tempdir().unwrap();
+    let zc_dir = zccache_test_support::temp_cache_dir().unwrap();
     generate_project(zc_dir.path());
     generate_response_files(zc_dir.path());
     let zc_cwd = zc_dir.path().to_string_lossy().into_owned();
@@ -1480,7 +1480,7 @@ async fn perf_rustc_zccache_vs_sccache() {
     eprintln!("  ─── Build mode (cargo build) ───");
     eprintln!();
 
-    let bl_dir = tempfile::tempdir().unwrap();
+    let bl_dir = zccache_test_support::temp_cache_dir().unwrap();
     generate_rust_project(bl_dir.path());
     eprintln!("  [1/3] Bare rustc");
     warmup_rustc(&rc, bl_dir.path());
@@ -1494,9 +1494,9 @@ async fn perf_rustc_zccache_vs_sccache() {
     let build_sc_cold;
     let build_sc_warm;
     if let Some(ref scc_bin) = find_sccache() {
-        let sd = tempfile::tempdir().unwrap();
+        let sd = zccache_test_support::temp_cache_dir().unwrap();
         generate_rust_project(sd.path());
-        let scd = tempfile::tempdir().unwrap();
+        let scd = zccache_test_support::temp_cache_dir().unwrap();
         let scd_s = scd.path().to_string_lossy().into_owned();
         std::env::set_var("SCCACHE_DIR", &scd_s);
         eprintln!("  [2/3] sccache");
@@ -1544,7 +1544,7 @@ async fn perf_rustc_zccache_vs_sccache() {
         build_sc_warm = None;
     }
 
-    let zd = tempfile::tempdir().unwrap();
+    let zd = zccache_test_support::temp_cache_dir().unwrap();
     generate_rust_project(zd.path());
     let zc = zd.path().to_string_lossy().into_owned();
     eprintln!("  [3/3] zccache");
@@ -1579,7 +1579,7 @@ async fn perf_rustc_zccache_vs_sccache() {
     eprintln!("  ─── Check mode (cargo check) ───");
     eprintln!();
 
-    let bl_dir2 = tempfile::tempdir().unwrap();
+    let bl_dir2 = zccache_test_support::temp_cache_dir().unwrap();
     generate_rust_project(bl_dir2.path());
     eprintln!("  [1/3] Bare rustc");
     warmup_rustc(&rc, bl_dir2.path());
@@ -1593,9 +1593,9 @@ async fn perf_rustc_zccache_vs_sccache() {
     let check_sc_cold;
     let check_sc_warm;
     if let Some(ref scc_bin) = find_sccache() {
-        let sd = tempfile::tempdir().unwrap();
+        let sd = zccache_test_support::temp_cache_dir().unwrap();
         generate_rust_project(sd.path());
-        let scd = tempfile::tempdir().unwrap();
+        let scd = zccache_test_support::temp_cache_dir().unwrap();
         let scd_s = scd.path().to_string_lossy().into_owned();
         std::env::set_var("SCCACHE_DIR", &scd_s);
         eprintln!("  [2/3] sccache");

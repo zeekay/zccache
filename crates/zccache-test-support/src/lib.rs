@@ -4,6 +4,7 @@
 //! daemon lifecycle management, and test fixtures.
 
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 use zccache_core::NormalizedPath;
 
 // ─── Tool discovery ─────────────────────────────────────────────────────────
@@ -143,7 +144,52 @@ pub async fn test_timeout<F: std::future::Future<Output = ()>>(f: F) {
 ///
 /// Returns an error if the temp directory cannot be created.
 pub fn temp_cache_dir() -> std::io::Result<tempfile::TempDir> {
-    tempfile::Builder::new().prefix("zccache-test-").tempdir()
+    use std::sync::Once;
+
+    const TEMP_PREFIX: &str = "zccache-test-";
+    const STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+    static CLEANUP_ONCE: Once = Once::new();
+    CLEANUP_ONCE.call_once(|| cleanup_stale_temp_dirs(TEMP_PREFIX, STALE_AFTER));
+
+    tempfile::Builder::new().prefix(TEMP_PREFIX).tempdir()
+}
+
+fn cleanup_stale_temp_dirs(prefix: &str, stale_after: Duration) {
+    let root = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let now = SystemTime::now();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(prefix) {
+            continue;
+        }
+
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age < stale_after {
+            continue;
+        }
+
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
 
 /// Initialize tracing for tests (only installs once).
