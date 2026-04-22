@@ -4430,14 +4430,18 @@ mod tests {
     #[test]
     fn trim_request_cache_removes_old_entries() {
         let cache = DashMap::new();
-        let now = std::time::Instant::now();
-        cache.insert(ContentHash::from_bytes([1; 32]), test_request_entry(now));
+        let max_age = std::time::Duration::from_millis(1);
         cache.insert(
             ContentHash::from_bytes([2; 32]),
-            test_request_entry(now - std::time::Duration::from_secs(600)),
+            test_request_entry(std::time::Instant::now()),
+        );
+        std::thread::sleep(max_age * 2);
+        cache.insert(
+            ContentHash::from_bytes([1; 32]),
+            test_request_entry(std::time::Instant::now()),
         );
 
-        let removed = trim_request_cache(&cache, EPHEMERAL_CACHE_MAX_AGE);
+        let removed = trim_request_cache(&cache, max_age);
 
         assert_eq!(removed, 1);
         assert_eq!(cache.len(), 1);
