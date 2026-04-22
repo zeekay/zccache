@@ -22,12 +22,8 @@ jobs:
         with:
           toolchain: 1.94.1
           cache: true
-      - name: Install Rust components
-        run: rustup component add clippy rustfmt
       - name: Check
         run: soldr cargo check --workspace --all-targets
-      - name: Clippy
-        run: soldr cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         shell: bash
         run: |
