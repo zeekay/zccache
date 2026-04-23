@@ -49,7 +49,7 @@ def stage_tree(version: str, target: str, binary_ext: str, input_dir: Path, outp
 
 
 def write_tarball(stage_dir: Path, archive_base: Path) -> Path:
-    archive_path = archive_base.with_suffix(".tar.gz")
+    archive_path = archive_base.parent / f"{archive_base.name}.tar.gz"
     if archive_path.exists():
         archive_path.unlink()
     with tarfile.open(archive_path, "w:gz") as tar:
@@ -58,7 +58,7 @@ def write_tarball(stage_dir: Path, archive_base: Path) -> Path:
 
 
 def write_zip(stage_dir: Path, archive_base: Path) -> Path:
-    archive_path = archive_base.with_suffix(".zip")
+    archive_path = archive_base.parent / f"{archive_base.name}.zip"
     if archive_path.exists():
         archive_path.unlink()
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
