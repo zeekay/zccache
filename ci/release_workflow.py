@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import platform as platform_module
 import shutil
 import stat
 import subprocess
@@ -472,11 +473,41 @@ def _can_smoke_install_wheel_on_host(wheel_path: Path) -> bool:
         return False
     if "-py3-none-any.whl" in name:
         return True
+
+    platform_tags = _wheel_platform_tags(name)
+    host_arch = _normalized_host_arch()
     if sys.platform.startswith("linux"):
-        return "manylinux" in name or "musllinux" in name
+        return any(
+            (
+                tag.startswith(("manylinux", "musllinux", "linux"))
+                and tag.endswith(f"_{host_arch}")
+            )
+            for tag in platform_tags
+        )
     if sys.platform == "darwin":
-        return "macosx" in name
+        return any(
+            tag.startswith("macosx") and tag.endswith(f"_{host_arch}")
+            for tag in platform_tags
+        )
     return False
+
+
+def _wheel_platform_tags(wheel_name: str) -> list[str]:
+    if not wheel_name.endswith(".whl"):
+        return []
+    parts = wheel_name[:-4].split("-")
+    if len(parts) < 5:
+        return []
+    return parts[-1].split(".")
+
+
+def _normalized_host_arch() -> str:
+    machine = platform_module.machine().lower().replace("-", "_")
+    return {
+        "amd64": "x86_64",
+        "x64": "x86_64",
+        "arm64": "aarch64",
+    }.get(machine, machine)
 
 
 def build_all_wheels(
