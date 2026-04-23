@@ -157,7 +157,7 @@ where
 
 fn cleanup_legacy_temp_cache_dir(temp_root: &Path, current_cache_dir: &Path) -> usize {
     let legacy_cache_dir = temp_root.join(".zccache");
-    if legacy_cache_dir == current_cache_dir {
+    if path_is_or_contains(&legacy_cache_dir, current_cache_dir) {
         return 0;
     }
 
@@ -235,6 +235,20 @@ fn legacy_temp_depfile_pid(name: &str) -> Option<u32> {
 fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|meta| meta.file_type().is_dir())
+        .unwrap_or(false)
+}
+
+fn path_is_or_contains(parent: &Path, child: &Path) -> bool {
+    if child.starts_with(parent) {
+        return true;
+    }
+
+    let parent = match std::fs::canonicalize(parent) {
+        Ok(parent) => parent,
+        Err(_) => return false,
+    };
+    std::fs::canonicalize(child)
+        .map(|child| child.starts_with(parent))
         .unwrap_or(false)
 }
 
@@ -508,6 +522,24 @@ mod tests {
     fn cleanup_legacy_temp_root_state_skips_current_cache_dir() {
         let temp_root = tempfile::tempdir().unwrap();
         let current_cache_dir = temp_root.path().join(".zccache");
+        std::fs::create_dir_all(&current_cache_dir).unwrap();
+        std::fs::write(current_cache_dir.join("sentinel"), "keep").unwrap();
+
+        let cleaned =
+            cleanup_legacy_temp_root_state(temp_root.path(), &current_cache_dir, |_| false);
+
+        assert_eq!(cleaned, 0);
+        assert!(current_cache_dir.exists());
+        assert_eq!(
+            std::fs::read_to_string(current_cache_dir.join("sentinel")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn cleanup_legacy_temp_root_state_skips_parent_of_current_cache_dir() {
+        let temp_root = tempfile::tempdir().unwrap();
+        let current_cache_dir = temp_root.path().join(".zccache").join("current");
         std::fs::create_dir_all(&current_cache_dir).unwrap();
         std::fs::write(current_cache_dir.join("sentinel"), "keep").unwrap();
 
