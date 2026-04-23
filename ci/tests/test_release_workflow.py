@@ -93,6 +93,31 @@ def test_assert_installed_wheel_scripts_executable_accepts_pip_target_install(
     assert_installed_wheel_scripts_executable(wheel_path)
 
 
+def test_can_smoke_install_wheel_on_host_rejects_cross_arch_linux_wheel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(release_workflow.os, "name", "posix")
+    monkeypatch.setattr(release_workflow.sys, "platform", "linux")
+    monkeypatch.setattr(release_workflow.platform_module, "machine", lambda: "x86_64")
+
+    assert release_workflow._can_smoke_install_wheel_on_host(
+        Path("zccache-1.2.3-py3-none-manylinux_2_17_x86_64.whl")
+    )
+    assert not release_workflow._can_smoke_install_wheel_on_host(
+        Path("zccache-1.2.3-py3-none-manylinux_2_17_aarch64.whl")
+    )
+
+
+def test_can_smoke_install_wheel_on_host_accepts_pure_python_wheel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(release_workflow.os, "name", "posix")
+
+    assert release_workflow._can_smoke_install_wheel_on_host(
+        Path("zccache-1.2.3-py3-none-any.whl")
+    )
+
+
 def test_check_crates_versions_fails_preflight_when_all_crates_exist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
