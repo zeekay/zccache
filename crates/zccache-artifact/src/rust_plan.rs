@@ -465,6 +465,7 @@ pub fn save_rust_plan_local(
     cache_dir: &Path,
 ) -> Result<RustPlanSummary, RustPlanError> {
     plan.validate()?;
+    ensure_supported_cache_schema_version(plan.cache_schema_version)?;
     let cache_key = rust_plan_cache_key(plan);
     let bundle_dir = rust_plan_bundle_dir(cache_dir, &cache_key);
     let files_dir = bundle_dir.join(BUNDLE_FILES_DIR);
@@ -530,6 +531,7 @@ pub fn restore_rust_plan_local(
     cache_dir: &Path,
 ) -> Result<RustPlanSummary, RustPlanError> {
     plan.validate()?;
+    ensure_supported_cache_schema_version(plan.cache_schema_version)?;
     let cache_key = rust_plan_cache_key(plan);
     let bundle_dir = rust_plan_bundle_dir(cache_dir, &cache_key);
     let files_dir = bundle_dir.join(BUNDLE_FILES_DIR);
@@ -817,6 +819,16 @@ fn json_u32_field(value: &serde_json::Value, field: &'static str) -> Result<u32,
     u32::try_from(n).map_err(|_| RustPlanError::InvalidPlan(format!("{field} is too large")))
 }
 
+
+fn ensure_supported_cache_schema_version(cache_schema_version: u32) -> Result<(), RustPlanError> {
+    if cache_schema_version != RUST_ARTIFACT_CACHE_SCHEMA_VERSION {
+        return Err(RustPlanError::UnsupportedCacheSchemaVersion {
+            found: cache_schema_version,
+            supported: RUST_ARTIFACT_CACHE_SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
 fn relative_path_string(path: &Path) -> String {
     path.components()
         .filter_map(|component| match component {
@@ -992,6 +1004,68 @@ mod tests {
         write(&target.join("incremental").join("state.bin"), b"transient");
     }
 
+    fn synthetic_target_with_package_exclusions(root: &Path) {
+        synthetic_target(root);
+        let target = root.join("target").join("debug");
+        write(
+            &target.join("deps").join("libapp-abc.rmeta"),
+            b"workspace rmeta",
+        );
+        write(&target.join("deps").join("app-abc.d"), b"workspace depinfo");
+        write(
+            &target.join("deps").join("liblocal_dep-abc.rmeta"),
+            b"path dep rmeta",
+        );
+        write(
+            &target.join("deps").join("local_dep-abc.d"),
+            b"path dep depinfo",
+        );
+        write(
+            &target
+                .join(".fingerprint")
+                .join("app-abc")
+                .join("dep-lib-app"),
+            b"workspace fingerprint",
+        );
+        write(
+            &target
+                .join(".fingerprint")
+                .join("local_dep-abc")
+                .join("dep-lib-local_dep"),
+            b"path dep fingerprint",
+        );
+        write(
+            &target
+                .join("build")
+                .join("app-abc")
+                .join("invoked.timestamp"),
+            b"workspace timestamp",
+        );
+        write(
+            &target
+                .join("build")
+                .join("local_dep-abc")
+                .join("invoked.timestamp"),
+            b"path dep timestamp",
+        );
+        write(
+            &target
+                .join("build")
+                .join("app-abc")
+                .join("out")
+                .join("gen.rs"),
+            b"workspace generated",
+        );
+        write(
+            &target
+                .join("build")
+                .join("local_dep-abc")
+                .join("out")
+                .join("gen.rs"),
+            b"path dep generated",
+        );
+    }
+
     #[test]
     fn rejects_unsupported_schema_before_deserializing_unknown_fields() {
         let raw = serde_json::json!({
@@ -1009,6 +1083,68 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rejects_unsupported_cache_schema_before_filesystem_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        synthetic_target(dir.path());
+        let plan = RustArtifactPlanV1 {
+            cache_schema_version: 99,
+            ..sample_plan(dir.path(), RustPlanMode::Thin)
+        };
+        let cache = dir.path().join("cache");
+
+        let err = save_rust_plan_local(&plan, &cache).unwrap_err();
+        assert!(matches!(
+            err,
+            RustPlanError::UnsupportedCacheSchemaVersion {
+                found: 99,
+                supported: 1
+            }
+        ));
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    fn restore_rejects_unsupported_cache_schema_before_filesystem_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        synthetic_target(dir.path());
+        let plan = RustArtifactPlanV1 {
+            cache_schema_version: 99,
+            ..sample_plan(dir.path(), RustPlanMode::Thin)
+        };
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(plan.target_dir.as_path()).unwrap();
+        let sentinel = plan.target_dir.join("sentinel.txt");
+        std::fs::write(&sentinel, b"keep me").unwrap();
+
+        let err = restore_rust_plan_local(&plan, &cache).unwrap_err();
+        assert!(matches!(
+            err,
+            RustPlanError::UnsupportedCacheSchemaVersion {
+                found: 99,
+                supported: 1
+            }
+        ));
+        assert!(sentinel.exists());
+    }
+
+    #[test]
+    fn omitted_or_empty_allowed_classes_default_to_thin_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan_value = serde_json::to_value(sample_plan(dir.path(), RustPlanMode::Thin)).unwrap();
+
+        plan_value.as_object_mut().unwrap().remove("allowed_artifact_classes");
+        let omitted = RustArtifactPlanV1::from_json_value(plan_value.clone()).unwrap();
+        assert_eq!(omitted.effective_allowed_classes(), default_thin_classes());
+
+        plan_value
+            .as_object_mut()
+            .unwrap()
+            .insert("allowed_artifact_classes".to_string(), serde_json::json!([]));
+        let empty = RustArtifactPlanV1::from_json_value(plan_value).unwrap();
+        assert_eq!(empty.effective_allowed_classes(), default_thin_classes());
+    }
     #[test]
     fn thin_save_restore_selects_dependency_artifacts_and_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -1169,7 +1305,7 @@ mod tests {
     #[test]
     fn package_name_parsing_handles_cargo_package_id_shapes() {
         assert_eq!(
-            package_name_from_id("serde 1.0.0 (registry+https://example.invalid)"),
+            package_name_from_id("registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0"),
             Some("serde".to_string())
         );
         assert_eq!(
@@ -1178,6 +1314,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn thin_package_exclusions_match_deps_fingerprint_and_build_by_package_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        synthetic_target_with_package_exclusions(dir.path());
+        let mut plan = sample_plan(dir.path(), RustPlanMode::Thin);
+        plan.packages.workspace_package_ids = vec![
+            "registry+https://github.com/rust-lang/crates.io-index#app@0.1.0".to_string(),
+        ];
+        plan.packages.excluded_path_package_ids = vec![
+            "path+file:///workspace/local_dep#local-dep@0.1.0".to_string(),
+        ];
+        let cache = dir.path().join("cache");
+
+        let saved = save_rust_plan_local(&plan, &cache).unwrap();
+        assert_eq!(saved.saved_file_count, 6);
+        assert_eq!(
+            saved
+                .skipped_reasons
+                .get("workspace_or_path_dependency_excluded_by_plan"),
+            Some(&12)
+        );
+        assert_eq!(saved.skipped_reasons.get("transient_state"), Some(&1));
+        assert!(saved
+            .skipped_samples
+            .iter()
+            .any(|sample| sample.path.ends_with("debug/deps/libapp-abc.rlib")));
+        assert!(saved
+            .skipped_samples
+            .iter()
+            .any(|sample| sample.path.ends_with("debug/.fingerprint/app-abc/dep-lib-app")));
+        assert!(saved
+            .skipped_samples
+            .iter()
+            .any(|sample| sample.path.ends_with("debug/build/local_dep-abc/out/gen.rs")));
+    }
     #[test]
     fn from_json_str_accepts_utf8_bom() {
         let dir = tempfile::tempdir().unwrap();
