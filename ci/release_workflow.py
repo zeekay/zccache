@@ -171,10 +171,10 @@ def check_pypi_version(name: str, version: str) -> set[str]:
             expected_files = expected_pypi_wheel_filenames(name, version)
             if latest_version == version and expected_files.issubset(release_files):
                 log(
-                    f"  ERROR: {version} is already the latest PyPI release and all "
-                    "expected wheels are present."
+                    f"  {version} is already the latest PyPI release and all "
+                    "expected wheels are present; PyPI publish will be skipped."
                 )
-                raise SystemExit(1)
+                return release_files
             log(
                 f"  {name} {version} already exists on PyPI with {len(release_files)} "
                 "file(s); missing files may still be published."
@@ -205,7 +205,7 @@ def crate_version_exists(name: str, version: str) -> bool:
         raise
 
 
-def check_crates_versions(version: str, *, fail_if_all_exist: bool = True) -> set[str]:
+def check_crates_versions(version: str) -> set[str]:
     log(f"\n=== Pre-check crates.io for Rust crates {version} ===")
     existing: list[str] = []
     for crate in RUST_PUBLISH_ORDER:
@@ -220,15 +220,21 @@ def check_crates_versions(version: str, *, fail_if_all_exist: bool = True) -> se
 
     all_crates_exist = len(existing) == len(RUST_PUBLISH_ORDER)
     if all_crates_exist:
-        if fail_if_all_exist:
-            log("  ERROR: all publishable crates already exist on crates.io")
-            raise SystemExit(1)
-        log("  All publishable crates already exist on crates.io; nothing to publish.")
+        log("  All publishable crates already exist on crates.io; crates publish will be skipped.")
 
     if existing and not all_crates_exist:
         log("  Resuming partial crates.io release; already-published crates will be skipped.")
 
     return set(existing)
+
+
+def write_github_output(values: dict[str, str]) -> None:
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if not output_path:
+        return
+    with open(output_path, "a", encoding="utf-8") as f:
+        for key, value in values.items():
+            f.write(f"{key}={value}\n")
 
 
 def organize_downloaded_artifacts(artifacts_root: Path) -> None:
@@ -588,8 +594,22 @@ def publish_rust_crates(version: str, existing_crates: set[str] | None = None) -
 
 def command_check_registries(_: argparse.Namespace) -> None:
     name, version, *_ = read_project_meta()
-    check_pypi_version(name, version)
-    check_crates_versions(version)
+    pypi_files = check_pypi_version(name, version)
+    expected_pypi_files = expected_pypi_wheel_filenames(name, version)
+    existing_crates = check_crates_versions(version)
+    pypi_complete = expected_pypi_files.issubset(pypi_files)
+    crates_complete = len(existing_crates) == len(RUST_PUBLISH_ORDER)
+    write_github_output(
+        {
+            "pypi_complete": str(pypi_complete).lower(),
+            "crates_complete": str(crates_complete).lower(),
+        }
+    )
+    log(
+        "\n=== Registry publish plan ===\n"
+        f"  PyPI: {'skip' if pypi_complete else 'publish missing files'}\n"
+        f"  crates.io: {'skip' if crates_complete else 'publish missing crates'}"
+    )
 
 
 def command_build_wheels(args: argparse.Namespace) -> None:
@@ -606,7 +626,7 @@ def command_publish_crates(_: argparse.Namespace) -> None:
     if not os.environ.get("CARGO_REGISTRY_TOKEN"):
         raise SystemExit("ERROR: CARGO_REGISTRY_TOKEN is required for crates.io publish")
     version = read_workspace_version()
-    existing_crates = check_crates_versions(version, fail_if_all_exist=False)
+    existing_crates = check_crates_versions(version)
     publish_rust_crates(version, existing_crates)
 
 
@@ -618,7 +638,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     check_parser = subparsers.add_parser(
         "check-registries",
-        help="Fail fast if the current version is already fully published.",
+        help="Report which registries still need publishing for the current version.",
     )
     check_parser.set_defaults(func=command_check_registries)
 

@@ -118,23 +118,41 @@ def test_can_smoke_install_wheel_on_host_accepts_pure_python_wheel(
     )
 
 
-def test_check_crates_versions_fails_preflight_when_all_crates_exist(
+def test_check_crates_versions_reports_all_existing_crates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(release_workflow, "RUST_PUBLISH_ORDER", ["zccache-a", "zccache-b"])
     monkeypatch.setattr(release_workflow, "crate_version_exists", lambda _name, _version: True)
 
-    with pytest.raises(SystemExit):
-        release_workflow.check_crates_versions("1.2.3")
+    assert release_workflow.check_crates_versions("1.2.3") == {
+        "zccache-a",
+        "zccache-b",
+    }
 
 
-def test_check_crates_versions_allows_publish_resume_when_all_crates_exist(
+def test_command_check_registries_writes_registry_completion_outputs(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(release_workflow, "RUST_PUBLISH_ORDER", ["zccache-a", "zccache-b"])
     monkeypatch.setattr(release_workflow, "crate_version_exists", lambda _name, _version: True)
+    monkeypatch.setattr(
+        release_workflow,
+        "read_project_meta",
+        lambda: ("zccache", "1.2.3", "", ">=3.9", ""),
+    )
+    expected_wheels = release_workflow.expected_pypi_wheel_filenames("zccache", "1.2.3")
+    monkeypatch.setattr(
+        release_workflow,
+        "check_pypi_version",
+        lambda _name, _version: expected_wheels,
+    )
+    output_path = tmp_path / "github-output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_path))
 
-    assert release_workflow.check_crates_versions(
-        "1.2.3",
-        fail_if_all_exist=False,
-    ) == {"zccache-a", "zccache-b"}
+    release_workflow.command_check_registries(None)  # type: ignore[arg-type]
+
+    assert output_path.read_text(encoding="utf-8") == (
+        "pypi_complete=true\n"
+        "crates_complete=true\n"
+    )
