@@ -2685,11 +2685,10 @@ async fn handle_compile(
     // discovery, watch_directories, response file expansion, arg parsing,
     // context building, and dep_graph registration.
     if state.watcher_active.load(Ordering::Acquire) {
-        let cache_now = Instant::now();
         let request_fp = request_fingerprint(compiler_path, &expanded_args, cwd);
         if let Some(req_entry) = state.request_cache.get(&request_fp) {
             if let Some(fh_entry) = state.fast_hit_cache.get(&req_entry.context_key) {
-                if cache_entry_fresh_at(cache_now, fh_entry.cached_at, FAST_HIT_MAX_AGE)
+                if cache_entry_fresh_at(compile_start, fh_entry.cached_at, FAST_HIT_MAX_AGE)
                     && context_files_fresh(
                         state,
                         &req_entry.context_key,
@@ -2825,6 +2824,7 @@ async fn handle_compile(
                 cwd.into(),
                 system_includes,
                 client_env,
+                compile_start,
             )
             .await;
         }
@@ -2877,9 +2877,8 @@ async fn handle_compile(
     // Uses per-file journal checks instead of global clock comparison so
     // output file writes don't invalidate unrelated fast-hit entries.
     if state.watcher_active.load(Ordering::Acquire) {
-        let cache_now = Instant::now();
         if let Some(entry) = state.fast_hit_cache.get(&context_key) {
-            if cache_entry_fresh_at(cache_now, entry.cached_at, FAST_HIT_MAX_AGE)
+            if cache_entry_fresh_at(compile_start, entry.cached_at, FAST_HIT_MAX_AGE)
                 && context_files_fresh(state, &context_key, &source_path, entry.clock)
             {
                 let artifact_key_hex = &entry.artifact_key_hex;
@@ -3736,6 +3735,7 @@ fn check_unit_cache(
     cwd_path: &Path,
     system_includes: &[NormalizedPath],
     shared_base: Option<&CompileContext>,
+    cache_now: Instant,
 ) -> UnitCacheResult {
     let t0 = std::time::Instant::now();
     let snap_clock = state.cache_system.current_clock();
@@ -3778,7 +3778,6 @@ fn check_unit_cache(
     // If the watcher is active and none of the source/header files have
     // changed since the last verified hit, skip ALL hash/depgraph work.
     if state.watcher_active.load(Ordering::Acquire) {
-        let cache_now = Instant::now();
         if let Some(entry) = state.fast_hit_cache.get(&context_key) {
             if cache_entry_fresh_at(cache_now, entry.cached_at, FAST_HIT_MAX_AGE)
                 && context_files_fresh(state, &context_key, &source_path, entry.clock)
@@ -3977,6 +3976,7 @@ async fn handle_compile_multi(
     cwd_path: NormalizedPath,
     system_includes: Vec<NormalizedPath>,
     client_env: Option<Vec<(String, String)>>,
+    compile_start: Instant,
 ) -> Response {
     let snap_clock = state.cache_system.current_clock();
     let mut all_stdout = Vec::new();
@@ -4011,6 +4011,7 @@ async fn handle_compile_multi(
         let system_includes = system_includes.clone();
         let compilation = compilation.clone();
         let shared_base = Arc::clone(&shared_base);
+        let cache_now = compile_start;
         join_set.spawn_blocking(move || {
             (
                 idx,
@@ -4020,6 +4021,7 @@ async fn handle_compile_multi(
                     &cwd_path,
                     &system_includes,
                     Some(&shared_base),
+                    cache_now,
                 ),
             )
         });
@@ -4532,6 +4534,17 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(cache.len(), 1);
         assert!(cache.contains_key(&ContentHash::from_bytes([1; 32])));
+    }
+
+    #[test]
+    fn cache_entry_freshness_uses_supplied_timestamp() {
+        let max_age = std::time::Duration::from_millis(10);
+        let cached_at = std::time::Instant::now();
+        let compile_start = cached_at.checked_add(max_age / 2).unwrap();
+        let later_check = cached_at.checked_add(max_age * 2).unwrap();
+
+        assert!(cache_entry_fresh_at(compile_start, cached_at, max_age));
+        assert!(!cache_entry_fresh_at(later_check, cached_at, max_age));
     }
 
     #[test]
