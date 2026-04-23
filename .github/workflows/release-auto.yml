@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag || github.ref_name }}
+          ref: ${{ github.ref_type == 'tag' && github.ref_name || github.ref_name }}
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
