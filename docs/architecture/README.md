@@ -9,5 +9,6 @@ Detailed design specification for zccache, split by subsystem.
 | [ipc.md](ipc.md) | Transport abstraction, socket discovery, connection lifecycle |
 | [metadata-cache.md](metadata-cache.md) | In-memory cache, confidence model, file watcher integration |
 | [artifact-store.md](artifact-store.md) | Disk layout, redb index, eviction, corruption detection |
+| [rust-artifact-plan.md](rust-artifact-plan.md) | Rust plan ownership, thin/full semantics, backends, diagnostics, CLI contract |
 | [runtime.md](runtime.md) | Concurrency, correctness model, failure modes, crash recovery |
 | [portability.md](portability.md) | Platform differences, path handling, future extensions |
