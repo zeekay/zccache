@@ -192,9 +192,7 @@ fn validate_consistent(
 }
 
 fn validate_absolute(flag: &PathFlag) -> Result<(), StrictPathsViolation> {
-    let reason = if flag.path.contains('\\') {
-        Some("expected forward-slash absolute path")
-    } else if !is_forward_absolute(&flag.path) {
+    let reason = if flag.path.contains('\\') || !is_forward_absolute(&flag.path) {
         Some("expected forward-slash absolute path")
     } else if has_dot_component(&flag.path) {
         Some("expected normalized path without /./ or /../ components")
