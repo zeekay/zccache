@@ -5,8 +5,16 @@
 
 #![allow(clippy::missing_errors_doc)] // TODO: add error docs
 
+mod rust_plan;
 mod store;
 
+pub use rust_plan::{
+    restore_rust_plan_local, rust_plan_bundle_dir, rust_plan_cache_key, save_rust_plan_local,
+    RustArtifactBundleManifest, RustArtifactClass, RustArtifactPlanV1, RustBundledArtifact,
+    RustPlanArtifactEffectiveness, RustPlanCompatibility, RustPlanError, RustPlanInputs,
+    RustPlanMode, RustPlanOperation, RustPlanPackages, RustPlanSkippedSample, RustPlanSummary,
+    RustToolchainIdentity, RUST_ARTIFACT_CACHE_SCHEMA_VERSION, RUST_ARTIFACT_PLAN_SCHEMA_VERSION,
+};
 pub use store::{ArtifactIndex, ArtifactStore};
 
 use std::path::Path;
