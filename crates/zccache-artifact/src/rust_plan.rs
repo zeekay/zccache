@@ -1,0 +1,1044 @@
+//! Plan-driven Rust target artifact save/restore.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use zccache_core::{normalize_for_key, NormalizedPath};
+
+/// Supported Rust artifact plan schema version.
+pub const RUST_ARTIFACT_PLAN_SCHEMA_VERSION: u32 = 1;
+/// Supported cache bundle schema version.
+pub const RUST_ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 1;
+
+const BUNDLE_MANIFEST_NAME: &str = "manifest.json";
+const BUNDLE_FILES_DIR: &str = "files";
+
+/// Errors returned by plan loading and execution.
+#[derive(Debug, thiserror::Error)]
+pub enum RustPlanError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error(
+        "unsupported Rust artifact plan schema version {found}; supported version is {supported}"
+    )]
+    UnsupportedSchemaVersion { found: u32, supported: u32 },
+    #[error(
+        "unsupported Rust artifact cache schema version {found}; supported version is {supported}"
+    )]
+    UnsupportedCacheSchemaVersion { found: u32, supported: u32 },
+    #[error("invalid Rust artifact plan: {0}")]
+    InvalidPlan(String),
+    #[error("Rust artifact bundle is missing: {0}")]
+    BundleMissing(NormalizedPath),
+    #[error("invalid Rust artifact bundle manifest: {0}")]
+    InvalidManifest(String),
+    #[error("unsafe relative artifact path in bundle: {0}")]
+    UnsafeRelativePath(String),
+}
+
+/// Rust artifact plan mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RustPlanMode {
+    /// Restore/save bounded dependency artifacts and Cargo freshness metadata.
+    Thin,
+    /// Restore/save the target tree explicitly, except transient state.
+    Full,
+}
+
+impl std::fmt::Display for RustPlanMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Thin => write!(f, "thin"),
+            Self::Full => write!(f, "full"),
+        }
+    }
+}
+
+/// Artifact classes that a plan may allow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RustArtifactClass {
+    Rlib,
+    Rmeta,
+    DepInfo,
+    ProcMacro,
+    SharedLib,
+    CargoFingerprint,
+    BuildScriptMetadata,
+    BuildScriptOutput,
+    FullTarget,
+}
+
+/// Toolchain identity supplied by soldr.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RustToolchainIdentity {
+    pub rustc: String,
+    pub cargo: String,
+    pub channel: String,
+    pub host: String,
+}
+
+/// Input hashes that affect Cargo build outputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RustPlanInputs {
+    pub features_hash: String,
+    pub rustflags_hash: String,
+    pub env_hash: String,
+    pub lockfile_hash: String,
+    pub cargo_config_hash: String,
+    #[serde(default)]
+    pub manifest_hashes: Vec<String>,
+}
+
+/// Package IDs selected or excluded by the planner.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RustPlanPackages {
+    #[serde(default)]
+    pub selected_package_ids: Vec<String>,
+    #[serde(default)]
+    pub workspace_package_ids: Vec<String>,
+    #[serde(default)]
+    pub excluded_path_package_ids: Vec<String>,
+}
+
+/// Versioned v1 Rust artifact cache plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RustArtifactPlanV1 {
+    pub schema_version: u32,
+    pub mode: RustPlanMode,
+    pub workspace_root: NormalizedPath,
+    pub target_dir: NormalizedPath,
+    pub toolchain: RustToolchainIdentity,
+    pub target_triple: String,
+    pub profile: String,
+    pub inputs: RustPlanInputs,
+    pub packages: RustPlanPackages,
+    #[serde(default)]
+    pub allowed_artifact_classes: Vec<RustArtifactClass>,
+    pub cache_schema_version: u32,
+    #[serde(default)]
+    pub journal_log_path: Option<NormalizedPath>,
+}
+
+impl RustArtifactPlanV1 {
+    /// Load, version-check, and validate a plan from a JSON file.
+    pub fn load(path: &Path) -> Result<Self, RustPlanError> {
+        let raw = std::fs::read_to_string(path)?;
+        Self::from_json_str(&raw)
+    }
+
+    /// Load, version-check, and validate a plan from a JSON string.
+    pub fn from_json_str(raw: &str) -> Result<Self, RustPlanError> {
+        let value: serde_json::Value = serde_json::from_str(raw.trim_start_matches('\u{feff}'))?;
+        Self::from_json_value(value)
+    }
+
+    /// Load, version-check, and validate a plan from a JSON value.
+    pub fn from_json_value(value: serde_json::Value) -> Result<Self, RustPlanError> {
+        let schema_version = json_u32_field(&value, "schema_version")?;
+        if schema_version != RUST_ARTIFACT_PLAN_SCHEMA_VERSION {
+            return Err(RustPlanError::UnsupportedSchemaVersion {
+                found: schema_version,
+                supported: RUST_ARTIFACT_PLAN_SCHEMA_VERSION,
+            });
+        }
+
+        let cache_schema_version = json_u32_field(&value, "cache_schema_version")?;
+        if cache_schema_version != RUST_ARTIFACT_CACHE_SCHEMA_VERSION {
+            return Err(RustPlanError::UnsupportedCacheSchemaVersion {
+                found: cache_schema_version,
+                supported: RUST_ARTIFACT_CACHE_SCHEMA_VERSION,
+            });
+        }
+
+        let plan: Self = serde_json::from_value(value)?;
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// Validate fields whose constraints are outside serde's type checks.
+    pub fn validate(&self) -> Result<(), RustPlanError> {
+        let mut errors = Vec::new();
+        if self.profile.trim().is_empty() {
+            errors.push("profile must not be empty");
+        }
+        if self.target_triple.trim().is_empty() {
+            errors.push("target_triple must not be empty");
+        }
+        if self.toolchain.rustc.trim().is_empty() {
+            errors.push("toolchain.rustc must not be empty");
+        }
+        if self.toolchain.cargo.trim().is_empty() {
+            errors.push("toolchain.cargo must not be empty");
+        }
+        if self.toolchain.channel.trim().is_empty() {
+            errors.push("toolchain.channel must not be empty");
+        }
+        if self.toolchain.host.trim().is_empty() {
+            errors.push("toolchain.host must not be empty");
+        }
+        if self.workspace_root.as_os_str().is_empty() {
+            errors.push("workspace_root must not be empty");
+        }
+        if self.target_dir.as_os_str().is_empty() {
+            errors.push("target_dir must not be empty");
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(RustPlanError::InvalidPlan(errors.join("; ")))
+        }
+    }
+
+    /// Effective allowed classes for thin mode.
+    #[must_use]
+    pub fn effective_allowed_classes(&self) -> BTreeSet<RustArtifactClass> {
+        if self.allowed_artifact_classes.is_empty() {
+            default_thin_classes()
+        } else {
+            self.allowed_artifact_classes.iter().copied().collect()
+        }
+    }
+}
+
+/// Backend operation represented in summaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RustPlanOperation {
+    Validate,
+    Restore,
+    Save,
+}
+
+/// Compatibility section in a machine-readable summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustPlanCompatibility {
+    pub status: String,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+/// Representative skipped artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustPlanSkippedSample {
+    pub path: String,
+    pub reason: String,
+}
+
+/// Artifact restore effectiveness, independent from compile-cache hit rate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RustPlanArtifactEffectiveness {
+    pub eligible_file_count: u64,
+    pub restored_file_count: u64,
+    pub reuse_ratio: f64,
+}
+
+/// Machine-readable operation summary for soldr/setup-soldr.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RustPlanSummary {
+    pub operation: RustPlanOperation,
+    pub mode: RustPlanMode,
+    pub plan_schema_version: u32,
+    pub cache_schema_version: u32,
+    pub compatibility: RustPlanCompatibility,
+    pub restored_file_count: u64,
+    pub restored_bytes: u64,
+    pub saved_file_count: u64,
+    pub saved_bytes: u64,
+    pub skipped_count: u64,
+    #[serde(default)]
+    pub skipped_reasons: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub skipped_samples: Vec<RustPlanSkippedSample>,
+    #[serde(default)]
+    pub key_input_mismatches: Vec<String>,
+    pub cache_key: String,
+    pub archive_path: Option<NormalizedPath>,
+    pub journal_log_path: Option<NormalizedPath>,
+    pub target_artifact_effectiveness: RustPlanArtifactEffectiveness,
+    pub compile_cache_stats: Option<serde_json::Value>,
+}
+
+impl RustPlanSummary {
+    /// Create a validation-only success summary.
+    #[must_use]
+    pub fn validation_success(plan: &RustArtifactPlanV1, cache_dir: &Path) -> Self {
+        let cache_key = rust_plan_cache_key(plan);
+        let archive_path = rust_plan_bundle_dir(cache_dir, &cache_key);
+        Self::new(
+            RustPlanOperation::Validate,
+            plan.mode,
+            plan.schema_version,
+            plan.cache_schema_version,
+            cache_key,
+            Some(archive_path.into()),
+            plan.journal_log_path.clone(),
+        )
+    }
+
+    /// Create a compatibility failure summary for JSON CLI output.
+    #[must_use]
+    pub fn compatibility_failure(operation: RustPlanOperation, err: &RustPlanError) -> Self {
+        Self {
+            operation,
+            mode: RustPlanMode::Thin,
+            plan_schema_version: 0,
+            cache_schema_version: 0,
+            compatibility: RustPlanCompatibility {
+                status: "error".to_string(),
+                errors: vec![err.to_string()],
+            },
+            restored_file_count: 0,
+            restored_bytes: 0,
+            saved_file_count: 0,
+            saved_bytes: 0,
+            skipped_count: 0,
+            skipped_reasons: BTreeMap::new(),
+            skipped_samples: Vec::new(),
+            key_input_mismatches: Vec::new(),
+            cache_key: String::new(),
+            archive_path: None,
+            journal_log_path: None,
+            target_artifact_effectiveness: RustPlanArtifactEffectiveness {
+                eligible_file_count: 0,
+                restored_file_count: 0,
+                reuse_ratio: 0.0,
+            },
+            compile_cache_stats: None,
+        }
+    }
+
+    fn new(
+        operation: RustPlanOperation,
+        mode: RustPlanMode,
+        plan_schema_version: u32,
+        cache_schema_version: u32,
+        cache_key: String,
+        archive_path: Option<NormalizedPath>,
+        journal_log_path: Option<NormalizedPath>,
+    ) -> Self {
+        Self {
+            operation,
+            mode,
+            plan_schema_version,
+            cache_schema_version,
+            compatibility: RustPlanCompatibility {
+                status: "ok".to_string(),
+                errors: Vec::new(),
+            },
+            restored_file_count: 0,
+            restored_bytes: 0,
+            saved_file_count: 0,
+            saved_bytes: 0,
+            skipped_count: 0,
+            skipped_reasons: BTreeMap::new(),
+            skipped_samples: Vec::new(),
+            key_input_mismatches: Vec::new(),
+            cache_key,
+            archive_path,
+            journal_log_path,
+            target_artifact_effectiveness: RustPlanArtifactEffectiveness {
+                eligible_file_count: 0,
+                restored_file_count: 0,
+                reuse_ratio: 0.0,
+            },
+            compile_cache_stats: None,
+        }
+    }
+
+    fn skip(&mut self, path: impl Into<String>, reason: &'static str) {
+        self.skipped_count += 1;
+        *self.skipped_reasons.entry(reason.to_string()).or_insert(0) += 1;
+        if self.skipped_samples.len() < 16 {
+            self.skipped_samples.push(RustPlanSkippedSample {
+                path: path.into(),
+                reason: reason.to_string(),
+            });
+        }
+    }
+
+    fn refresh_effectiveness(&mut self, eligible: u64) {
+        self.target_artifact_effectiveness.eligible_file_count = eligible;
+        self.target_artifact_effectiveness.restored_file_count = self.restored_file_count;
+        self.target_artifact_effectiveness.reuse_ratio = if eligible == 0 {
+            0.0
+        } else {
+            self.restored_file_count as f64 / eligible as f64
+        };
+    }
+}
+
+/// File stored in a Rust artifact bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustBundledArtifact {
+    pub relative_path: String,
+    pub class: RustArtifactClass,
+    pub size: u64,
+    pub content_hash: String,
+}
+
+/// Manifest for zccache-owned Rust artifact bundles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RustArtifactBundleManifest {
+    pub manifest_schema_version: u32,
+    pub plan_schema_version: u32,
+    pub cache_schema_version: u32,
+    pub mode: RustPlanMode,
+    pub cache_key: String,
+    pub created_at_secs: u64,
+    pub plan_identity_hash: String,
+    pub artifacts: Vec<RustBundledArtifact>,
+}
+
+/// Compute the stable cache key for a plan.
+#[must_use]
+pub fn rust_plan_cache_key(plan: &RustArtifactPlanV1) -> String {
+    let identity = rust_plan_identity_hash(plan);
+    format!("rust-plan-v1-{}", &identity[..32])
+}
+
+/// Compute the stable identity hash used by manifests.
+#[must_use]
+pub fn rust_plan_identity_hash(plan: &RustArtifactPlanV1) -> String {
+    let payload = serde_json::json!({
+        "schema_version": plan.schema_version,
+        "mode": plan.mode,
+        "workspace_root": normalize_for_key(plan.workspace_root.as_path()),
+        "target_dir": normalize_for_key(plan.target_dir.as_path()),
+        "toolchain": plan.toolchain,
+        "target_triple": plan.target_triple,
+        "profile": plan.profile,
+        "inputs": plan.inputs,
+        "packages": plan.packages,
+        "allowed_artifact_classes": plan.effective_allowed_classes().into_iter().collect::<Vec<_>>(),
+        "cache_schema_version": plan.cache_schema_version,
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    zccache_hash::hash_bytes(&bytes).to_hex()
+}
+
+/// Bundle directory for a plan cache key.
+#[must_use]
+pub fn rust_plan_bundle_dir(cache_dir: &Path, cache_key: &str) -> PathBuf {
+    cache_dir.join("rust-plan").join(cache_key)
+}
+
+/// Execute local bundle save for a validated plan.
+pub fn save_rust_plan_local(
+    plan: &RustArtifactPlanV1,
+    cache_dir: &Path,
+) -> Result<RustPlanSummary, RustPlanError> {
+    plan.validate()?;
+    let cache_key = rust_plan_cache_key(plan);
+    let bundle_dir = rust_plan_bundle_dir(cache_dir, &cache_key);
+    let files_dir = bundle_dir.join(BUNDLE_FILES_DIR);
+    let mut summary = RustPlanSummary::new(
+        RustPlanOperation::Save,
+        plan.mode,
+        plan.schema_version,
+        plan.cache_schema_version,
+        cache_key.clone(),
+        Some(bundle_dir.clone().into()),
+        plan.journal_log_path.clone(),
+    );
+
+    let mut candidates = Vec::new();
+    collect_files(plan.target_dir.as_path(), &mut candidates)?;
+    candidates.sort();
+
+    let selected = select_artifacts(plan, candidates, &mut summary);
+
+    if bundle_dir.exists() {
+        std::fs::remove_dir_all(&bundle_dir)?;
+    }
+    std::fs::create_dir_all(&files_dir)?;
+
+    let mut artifacts = Vec::new();
+    for selected_file in selected {
+        let rel = selected_file.relative_path;
+        let dst = safe_join(&files_dir, &rel)?;
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&selected_file.source_path, &dst)?;
+        let size = std::fs::metadata(&selected_file.source_path)?.len();
+        let content_hash = zccache_hash::hash_file(&selected_file.source_path)?.to_hex();
+        summary.saved_file_count += 1;
+        summary.saved_bytes += size;
+        artifacts.push(RustBundledArtifact {
+            relative_path: rel,
+            class: selected_file.class,
+            size,
+            content_hash,
+        });
+    }
+
+    let manifest = RustArtifactBundleManifest {
+        manifest_schema_version: RUST_ARTIFACT_CACHE_SCHEMA_VERSION,
+        plan_schema_version: plan.schema_version,
+        cache_schema_version: plan.cache_schema_version,
+        mode: plan.mode,
+        cache_key,
+        created_at_secs: now_secs(),
+        plan_identity_hash: rust_plan_identity_hash(plan),
+        artifacts,
+    };
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    std::fs::write(bundle_dir.join(BUNDLE_MANIFEST_NAME), manifest_bytes)?;
+    Ok(summary)
+}
+
+/// Execute local bundle restore for a validated plan.
+pub fn restore_rust_plan_local(
+    plan: &RustArtifactPlanV1,
+    cache_dir: &Path,
+) -> Result<RustPlanSummary, RustPlanError> {
+    plan.validate()?;
+    let cache_key = rust_plan_cache_key(plan);
+    let bundle_dir = rust_plan_bundle_dir(cache_dir, &cache_key);
+    let files_dir = bundle_dir.join(BUNDLE_FILES_DIR);
+    let mut summary = RustPlanSummary::new(
+        RustPlanOperation::Restore,
+        plan.mode,
+        plan.schema_version,
+        plan.cache_schema_version,
+        cache_key.clone(),
+        Some(bundle_dir.clone().into()),
+        plan.journal_log_path.clone(),
+    );
+
+    if !bundle_dir.exists() {
+        summary.skip("<bundle>", "artifact_absent_from_restored_plan");
+        summary.refresh_effectiveness(0);
+        return Ok(summary);
+    }
+
+    let manifest_path = bundle_dir.join(BUNDLE_MANIFEST_NAME);
+    let manifest: RustArtifactBundleManifest =
+        serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    validate_manifest(plan, &cache_key, &manifest, &mut summary)?;
+
+    let now = SystemTime::now();
+    let file_times = std::fs::FileTimes::new()
+        .set_accessed(now)
+        .set_modified(now);
+    let eligible = manifest.artifacts.len() as u64;
+
+    for artifact in &manifest.artifacts {
+        let src = match safe_join(&files_dir, &artifact.relative_path) {
+            Ok(path) => path,
+            Err(err) => {
+                summary.skip(&artifact.relative_path, "path_traversal");
+                summary.compatibility.errors.push(err.to_string());
+                continue;
+            }
+        };
+        let dst = match safe_join(plan.target_dir.as_path(), &artifact.relative_path) {
+            Ok(path) => path,
+            Err(err) => {
+                summary.skip(&artifact.relative_path, "path_traversal");
+                summary.compatibility.errors.push(err.to_string());
+                continue;
+            }
+        };
+        if !src.exists() {
+            summary.skip(
+                &artifact.relative_path,
+                "restored_payload_missing_or_corrupt",
+            );
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if dst.exists() {
+            std::fs::remove_file(&dst)?;
+        }
+        if std::fs::hard_link(&src, &dst).is_err() {
+            std::fs::copy(&src, &dst)?;
+        }
+        if let Ok(file) = std::fs::File::open(&dst) {
+            let _ = file.set_times(file_times);
+        }
+        summary.restored_file_count += 1;
+        summary.restored_bytes += artifact.size;
+    }
+
+    summary.refresh_effectiveness(eligible);
+    Ok(summary)
+}
+
+fn validate_manifest(
+    plan: &RustArtifactPlanV1,
+    cache_key: &str,
+    manifest: &RustArtifactBundleManifest,
+    summary: &mut RustPlanSummary,
+) -> Result<(), RustPlanError> {
+    if manifest.manifest_schema_version != RUST_ARTIFACT_CACHE_SCHEMA_VERSION {
+        return Err(RustPlanError::UnsupportedCacheSchemaVersion {
+            found: manifest.manifest_schema_version,
+            supported: RUST_ARTIFACT_CACHE_SCHEMA_VERSION,
+        });
+    }
+    if manifest.cache_key != cache_key {
+        summary
+            .key_input_mismatches
+            .push("bundle cache key does not match requested plan".to_string());
+    }
+    if manifest.mode != plan.mode {
+        summary
+            .key_input_mismatches
+            .push("bundle mode does not match requested plan".to_string());
+    }
+    let plan_identity_hash = rust_plan_identity_hash(plan);
+    if manifest.plan_identity_hash != plan_identity_hash {
+        summary
+            .key_input_mismatches
+            .push("bundle input hash does not match requested plan".to_string());
+    }
+    if summary.key_input_mismatches.is_empty() {
+        Ok(())
+    } else {
+        summary.compatibility.status = "warning".to_string();
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedArtifact {
+    source_path: PathBuf,
+    relative_path: String,
+    class: RustArtifactClass,
+}
+
+fn select_artifacts(
+    plan: &RustArtifactPlanV1,
+    candidates: Vec<PathBuf>,
+    summary: &mut RustPlanSummary,
+) -> Vec<SelectedArtifact> {
+    let allowed = plan.effective_allowed_classes();
+    let excluded_names = excluded_package_names(&plan.packages);
+    let mut selected = Vec::new();
+
+    for path in candidates {
+        let rel_path = match path.strip_prefix(plan.target_dir.as_path()) {
+            Ok(rel) => rel,
+            Err(_) => {
+                summary.skip(path.display().to_string(), "outside_target_dir");
+                continue;
+            }
+        };
+        let rel = relative_path_string(rel_path);
+
+        if has_component(rel_path, "incremental") {
+            summary.skip(rel, "transient_state");
+            continue;
+        }
+
+        let class = classify_artifact(rel_path, plan.mode);
+
+        if plan.mode == RustPlanMode::Thin {
+            let Some(class) = class else {
+                summary.skip(rel, "artifact_class_disallowed_by_plan");
+                continue;
+            };
+            if !allowed.contains(&class) {
+                summary.skip(rel, "artifact_class_disallowed_by_plan");
+                continue;
+            }
+            if artifact_matches_excluded_package(rel_path, &excluded_names) {
+                summary.skip(rel, "workspace_or_path_dependency_excluded_by_plan");
+                continue;
+            }
+            selected.push(SelectedArtifact {
+                source_path: path,
+                relative_path: rel,
+                class,
+            });
+            continue;
+        }
+
+        selected.push(SelectedArtifact {
+            source_path: path,
+            relative_path: rel,
+            class: class.unwrap_or(RustArtifactClass::FullTarget),
+        });
+    }
+
+    selected.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    selected
+}
+
+fn classify_artifact(rel: &Path, mode: RustPlanMode) -> Option<RustArtifactClass> {
+    if has_component(rel, ".fingerprint") {
+        return Some(RustArtifactClass::CargoFingerprint);
+    }
+    if has_component(rel, "build") {
+        if has_component(rel, "out") {
+            return Some(RustArtifactClass::BuildScriptOutput);
+        }
+        if let Some(name) = rel.file_name().and_then(OsStr::to_str) {
+            if matches!(name, "output" | "invoked.timestamp" | "root-output") {
+                return Some(RustArtifactClass::BuildScriptMetadata);
+            }
+        }
+    }
+
+    match rel.extension().and_then(OsStr::to_str) {
+        Some("rlib") => Some(RustArtifactClass::Rlib),
+        Some("rmeta") => Some(RustArtifactClass::Rmeta),
+        Some("d") => Some(RustArtifactClass::DepInfo),
+        Some("so" | "dylib" | "dll") => Some(RustArtifactClass::SharedLib),
+        _ if mode == RustPlanMode::Full => Some(RustArtifactClass::FullTarget),
+        _ => None,
+    }
+}
+
+fn collect_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), RustPlanError> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        entries.push(entry?);
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_files(&path, files)?;
+        } else if file_type.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, RustPlanError> {
+    let rel = Path::new(relative);
+    if rel.as_os_str().is_empty() {
+        return Err(RustPlanError::UnsafeRelativePath(relative.to_string()));
+    }
+    for component in rel.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(RustPlanError::UnsafeRelativePath(relative.to_string()));
+            }
+        }
+    }
+    Ok(root.join(rel))
+}
+
+fn default_thin_classes() -> BTreeSet<RustArtifactClass> {
+    [
+        RustArtifactClass::Rlib,
+        RustArtifactClass::Rmeta,
+        RustArtifactClass::DepInfo,
+        RustArtifactClass::ProcMacro,
+        RustArtifactClass::SharedLib,
+        RustArtifactClass::CargoFingerprint,
+        RustArtifactClass::BuildScriptMetadata,
+        RustArtifactClass::BuildScriptOutput,
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn json_u32_field(value: &serde_json::Value, field: &'static str) -> Result<u32, RustPlanError> {
+    let Some(raw) = value.get(field) else {
+        return Err(RustPlanError::InvalidPlan(format!("{field} is required")));
+    };
+    let Some(n) = raw.as_u64() else {
+        return Err(RustPlanError::InvalidPlan(format!(
+            "{field} must be an unsigned integer"
+        )));
+    };
+    u32::try_from(n).map_err(|_| RustPlanError::InvalidPlan(format!("{field} is too large")))
+}
+
+fn relative_path_string(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            Component::CurDir => None,
+            _ => Some(component.as_os_str().to_string_lossy().into_owned()),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn has_component(path: &Path, needle: &str) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == OsStr::new(needle))
+}
+
+fn excluded_package_names(packages: &RustPlanPackages) -> BTreeSet<String> {
+    packages
+        .workspace_package_ids
+        .iter()
+        .chain(packages.excluded_path_package_ids.iter())
+        .filter_map(|id| package_name_from_id(id))
+        .collect()
+}
+
+fn package_name_from_id(id: &str) -> Option<String> {
+    let candidate = if let Some(after_hash) = id.rsplit_once('#').map(|(_, right)| right) {
+        after_hash.split('@').next().unwrap_or(after_hash)
+    } else if let Some((left, _)) = id.split_once(' ') {
+        left
+    } else {
+        id
+    };
+    let candidate = candidate
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .replace('-', "_");
+    if candidate.is_empty()
+        || candidate.contains('/')
+        || candidate.contains('\\')
+        || candidate.contains(':')
+    {
+        None
+    } else {
+        Some(candidate)
+    }
+}
+
+fn artifact_matches_excluded_package(rel: &Path, excluded_names: &BTreeSet<String>) -> bool {
+    if excluded_names.is_empty() {
+        return false;
+    }
+    rel.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        excluded_names.iter().any(|package| {
+            let without_lib = name.strip_prefix("lib").unwrap_or(&name);
+            without_lib == package
+                || without_lib.starts_with(&format!("{package}-"))
+                || without_lib.starts_with(&format!("{package}."))
+        })
+    })
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_plan(root: &Path, mode: RustPlanMode) -> RustArtifactPlanV1 {
+        RustArtifactPlanV1 {
+            schema_version: 1,
+            mode,
+            workspace_root: root.into(),
+            target_dir: root.join("target").into(),
+            toolchain: RustToolchainIdentity {
+                rustc: "rustc 1.94.1".to_string(),
+                cargo: "cargo 1.94.1".to_string(),
+                channel: "1.94.1".to_string(),
+                host: "x86_64-pc-windows-msvc".to_string(),
+            },
+            target_triple: "x86_64-pc-windows-msvc".to_string(),
+            profile: "debug".to_string(),
+            inputs: RustPlanInputs {
+                features_hash: "features".to_string(),
+                rustflags_hash: "rustflags".to_string(),
+                env_hash: "env".to_string(),
+                lockfile_hash: "lock".to_string(),
+                cargo_config_hash: "config".to_string(),
+                manifest_hashes: vec!["manifest".to_string()],
+            },
+            packages: RustPlanPackages {
+                selected_package_ids: vec!["app 0.1.0".to_string()],
+                workspace_package_ids: vec!["app 0.1.0".to_string()],
+                excluded_path_package_ids: vec!["local_dep 0.1.0".to_string()],
+            },
+            allowed_artifact_classes: vec![
+                RustArtifactClass::Rlib,
+                RustArtifactClass::Rmeta,
+                RustArtifactClass::DepInfo,
+                RustArtifactClass::CargoFingerprint,
+                RustArtifactClass::BuildScriptMetadata,
+                RustArtifactClass::BuildScriptOutput,
+            ],
+            cache_schema_version: 1,
+            journal_log_path: Some(root.join("zccache-session.jsonl").into()),
+        }
+    }
+
+    fn write(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn synthetic_target(root: &Path) {
+        let target = root.join("target").join("debug");
+        write(
+            &target.join("deps").join("libserde-abc.rlib"),
+            b"serde rlib",
+        );
+        write(
+            &target.join("deps").join("libserde-abc.rmeta"),
+            b"serde rmeta",
+        );
+        write(&target.join("deps").join("serde-abc.d"), b"serde depinfo");
+        write(
+            &target.join("deps").join("libapp-abc.rlib"),
+            b"workspace rlib",
+        );
+        write(
+            &target.join("deps").join("liblocal_dep-abc.rlib"),
+            b"path dep rlib",
+        );
+        write(
+            &target
+                .join(".fingerprint")
+                .join("serde-abc")
+                .join("dep-lib-serde"),
+            b"fingerprint",
+        );
+        write(
+            &target
+                .join("build")
+                .join("serde-abc")
+                .join("invoked.timestamp"),
+            b"timestamp",
+        );
+        write(
+            &target
+                .join("build")
+                .join("serde-abc")
+                .join("out")
+                .join("gen.rs"),
+            b"generated",
+        );
+        write(&target.join("incremental").join("state.bin"), b"transient");
+    }
+
+    #[test]
+    fn rejects_unsupported_schema_before_deserializing_unknown_fields() {
+        let raw = serde_json::json!({
+            "schema_version": 99,
+            "cache_schema_version": 1,
+            "unexpected_future_field": true
+        });
+        let err = RustArtifactPlanV1::from_json_value(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            RustPlanError::UnsupportedSchemaVersion {
+                found: 99,
+                supported: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn thin_save_restore_selects_dependency_artifacts_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        synthetic_target(dir.path());
+        let plan = sample_plan(dir.path(), RustPlanMode::Thin);
+        let cache = dir.path().join("cache");
+
+        let saved = save_rust_plan_local(&plan, &cache).unwrap();
+        assert_eq!(saved.saved_file_count, 6);
+        assert_eq!(
+            saved
+                .skipped_reasons
+                .get("workspace_or_path_dependency_excluded_by_plan"),
+            Some(&2)
+        );
+        assert_eq!(saved.skipped_reasons.get("transient_state"), Some(&1));
+
+        std::fs::remove_dir_all(plan.target_dir.as_path()).unwrap();
+        let restored = restore_rust_plan_local(&plan, &cache).unwrap();
+        assert_eq!(restored.restored_file_count, 6);
+        assert!(plan
+            .target_dir
+            .join("debug/deps/libserde-abc.rlib")
+            .exists());
+        assert!(plan
+            .target_dir
+            .join("debug/.fingerprint/serde-abc/dep-lib-serde")
+            .exists());
+        assert!(!plan.target_dir.join("debug/deps/libapp-abc.rlib").exists());
+        assert!(!plan.target_dir.join("debug/incremental/state.bin").exists());
+    }
+
+    #[test]
+    fn full_save_restore_includes_workspace_outputs_but_prunes_incremental() {
+        let dir = tempfile::tempdir().unwrap();
+        synthetic_target(dir.path());
+        let plan = sample_plan(dir.path(), RustPlanMode::Full);
+        let cache = dir.path().join("cache");
+
+        let saved = save_rust_plan_local(&plan, &cache).unwrap();
+        assert_eq!(saved.skipped_reasons.get("transient_state"), Some(&1));
+        assert!(saved.saved_file_count > 6);
+
+        std::fs::remove_dir_all(plan.target_dir.as_path()).unwrap();
+        let restored = restore_rust_plan_local(&plan, &cache).unwrap();
+        assert!(restored.restored_file_count > 6);
+        assert!(plan.target_dir.join("debug/deps/libapp-abc.rlib").exists());
+        assert!(!plan.target_dir.join("debug/incremental/state.bin").exists());
+    }
+
+    #[test]
+    fn restore_missing_bundle_is_a_diagnostic_cache_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = sample_plan(dir.path(), RustPlanMode::Thin);
+        let summary = restore_rust_plan_local(&plan, &dir.path().join("cache")).unwrap();
+        assert_eq!(summary.restored_file_count, 0);
+        assert_eq!(
+            summary
+                .skipped_reasons
+                .get("artifact_absent_from_restored_plan"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_path_traversal() {
+        let err = safe_join(Path::new("root"), "../outside").unwrap_err();
+        assert!(matches!(err, RustPlanError::UnsafeRelativePath(_)));
+    }
+
+    #[test]
+    fn package_name_parsing_handles_cargo_package_id_shapes() {
+        assert_eq!(
+            package_name_from_id("serde 1.0.0 (registry+https://example.invalid)"),
+            Some("serde".to_string())
+        );
+        assert_eq!(
+            package_name_from_id("path+file:///repo#my-crate@0.1.0"),
+            Some("my_crate".to_string())
+        );
+    }
+
+    #[test]
+    fn from_json_str_accepts_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = sample_plan(dir.path(), RustPlanMode::Thin);
+        let json = serde_json::to_string(&plan).unwrap();
+        let loaded = RustArtifactPlanV1::from_json_str(&format!("\u{feff}{json}")).unwrap();
+        assert_eq!(loaded.schema_version, 1);
+    }
+}

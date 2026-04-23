@@ -22,9 +22,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::Path;
 use std::process::ExitCode;
+use zccache_artifact::{
+    restore_rust_plan_local, rust_plan_bundle_dir, rust_plan_cache_key, save_rust_plan_local,
+    RustArtifactPlanV1, RustPlanError, RustPlanOperation, RustPlanSummary,
+};
 use zccache_cli::{
     client_download, run_ino_convert_cached, ArchiveFormat, DownloadParams, DownloadSource,
     InoConvertOptions, WaitMode,
@@ -179,6 +183,12 @@ enum Commands {
         #[command(subcommand)]
         action: GhaCacheCommands,
     },
+    /// Execute versioned Rust artifact cache plans.
+    #[command(name = "rust-plan")]
+    RustPlan {
+        #[command(subcommand)]
+        action: RustPlanCommands,
+    },
     /// Download and optionally unarchive an artifact using the dedicated download daemon.
     Download {
         /// Source URL for a normal single-file download.
@@ -322,6 +332,61 @@ enum GhaCacheCommands {
     },
 }
 
+/// Rust artifact plan subcommands.
+#[derive(Debug, Subcommand)]
+enum RustPlanCommands {
+    /// Validate a soldr-generated Rust artifact plan.
+    Validate {
+        /// Path to the plan JSON file.
+        #[arg(long)]
+        plan: String,
+        /// Print a machine-readable JSON summary.
+        #[arg(long)]
+        json: bool,
+        /// Local cache directory for bundle path/key reporting.
+        #[arg(long = "cache-dir")]
+        cache_dir: Option<String>,
+    },
+    /// Restore Rust target artifacts from a saved plan bundle.
+    Restore {
+        /// Path to the plan JSON file.
+        #[arg(long)]
+        plan: String,
+        /// Print a machine-readable JSON summary.
+        #[arg(long)]
+        json: bool,
+        /// Cache backend to use.
+        #[arg(long, default_value = "auto")]
+        backend: RustPlanBackendArg,
+        /// Local cache directory used for bundle storage.
+        #[arg(long = "cache-dir")]
+        cache_dir: Option<String>,
+    },
+    /// Save Rust target artifacts selected by a plan.
+    Save {
+        /// Path to the plan JSON file.
+        #[arg(long)]
+        plan: String,
+        /// Print a machine-readable JSON summary.
+        #[arg(long)]
+        json: bool,
+        /// Cache backend to use.
+        #[arg(long, default_value = "auto")]
+        backend: RustPlanBackendArg,
+        /// Local cache directory used for bundle storage.
+        #[arg(long = "cache-dir")]
+        cache_dir: Option<String>,
+    },
+}
+
+/// Rust artifact plan backend selection.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RustPlanBackendArg {
+    Auto,
+    Local,
+    Gha,
+}
+
 /// Known subcommand names for auto-detect.
 const KNOWN_SUBCOMMANDS: &[&str] = &[
     "start",
@@ -339,6 +404,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "download",
     "cargo-registry",
     "gha-cache",
+    "rust-plan",
     "warm",
     "help",
     "--help",
@@ -457,6 +523,7 @@ fn main() -> ExitCode {
             GhaCacheCommands::Save { key, path } => run_async(cmd_gha_save(&key, &path)),
             GhaCacheCommands::Restore { key, path } => run_async(cmd_gha_restore(&key, &path)),
         },
+        Commands::RustPlan { action } => run_async(cmd_rust_plan(action)),
         Commands::Download {
             url,
             part_urls,
@@ -1638,6 +1705,229 @@ async fn cmd_gha_restore(key: &str, path: &str) -> ExitCode {
             eprintln!("zccache gha-cache restore: failed to extract archive: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+// ─── Rust artifact plan subcommands ─────────────────────────────────────────
+
+async fn cmd_rust_plan(action: RustPlanCommands) -> ExitCode {
+    match action {
+        RustPlanCommands::Validate {
+            plan,
+            json,
+            cache_dir,
+        } => {
+            let cache_dir = resolve_rust_plan_cache_dir(cache_dir.as_deref());
+            match load_rust_plan_for_cli(&plan, RustPlanOperation::Validate, json) {
+                Ok(plan) => {
+                    let summary = RustPlanSummary::validation_success(&plan, cache_dir.as_path());
+                    print_rust_plan_summary(&summary, json);
+                    ExitCode::SUCCESS
+                }
+                Err(code) => code,
+            }
+        }
+        RustPlanCommands::Restore {
+            plan,
+            json,
+            backend,
+            cache_dir,
+        } => {
+            let cache_dir = resolve_rust_plan_cache_dir(cache_dir.as_deref());
+            let plan = match load_rust_plan_for_cli(&plan, RustPlanOperation::Restore, json) {
+                Ok(plan) => plan,
+                Err(code) => return code,
+            };
+            match run_rust_plan_restore(&plan, cache_dir.as_path(), backend).await {
+                Ok(summary) => {
+                    print_rust_plan_summary(&summary, json);
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    print_rust_plan_error(RustPlanOperation::Restore, &err, json);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        RustPlanCommands::Save {
+            plan,
+            json,
+            backend,
+            cache_dir,
+        } => {
+            let cache_dir = resolve_rust_plan_cache_dir(cache_dir.as_deref());
+            let plan = match load_rust_plan_for_cli(&plan, RustPlanOperation::Save, json) {
+                Ok(plan) => plan,
+                Err(code) => return code,
+            };
+            match run_rust_plan_save(&plan, cache_dir.as_path(), backend).await {
+                Ok(summary) => {
+                    print_rust_plan_summary(&summary, json);
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    print_rust_plan_error(RustPlanOperation::Save, &err, json);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+fn resolve_rust_plan_cache_dir(explicit: Option<&str>) -> NormalizedPath {
+    explicit
+        .map(NormalizedPath::from)
+        .unwrap_or_else(|| zccache_core::config::default_cache_dir().join("rust-artifacts"))
+}
+
+fn load_rust_plan_for_cli(
+    path: &str,
+    operation: RustPlanOperation,
+    json: bool,
+) -> Result<RustArtifactPlanV1, ExitCode> {
+    match RustArtifactPlanV1::load(Path::new(path)) {
+        Ok(plan) => Ok(plan),
+        Err(err) => {
+            print_rust_plan_error(operation, &err, json);
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+async fn run_rust_plan_restore(
+    plan: &RustArtifactPlanV1,
+    cache_dir: &Path,
+    backend: RustPlanBackendArg,
+) -> Result<RustPlanSummary, RustPlanError> {
+    match resolve_rust_plan_backend(backend) {
+        RustPlanBackendArg::Local => restore_rust_plan_local(plan, cache_dir),
+        RustPlanBackendArg::Gha => restore_rust_plan_gha(plan, cache_dir).await,
+        RustPlanBackendArg::Auto => unreachable!("auto backend is resolved before execution"),
+    }
+}
+
+async fn run_rust_plan_save(
+    plan: &RustArtifactPlanV1,
+    cache_dir: &Path,
+    backend: RustPlanBackendArg,
+) -> Result<RustPlanSummary, RustPlanError> {
+    match resolve_rust_plan_backend(backend) {
+        RustPlanBackendArg::Local => save_rust_plan_local(plan, cache_dir),
+        RustPlanBackendArg::Gha => save_rust_plan_gha(plan, cache_dir).await,
+        RustPlanBackendArg::Auto => unreachable!("auto backend is resolved before execution"),
+    }
+}
+
+fn resolve_rust_plan_backend(backend: RustPlanBackendArg) -> RustPlanBackendArg {
+    match backend {
+        RustPlanBackendArg::Auto if GhaCache::is_available() => RustPlanBackendArg::Gha,
+        RustPlanBackendArg::Auto => RustPlanBackendArg::Local,
+        other => other,
+    }
+}
+
+async fn restore_rust_plan_gha(
+    plan: &RustArtifactPlanV1,
+    cache_dir: &Path,
+) -> Result<RustPlanSummary, RustPlanError> {
+    let cache_key = rust_plan_cache_key(plan);
+    let version = GhaCache::version_hash(&["zccache-rust-plan-v1", &cache_key]);
+    let cache = GhaCache::from_env().map_err(rust_plan_gha_error)?;
+    let Some(data) = cache
+        .restore(&cache_key, &version)
+        .await
+        .map_err(rust_plan_gha_error)?
+    else {
+        return restore_rust_plan_local(plan, cache_dir);
+    };
+
+    let bundle_dir = rust_plan_bundle_dir(cache_dir, &cache_key);
+    if bundle_dir.exists() {
+        std::fs::remove_dir_all(&bundle_dir)?;
+    }
+    let bundle_parent = bundle_dir
+        .parent()
+        .ok_or_else(|| RustPlanError::InvalidPlan("invalid rust-plan bundle path".to_string()))?;
+    std::fs::create_dir_all(bundle_parent)?;
+    tar_gz_decode(&data, bundle_parent)?;
+    restore_rust_plan_local(plan, cache_dir)
+}
+
+async fn save_rust_plan_gha(
+    plan: &RustArtifactPlanV1,
+    cache_dir: &Path,
+) -> Result<RustPlanSummary, RustPlanError> {
+    let summary = save_rust_plan_local(plan, cache_dir)?;
+    let cache_key = summary.cache_key.clone();
+    let bundle_dir = rust_plan_bundle_dir(cache_dir, &cache_key);
+    let data = tar_gz_encode(&bundle_dir)?;
+    let version = GhaCache::version_hash(&["zccache-rust-plan-v1", &cache_key]);
+    let cache = GhaCache::from_env().map_err(rust_plan_gha_error)?;
+    cache
+        .save(&cache_key, &version, &data)
+        .await
+        .map_err(rust_plan_gha_error)?;
+    Ok(summary)
+}
+
+fn rust_plan_gha_error(err: GhaError) -> RustPlanError {
+    RustPlanError::InvalidPlan(format!("GHA cache backend error: {err}"))
+}
+
+fn print_rust_plan_summary(summary: &RustPlanSummary, json: bool) {
+    if json {
+        match serde_json::to_string_pretty(summary) {
+            Ok(s) => println!("{s}"),
+            Err(err) => eprintln!("zccache rust-plan: failed to encode JSON summary: {err}"),
+        }
+        return;
+    }
+
+    println!(
+        "zccache rust-plan {}: {}",
+        match summary.operation {
+            RustPlanOperation::Validate => "validate",
+            RustPlanOperation::Restore => "restore",
+            RustPlanOperation::Save => "save",
+        },
+        summary.compatibility.status
+    );
+    println!("  mode: {}", summary.mode);
+    println!("  cache key: {}", summary.cache_key);
+    if let Some(path) = &summary.archive_path {
+        println!("  bundle: {}", path.display());
+    }
+    if summary.saved_file_count > 0 || summary.saved_bytes > 0 {
+        println!(
+            "  saved: {} files ({})",
+            summary.saved_file_count,
+            format_bytes(summary.saved_bytes)
+        );
+    }
+    if summary.restored_file_count > 0 || summary.restored_bytes > 0 {
+        println!(
+            "  restored: {} files ({})",
+            summary.restored_file_count,
+            format_bytes(summary.restored_bytes)
+        );
+    }
+    if summary.skipped_count > 0 {
+        println!("  skipped: {}", summary.skipped_count);
+        for (reason, count) in &summary.skipped_reasons {
+            println!("    {reason}: {count}");
+        }
+    }
+    for mismatch in &summary.key_input_mismatches {
+        println!("  mismatch: {mismatch}");
+    }
+}
+
+fn print_rust_plan_error(operation: RustPlanOperation, err: &RustPlanError, json: bool) {
+    if json {
+        let summary = RustPlanSummary::compatibility_failure(operation, err);
+        print_rust_plan_summary(&summary, true);
+    } else {
+        eprintln!("zccache rust-plan: {err}");
     }
 }
 
@@ -2860,6 +3150,67 @@ mod tests {
     fn exit_code_257_keeps_low_byte() {
         // 257 & 0xFF == 1, non-zero, so kept as-is.
         assert_eq!(exit_code_from_i32(257), ExitCode::from(1));
+    }
+
+    #[test]
+    fn rust_plan_cli_parses_validate_restore_save() {
+        let validate = Cli::try_parse_from([
+            "zccache",
+            "rust-plan",
+            "validate",
+            "--plan",
+            "plan.json",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            validate.command,
+            Some(Commands::RustPlan {
+                action: RustPlanCommands::Validate { json: true, .. }
+            })
+        ));
+
+        let restore = Cli::try_parse_from([
+            "zccache",
+            "rust-plan",
+            "restore",
+            "--plan",
+            "plan.json",
+            "--backend",
+            "local",
+            "--cache-dir",
+            ".cache/rust-plan",
+        ])
+        .unwrap();
+        assert!(matches!(
+            restore.command,
+            Some(Commands::RustPlan {
+                action: RustPlanCommands::Restore {
+                    backend: RustPlanBackendArg::Local,
+                    ..
+                }
+            })
+        ));
+
+        let save = Cli::try_parse_from([
+            "zccache",
+            "rust-plan",
+            "save",
+            "--plan",
+            "plan.json",
+            "--backend",
+            "gha",
+        ])
+        .unwrap();
+        assert!(matches!(
+            save.command,
+            Some(Commands::RustPlan {
+                action: RustPlanCommands::Save {
+                    backend: RustPlanBackendArg::Gha,
+                    ..
+                }
+            })
+        ));
     }
 
     #[test]
