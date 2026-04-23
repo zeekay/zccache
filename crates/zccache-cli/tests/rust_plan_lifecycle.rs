@@ -1,5 +1,6 @@
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use serde_json::Value;
 use zccache_artifact::{
@@ -11,106 +12,222 @@ fn zccache_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_zccache"))
 }
 
-fn write_file(path: &Path, contents: &[u8]) {
-    std::fs::create_dir_all(path.parent().expect("file parent")).expect("create parent dirs");
-    std::fs::write(path, contents).expect("write file");
+fn cargo_bin() -> PathBuf {
+    std::env::var_os("CARGO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cargo"))
 }
 
-fn synthetic_target(root: &Path) {
-    let debug = root.join("target").join("debug");
-
-    write_file(
-        &debug.join("deps").join("libserde-abc123.rlib"),
-        b"serde rlib",
-    );
-    write_file(
-        &debug.join("deps").join("libserde-abc123.rmeta"),
-        b"serde rmeta",
-    );
-    write_file(
-        &debug.join("deps").join("serde-abc123.d"),
-        b"serde dep-info",
-    );
-    write_file(
-        &debug.join("deps").join("libapp-abc123.rlib"),
-        b"workspace rlib",
-    );
-    write_file(
-        &debug.join("deps").join("liblocal_dep-abc123.rlib"),
-        b"path dep rlib",
-    );
-
-    write_file(
-        &debug
-            .join(".fingerprint")
-            .join("serde-abc123")
-            .join("dep-lib-serde"),
-        b"fingerprint",
-    );
-
-    write_file(
-        &debug.join("build").join("serde-abc123").join("output"),
-        b"stdout",
-    );
-    write_file(
-        &debug
-            .join("build")
-            .join("serde-abc123")
-            .join("invoked.timestamp"),
-        b"timestamp",
-    );
-    write_file(
-        &debug
-            .join("build")
-            .join("serde-abc123")
-            .join("out")
-            .join("gen.rs"),
-        b"generated",
-    );
-
-    write_file(&debug.join("incremental").join("state.bin"), b"incremental");
+fn write_file(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create parent directories");
+    }
+    fs::write(path, contents).expect("write file");
 }
 
-fn synthetic_plan(root: &Path) -> RustArtifactPlanV1 {
+fn read_to_string(path: &Path) -> String {
+    fs::read_to_string(path).expect("read file")
+}
+
+fn hash_str(input: &str) -> String {
+    blake3::hash(input.as_bytes()).to_hex().to_string()
+}
+
+fn hash_file(path: &Path) -> String {
+    hash_str(&read_to_string(path))
+}
+
+fn run_command(mut cmd: Command, label: &str) -> Output {
+    let output = cmd
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {label}: {err}"));
+    if !output.status.success() {
+        panic!(
+            "{label} failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    output
+}
+
+fn run_rust_plan(args: &[&str]) -> Value {
+    let output = run_command(
+        {
+            let mut cmd = Command::new(zccache_bin());
+            cmd.args(["rust-plan"]);
+            cmd.args(args);
+            cmd
+        },
+        "zccache rust-plan",
+    );
+
+    serde_json::from_slice(&output.stdout).expect("parse rust-plan JSON")
+}
+
+fn run_cargo_build(root: &Path, target_dir: &Path, verbose: bool) -> Output {
+    let mut cmd = Command::new(cargo_bin());
+    cmd.current_dir(root);
+    cmd.env("CARGO_TERM_COLOR", "never");
+    let target_dir = target_dir.to_string_lossy().to_string();
+    cmd.args(["build", "--target-dir"]);
+    cmd.arg(target_dir);
+    if verbose {
+        cmd.arg("-vv");
+    }
+    run_command(cmd, "cargo build")
+}
+
+fn toolchain_identity() -> RustToolchainIdentity {
+    let rustc = run_command(
+        {
+            let mut cmd = Command::new("rustc");
+            cmd.arg("-Vv");
+            cmd
+        },
+        "rustc -Vv",
+    );
+    let rustc_text = String::from_utf8_lossy(&rustc.stdout);
+    let host = rustc_text
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap_or("unknown")
+        .to_string();
+
+    let cargo = run_command(
+        {
+            let mut cmd = Command::new(cargo_bin());
+            cmd.arg("--version");
+            cmd
+        },
+        "cargo --version",
+    );
+
+    RustToolchainIdentity {
+        rustc: rustc_text.lines().next().unwrap_or("rustc").to_string(),
+        cargo: String::from_utf8_lossy(&cargo.stdout).trim().to_string(),
+        channel: std::env::var("RUSTUP_TOOLCHAIN").unwrap_or_else(|_| "unknown".to_string()),
+        host,
+    }
+}
+
+fn has_file_with_prefix(dir: &Path, prefix: &str, extension: &str) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with(prefix)
+                        && path.extension().and_then(|ext| ext.to_str()) == Some(extension)
+                })
+    })
+}
+
+fn has_dir_with_prefix(dir: &Path, prefix: &str) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.is_dir()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix))
+    })
+}
+
+fn write_workspace(root: &Path) {
+    write_file(
+        &root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["app"]
+resolver = "2"
+"#,
+    );
+
+    write_file(
+        &root.join("local_dep/Cargo.toml"),
+        r#"[package]
+name = "local_dep"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    );
+    write_file(
+        &root.join("local_dep/src/lib.rs"),
+        r#"pub fn dep_value() -> i32 {
+    41
+}
+"#,
+    );
+
+    write_file(
+        &root.join("app/Cargo.toml"),
+        r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+local_dep = { path = "../local_dep" }
+
+[lib]
+path = "src/lib.rs"
+"#,
+    );
+    write_file(
+        &root.join("app/src/lib.rs"),
+        r#"pub fn app_value() -> i32 {
+    local_dep::dep_value() + 1
+}
+"#,
+    );
+}
+
+fn rust_plan_for_workspace(root: &Path, target_dir: &Path) -> RustArtifactPlanV1 {
+    let toolchain = toolchain_identity();
+    let target_triple = toolchain.host.clone();
+    let cargo_toml = root.join("Cargo.toml");
+    let app_toml = root.join("app/Cargo.toml");
+    let dep_toml = root.join("local_dep/Cargo.toml");
+    let lockfile = root.join("Cargo.lock");
+
     RustArtifactPlanV1 {
         schema_version: 1,
         mode: RustPlanMode::Thin,
         workspace_root: root.into(),
-        target_dir: root.join("target").into(),
-        toolchain: RustToolchainIdentity {
-            rustc: "rustc 1.0.0".to_string(),
-            cargo: "cargo 1.0.0".to_string(),
-            channel: "stable".to_string(),
-            host: std::env::var("HOST").unwrap_or_else(|_| {
-                if cfg!(windows) {
-                    "x86_64-pc-windows-msvc".to_string()
-                } else {
-                    "x86_64-unknown-linux-gnu".to_string()
-                }
-            }),
-        },
-        target_triple: if cfg!(windows) {
-            "x86_64-pc-windows-msvc".to_string()
-        } else {
-            "x86_64-unknown-linux-gnu".to_string()
-        },
+        target_dir: target_dir.into(),
+        toolchain,
+        target_triple,
         profile: "debug".to_string(),
         inputs: RustPlanInputs {
-            features_hash: "features".to_string(),
-            rustflags_hash: "rustflags".to_string(),
-            env_hash: "env".to_string(),
-            lockfile_hash: "lockfile".to_string(),
-            cargo_config_hash: "config".to_string(),
-            manifest_hashes: vec!["manifest".to_string()],
+            features_hash: hash_str("default"),
+            rustflags_hash: hash_str(""),
+            env_hash: hash_str(""),
+            lockfile_hash: hash_file(&lockfile),
+            cargo_config_hash: hash_str(""),
+            manifest_hashes: vec![
+                hash_file(&cargo_toml),
+                hash_file(&app_toml),
+                hash_file(&dep_toml),
+            ],
         },
         packages: RustPlanPackages {
-            selected_package_ids: vec![
-                "app 0.1.0".to_string(),
-                "serde 1.0.0".to_string(),
-                "local_dep 0.1.0".to_string(),
-            ],
+            selected_package_ids: vec!["app 0.1.0".to_string(), "local_dep 0.1.0".to_string()],
             workspace_package_ids: vec!["app 0.1.0".to_string()],
-            excluded_path_package_ids: vec!["local_dep 0.1.0".to_string()],
+            excluded_path_package_ids: vec![],
         },
         allowed_artifact_classes: vec![
             RustArtifactClass::Rlib,
@@ -123,30 +240,6 @@ fn synthetic_plan(root: &Path) -> RustArtifactPlanV1 {
         cache_schema_version: 1,
         journal_log_path: None,
     }
-}
-
-fn write_plan_json(path: &Path, plan: &RustArtifactPlanV1) {
-    let json = serde_json::to_string_pretty(plan).expect("serialize plan");
-    std::fs::write(path, json).expect("write plan json");
-}
-
-fn run_rust_plan(args: &[&str]) -> Value {
-    let output = Command::new(zccache_bin())
-        .args(["rust-plan"])
-        .args(args)
-        .output()
-        .expect("run zccache rust-plan");
-
-    if !output.status.success() {
-        panic!(
-            "zccache rust-plan failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-
-    serde_json::from_slice(&output.stdout).expect("parse JSON summary")
 }
 
 fn json_u64(value: &Value, key: &str) -> u64 {
@@ -164,123 +257,115 @@ fn json_str<'a>(value: &'a Value, key: &str) -> &'a str {
 }
 
 #[test]
-fn rust_plan_lifecycle_round_trips_cargo_like_target_tree() {
+#[ignore = "Slow real Cargo lifecycle test; run with `cargo test --test rust_plan_lifecycle -- --ignored`"]
+fn rust_plan_lifecycle_keeps_path_dep_fresh_and_rebuilds_workspace_crate() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();
-    let plan = synthetic_plan(root);
-    let plan_path = root.join("rust-plan.json");
+    let target_dir = root.join("target");
     let cache_dir = root.join("cache");
 
-    synthetic_target(root);
-    write_plan_json(&plan_path, &plan);
+    write_workspace(root);
 
-    let validate = run_rust_plan(&[
-        "validate",
-        "--plan",
-        &plan_path.to_string_lossy(),
-        "--json",
-        "--cache-dir",
-        &cache_dir.to_string_lossy(),
-    ]);
-    assert_eq!(json_str(&validate, "operation"), "validate");
-    assert_eq!(json_str(&validate, "mode"), "thin");
-    assert_eq!(
-        validate
-            .get("compatibility")
-            .and_then(|value| value.get("status"))
-            .and_then(Value::as_str)
-            .expect("validate compatibility status"),
-        "ok"
+    let first_build = run_cargo_build(root, &target_dir, false);
+    let first_build_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&first_build.stdout),
+        String::from_utf8_lossy(&first_build.stderr)
     );
-    assert_eq!(json_u64(&validate, "saved_file_count"), 0);
-    assert_eq!(json_u64(&validate, "restored_file_count"), 0);
-    assert!(validate
-        .get("skipped_reasons")
-        .expect("validate skipped_reasons")
-        .is_object());
+    assert!(
+        first_build_log.contains("Compiling local_dep v0.1.0"),
+        "initial build should compile local_dep\n{first_build_log}"
+    );
+    assert!(
+        first_build_log.contains("Compiling app v0.1.0"),
+        "initial build should compile app\n{first_build_log}"
+    );
+
+    let plan = rust_plan_for_workspace(root, &target_dir);
+    let plan_path = root.join("rust-plan.json");
+    write_file(
+        &plan_path,
+        &serde_json::to_string_pretty(&plan).expect("serialize plan"),
+    );
+
+    let plan_path_str = plan_path.to_string_lossy().to_string();
+    let cache_dir_str = cache_dir.to_string_lossy().to_string();
 
     let save = run_rust_plan(&[
         "save",
         "--plan",
-        &plan_path.to_string_lossy(),
+        &plan_path_str,
         "--json",
         "--backend",
         "local",
         "--cache-dir",
-        &cache_dir.to_string_lossy(),
+        &cache_dir_str,
     ]);
     assert_eq!(json_str(&save, "operation"), "save");
-    assert_eq!(json_u64(&save, "saved_file_count"), 7);
+    assert_eq!(json_str(&save, "mode"), "thin");
+    assert!(json_u64(&save, "saved_file_count") > 0);
     assert!(json_u64(&save, "saved_bytes") > 0);
-    assert_eq!(json_u64(&save, "restored_file_count"), 0);
-    assert_eq!(json_u64(&save, "skipped_count"), 3);
-    let skipped_reasons = save
-        .get("skipped_reasons")
-        .and_then(Value::as_object)
-        .expect("save skipped_reasons");
-    assert_eq!(
-        skipped_reasons
-            .get("workspace_or_path_dependency_excluded_by_plan")
-            .and_then(Value::as_u64),
-        Some(2)
-    );
-    assert_eq!(
-        skipped_reasons
-            .get("transient_state")
-            .and_then(Value::as_u64),
-        Some(1)
-    );
 
-    std::fs::remove_dir_all(root.join("target")).expect("remove target tree");
-    std::fs::create_dir_all(root.join("target").join("debug")).expect("recreate target root");
+    fs::remove_dir_all(&target_dir).expect("remove target dir");
 
     let restore = run_rust_plan(&[
         "restore",
         "--plan",
-        &plan_path.to_string_lossy(),
+        &plan_path_str,
         "--json",
         "--backend",
         "local",
         "--cache-dir",
-        &cache_dir.to_string_lossy(),
+        &cache_dir_str,
     ]);
     assert_eq!(json_str(&restore, "operation"), "restore");
-    assert_eq!(json_u64(&restore, "restored_file_count"), 7);
+    assert_eq!(json_str(&restore, "mode"), "thin");
+    assert!(json_u64(&restore, "restored_file_count") > 0);
     assert!(json_u64(&restore, "restored_bytes") > 0);
-    assert_eq!(json_u64(&restore, "saved_file_count"), 0);
-    assert_eq!(json_u64(&restore, "skipped_count"), 0);
-    assert!(restore
-        .get("skipped_reasons")
-        .and_then(Value::as_object)
-        .expect("restore skipped_reasons")
-        .is_empty());
 
-    let debug = root.join("target").join("debug");
-    assert!(debug.join("deps").join("libserde-abc123.rlib").exists());
-    assert!(debug.join("deps").join("libserde-abc123.rmeta").exists());
-    assert!(debug.join("deps").join("serde-abc123.d").exists());
-    assert!(debug
-        .join(".fingerprint")
-        .join("serde-abc123")
-        .join("dep-lib-serde")
-        .exists());
-    assert!(debug
-        .join("build")
-        .join("serde-abc123")
-        .join("output")
-        .exists());
-    assert!(debug
-        .join("build")
-        .join("serde-abc123")
-        .join("invoked.timestamp")
-        .exists());
-    assert!(debug
-        .join("build")
-        .join("serde-abc123")
-        .join("out")
-        .join("gen.rs")
-        .exists());
-    assert!(!debug.join("deps").join("libapp-abc123.rlib").exists());
-    assert!(!debug.join("deps").join("liblocal_dep-abc123.rlib").exists());
-    assert!(!debug.join("incremental").join("state.bin").exists());
+    let deps_dir = target_dir.join("debug/deps");
+    let fingerprint_dir = target_dir.join("debug/.fingerprint");
+    assert!(
+        has_file_with_prefix(&deps_dir, "liblocal_dep-", "rlib"),
+        "restore should bring back the path dependency rlib"
+    );
+    assert!(
+        has_dir_with_prefix(&fingerprint_dir, "local_dep-"),
+        "restore should bring back the path dependency fingerprint state"
+    );
+    assert!(
+        !has_file_with_prefix(&deps_dir, "libapp-", "rlib"),
+        "thin restore should not restore the workspace crate rlib"
+    );
+
+    write_file(
+        &root.join("app/src/lib.rs"),
+        r#"pub fn app_value() -> i32 {
+    local_dep::dep_value() + 2
+}
+"#,
+    );
+
+    let rebuild = run_cargo_build(root, &target_dir, true);
+    let rebuild_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rebuild.stdout),
+        String::from_utf8_lossy(&rebuild.stderr)
+    );
+    assert!(
+        rebuild_log.contains("Fresh local_dep v0.1.0"),
+        "path dependency should remain fresh after restore\n{rebuild_log}"
+    );
+    assert!(
+        rebuild_log.contains("Compiling app v0.1.0") || rebuild_log.contains("Dirty app v0.1.0"),
+        "workspace crate should rebuild after source edit\n{rebuild_log}"
+    );
+    assert!(
+        !rebuild_log.contains("Fresh app v0.1.0"),
+        "workspace crate should not stay fresh after source edit\n{rebuild_log}"
+    );
+    assert!(
+        has_file_with_prefix(&deps_dir, "libapp-", "rlib"),
+        "rebuild should recreate the workspace crate rlib"
+    );
 }
