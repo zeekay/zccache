@@ -19,13 +19,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: zackees/setup-soldr@v0
         with:
-          version: v0.7.8
           toolchain: 1.94.1
           cache: true
-          target-cache-mode: full
-          target-cache-paths: |
-            target/debug
-            target/x86_64-pc-windows-msvc/debug
       - name: Check
         run: soldr cargo check --workspace --all-targets
       - name: Test

@@ -1345,12 +1345,13 @@ async fn handle_compile_ephemeral(
 /// all input file hashes, and returns a cached result or runs the real tool.
 async fn handle_link_ephemeral(
     state: &Arc<SharedState>,
-    _client_pid: u32,
+    client_pid: u32,
     tool: &Path,
     args: &[String],
     cwd: &Path,
     env: Option<Vec<(String, String)>>,
 ) -> Response {
+    let lineage = crate::lineage::Lineage::current(Some(client_pid), None);
     use zccache_compiler::parse_archiver::{parse_archive_invocation, ParsedArchiveInvocation};
     use zccache_compiler::parse_linker::{parse_linker_invocation, ParsedLinkerInvocation};
 
@@ -1403,7 +1404,7 @@ async fn handle_link_ephemeral(
                         "link non-cacheable, passing through"
                     );
                     state.stats.record_link_non_cacheable();
-                    return run_tool_passthrough(tool, args, cwd, env).await;
+                    return run_tool_passthrough(tool, args, cwd, env, &lineage).await;
                 }
             }
         }
@@ -1427,7 +1428,7 @@ async fn handle_link_ephemeral(
         Some(h) => h,
         None => {
             tracing::warn!("cannot hash tool {}", tool.display());
-            return run_tool_passthrough(tool, args, cwd, env).await;
+            return run_tool_passthrough(tool, args, cwd, env, &lineage).await;
         }
     };
 
@@ -1452,7 +1453,7 @@ async fn handle_link_ephemeral(
                     "cannot hash input file {}: skipping cache",
                     input_path.display()
                 );
-                return run_tool_passthrough(tool, args, cwd, env).await;
+                return run_tool_passthrough(tool, args, cwd, env, &lineage).await;
             }
         };
         key_builder = key_builder.input(input_hash);
@@ -1513,7 +1514,7 @@ async fn handle_link_ephemeral(
                 };
             }
             // Fall through to passthrough if write failed
-            return run_tool_passthrough(tool, args, cwd, env).await;
+            return run_tool_passthrough(tool, args, cwd, env, &lineage).await;
         }
         // Payloads missing — treat as cache miss, fall through
     }
@@ -1547,7 +1548,7 @@ async fn handle_link_ephemeral(
     // Clone env for the hook (we need to re-use it; passthrough consumes env).
     let env_for_hook = env.clone();
 
-    let result = run_tool_passthrough(tool, args, cwd, env).await;
+    let result = run_tool_passthrough(tool, args, cwd, env, &lineage).await;
 
     // 6b. Invoke optional post-link deploy command on successful link.
     // This handles the case where the compiler driver does NOT auto-deploy
@@ -1556,7 +1557,7 @@ async fn handle_link_ephemeral(
     // The hook runs BEFORE the side-effect scan so scanning picks up
     // whatever it deployed.
     if let (Some(cmd), Response::LinkResult { exit_code: 0, .. }) = (&deploy_cmd, &result) {
-        run_post_link_deploy_hook(cmd, &output_path, env_for_hook.as_deref()).await;
+        run_post_link_deploy_hook(cmd, &output_path, env_for_hook.as_deref(), &lineage).await;
     }
 
     // 7. If successful, cache the output
@@ -1718,6 +1719,7 @@ async fn run_tool_passthrough(
     args: &[String],
     cwd: &Path,
     env: Option<Vec<(String, String)>>,
+    lineage: &crate::lineage::Lineage,
 ) -> Response {
     let tmp_dir = std::env::temp_dir();
     let _rsp_guard =
@@ -1738,12 +1740,7 @@ async fn run_tool_passthrough(
     }
     cmd.current_dir(cwd);
 
-    if let Some(env_vars) = env {
-        cmd.env_clear();
-        for (k, v) in &env_vars {
-            cmd.env(k, v);
-        }
-    }
+    apply_client_env_sync(&mut cmd, env.as_deref(), lineage);
 
     match crate::process::command_output(&mut cmd) {
         Ok(output) => Response::LinkResult {
@@ -1790,6 +1787,7 @@ async fn run_post_link_deploy_hook(
     cmd_str: &str,
     output_path: &Path,
     env: Option<&[(String, String)]>,
+    lineage: &crate::lineage::Lineage,
 ) {
     // Split command string on whitespace — first token is the executable,
     // remaining tokens are extra args. We don't support quoted args yet;
@@ -1815,13 +1813,10 @@ async fn run_post_link_deploy_hook(
     }
 
     // Propagate the client's env — the deploy tool may rely on PATH, TMP,
-    // language-specific vars (CLANG_TOOL_CHAIN_*), etc.
-    if let Some(env_vars) = env {
-        cmd.env_clear();
-        for (k, v) in env_vars {
-            cmd.env(k, v);
-        }
-    }
+    // language-specific vars (CLANG_TOOL_CHAIN_*), etc. Spawn-lineage env
+    // vars are layered on top so the hook (and anything it spawns) can be
+    // attributed back to the daemon.
+    apply_client_env_sync(&mut cmd, env, lineage);
 
     tracing::debug!(
         program = %program,
@@ -2765,15 +2760,22 @@ async fn handle_compile(
 
     let compiler: NormalizedPath = compiler_path.into();
 
+    // Lineage carried into every child spawned for this compile request —
+    // compiler, depfile probe, etc. See `crate::lineage` and issue #7.
+    let lineage =
+        crate::lineage::Lineage::current(session_client_pid(state, &sid), Some(session_id.into()));
+
     // Discover system includes for this compiler (cached per compiler path)
     let system_includes = {
         let mut cache = state.system_includes.lock().await;
+        let lineage_for_probe = lineage.clone();
         cache
             .get_or_discover(&compiler, |c| {
                 let disc_args = zccache_depgraph::discovery_args();
                 let output = {
                     let mut cmd = std::process::Command::new(c);
                     cmd.args(&disc_args);
+                    lineage_for_probe.apply_to_sync(&mut cmd, None);
                     crate::process::command_output(&mut cmd)
                 };
                 match output {
@@ -3330,7 +3332,7 @@ async fn handle_compile(
             cmd.args(&extra_args);
         }
     }
-    apply_client_env(&mut cmd, &client_env);
+    apply_client_env(&mut cmd, &client_env, &lineage);
     let result = crate::process::tokio_command_output(&mut cmd).await;
 
     let output = match result {
@@ -3687,15 +3689,47 @@ async fn handle_compile(
     }
 }
 
-/// Apply client environment variables to a compiler command.
-/// If `client_env` is `Some`, clears the inherited env and sets only the client's vars.
-fn apply_client_env(cmd: &mut tokio::process::Command, client_env: &Option<Vec<(String, String)>>) {
+/// Apply client environment variables to a compiler command, then overlay
+/// spawn-lineage markers so orphan trackers can attribute the child to
+/// zccache (see `crate::lineage`).
+///
+/// If `client_env` is `Some`, the inherited env is cleared and replaced with
+/// the client's vars. Lineage env vars are layered on top in either case so
+/// the child always carries the chain.
+fn apply_client_env(
+    cmd: &mut tokio::process::Command,
+    client_env: &Option<Vec<(String, String)>>,
+    lineage: &crate::lineage::Lineage,
+) {
     if let Some(vars) = client_env {
         cmd.env_clear();
         for (key, val) in vars {
             cmd.env(key, val);
         }
     }
+    lineage.apply_to_tokio(cmd, client_env.as_deref());
+}
+
+/// Sync-command counterpart of [`apply_client_env`].
+fn apply_client_env_sync(
+    cmd: &mut std::process::Command,
+    client_env: Option<&[(String, String)]>,
+    lineage: &crate::lineage::Lineage,
+) {
+    if let Some(vars) = client_env {
+        cmd.env_clear();
+        for (key, val) in vars {
+            cmd.env(key, val);
+        }
+    }
+    lineage.apply_to_sync(cmd, client_env);
+}
+
+/// Look up the client PID for a session. Returns `None` if the session is
+/// unknown (already ended) — callers should still emit lineage with whatever
+/// they know.
+fn session_client_pid(state: &SharedState, sid: &SessionId) -> Option<u32> {
+    state.sessions.get(sid).map(|s| s.client_pid)
 }
 
 /// A deferred output write for a cache hit.
@@ -4185,13 +4219,15 @@ async fn handle_compile_multi(
         }
     };
 
+    let lineage =
+        crate::lineage::Lineage::current(session_client_pid(&state, &sid), Some(sid.to_string()));
     let mut cmd = tokio::process::Command::new(&compiler);
     if let Some(ref rsp) = _rsp_guard {
         cmd.arg(rsp.at_arg()).current_dir(&cwd_path);
     } else {
         cmd.args(&compiler_args).current_dir(&cwd_path);
     }
-    apply_client_env(&mut cmd, &client_env);
+    apply_client_env(&mut cmd, &client_env, &lineage);
     let result = crate::process::tokio_command_output(&mut cmd).await;
 
     let output = match result {
@@ -4437,13 +4473,17 @@ async fn run_compiler_direct(
             }
         };
 
+    let lineage = crate::lineage::Lineage::current(
+        sessions.get(sid).map(|s| s.client_pid),
+        Some(sid.to_string()),
+    );
     let mut cmd = tokio::process::Command::new(compiler);
     if let Some(ref rsp) = _rsp_guard {
         cmd.arg(rsp.at_arg()).current_dir(cwd);
     } else {
         cmd.args(args).current_dir(cwd);
     }
-    apply_client_env(&mut cmd, client_env);
+    apply_client_env(&mut cmd, client_env, &lineage);
     let result = crate::process::tokio_command_output(&mut cmd).await;
 
     match result {
@@ -5686,7 +5726,8 @@ exit /b 0
             .unwrap();
 
         let cmd_str = script.to_string_lossy().to_string();
-        run_post_link_deploy_hook(&cmd_str, &output, None).await;
+        let lineage = crate::lineage::Lineage::current(None, None);
+        run_post_link_deploy_hook(&cmd_str, &output, None, &lineage).await;
 
         assert!(
             dir.path().join("libruntime.so").exists(),
@@ -5703,7 +5744,8 @@ exit /b 0
         std::fs::write(&output, b"binary").unwrap();
 
         // Just exit 1 — no side effect.
-        run_post_link_deploy_hook("false", &output, None).await;
+        let lineage = crate::lineage::Lineage::current(None, None);
+        run_post_link_deploy_hook("false", &output, None, &lineage).await;
         // If we reached here without panic, the test passes. A warning should
         // have been logged by the hook.
     }
@@ -5715,10 +5757,12 @@ exit /b 0
         let output = dir.path().join("app.dll");
         std::fs::write(&output, b"binary").unwrap();
 
+        let lineage = crate::lineage::Lineage::current(None, None);
         run_post_link_deploy_hook(
             "this-program-does-not-exist-zccache-test-12345",
             &output,
             None,
+            &lineage,
         )
         .await;
         // No panic = pass.
@@ -5731,8 +5775,9 @@ exit /b 0
         let output = dir.path().join("app.dll");
         std::fs::write(&output, b"binary").unwrap();
 
-        run_post_link_deploy_hook("", &output, None).await;
-        run_post_link_deploy_hook("   ", &output, None).await;
+        let lineage = crate::lineage::Lineage::current(None, None);
+        run_post_link_deploy_hook("", &output, None, &lineage).await;
+        run_post_link_deploy_hook("   ", &output, None, &lineage).await;
         // No panic = pass.
     }
 
@@ -5765,7 +5810,8 @@ exit /b 0
             ),
             ("ZCCACHE_TEST_MARKER".to_string(), "hello-hook".to_string()),
         ];
-        run_post_link_deploy_hook(&script.to_string_lossy(), &output, Some(&env)).await;
+        let lineage = crate::lineage::Lineage::current(None, None);
+        run_post_link_deploy_hook(&script.to_string_lossy(), &output, Some(&env), &lineage).await;
 
         let marker = std::fs::read_to_string(dir.path().join("marker.txt")).unwrap();
         assert_eq!(marker, "hello-hook");

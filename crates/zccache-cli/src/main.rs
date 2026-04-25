@@ -3264,6 +3264,8 @@ fn spawn_daemon(bin: &std::path::Path, endpoint: &str) -> Result<(), String> {
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
 
+    apply_cli_spawn_lineage(&mut cmd);
+
     // Platform-specific: prevent console window on Windows and avoid
     // inheriting parent pipe handles (which cause subprocess hangs).
     #[cfg(windows)]
@@ -3288,6 +3290,42 @@ fn spawn_daemon(bin: &std::path::Path, endpoint: &str) -> Result<(), String> {
     restore_handle_inheritance();
 
     Ok(())
+}
+
+/// Initialize spawn-lineage env vars on a command the CLI is about to spawn.
+///
+/// Mirrors the daemon-side propagation in `zccache_daemon::lineage` so process
+/// attribution (orphan tracking, running-process scanners) sees a consistent
+/// chain across CLI -> daemon -> compiler hops. The chain is initialized with
+/// the CLI's PID, and the originator marker is set to `zccache-cli:<pid>`
+/// unless an outer tool has already claimed it.
+fn apply_cli_spawn_lineage(cmd: &mut std::process::Command) {
+    const ENV_ORIGINATOR: &str = "RUNNING_PROCESS_ORIGINATOR";
+    const ENV_LINEAGE: &str = "ZCCACHE_LINEAGE";
+    const ENV_PARENT_PID: &str = "ZCCACHE_PARENT_PID";
+    const ENV_CLIENT_PID: &str = "ZCCACHE_CLIENT_PID";
+
+    let cli_pid = std::process::id();
+
+    if std::env::var(ENV_ORIGINATOR).is_err() {
+        cmd.env(ENV_ORIGINATOR, format!("zccache-cli:{cli_pid}"));
+    }
+
+    let chain = match std::env::var(ENV_LINEAGE) {
+        Ok(existing)
+            if existing
+                .rsplit_once('>')
+                .map_or(existing.as_str(), |(_, last)| last)
+                != cli_pid.to_string() =>
+        {
+            format!("{existing}>{cli_pid}")
+        }
+        Ok(existing) => existing,
+        Err(_) => cli_pid.to_string(),
+    };
+    cmd.env(ENV_LINEAGE, chain);
+    cmd.env(ENV_PARENT_PID, cli_pid.to_string());
+    cmd.env(ENV_CLIENT_PID, cli_pid.to_string());
 }
 
 /// On Windows, mark stdout/stderr handles as non-inheritable so that child
