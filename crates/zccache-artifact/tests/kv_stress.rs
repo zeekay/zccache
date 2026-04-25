@@ -1,8 +1,8 @@
 //! Stress / concurrency / platform-compliance tests for the K/V store.
 //!
-//! These run under the regular `cargo test -p zccache-artifact` umbrella
-//! but are kept out of the inline `kv.rs` tests so that quick `cargo
-//! check` / unit-only test runs stay fast.
+//! Heavy tests (thousands of fsync commits, 64 MiB allocations, busy-loop
+//! reader/writer races) are marked `#[ignore]` so they only run under
+//! `./test --full`. Default `./test` and the Stop hook stay fast.
 
 use std::sync::Arc;
 
@@ -22,6 +22,7 @@ fn key_from(seed: &[u8]) -> Key {
 // =====================================================================
 
 #[test]
+#[ignore = "stress: 1600 fsync commits"]
 fn c1_thundering_herd_same_key() {
     let dir = tempfile::tempdir().unwrap();
     let s = store_in_dir(dir.path());
@@ -50,6 +51,7 @@ fn c1_thundering_herd_same_key() {
 }
 
 #[test]
+#[ignore = "stress: 640 fsync commits"]
 fn c2_distinct_key_parallel_writers() {
     let dir = tempfile::tempdir().unwrap();
     let s = store_in_dir(dir.path());
@@ -84,6 +86,7 @@ fn c2_distinct_key_parallel_writers() {
 }
 
 #[test]
+#[ignore = "stress: spinning reader/writer race"]
 fn c3_reader_writer_race() {
     let dir = tempfile::tempdir().unwrap();
     let s = store_in_dir(dir.path());
@@ -157,6 +160,7 @@ fn c4_open_while_write_visibility() {
 }
 
 #[test]
+#[ignore = "stress: 1000 fsync commits"]
 fn c5_clear_while_writes_keeps_consistency() {
     let dir = tempfile::tempdir().unwrap();
     let s = store_in_dir(dir.path());
@@ -190,6 +194,7 @@ fn c5_clear_while_writes_keeps_consistency() {
 // =====================================================================
 
 #[test]
+#[ignore = "stress: 50 redb open/close cycles"]
 fn d3_repeated_open_close() {
     let dir = tempfile::tempdir().unwrap();
     for i in 0..50 {
@@ -301,10 +306,10 @@ fn p6_utf8_namespace_rejected_on_every_os() {
 // Input edge cases (I5)
 // =====================================================================
 
-// I5: value at MAX_VALUE_BYTES is accepted. Allocates 64 MiB; ignored when the
-// system is memory-constrained by setting #[ignore] off-by-default would be
-// overkill for CI — we run it.
+// I5: value at MAX_VALUE_BYTES is accepted. Allocates 64 MiB and writes it,
+// so we hide it behind #[ignore] / `./test --full`.
 #[test]
+#[ignore = "stress: 64 MiB allocation + spill"]
 fn i5_value_at_max_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let s = store_in_dir(dir.path());

@@ -501,6 +501,9 @@ mod tests {
     #[test]
     fn f1_round_trip_sizes() {
         let (_d, s) = store();
+        // Boundary-focused sizes; the 4-MiB / 64-MiB cases live in the
+        // `--full` stress tests (`tests/kv_stress.rs`) so the default test
+        // run stays fast on Windows where every redb commit is an fsync.
         let sizes = [
             0,
             1,
@@ -508,8 +511,7 @@ mod tests {
             INLINE_THRESHOLD - 1,
             INLINE_THRESHOLD,
             INLINE_THRESHOLD + 1,
-            100 * 1024,
-            4 * 1024 * 1024,
+            64 * 1024,
         ];
         for (i, n) in sizes.iter().enumerate() {
             let k = key_from(&i.to_le_bytes());
@@ -762,16 +764,13 @@ mod tests {
         ));
     }
 
-    // ---- I5/I6: max value bytes ----
+    // ---- I5/I6: max value bytes (allocates 64 MiB, runs only under --full) ----
     #[test]
+    #[ignore = "allocates 64 MiB; see tests/kv_stress.rs for max-cap coverage"]
     fn i6_too_large_rejected() {
         let (_d, s) = store();
         let k = key_from(b"big");
         let oversized = MAX_VALUE_BYTES + 1;
-        // We don't actually allocate 64 MiB for a unit test that just checks
-        // the bound — fake a slice that would exceed the cap by checking the
-        // smaller of: the cap, an artificially small synthetic cap.
-        // We exercise the genuine path with a Vec of cap+1 bytes.
         let v = vec![0u8; oversized];
         let err = s.put("ns", &k, &v).unwrap_err();
         assert!(matches!(err, KvError::TooLarge(n, m) if n == oversized && m == MAX_VALUE_BYTES));
