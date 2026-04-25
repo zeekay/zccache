@@ -492,12 +492,54 @@ fn which_on_path(name: &str) -> Option<NormalizedPath> {
     None
 }
 
+/// Initialize spawn-lineage env vars on a command the CLI is about to spawn.
+///
+/// Mirrors the daemon-side propagation in `zccache_daemon::lineage` so that
+/// any process attribution (orphan tracking, running-process scanners) sees
+/// a consistent chain across CLI -> daemon -> compiler hops. The chain is
+/// initialized with the CLI's PID, and the originator marker (used by
+/// running-process for crash-resilient orphan discovery) is set to
+/// `zccache-cli:<pid>` unless an outer tool has already claimed it.
+fn apply_cli_spawn_lineage(cmd: &mut std::process::Command) {
+    const ENV_ORIGINATOR: &str = "RUNNING_PROCESS_ORIGINATOR";
+    const ENV_LINEAGE: &str = "ZCCACHE_LINEAGE";
+    const ENV_PARENT_PID: &str = "ZCCACHE_PARENT_PID";
+    const ENV_CLIENT_PID: &str = "ZCCACHE_CLIENT_PID";
+
+    let cli_pid = std::process::id();
+
+    // Preserve any outer originator (e.g. the build tool was already wrapped
+    // by running-process). Otherwise, claim the originator slot ourselves.
+    if std::env::var(ENV_ORIGINATOR).is_err() {
+        cmd.env(ENV_ORIGINATOR, format!("zccache-cli:{cli_pid}"));
+    }
+
+    // Extend or initialize the chain with our PID.
+    let chain = match std::env::var(ENV_LINEAGE) {
+        Ok(existing)
+            if existing
+                .rsplit_once('>')
+                .map_or(existing.as_str(), |(_, last)| last)
+                != cli_pid.to_string() =>
+        {
+            format!("{existing}>{cli_pid}")
+        }
+        Ok(existing) => existing,
+        Err(_) => cli_pid.to_string(),
+    };
+    cmd.env(ENV_LINEAGE, chain);
+    cmd.env(ENV_PARENT_PID, cli_pid.to_string());
+    cmd.env(ENV_CLIENT_PID, cli_pid.to_string());
+}
+
 fn spawn_daemon(bin: &Path, endpoint: &str) -> Result<(), String> {
     let mut cmd = std::process::Command::new(bin);
     cmd.args(["--foreground", "--endpoint", endpoint]);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
+
+    apply_cli_spawn_lineage(&mut cmd);
 
     #[cfg(windows)]
     {
