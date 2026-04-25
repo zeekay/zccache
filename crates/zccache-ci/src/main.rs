@@ -207,7 +207,10 @@ fn kill_daemon(root: &Path) {
         if !exe.starts_with(&target_dir) {
             continue;
         }
-        eprintln!("Killing in-tree daemon (PID {pid}, {}) to unlock target binaries", exe.display());
+        eprintln!(
+            "Killing in-tree daemon (PID {pid}, {}) to unlock target binaries",
+            exe.display()
+        );
         process.kill();
     }
 }
