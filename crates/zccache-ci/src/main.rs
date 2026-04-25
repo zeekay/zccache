@@ -180,18 +180,35 @@ fn dump_threads(pid: sysinfo::Pid) {
 // Pre-check: kill running daemon so cargo can replace the exe
 // ---------------------------------------------------------------------------
 
-fn kill_daemon() {
+/// Kill any leftover in-tree zccache daemon so cargo can replace its exe.
+///
+/// **Crucially**, this only kills processes whose executable lives inside the
+/// repo's `target/` directory. soldr ships its own managed zccache daemon
+/// (same binary name, `zccache-daemon.exe`); killing soldr's daemon breaks
+/// the rustc wrapper that the very next cargo invocation depends on. Filtering
+/// by exe path is what keeps the two coexisting cleanly.
+fn kill_daemon(root: &Path) {
     use sysinfo::ProcessesToUpdate;
 
+    let target_dir = root.join("target");
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
 
     for (pid, process) in sys.processes() {
         let name = process.name().to_string_lossy();
-        if name == "zccache-daemon" || name == "zccache-daemon.exe" {
-            eprintln!("Killing running daemon (PID {pid}) to unlock target binaries");
-            process.kill();
+        if name != "zccache-daemon" && name != "zccache-daemon.exe" {
+            continue;
         }
+        // exe() can return None for processes we lack permission to inspect —
+        // in that case it's not ours to kill anyway, so skip.
+        let Some(exe) = process.exe() else {
+            continue;
+        };
+        if !exe.starts_with(&target_dir) {
+            continue;
+        }
+        eprintln!("Killing in-tree daemon (PID {pid}, {}) to unlock target binaries", exe.display());
+        process.kill();
     }
 }
 
@@ -295,8 +312,9 @@ fn main() -> ExitCode {
     // Ensure all spawned cargo/rustc processes find the rustup toolchain
     activate_rustup_toolchain(&root);
 
-    // Kill any running daemon so cargo can replace the exe on Windows
-    kill_daemon();
+    // Kill any running in-tree daemon so cargo can replace the exe on Windows.
+    // (Soldr-managed zccache daemons outside the repo's target/ are left alone.)
+    kill_daemon(root.as_path());
 
     if level == CheckLevel::QuickCheck {
         eprintln!("Pre-existing dirty files — running cargo check");
