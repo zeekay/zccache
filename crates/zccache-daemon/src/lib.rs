@@ -15,6 +15,7 @@ mod process;
 pub mod server;
 pub mod side_effect;
 pub mod stats;
+pub mod trampoline;
 
 pub use event_log::EventLogger;
 pub use server::DaemonServer;

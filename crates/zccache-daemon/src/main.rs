@@ -2,6 +2,10 @@
 //!
 //! The daemon maintains in-memory caches, manages the artifact store,
 //! runs the file watcher, and handles IPC requests from CLI/wrappers.
+//!
+//! On the long-lived foreground path, the daemon releases its launch
+//! handles (exe file lock on Windows, implicit cwd handle on all OSes)
+//! via [`zccache_daemon::trampoline`] before entering [`run_server`].
 
 #[cfg(unix)]
 #[global_allocator]
@@ -50,6 +54,11 @@ fn main() {
 
     if args.foreground {
         init_tracing(&args.log_level);
+        // Long-lived process: release exe-file lock and cwd handle so
+        // `pip install --upgrade zccache` and `rm -rf <project>` can
+        // succeed while the daemon is running. See issue #134.
+        zccache_daemon::trampoline::unlock_exe();
+        zccache_daemon::trampoline::release_cwd();
         run_server(args);
     } else {
         print_status(&args);
