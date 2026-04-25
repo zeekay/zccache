@@ -27,7 +27,10 @@ pub use zccache_download_protocol::daemon_mgmt::{
 
 pub fn check_running_daemon() -> Option<u32> {
     let pid = read_lock_file_pid()?;
-    if zccache_ipc::is_process_alive(pid) {
+    // Verify the PID actually points at the download daemon. A bare
+    // is_process_alive check would falsely accept a recycled PID inherited
+    // from a restored CI cache (see issue #132).
+    if zccache_ipc::verify_pid_exe_stem(pid, "zccache-download-daemon") {
         Some(pid)
     } else {
         remove_lock_file();

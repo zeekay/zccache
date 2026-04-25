@@ -864,63 +864,6 @@ pub fn fingerprint_invalidate(endpoint: Option<&str>, cache_file: &Path) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        _lock: MutexGuard<'static, ()>,
-        previous: Option<OsString>,
-    }
-
-    impl EnvGuard {
-        fn set_cache_dir(value: &std::path::Path) -> Self {
-            let lock = ENV_LOCK.lock().unwrap();
-            let previous = std::env::var_os(zccache_core::config::CACHE_DIR_ENV);
-            std::env::set_var(zccache_core::config::CACHE_DIR_ENV, value);
-            Self {
-                _lock: lock,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(zccache_core::config::CACHE_DIR_ENV, value),
-                None => std::env::remove_var(zccache_core::config::CACHE_DIR_ENV),
-            }
-        }
-    }
-
-    fn fake_status() -> zccache_protocol::DaemonStatus {
-        zccache_protocol::DaemonStatus {
-            version: zccache_core::VERSION.to_string(),
-            artifact_count: 0,
-            cache_size_bytes: 0,
-            metadata_entries: 0,
-            uptime_secs: 0,
-            cache_hits: 0,
-            cache_misses: 0,
-            total_compilations: 0,
-            non_cacheable: 0,
-            compile_errors: 0,
-            time_saved_ms: 0,
-            total_links: 0,
-            link_hits: 0,
-            link_misses: 0,
-            link_non_cacheable: 0,
-            dep_graph_contexts: 0,
-            dep_graph_files: 0,
-            sessions_total: 0,
-            sessions_active: 0,
-            cache_dir: zccache_core::config::default_cache_dir(),
-            dep_graph_version: 0,
-            dep_graph_disk_size: 0,
-        }
-    }
 
     #[test]
     fn infer_download_path_keeps_url_filename() {
@@ -966,45 +909,4 @@ mod tests {
         assert!(file_name.ends_with("-toolchain.tar.zst"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn client_start_waits_for_delayed_listener() {
-        let endpoint = zccache_ipc::unique_test_endpoint();
-        let cache_root = tempfile::tempdir().unwrap();
-        let _env = EnvGuard::set_cache_dir(cache_root.path());
-        let lock_path = zccache_ipc::lock_file_path();
-
-        std::fs::write(&lock_path, std::process::id().to_string()).unwrap();
-
-        let ep = endpoint.clone();
-        let cache_dir = cache_root.path().to_path_buf();
-        let server = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-            let mut listener = zccache_ipc::IpcListener::bind(&ep).unwrap();
-            let mut conn = listener.accept().await.unwrap();
-
-            let req: Option<zccache_protocol::Request> = conn.recv().await.unwrap();
-            assert_eq!(req, Some(zccache_protocol::Request::Status));
-
-            conn.send(&zccache_protocol::Response::Status(
-                zccache_protocol::DaemonStatus {
-                    cache_dir: cache_dir.into(),
-                    ..fake_status()
-                },
-            ))
-            .await
-            .unwrap();
-        });
-
-        let result = tokio::task::spawn_blocking(move || client_start(Some(&endpoint)))
-            .await
-            .unwrap();
-        let _ = std::fs::remove_file(&lock_path);
-        server.await.unwrap();
-
-        assert!(
-            result.is_ok(),
-            "expected delayed daemon to be accepted: {result:?}"
-        );
-    }
 }

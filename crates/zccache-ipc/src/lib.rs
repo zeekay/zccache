@@ -182,14 +182,103 @@ pub fn is_process_alive(pid: u32) -> bool {
     }
 }
 
+/// Returns true if `pid` exists **and** its executable looks like a zccache
+/// daemon. Defends against stale `daemon.lock` files where the recorded PID has
+/// been recycled by an unrelated process — typical when a CI runner restores a
+/// cache directory containing a lock file from a prior, abruptly-terminated
+/// run. Without this check, [`check_running_daemon`] would mis-identify the
+/// recycled PID as our daemon and callers like `zccache stop` would
+/// `force_kill_process` an arbitrary system process. See issue #132.
+#[must_use]
+pub fn verify_daemon_pid(pid: u32) -> bool {
+    verify_pid_exe_stem(pid, "zccache-daemon")
+}
+
+/// Generic version of [`verify_daemon_pid`]: confirms `pid` is alive and its
+/// executable filename (without `.exe`) matches `expected_stem`. Used by
+/// callers that own a different daemon binary (e.g. the download daemon).
+#[must_use]
+pub fn verify_pid_exe_stem(pid: u32, expected_stem: &str) -> bool {
+    if !is_process_alive(pid) {
+        return false;
+    }
+    match daemon_exe_for_pid(pid) {
+        // Got an exe path — only trust the PID if it points at our daemon.
+        Some(exe) => exe_stem_matches(&exe, expected_stem),
+        // Platform doesn't support reading the exe path. Fall back to the
+        // existing alive-only behavior so we don't regress on those platforms.
+        None => true,
+    }
+}
+
+fn exe_stem_matches(path: &std::path::Path, expected_stem: &str) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let name = name.to_string_lossy();
+    let stem = name.strip_suffix(".exe").unwrap_or(&name);
+    stem == expected_stem
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_exe_for_pid(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_exe_for_pid(_pid: u32) -> Option<std::path::PathBuf> {
+    // proc_pidpath is the right call but pulling in libc/libproc just for
+    // CI-recycle defense isn't worth it on macOS, where this failure mode
+    // hasn't been observed. Fall back to alive-only.
+    None
+}
+
+#[cfg(windows)]
+fn daemon_exe_for_pid(pid: u32) -> Option<std::path::PathBuf> {
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn CloseHandle(handle: isize) -> i32;
+        fn QueryFullProcessImageNameW(
+            handle: isize,
+            flags: u32,
+            buffer: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; 32_768];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
+        CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        use std::os::windows::ffi::OsStringExt;
+        let os = std::ffi::OsString::from_wide(&buf[..size as usize]);
+        Some(std::path::PathBuf::from(os))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn daemon_exe_for_pid(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Check if a daemon is already running. Returns the PID if alive.
 #[must_use]
 pub fn check_running_daemon() -> Option<u32> {
     let pid = read_lock_file_pid()?;
-    if is_process_alive(pid) {
+    if verify_daemon_pid(pid) {
         Some(pid)
     } else {
-        // Stale lock file — clean up
+        // Stale lock file — clean up. The PID may be dead, or may belong to
+        // an unrelated process that recycled the lock file's PID (issue #132).
         remove_lock_file();
         #[cfg(unix)]
         {
@@ -261,5 +350,55 @@ mod tests {
         let a = NormalizedPath::from("/tmp/zccache-a");
         let b = NormalizedPath::from("/tmp/zccache-b");
         assert_ne!(endpoint_for_cache_dir(&a), endpoint_for_cache_dir(&b));
+    }
+
+    #[test]
+    fn exe_stem_matches_strips_exe_suffix_and_compares_basename() {
+        use std::path::Path;
+        assert!(exe_stem_matches(
+            Path::new("/usr/bin/zccache-daemon"),
+            "zccache-daemon"
+        ));
+        assert!(exe_stem_matches(
+            Path::new(r"C:\bin\zccache-daemon.exe"),
+            "zccache-daemon"
+        ));
+        // A different binary at the same PID must not be accepted.
+        assert!(!exe_stem_matches(
+            Path::new("/usr/bin/bash"),
+            "zccache-daemon"
+        ));
+        assert!(!exe_stem_matches(
+            Path::new("/usr/bin/zccache-daemon-x"),
+            "zccache-daemon"
+        ));
+    }
+
+    /// Regression test for issue #132: a stale `daemon.lock` restored from a
+    /// CI cache can carry a PID that's been recycled by an unrelated process
+    /// on a fresh runner. `check_running_daemon` must NOT report that process
+    /// as our daemon — otherwise `zccache stop` would `force_kill_process`
+    /// the unrelated process.
+    ///
+    /// We use the test's own PID, which is guaranteed alive but is clearly
+    /// not zccache-daemon, then assert the lock file is treated as stale.
+    #[test]
+    fn stale_lock_with_recycled_pid_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let cache_dir = root.path().join("zc");
+        let _env = EnvGuard::set_cache_dir(&cache_dir);
+
+        let lock = lock_file_path();
+        write_lock_file(std::process::id()).unwrap();
+        assert!(lock.exists());
+
+        // The test process is alive but is not zccache-daemon — must be rejected.
+        // (On macOS we can't read the exe path, so this test relaxes there: see
+        // `daemon_exe_for_pid` for the platform fallback.)
+        #[cfg(any(target_os = "linux", windows))]
+        {
+            assert!(check_running_daemon().is_none());
+            assert!(!lock.exists(), "stale lock file should have been removed");
+        }
     }
 }
