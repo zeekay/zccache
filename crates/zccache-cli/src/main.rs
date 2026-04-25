@@ -227,6 +227,14 @@ enum Commands {
         #[command(subcommand)]
         action: CargoRegistryCommands,
     },
+    /// Namespaced blake3-keyed key/value store.
+    ///
+    /// Backed by `~/.zccache/index.redb` (separate redb table) and spilled
+    /// payloads under `~/.zccache/kv/<namespace>/<hex>.bin`. See issue #130.
+    Kv {
+        #[command(subcommand)]
+        action: KvCommands,
+    },
     /// Pre-populate target/ with cached artifacts for near-instant builds.
     Warm {
         /// Cargo target directory (default: ./target).
@@ -269,6 +277,51 @@ enum CargoRegistryCommands {
     },
     /// Remove cached registry archives.
     Clean,
+}
+
+/// `zccache kv` subcommands.
+#[derive(Debug, Subcommand)]
+enum KvCommands {
+    /// Read a value to stdout. Exit 2 if missing.
+    Get {
+        /// Namespace (`[a-z0-9-]{1,64}`).
+        namespace: String,
+        /// 64-char hex key.
+        hex_key: String,
+    },
+    /// Write a value. Source is either `--value-from <file>` or stdin.
+    Put {
+        /// Namespace (`[a-z0-9-]{1,64}`).
+        namespace: String,
+        /// 64-char hex key.
+        hex_key: String,
+        /// Read value bytes from this file.
+        #[arg(long, conflicts_with = "value_from_stdin")]
+        value_from: Option<String>,
+        /// Read value bytes from stdin.
+        #[arg(long, conflicts_with = "value_from")]
+        value_from_stdin: bool,
+    },
+    /// Remove an entry. Idempotent — missing keys exit 0.
+    Rm {
+        /// Namespace.
+        namespace: String,
+        /// 64-char hex key.
+        hex_key: String,
+    },
+    /// List entries under a namespace, sorted by hex key. One row per entry:
+    /// `<hex>  <bytes>`.
+    Ls {
+        /// Namespace.
+        namespace: String,
+    },
+    /// Drop every entry under a namespace.
+    Clear {
+        /// Namespace.
+        namespace: String,
+    },
+    /// Print total bytes and per-namespace bytes.
+    Stats,
 }
 
 /// Fingerprint subcommands.
@@ -736,6 +789,7 @@ fn main() -> ExitCode {
             CargoRegistryCommands::Hash { lockfile } => cmd_cargo_registry_hash(&lockfile),
             CargoRegistryCommands::Clean => cmd_cargo_registry_clean(),
         },
+        Commands::Kv { action } => cmd_kv(action),
         Commands::Warm {
             target_dir,
             profile,
@@ -1015,6 +1069,175 @@ async fn cmd_clear(endpoint: &str) -> ExitCode {
         Some(other) => {
             eprintln!("zccache: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_kv(action: KvCommands) -> ExitCode {
+    use std::io::{Read, Write};
+    use zccache_artifact::{Key, KvError, KvStore};
+
+    fn open_store() -> Result<KvStore, ExitCode> {
+        match KvStore::open_default() {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                eprintln!("zccache kv: open: {e}");
+                Err(ExitCode::FAILURE)
+            }
+        }
+    }
+
+    fn parse_key(hex: &str) -> Result<Key, ExitCode> {
+        Key::from_hex(hex).map_err(|e| {
+            eprintln!("zccache kv: bad key: {e}");
+            ExitCode::FAILURE
+        })
+    }
+
+    match action {
+        KvCommands::Get { namespace, hex_key } => {
+            let store = match open_store() {
+                Ok(s) => s,
+                Err(c) => return c,
+            };
+            let key = match parse_key(&hex_key) {
+                Ok(k) => k,
+                Err(c) => return c,
+            };
+            match store.get(&namespace, &key) {
+                Ok(Some(bytes)) => {
+                    let stdout = std::io::stdout();
+                    let mut handle = stdout.lock();
+                    if let Err(e) = handle.write_all(&bytes) {
+                        eprintln!("zccache kv get: write stdout: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                    ExitCode::SUCCESS
+                }
+                Ok(None) => ExitCode::from(2),
+                Err(e) => {
+                    eprintln!("zccache kv get: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        KvCommands::Put {
+            namespace,
+            hex_key,
+            value_from,
+            value_from_stdin,
+        } => {
+            let store = match open_store() {
+                Ok(s) => s,
+                Err(c) => return c,
+            };
+            let key = match parse_key(&hex_key) {
+                Ok(k) => k,
+                Err(c) => return c,
+            };
+            let bytes = if let Some(path) = value_from {
+                match std::fs::read(&path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("zccache kv put: read {path}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else if value_from_stdin {
+                let mut buf = Vec::new();
+                if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
+                    eprintln!("zccache kv put: read stdin: {e}");
+                    return ExitCode::FAILURE;
+                }
+                buf
+            } else {
+                eprintln!("zccache kv put: must specify --value-from <file> or --value-from-stdin");
+                return ExitCode::FAILURE;
+            };
+            match store.put(&namespace, &key, &bytes) {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(KvError::TooLarge(n, m)) => {
+                    eprintln!("zccache kv put: value too large: {n} bytes (max {m})");
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("zccache kv put: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        KvCommands::Rm { namespace, hex_key } => {
+            let store = match open_store() {
+                Ok(s) => s,
+                Err(c) => return c,
+            };
+            let key = match parse_key(&hex_key) {
+                Ok(k) => k,
+                Err(c) => return c,
+            };
+            match store.remove(&namespace, &key) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("zccache kv rm: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        KvCommands::Ls { namespace } => {
+            let store = match open_store() {
+                Ok(s) => s,
+                Err(c) => return c,
+            };
+            match store.list_namespace(&namespace) {
+                Ok(entries) => {
+                    for (k, len) in entries {
+                        println!("{}  {}", k.to_hex(), len);
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("zccache kv ls: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        KvCommands::Clear { namespace } => {
+            let store = match open_store() {
+                Ok(s) => s,
+                Err(c) => return c,
+            };
+            match store.clear_namespace(&namespace) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("zccache kv clear: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        KvCommands::Stats => {
+            let store = match open_store() {
+                Ok(s) => s,
+                Err(c) => return c,
+            };
+            let total = match store.total_bytes() {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("zccache kv stats: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let by_ns = match store.stats() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("zccache kv stats: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            println!("total_bytes  {total}");
+            for (ns, bytes) in by_ns {
+                println!("{ns}  {bytes}");
+            }
+            ExitCode::SUCCESS
         }
     }
 }

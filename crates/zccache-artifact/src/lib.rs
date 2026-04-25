@@ -5,9 +5,13 @@
 
 #![allow(clippy::missing_errors_doc)] // TODO: add error docs
 
+pub mod kv;
 mod rust_plan;
 mod store;
 
+pub use kv::{
+    is_valid_namespace, Key, KvError, KvResult, KvStore, INLINE_THRESHOLD, MAX_VALUE_BYTES,
+};
 pub use rust_plan::{
     restore_rust_plan_local, rust_plan_bundle_dir, rust_plan_cache_key, save_rust_plan_local,
     RustArtifactBundleManifest, RustArtifactClass, RustArtifactPlanV1, RustBundledArtifact,
