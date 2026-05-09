@@ -51,7 +51,7 @@ per invocation.
 1. `zccache session-start [--stats] [--log FILE]` → `Request::SessionStart` → `Response::SessionStarted { session_id }`.
 2. Build system sets `ZCCACHE_SESSION_ID=<uuid>`. Each compiler invocation sends `Request::Compile`.
 3. `zccache session-stats <id>` → `Request::SessionStats` → `Response::SessionStatsResult`. Non-destructive; session stays active. Returns `Option<SessionStats>` (`None` if `--stats` was not used at start).
-4. `zccache session-end <id>` → `Request::SessionEnd` → `Response::SessionEnded { stats }`. Removes the session.
+4. `zccache session-end <id>` → `Request::SessionEnd` → `Response::SessionEnded { stats }`. Removes the session. Idempotent: ending a UUID the daemon does not know returns `SessionEnded { stats: None }` rather than an error so wrappers can safely call `session-end` after a daemon restart (e.g. zccache-ci killing the daemon to unlock target binaries on Windows).
 
 **Daemon side:**
 1. Acquire lock file (write PID).

@@ -1117,9 +1117,15 @@ async fn handle_connection(
                             });
                             Response::SessionEnded { stats }
                         } else {
-                            Response::Error {
-                                message: format!("unknown session: {session_id}"),
-                            }
+                            // Idempotent: session-end on an unknown session is a
+                            // no-op success. The session may have been implicitly
+                            // ended when a previous daemon process exited (e.g.
+                            // killed by zccache-ci to unlock target binaries on
+                            // Windows). Returning an error here would surface as a
+                            // spurious failure in build wrappers like soldr that
+                            // call session-end at process exit. No stats are
+                            // returned because the session state is gone.
+                            Response::SessionEnded { stats: None }
                         }
                     }
                     Err(_) => Response::Error {
@@ -5095,7 +5101,7 @@ exit /b 0
         .await;
     }
 
-    /// Ending a nonexistent session returns an error.
+    /// Ending a session with a malformed (non-UUID) ID returns an error.
     #[tokio::test]
     #[ignore] // integration-level: starts real daemon with IPC
     async fn cli_session_end_invalid_id() {
@@ -5118,6 +5124,45 @@ exit /b 0
                     );
                 }
                 other => panic!("expected Error, got: {other:?}"),
+            }
+
+            shutdown.notify_one();
+            server_handle.await.unwrap();
+        })
+        .await;
+    }
+
+    /// Ending an unknown session (well-formed UUID, but daemon has no record
+    /// of it) is idempotent and returns SessionEnded { stats: None }.
+    ///
+    /// This simulates the scenario where the daemon was restarted between
+    /// `session-start` and `session-end` (e.g. zccache-ci kills the daemon
+    /// mid-build to unlock target binaries on Windows). Build wrappers like
+    /// soldr call `session-end` at process exit and must not see a spurious
+    /// failure when the in-memory session is gone.
+    #[tokio::test]
+    #[ignore] // integration-level: starts real daemon with IPC
+    async fn cli_session_end_unknown_uuid_is_idempotent() {
+        zccache_test_support::test_timeout(async {
+            let (endpoint, server_handle, shutdown) = start_daemon().await;
+            let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+
+            client
+                .send(&Request::SessionEnd {
+                    // A well-formed UUID that the daemon has never seen.
+                    session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+                })
+                .await
+                .unwrap();
+
+            match client.recv().await.unwrap() {
+                Some(Response::SessionEnded { stats }) => {
+                    assert!(
+                        stats.is_none(),
+                        "no stats expected for unknown session, got: {stats:?}"
+                    );
+                }
+                other => panic!("expected SessionEnded for unknown UUID, got: {other:?}"),
             }
 
             shutdown.notify_one();
