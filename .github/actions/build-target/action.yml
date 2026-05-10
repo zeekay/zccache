@@ -63,7 +63,6 @@ runs:
         toolchain: 1.94.1
         cache: true
         cache-key-suffix: ${{ inputs.cache_key }}
-        target-cache-paths: target/${{ inputs.target }}
 
     - name: Ensure target stdlib is installed
       shell: bash
