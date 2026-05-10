@@ -57,6 +57,13 @@ pub fn unlock_exe() {
         Err(_) => return,
     };
 
+    // If the CLI already relocated us into `<global>/runtime-binaries/`
+    // before spawning, the install path is already unlocked. No rename
+    // needed — short-circuit. See issue #134.
+    if exe_is_under_runtime_binaries(&my_exe) {
+        return;
+    }
+
     // Rename zccache-daemon.exe → zccache-daemon.exe.old.<rand>. We keep
     // running from the renamed file.
     let rand_id: u32 = std::process::id()
@@ -95,6 +102,27 @@ pub fn unlock_exe() {
 /// that dir until the daemon exits. Cheap one-liner, runs on every OS.
 pub fn release_cwd() {
     let _ = std::env::set_current_dir(std::env::temp_dir());
+}
+
+/// True if `exe` lives directly inside `<global_cache_dir>/runtime-binaries/`,
+/// i.e. the CLI already copied us out of the install path. Compared
+/// against the canonicalized cache dir to be robust to symlinks and
+/// short-name (8.3) tilde expansion on Windows.
+fn exe_is_under_runtime_binaries(exe: &Path) -> bool {
+    let runtime_dir = zccache_core::config::default_cache_dir().join("runtime-binaries");
+    let runtime_canon = match fs::canonicalize(&runtime_dir) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let exe_parent = match exe.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    let exe_parent_canon = match fs::canonicalize(exe_parent) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    exe_parent_canon == runtime_canon
 }
 
 /// Delete stale .old files next to the exe. Best-effort — locked files skipped.

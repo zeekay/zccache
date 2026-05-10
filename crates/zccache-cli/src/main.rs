@@ -3491,7 +3491,20 @@ fn which_on_path(name: &str) -> Option<NormalizedPath> {
 /// inherits these handles, the parent hangs forever waiting for pipe closure
 /// because the daemon never exits.
 fn spawn_daemon(bin: &std::path::Path, endpoint: &str) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(bin);
+    // Best-effort: GC stale copies, then spawn from a fresh copy in the
+    // zccache global runtime-binaries dir so the install path stays
+    // overwritable. See issue #134.
+    zccache_cli::gc_runtime_binaries();
+    let bin_owned: std::path::PathBuf;
+    let spawn_bin: &std::path::Path = match zccache_cli::prepare_daemon_exe(bin) {
+        Ok(p) => {
+            bin_owned = p;
+            &bin_owned
+        }
+        Err(_) => bin,
+    };
+
+    let mut cmd = std::process::Command::new(spawn_bin);
     cmd.args(["--foreground", "--endpoint", endpoint]);
 
     // Detach stdio so the daemon doesn't hold our console
