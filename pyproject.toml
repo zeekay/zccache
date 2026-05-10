@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 dependencies = []
 
 [dependency-groups]
-dev = ["soldr>=0.7.6"]
+dev = ["soldr>=0.7.14"]
 
 [project.scripts]
 run_zccache = "ci.soldr:run_zccache"
