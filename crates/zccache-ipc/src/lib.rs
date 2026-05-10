@@ -221,12 +221,14 @@ fn exe_stem_matches(path: &std::path::Path, expected_stem: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn daemon_exe_for_pid(pid: u32) -> Option<std::path::PathBuf> {
-    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+fn daemon_exe_for_pid(pid: u32) -> Option<NormalizedPath> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(NormalizedPath::from)
 }
 
 #[cfg(target_os = "macos")]
-fn daemon_exe_for_pid(_pid: u32) -> Option<std::path::PathBuf> {
+fn daemon_exe_for_pid(_pid: u32) -> Option<NormalizedPath> {
     // proc_pidpath is the right call but pulling in libc/libproc just for
     // CI-recycle defense isn't worth it on macOS, where this failure mode
     // hasn't been observed. Fall back to alive-only.
@@ -234,7 +236,7 @@ fn daemon_exe_for_pid(_pid: u32) -> Option<std::path::PathBuf> {
 }
 
 #[cfg(windows)]
-fn daemon_exe_for_pid(pid: u32) -> Option<std::path::PathBuf> {
+fn daemon_exe_for_pid(pid: u32) -> Option<NormalizedPath> {
     extern "system" {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
         fn CloseHandle(handle: isize) -> i32;
@@ -261,12 +263,12 @@ fn daemon_exe_for_pid(pid: u32) -> Option<std::path::PathBuf> {
         }
         use std::os::windows::ffi::OsStringExt;
         let os = std::ffi::OsString::from_wide(&buf[..size as usize]);
-        Some(std::path::PathBuf::from(os))
+        Some(NormalizedPath::new(&os))
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn daemon_exe_for_pid(_pid: u32) -> Option<std::path::PathBuf> {
+fn daemon_exe_for_pid(_pid: u32) -> Option<NormalizedPath> {
     None
 }
 
@@ -359,10 +361,6 @@ mod tests {
             Path::new("/usr/bin/zccache-daemon"),
             "zccache-daemon"
         ));
-        assert!(exe_stem_matches(
-            Path::new(r"C:\bin\zccache-daemon.exe"),
-            "zccache-daemon"
-        ));
         // A different binary at the same PID must not be accepted.
         assert!(!exe_stem_matches(
             Path::new("/usr/bin/bash"),
@@ -370,6 +368,19 @@ mod tests {
         ));
         assert!(!exe_stem_matches(
             Path::new("/usr/bin/zccache-daemon-x"),
+            "zccache-daemon"
+        ));
+    }
+
+    /// Windows-only: backslash-separated paths require the OS-native
+    /// `Path::file_name` semantics. On Unix `\` is a regular filename
+    /// character, so the same assertion would fail there (issue #143).
+    #[cfg(windows)]
+    #[test]
+    fn exe_stem_matches_strips_exe_suffix_on_windows() {
+        use std::path::Path;
+        assert!(exe_stem_matches(
+            Path::new(r"C:\bin\zccache-daemon.exe"),
             "zccache-daemon"
         ));
     }
