@@ -113,6 +113,23 @@ impl CompileContext {
     }
 }
 
+/// Reduce an `--extern name=path` value to its identity-bearing tail.
+///
+/// Cargo embeds a per-package `metadata=` hash in the file name (e.g.
+/// `libserde-abc123.rmeta`), so the file name alone uniquely identifies the
+/// extern. The directory prefix is incidental (changes per workspace
+/// location, target dir, profile dir layout) and must NOT enter the cache key.
+///
+/// If the path has no file-name component (defensively — shouldn't happen for
+/// real `--extern` values), fall back to the full string so we still hash
+/// _something_ stable rather than silently collapsing distinct externs.
+fn extern_path_key(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+}
+
 fn normalize_key_path(path: &Path, key_root: Option<&Path>) -> String {
     if let Some(root) = key_root {
         if let Ok(stripped) = path.strip_prefix(root) {
@@ -216,6 +233,30 @@ pub fn compute_artifact_key<P: AsRef<Path> + Ord>(
     ArtifactKey(ContentHash::from_bytes(*hasher.finalize().as_bytes()))
 }
 
+/// CARGO_* environment variables that must NOT participate in the cache key.
+///
+/// These are volatile (absolute paths or build-host transients) and either do
+/// not affect compiled output or affect it only via paths that should already
+/// be normalized elsewhere. Including them cascades cache invalidation across
+/// the entire dep graph whenever the workspace is moved, cloned, or re-checked
+/// out at a different on-disk location.
+///
+/// What stays in the key (everything else starting with `CARGO_`):
+/// - `CARGO_PKG_VERSION`, `CARGO_PKG_NAME`, `CARGO_PKG_AUTHORS`,
+///   `CARGO_PKG_DESCRIPTION`, `CARGO_PKG_HOMEPAGE`, `CARGO_PKG_REPOSITORY`,
+///   `CARGO_PKG_LICENSE`, `CARGO_PKG_RUST_VERSION`, `CARGO_CRATE_NAME`, etc.
+///   These feed `env!()` macros and are baked into the compiled artifact.
+///
+/// Already excluded earlier in the filter (orthogonal reasons):
+/// - `CARGO_MAKEFLAGS` (job-server token, transient).
+/// - `CARGO_INCREMENTAL` (handled by stripping `-C incremental` from args).
+///
+/// Filtered here (this list):
+/// - `CARGO_MANIFEST_DIR` — absolute path to the crate dir; changes per
+///   checkout location. Cascades the cache.
+/// - `CARGO_MANIFEST_PATH` — absolute path to `Cargo.toml`; same issue.
+const VOLATILE_CARGO_ENV_VARS: &[&str] = &["CARGO_MANIFEST_DIR", "CARGO_MANIFEST_PATH"];
+
 /// All inputs defining a rustc compilation context.
 ///
 /// Separate from `CompileContext` because Rust's compilation model differs
@@ -283,12 +324,16 @@ impl RustcCompileContext {
         remap_path_prefixes.sort();
 
         // Filter CARGO_* env vars â€” these affect compilation output via env!() macro.
-        // Exclude CARGO_MAKEFLAGS (job server, not output-affecting) and
-        // CARGO_INCREMENTAL (handled by stripping -C incremental).
+        // Exclude CARGO_MAKEFLAGS (job server, not output-affecting),
+        // CARGO_INCREMENTAL (handled by stripping -C incremental), and
+        // VOLATILE_CARGO_ENV_VARS (absolute paths that cascade cache misses).
         let mut env_vars: Vec<(String, String)> = client_env
             .iter()
             .filter(|(k, _)| {
-                k.starts_with("CARGO_") && k != "CARGO_MAKEFLAGS" && k != "CARGO_INCREMENTAL"
+                k.starts_with("CARGO_")
+                    && k != "CARGO_MAKEFLAGS"
+                    && k != "CARGO_INCREMENTAL"
+                    && !VOLATILE_CARGO_ENV_VARS.contains(&k.as_str())
             })
             .cloned()
             .collect();
@@ -398,13 +443,19 @@ impl RustcCompileContext {
             hasher.update(b"\0");
         }
 
-        // Extern crate (name, path) pairs - path included so different
-        // --extern a=v1.rlib vs --extern a=v2.rlib get different context keys.
+        // Extern crate (name, path) pairs - hash only the file name component,
+        // not the absolute directory prefix. The file name carries cargo's
+        // per-package `metadata=` hash (e.g. `libserde-abc123.rmeta`), which
+        // uniquely identifies the extern's identity. Including the directory
+        // prefix would cascade cache misses across workspace clones / renames
+        // (issue #139, fix #1). Different `--extern a=v1.rmeta` vs
+        // `--extern a=v2.rmeta` still get different keys because the metadata
+        // suffix is part of the file name.
         hasher.update(b"externs\0");
         for (name, path) in &self.extern_crates {
             hasher.update(name.as_bytes());
             hasher.update(b"=");
-            hasher.update(path.as_bytes());
+            hasher.update(extern_path_key(path).as_bytes());
             hasher.update(b"\0");
         }
 
@@ -430,8 +481,17 @@ impl RustcCompileContext {
         }
 
         // CARGO_* environment variables (sorted, affect env!() macro output).
+        //
+        // Defense-in-depth: we ALSO filter VOLATILE_CARGO_ENV_VARS here, not
+        // only in `from_parsed_args`. The struct is public and may be built
+        // directly (in tests or by future call sites). Hashing must be the
+        // single source of truth on what counts. See `VOLATILE_CARGO_ENV_VARS`
+        // for the rationale (issue #139).
         hasher.update(b"env\0");
         for (key, val) in &self.env_vars {
+            if VOLATILE_CARGO_ENV_VARS.contains(&key.as_str()) {
+                continue;
+            }
             hasher.update(key.as_bytes());
             hasher.update(b"=");
             hasher.update(val.as_bytes());
@@ -1003,6 +1063,114 @@ mod tests {
         assert_ne!(
             ak1, ak2,
             "different extern content should produce different artifact key"
+        );
+    }
+
+    // ─── Cache-key path-independence tests (issue #139, fix #1) ────────────────
+    //
+    // These tests pin the contract that cache keys are independent of the absolute
+    // path at which a workspace happens to live on disk. The same project checked
+    // out at `/tmp/proj-a` and `/tmp/proj-b` must produce the same rustc cache key,
+    // otherwise every `cargo {check,clippy,test}` after moving / re-cloning the
+    // repo cold-misses through the entire dep graph.
+
+    fn make_rustc_context_with_env(env: Vec<(String, String)>) -> RustcCompileContext {
+        let mut ctx = make_rustc_context("/src/lib.rs", "2021");
+        ctx.env_vars = env;
+        ctx.env_vars.sort();
+        ctx
+    }
+
+    /// T1 — Two contexts that differ only in `CARGO_MANIFEST_DIR` must have
+    /// the same cache key. This is the headline regression: the same crate
+    /// checked out at two paths should not invalidate the cache.
+    #[test]
+    fn rustc_context_key_ignores_cargo_manifest_dir() {
+        let ctx_a = make_rustc_context_with_env(vec![
+            ("CARGO_MANIFEST_DIR".into(), "/tmp/proj-a/crates/foo".into()),
+            ("CARGO_PKG_NAME".into(), "foo".into()),
+            ("CARGO_PKG_VERSION".into(), "1.2.3".into()),
+        ]);
+        let ctx_b = make_rustc_context_with_env(vec![
+            ("CARGO_MANIFEST_DIR".into(), "/tmp/proj-b/crates/foo".into()),
+            ("CARGO_PKG_NAME".into(), "foo".into()),
+            ("CARGO_PKG_VERSION".into(), "1.2.3".into()),
+        ]);
+        assert_eq!(
+            ctx_a.context_key(),
+            ctx_b.context_key(),
+            "CARGO_MANIFEST_DIR is volatile (absolute path) and must NOT \
+             contribute to the cache key; otherwise a project clone or rename \
+             invalidates every dependent compile"
+        );
+    }
+
+    /// T2 — Same idea for `CARGO_MANIFEST_PATH`. Cargo started exporting this
+    /// in newer versions; it's similarly an absolute path to `Cargo.toml`.
+    #[test]
+    fn rustc_context_key_ignores_cargo_manifest_path() {
+        let ctx_a = make_rustc_context_with_env(vec![
+            (
+                "CARGO_MANIFEST_PATH".into(),
+                "/tmp/proj-a/crates/foo/Cargo.toml".into(),
+            ),
+            ("CARGO_PKG_NAME".into(), "foo".into()),
+            ("CARGO_PKG_VERSION".into(), "1.2.3".into()),
+        ]);
+        let ctx_b = make_rustc_context_with_env(vec![
+            (
+                "CARGO_MANIFEST_PATH".into(),
+                "/tmp/proj-b/crates/foo/Cargo.toml".into(),
+            ),
+            ("CARGO_PKG_NAME".into(), "foo".into()),
+            ("CARGO_PKG_VERSION".into(), "1.2.3".into()),
+        ]);
+        assert_eq!(
+            ctx_a.context_key(),
+            ctx_b.context_key(),
+            "CARGO_MANIFEST_PATH is volatile (absolute path) and must NOT \
+             contribute to the cache key"
+        );
+    }
+
+    /// T3 — Negative control: `CARGO_PKG_VERSION` MUST still affect the key
+    /// because `env!("CARGO_PKG_VERSION")` is embedded in compiled output.
+    /// This guards against an over-eager filter that strips too much.
+    #[test]
+    fn rustc_context_key_sensitive_to_cargo_pkg_version() {
+        let ctx_a = make_rustc_context_with_env(vec![("CARGO_PKG_VERSION".into(), "1.2.3".into())]);
+        let ctx_b = make_rustc_context_with_env(vec![("CARGO_PKG_VERSION".into(), "1.2.4".into())]);
+        assert_ne!(
+            ctx_a.context_key(),
+            ctx_b.context_key(),
+            "CARGO_PKG_VERSION feeds env!() macros and MUST be in the cache key"
+        );
+    }
+
+    /// T4 — Extern rmeta paths that share a filename (and therefore the same
+    /// `metadata=` hash from cargo) but differ in their absolute directory
+    /// prefix must produce equal cache keys. This is the cascade-killer: when
+    /// a dep crate is rebuilt at the same content but in a different target
+    /// dir, all downstream crates should still hit.
+    #[test]
+    fn rustc_context_key_ignores_extern_directory_prefix() {
+        let mut ctx_a = make_rustc_context("/src/lib.rs", "2021");
+        ctx_a.extern_crates = vec![(
+            "serde".into(),
+            "/tmp/proj-a/target/debug/deps/libserde-abc123.rmeta".into(),
+        )];
+        let mut ctx_b = make_rustc_context("/src/lib.rs", "2021");
+        ctx_b.extern_crates = vec![(
+            "serde".into(),
+            "/tmp/proj-b/target/debug/deps/libserde-abc123.rmeta".into(),
+        )];
+        assert_eq!(
+            ctx_a.context_key(),
+            ctx_b.context_key(),
+            "extern rmeta paths with the same filename (= same cargo metadata \
+             hash) but different absolute prefixes must produce equal cache \
+             keys; otherwise relocating the workspace cascades through every \
+             downstream crate"
         );
     }
 
