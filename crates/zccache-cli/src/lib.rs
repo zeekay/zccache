@@ -532,8 +532,95 @@ fn apply_cli_spawn_lineage(cmd: &mut std::process::Command) {
     cmd.env(ENV_CLIENT_PID, cli_pid.to_string());
 }
 
+/// Subdir of the zccache global cache directory where the CLI stores
+/// per-launch copies of the daemon binary. The daemon runs from one of
+/// these copies, never from the install path (e.g. `Scripts/zccache-daemon.exe`),
+/// so `pip install --upgrade zccache` can always overwrite the install
+/// path regardless of whether a daemon is alive. See issue #134.
+const RUNTIME_BINARIES_SUBDIR: &str = "runtime-binaries";
+
+/// Returns `<global_cache_dir>/runtime-binaries`.
+#[must_use]
+pub fn runtime_binaries_dir() -> NormalizedPath {
+    zccache_core::config::default_cache_dir().join(RUNTIME_BINARIES_SUBDIR)
+}
+
+/// Copy `canonical` (the daemon binary at its install location) to a unique
+/// path inside [`runtime_binaries_dir`] and return the new path. The caller
+/// then spawns from the returned path so the install location is never
+/// file-locked by a running daemon.
+///
+/// On copy failure the caller should fall back to spawning `canonical`
+/// directly; the in-place `unlock_exe()` in the daemon then handles the
+/// lock removal as a fallback.
+pub fn prepare_daemon_exe(canonical: &Path) -> Result<std::path::PathBuf, std::io::Error> {
+    prepare_daemon_exe_in(canonical, runtime_binaries_dir().as_path())
+}
+
+/// Test seam for [`prepare_daemon_exe`]: copies `canonical` into `dir`
+/// (which is created if missing) and returns the destination path.
+pub fn prepare_daemon_exe_in(
+    canonical: &Path,
+    dir: &Path,
+) -> Result<std::path::PathBuf, std::io::Error> {
+    std::fs::create_dir_all(dir)?;
+
+    // Per-launch unique name. PID alone is reused across reboots; xor with
+    // the current nanos timestamp to keep collisions rare even when several
+    // CLI processes spawn back-to-back.
+    let rand_id: u32 = std::process::id()
+        ^ std::time::UNIX_EPOCH
+            .elapsed()
+            .unwrap_or_default()
+            .subsec_nanos();
+    let extension = canonical.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let file_name = if extension.is_empty() {
+        format!("zccache-daemon.{rand_id}")
+    } else {
+        format!("zccache-daemon.{rand_id}.{extension}")
+    };
+    let dest = dir.join(&file_name);
+    std::fs::copy(canonical, &dest)?;
+    Ok(dest)
+}
+
+/// Best-effort delete every entry in [`runtime_binaries_dir`]. On Windows
+/// the kernel refuses to delete a file with an open handle, so files
+/// belonging to a *currently running* daemon are silently skipped — no PID
+/// tracking, no sidecar files. Cheap enough to call before every spawn.
+pub fn gc_runtime_binaries() {
+    gc_runtime_binaries_in(runtime_binaries_dir().as_path());
+}
+
+/// Test seam for [`gc_runtime_binaries`].
+pub fn gc_runtime_binaries_in(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
 fn spawn_daemon(bin: &Path, endpoint: &str) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(bin);
+    // GC before the new spawn so the dir doesn't grow unbounded across
+    // crash-loop scenarios. Live daemons are skipped (locked files).
+    gc_runtime_binaries();
+
+    // Prefer to spawn from a relocated copy in the zccache global dir.
+    // Fall back to the canonical install path if the copy fails — the
+    // daemon's own `unlock_exe()` then handles the in-place rename.
+    let bin_owned: std::path::PathBuf;
+    let spawn_bin: &Path = match prepare_daemon_exe(bin) {
+        Ok(p) => {
+            bin_owned = p;
+            &bin_owned
+        }
+        Err(_) => bin,
+    };
+
+    let mut cmd = std::process::Command::new(spawn_bin);
     cmd.args(["--foreground", "--endpoint", endpoint]);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
@@ -907,5 +994,84 @@ mod tests {
         );
         let file_name = path.file_name().unwrap().to_string_lossy();
         assert!(file_name.ends_with("-toolchain.tar.zst"));
+    }
+
+    #[test]
+    fn prepare_daemon_exe_in_copies_to_target_dir() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("zccache-daemon.exe");
+        std::fs::write(&src, b"fake-daemon-bytes").expect("write source");
+
+        let dest_dir = tmp.path().join("runtime-binaries");
+        let copied =
+            prepare_daemon_exe_in(&src, &dest_dir).expect("prepare_daemon_exe_in succeeds");
+
+        assert!(
+            copied.is_file(),
+            "copy at {} should exist",
+            copied.display()
+        );
+        assert_eq!(
+            copied.parent().unwrap(),
+            dest_dir,
+            "copy should land inside dest_dir"
+        );
+        assert!(
+            copied
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("zccache-daemon."),
+            "filename should start with zccache-daemon., got {}",
+            copied.display()
+        );
+        assert!(
+            copied.extension().and_then(|s| s.to_str()) == Some("exe"),
+            "extension should be preserved"
+        );
+        assert_eq!(
+            std::fs::read(&copied).unwrap(),
+            b"fake-daemon-bytes",
+            "copy contents should match source"
+        );
+    }
+
+    #[test]
+    fn prepare_daemon_exe_in_creates_missing_dest_dir() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let src = tmp.path().join("zccache-daemon");
+        std::fs::write(&src, b"x").expect("write source");
+
+        let dest_dir = tmp.path().join("nested").join("runtime-binaries");
+        assert!(!dest_dir.exists(), "precondition: dest_dir does not exist");
+
+        let copied = prepare_daemon_exe_in(&src, &dest_dir).expect("create + copy");
+        assert!(dest_dir.is_dir(), "dest_dir should now exist");
+        assert!(copied.is_file());
+    }
+
+    #[test]
+    fn gc_runtime_binaries_in_removes_unlocked_entries() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let dir = tmp.path().join("runtime-binaries");
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let a = dir.join("zccache-daemon.111.exe");
+        let b = dir.join("zccache-daemon.222.exe");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        gc_runtime_binaries_in(&dir);
+
+        assert!(!a.exists(), "{} should be GC'd", a.display());
+        assert!(!b.exists(), "{} should be GC'd", b.display());
+        assert!(dir.is_dir(), "directory itself remains");
+    }
+
+    #[test]
+    fn gc_runtime_binaries_in_is_noop_for_missing_dir() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let dir = tmp.path().join("does-not-exist");
+        gc_runtime_binaries_in(&dir);
     }
 }
