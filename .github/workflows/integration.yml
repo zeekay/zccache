@@ -1,0 +1,86 @@
+name: Integration
+
+# Linux-only full `cargo test --workspace --no-fail-fast`, including the
+# integration test binaries under `crates/*/tests/`. Most of those tests
+# are #[ignore]'d, but the binaries themselves are still compiled — which
+# costs ~4 minutes on Windows MSVC per run (see issue #106). The platform
+# Check / Test workflows in `ci-check.yml` therefore only run `--lib --bins`;
+# this workflow restores the cross-binary integration coverage on the
+# fastest platform (Linux).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  integration:
+    name: Integration (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: zackees/setup-soldr@v0
+        with:
+          version: "0.7.14"
+          toolchain: 1.94.1
+          cache: true
+      - name: Test (full workspace)
+        shell: bash
+        run: |
+          set +e
+          start=$SECONDS
+          soldr cargo test --workspace --no-fail-fast 2>&1 | tee test-output.txt
+          status=${PIPESTATUS[0]}
+          dur=$((SECONDS - start))
+          echo "- **Integration (Linux)**: ${dur}s" >> "$GITHUB_STEP_SUMMARY"
+          if [ $status -ne 0 ]; then
+            {
+              echo '## Integration Test Failures'
+              echo '```'
+              awk '/^failures:$/,/^test result:/' test-output.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $status
+      - name: Stop zccache before cache save
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          status = subprocess.run(
+              ["soldr", "status", "--json"],
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          if status.returncode != 0:
+              raise SystemExit(0)
+
+          try:
+              payload = json.loads(status.stdout)
+          except json.JSONDecodeError:
+              raise SystemExit(0)
+
+          zccache = payload.get("zccache") or {}
+          binary = zccache.get("binary_path")
+          cache_dir = zccache.get("cache_dir") or zccache.get("state_dir")
+          if not binary:
+              raise SystemExit(0)
+
+          env = os.environ.copy()
+          if cache_dir:
+              env["ZCCACHE_CACHE_DIR"] = cache_dir
+          subprocess.run([binary, "stop"], env=env, check=False)
+          PY
