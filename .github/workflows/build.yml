@@ -69,7 +69,7 @@ jobs:
             include_python: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.inputs.ref || github.sha }}
 
@@ -85,14 +85,14 @@ jobs:
           strip: ${{ matrix.strip || '' }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.target }}
           path: ${{ steps.build_target.outputs.staging_dir }}/
           if-no-files-found: error
 
       - name: Upload standalone archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: ${{ format('{0}/*{1}', steps.build_target.outputs.standalone_dir, matrix.binary_ext == '.exe' && '.zip' || '.tar.gz') }}

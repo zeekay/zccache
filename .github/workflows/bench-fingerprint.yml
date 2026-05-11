@@ -21,7 +21,7 @@ jobs:
     name: "Control: bare cargo"
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -57,7 +57,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -91,7 +91,7 @@ jobs:
     name: "H1: zccache hardlink (current)"
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -145,7 +145,7 @@ jobs:
     name: "H2: remove wrapper for Build 3"
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -186,7 +186,7 @@ jobs:
     name: "H3: different wrapper binary for Build 3"
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -235,7 +235,7 @@ jobs:
     name: "H4: touch output mtimes after Build 2"
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -280,7 +280,7 @@ jobs:
     name: "H5: touch outputs only (not fingerprints)"
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -327,7 +327,7 @@ jobs:
     name: "H6: break hardlinks (copy-over-self)"
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -377,7 +377,7 @@ jobs:
     name: "H7: cargo fingerprint trace"
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -416,7 +416,7 @@ jobs:
 
       - name: "Upload full trace"
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cargo-fingerprint-trace
           path: /tmp/cargo-fingerprint-trace.log

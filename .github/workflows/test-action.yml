@@ -27,7 +27,7 @@ jobs:
     name: "Target snapshot GC unit tests"
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Run target snapshot GC unit tests
         shell: bash
@@ -59,7 +59,7 @@ jobs:
             os: windows-2025
             target: aarch64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -170,7 +170,7 @@ jobs:
     name: "No-save mode (Linux)"
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -198,7 +198,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-15, windows-2025]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -291,7 +291,7 @@ jobs:
     name: "gha-cache (Linux)"
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -324,7 +324,7 @@ jobs:
       # The GHA cache API env vars are only available with actions/cache.
       # Use actions/cache to prime the environment, then test our CLI.
       - name: "Prime GHA cache environment"
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /tmp/gha-cache-primer
           key: zccache-gha-test-primer-${{ github.sha }}

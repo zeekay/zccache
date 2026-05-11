@@ -32,12 +32,12 @@ jobs:
       pypi_complete: ${{ steps.registries.outputs.pypi_complete }}
       crates_complete: ${{ steps.registries.outputs.crates_complete }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.ref_type == 'tag' && github.ref_name || github.ref_name }}
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
@@ -206,7 +206,7 @@ jobs:
             upload_release: "true"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.preflight.outputs.checkout_ref }}
 
@@ -221,14 +221,14 @@ jobs:
           strip: ${{ matrix.strip || '' }}
           version: ${{ needs.preflight.outputs.version }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.upload_binaries == 'true'
         with:
           name: binaries-${{ matrix.target }}
           path: ${{ steps.build_target.outputs.staging_dir }}/
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.upload_release == 'true'
         with:
           name: release-${{ matrix.target }}
@@ -241,15 +241,15 @@ jobs:
     needs: [preflight, build]
     if: needs.preflight.outputs.pypi_complete != 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.preflight.outputs.checkout_ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: binaries-*
           path: artifact-downloads
@@ -257,7 +257,7 @@ jobs:
       - name: Build wheels from downloaded artifacts
         run: python -m ci.release_workflow build-wheels --artifact-download-dir artifact-downloads
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pypi-wheels
           path: dist/wheels/*
@@ -274,7 +274,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: pypi-wheels
           path: dist/wheels
@@ -296,11 +296,11 @@ jobs:
       && needs.preflight.outputs.crates_complete != 'true'
       && (needs.preflight.outputs.pypi_complete == 'true' || needs.publish-pypi.result == 'success')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.preflight.outputs.checkout_ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
@@ -325,11 +325,11 @@ jobs:
       && (needs.publish-pypi.result == 'success' || needs.publish-pypi.result == 'skipped')
       && (needs.publish-crates.result == 'success' || needs.publish-crates.result == 'skipped')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ needs.preflight.outputs.checkout_ref }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: release-assets
@@ -348,7 +348,7 @@ jobs:
           find . -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.preflight.outputs.release_tag }}
           name: zccache ${{ needs.preflight.outputs.version }}
