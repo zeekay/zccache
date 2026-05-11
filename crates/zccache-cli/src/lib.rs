@@ -1074,4 +1074,56 @@ mod tests {
         let dir = tmp.path().join("does-not-exist");
         gc_runtime_binaries_in(&dir);
     }
+
+    /// Issue #159: `session_end_idempotent` is the shared library entry
+    /// point for ending a session — used by the CLI `session-end` command
+    /// AND by tools like soldr that call into the library directly. When
+    /// the daemon process is gone (pipe / socket missing), this function
+    /// must return `Ok(None)` rather than propagating the connect-time
+    /// I/O error. Soldr's at-exit `rust-plan save` previously failed
+    /// Windows CI because its in-process session-end did NOT go through
+    /// `cmd_session_end` (which is gated to the CLI subprocess path) and
+    /// so the #151 idempotency fix didn't apply.
+    #[test]
+    fn session_end_idempotent_swallows_vanished_daemon() {
+        // Construct an endpoint that is guaranteed to have no listener —
+        // a unique pipe / socket name with no server bound to it.
+        let endpoint = zccache_ipc::unique_test_endpoint();
+        let session_id = "00000000-0000-0000-0000-000000000000";
+
+        let result = session_end_idempotent(&endpoint, session_id);
+
+        assert!(
+            matches!(result, Ok(None)),
+            "vanished daemon must produce Ok(None) (success no-op), got {result:?}"
+        );
+    }
+
+    /// Control: non-unreachable errors (the function shouldn't be a
+    /// blanket "ignore everything"). We can't easily synthesize a live
+    /// daemon error here, but we can at least assert the routing via the
+    /// helper used inside the function: connect-time `TimedOut` must NOT
+    /// be classified as unreachable, so the function would propagate it
+    /// (rather than silently return Ok(None)). This guards against a
+    /// regression where someone widens the unreachable set to "any I/O
+    /// error".
+    #[test]
+    fn session_end_idempotent_treats_timeout_as_real_error() {
+        let err = zccache_ipc::IpcError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert!(
+            !is_daemon_unreachable_err(&err),
+            "TimedOut must NOT be classified as daemon-unreachable; session_end_idempotent \
+             would otherwise silently swallow real timeouts"
+        );
+    }
+
+    /// Control: protocol-layer errors (malformed framing, closed
+    /// connection mid-response) must NOT be classified as unreachable.
+    #[test]
+    fn session_end_idempotent_treats_protocol_errors_as_real() {
+        let err = zccache_ipc::IpcError::ConnectionClosed;
+        assert!(!is_daemon_unreachable_err(&err));
+        let err = zccache_ipc::IpcError::Endpoint("bogus".into());
+        assert!(!is_daemon_unreachable_err(&err));
+    }
 }
