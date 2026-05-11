@@ -377,9 +377,10 @@ fn write_to_file(path: &Path, line: &str) {
 mod tests {
     use super::*;
 
-    /// Give the background thread time to drain the channel and complete I/O.
-    fn flush_logger(_logger: &EventLogger) {
-        std::thread::sleep(Duration::from_millis(200));
+    /// Block until the background writer thread has processed all events
+    /// queued up to this point. Implemented by `EventLogger::flush()`.
+    fn flush_logger(logger: &EventLogger) {
+        logger.flush();
     }
 
     #[test]
@@ -436,6 +437,41 @@ mod tests {
         );
         assert!(line.contains("pch.h"), "source file: {line}");
         assert!(line.contains("reason=pch-generation"), "reason: {line}");
+    }
+
+    #[test]
+    fn test_flush_is_deterministic_no_sleep_required() {
+        // RED-then-GREEN regression for #146.
+        //
+        // The previous `flush_logger` was a blind 200ms sleep, which races with
+        // the background writer on slow CI runners. `EventLogger::flush()` must
+        // be a real sync primitive: queue N events, call flush(), and the file
+        // contents must be on disk *immediately* — no polling, no tolerance.
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().to_path_buf();
+        let logger = EventLogger::new(log_dir.clone().into(), 100, 3);
+
+        for i in 0..20 {
+            logger.log_daemon_event(&format!("event {i} with some padding to fill space"));
+        }
+        logger.flush();
+
+        // No sleep, no retry. If flush() is not deterministic, this fails.
+        let main_log = log_dir.join("daemon.log");
+        assert!(
+            main_log.exists(),
+            "daemon.log must exist immediately after flush()"
+        );
+
+        let rotated: Vec<_> = fs::read_dir(&log_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("daemon.log."))
+            .collect();
+        assert!(
+            !rotated.is_empty(),
+            "at least one rotated file must be visible immediately after flush()"
+        );
     }
 
     #[test]
