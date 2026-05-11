@@ -2757,12 +2757,13 @@ async fn handle_compile(
 
     state.stats.record_compilation();
 
-    // Verify session exists
-    if !state.sessions.exists(&sid) {
-        return Response::Error {
-            message: format!("unknown session: {session_id}"),
-        };
-    }
+    // Note: we do not require `state.sessions.exists(&sid)` here. A daemon
+    // restart (e.g. zccache-ci killing the daemon to unlock target binaries
+    // on Windows) drops the session map but client wrappers keep using the
+    // session UUID they were issued. The session-stat and touch helpers
+    // below already no-op for unknown sessions, so the compile itself
+    // proceeds; only per-session stats are lost. Mirrors PR #137's
+    // idempotent SessionEnd fix. See issues #166 and #167.
 
     let compiler: NormalizedPath = compiler_path.into();
 
@@ -5163,6 +5164,62 @@ exit /b 0
                     );
                 }
                 other => panic!("expected SessionEnded for unknown UUID, got: {other:?}"),
+            }
+
+            shutdown.notify_one();
+            server_handle.await.unwrap();
+        })
+        .await;
+    }
+
+    /// Regression for #166 — Compile on an unknown session must not fail with
+    /// "unknown session", mirroring #137's SessionEnd idempotency. Triggered
+    /// when zccache-ci kills the daemon mid-build (#167).
+    ///
+    /// The daemon used to short-circuit Compile with `Response::Error` if the
+    /// session UUID was unknown. After a daemon restart, soldr-managed rustc
+    /// wrappers keep using the old session UUID and would all fail; soldr in
+    /// turn exits 1 and the whole build breaks. We now let the compile
+    /// proceed; only per-session stats are lost.
+    #[tokio::test]
+    #[ignore] // integration-level: starts real daemon with IPC
+    async fn cli_compile_unknown_uuid_is_idempotent() {
+        zccache_test_support::test_timeout(async {
+            let tmp = tempfile::tempdir().unwrap();
+            // Use an isolated cache dir so we don't clash with any
+            // production daemon holding the global redb lock.
+            let _cache_dir = CacheDirEnvGuard::set(&tmp.path().join("zccache-cache"));
+
+            let (endpoint, server_handle, shutdown) = start_daemon().await;
+            let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+
+            let cwd = tmp.path().to_string_lossy().into_owned();
+
+            // Send a Compile with a well-formed UUID the daemon has never
+            // seen. We intentionally pass a bogus compiler path and trivial
+            // args — the only assertion is that we don't get the
+            // "unknown session" Error response that the pre-#166 code emitted
+            // before any real compilation work began.
+            client
+                .send(&Request::Compile {
+                    session_id: "00000000-0000-0000-0000-000000000000".to_string(),
+                    args: vec!["--version".to_string()],
+                    cwd: cwd.clone().into(),
+                    compiler: "/nonexistent/compiler".to_string().into(),
+                    env: None,
+                })
+                .await
+                .unwrap();
+
+            // Any non-Error response is acceptable — typically a
+            // CompileResult with a non-zero exit code because the compiler
+            // path is bogus. The key invariant is the absence of the
+            // pre-#166 "unknown session" hard error.
+            if let Some(Response::Error { message }) = client.recv().await.unwrap() {
+                assert!(
+                    !message.contains("unknown session"),
+                    "Compile must not fail with 'unknown session' on an unknown UUID, got: {message}"
+                );
             }
 
             shutdown.notify_one();

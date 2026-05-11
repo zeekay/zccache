@@ -18,7 +18,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
-use zccache_ci::{kill_daemon, reap_orphan_daemons, resolve_timeout, StageOutcome, StageRunner};
+use zccache_ci::{reap_orphan_daemons, resolve_timeout, StageOutcome, StageRunner};
 use zccache_core::NormalizedPath;
 
 fn project_root() -> NormalizedPath {
@@ -177,11 +177,16 @@ fn main() -> ExitCode {
     // Ensure all spawned cargo/rustc processes find the rustup toolchain
     activate_rustup_toolchain(&root);
 
-    // First reap any zccache-daemon whose parent PID is gone — these are
-    // true orphans from a previous force-killed agent turn. Then kill any
-    // remaining daemon so cargo can replace the exe on Windows.
+    // Reap any zccache-daemon whose parent PID is gone — these are true
+    // orphans from a previous force-killed agent turn. We deliberately do
+    // NOT also kill live daemons: every stage below is `cargo check` /
+    // `clippy` / `cargo test --exclude zccache-daemon`, none of which
+    // rebuild `zccache-daemon.exe`, so there is no binary to unlock. The
+    // prior blanket `kill_daemon()` here took down the soldr-managed daemon
+    // mid-build and broke session continuity. If a future stage rebuilds
+    // the daemon crate, call `kill_daemon()` immediately before that stage
+    // only — never globally at startup. See issues #166 and #167.
     let _ = reap_orphan_daemons();
-    kill_daemon();
 
     // Run every stage under a shared wall-clock deadline (default 300s,
     // overridable via env var). On timeout the entire process tree is killed

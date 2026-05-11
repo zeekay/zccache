@@ -490,14 +490,18 @@ pub fn kill_pids_and_wait(pids: &[u32], timeout: Duration) {
 }
 
 /// Kill every running `zccache-daemon`, wait for them to actually exit, and
-/// remove the stale `daemon.lock` file. Used by the stop hook before invoking
-/// cargo so the build can replace the daemon binary on Windows without racing
-/// the dying process.
+/// remove the stale `daemon.lock` file. Intended for callers that need to
+/// replace the daemon binary on Windows without racing the dying process.
 ///
 /// See issue #152: prior to this, `kill_daemon` returned immediately after
 /// `process.kill()` and left the lock file pointing at the just-killed PID,
 /// causing `cargo check` to fail with "cannot connect to daemon at \\.\\pipe\\..."
 /// because parallel rustc workers raced the half-dead daemon.
+///
+/// WARNING: Do not call from the stop hook unless your stage actually
+/// rebuilds `zccache-daemon.exe` — see issue #167 for why blanket calls
+/// broke soldr session continuity (and triggered the #166 "unknown session"
+/// failures downstream).
 pub fn kill_daemon() {
     let pids = find_daemon_pids();
     if pids.is_empty() {
