@@ -772,30 +772,21 @@ pub fn client_session_start(
     })
 }
 
+/// End a session — daemon-unreachable is treated as a successful no-op.
+///
+/// Thin `String`-error wrapper around [`session_end_idempotent`]. All in-process
+/// callers (Python bindings, soldr, future tools) route through here, so the
+/// idempotency contract that #151 / #159 established for the CLI subprocess
+/// path applies equally to library users. Without this, soldr's at-exit
+/// `zccache session-end` from `rust-plan save` fails Windows CI with
+/// "cannot connect to daemon at \\.\pipe\zccache-…" when the daemon already
+/// exited — every workspace test passed but teardown failed.
 pub fn client_session_end(
     endpoint: Option<&str>,
     session_id: &str,
 ) -> Result<Option<zccache_protocol::SessionStats>, String> {
     let endpoint = resolve_endpoint(endpoint);
-    let session_id = session_id.to_string();
-    run_async(async move {
-        let mut conn = connect_client(&endpoint)
-            .await
-            .map_err(|e| format!("cannot connect to daemon at {endpoint}: {e}"))?;
-        conn.send(&zccache_protocol::Request::SessionEnd {
-            session_id: session_id.clone(),
-        })
-        .await
-        .map_err(|e| format!("failed to send to daemon: {e}"))?;
-
-        match conn.recv::<zccache_protocol::Response>().await {
-            Ok(Some(zccache_protocol::Response::SessionEnded { stats })) => Ok(stats),
-            Ok(Some(zccache_protocol::Response::Error { message })) => Err(message),
-            Ok(None) => Err("lost connection to daemon (no response received)".to_string()),
-            Ok(Some(other)) => Err(format!("unexpected response from daemon: {other:?}")),
-            Err(e) => Err(format!("broken connection to daemon: {e}")),
-        }
-    })
+    session_end_idempotent(&endpoint, session_id).map_err(|e| e.to_string())
 }
 
 /// Is this connect-time error a "daemon process is gone entirely" error?
@@ -1272,6 +1263,26 @@ mod tests {
                 zccache_ipc::IpcError::Io(io) => io.kind(),
                 _ => unreachable!(),
             }
+        );
+    }
+
+    /// Regression: `client_session_end` is the in-process library entry point
+    /// used by Python bindings and external tools (soldr's `rust-plan save`).
+    /// It must mirror `session_end_idempotent` — a vanished daemon is a no-op
+    /// success, not a hard error. Before this fix, soldr called
+    /// `client_session_end`, got `Err("cannot connect to daemon at …")`,
+    /// surfaced it as "soldr: zccache session-end … failed: …", and Windows
+    /// Test failed teardown even after every workspace test passed.
+    #[test]
+    fn client_session_end_swallows_vanished_daemon() {
+        let endpoint = zccache_ipc::unique_test_endpoint();
+        let session_id = "00000000-0000-0000-0000-000000000000";
+
+        let result = client_session_end(Some(&endpoint), session_id);
+
+        assert!(
+            matches!(result, Ok(None)),
+            "vanished daemon must produce Ok(None) (success no-op), got {result:?}"
         );
     }
 }
