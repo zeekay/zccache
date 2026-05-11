@@ -91,6 +91,33 @@ jobs:
           status=${PIPESTATUS[0]}
           dur=$((SECONDS - start))
           echo "- **${{ inputs.os }} / Test**: ${dur}s" >> "$GITHUB_STEP_SUMMARY"
+
+          # Soldr 0.7.14 ships a bundled zccache 1.4.0 whose `client_session_end`
+          # was not yet idempotent against a vanished daemon (fixed upstream in
+          # #170; will arrive in CI once a future soldr release bundles
+          # zccache 1.4.1+). Until then, soldr exits non-zero from its at-exit
+          # session-end on Windows even when every `cargo test` passed:
+          #
+          #   soldr: zccache session-end <uuid> failed:
+          #     cannot connect to daemon at \\.\pipe\zccache-…: I/O error: …
+          #
+          # Treat this single, well-defined teardown error as a non-failure
+          # — but only if cargo itself reported no failed tests.
+          if [ $status -ne 0 ]; then
+            test_failure=0
+            if grep -qE "test result: FAILED|panicked at" test-output.txt; then
+              test_failure=1
+            fi
+            soldr_teardown_only=0
+            if grep -q "soldr: zccache session-end .* failed: cannot connect to daemon" test-output.txt; then
+              soldr_teardown_only=1
+            fi
+            if [ $test_failure -eq 0 ] && [ $soldr_teardown_only -eq 1 ]; then
+              echo "::warning::soldr at-exit session-end failed on a vanished daemon — treating as success (all cargo tests passed). Fix lands when soldr bundles zccache 1.4.1+ (#170)."
+              status=0
+            fi
+          fi
+
           if [ $status -ne 0 ]; then
             {
               echo '## Test Failures'
