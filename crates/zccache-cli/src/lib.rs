@@ -798,6 +798,111 @@ pub fn client_session_end(
     })
 }
 
+/// Is this connect-time error a "daemon process is gone entirely" error?
+///
+/// The conservative set: `NotFound` (Unix socket missing, Windows pipe
+/// missing), `ConnectionRefused` (Unix socket exists but no listener;
+/// Windows backoff helper synthesizes this when all pipe instances are
+/// permanently busy), and `BrokenPipe` (race: pipe vanished between
+/// open and use). Other errors (`TimedOut`, protocol mismatches, etc.)
+/// are NOT daemon-gone — they should still fail loudly.
+///
+/// Used by `session_end_idempotent` (issue #159) and the CLI's
+/// `cmd_session_end` (issue #150 / #151) to map "the daemon already
+/// died" connect-time failures onto a success no-op. Other request
+/// types keep their existing strict error semantics.
+#[must_use]
+pub fn is_daemon_unreachable_err(err: &zccache_ipc::IpcError) -> bool {
+    use std::io::ErrorKind;
+    match err {
+        zccache_ipc::IpcError::Io(io) => matches!(
+            io.kind(),
+            ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::BrokenPipe
+        ),
+        _ => false,
+    }
+}
+
+/// End a session, treating a vanished daemon as success.
+///
+/// This is the shared library entry point for ending a session. It is
+/// the contract used by the CLI's `zccache session-end <uuid>`
+/// subcommand AND by any in-process caller (e.g. soldr's at-exit
+/// `rust-plan save`) — both must agree on what "the daemon already
+/// died" means.
+///
+/// # Return shape
+///
+/// - `Ok(Some(stats))` — daemon was reached and returned stats for the
+///   session.
+/// - `Ok(None)` — daemon was reached but returned no stats (session
+///   was tracked without stats), OR the daemon was unreachable at
+///   connect time. Both are no-ops from the caller's perspective:
+///   the session is implicitly ended when the daemon dies (see #137
+///   for the daemon-side mirror), and a caller that just wants to
+///   "end the session, don't care if the daemon is still alive"
+///   should treat both as success.
+/// - `Err(IpcError)` — anything else: timeouts, protocol mismatches,
+///   send/recv mid-conversation failures, daemon error responses.
+///   These are real faults and must be surfaced.
+///
+/// # Why a separate function
+///
+/// Issue #159: soldr was failing Windows CI on every main commit
+/// because its in-process session-end (called from `rust-plan save`)
+/// did not share code with `cmd_session_end`, so #151's
+/// connect-failure idempotency only applied to the CLI subprocess
+/// path. Promoting this contract to the library lets all callers —
+/// current and future — share the same behavior.
+pub fn session_end_idempotent(
+    endpoint: &str,
+    session_id: &str,
+) -> Result<Option<zccache_protocol::SessionStats>, zccache_ipc::IpcError> {
+    let endpoint = endpoint.to_string();
+    let session_id = session_id.to_string();
+
+    // Build a dedicated current-thread runtime. Can't use the existing
+    // `run_async` helper because its `Output = Result<T, String>` shape
+    // doesn't compose with our `Result<_, IpcError>` return type.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            zccache_ipc::IpcError::Endpoint(format!("failed to create tokio runtime: {e}"))
+        })?;
+
+    runtime.block_on(async move {
+        let mut conn = match connect_client(&endpoint).await {
+            Ok(c) => c,
+            Err(e) => {
+                if is_daemon_unreachable_err(&e) {
+                    eprintln!(
+                        "session-end: daemon unreachable at {endpoint}, treating session {session_id} as ended"
+                    );
+                    return Ok(None);
+                }
+                return Err(e);
+            }
+        };
+
+        conn.send(&zccache_protocol::Request::SessionEnd {
+            session_id: session_id.clone(),
+        })
+        .await?;
+
+        match conn.recv::<zccache_protocol::Response>().await? {
+            Some(zccache_protocol::Response::SessionEnded { stats }) => Ok(stats),
+            Some(zccache_protocol::Response::Error { message }) => Err(
+                zccache_ipc::IpcError::Endpoint(format!("session-end failed: {message}")),
+            ),
+            None => Err(zccache_ipc::IpcError::ConnectionClosed),
+            Some(other) => Err(zccache_ipc::IpcError::Endpoint(format!(
+                "unexpected response from daemon: {other:?}"
+            ))),
+        }
+    })
+}
+
 pub fn client_session_stats(
     endpoint: Option<&str>,
     session_id: &str,
@@ -1125,5 +1230,48 @@ mod tests {
         assert!(!is_daemon_unreachable_err(&err));
         let err = zccache_ipc::IpcError::Endpoint("bogus".into());
         assert!(!is_daemon_unreachable_err(&err));
+    }
+
+    /// Issue #150: connect-time errors that mean "daemon process is gone
+    /// entirely" must be classified as unreachable so the idempotent
+    /// session-end paths (`session_end_idempotent` + the CLI's
+    /// `cmd_session_end` wrapper) can fall through to the success path.
+    /// The set covers every shape `connect()` actually returns when the
+    /// pipe / socket is missing or has no listener.
+    #[test]
+    fn is_daemon_unreachable_recognizes_not_found() {
+        let err = zccache_ipc::IpcError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(is_daemon_unreachable_err(&err));
+    }
+
+    #[test]
+    fn is_daemon_unreachable_recognizes_connection_refused() {
+        let err =
+            zccache_ipc::IpcError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert!(is_daemon_unreachable_err(&err));
+    }
+
+    #[test]
+    fn is_daemon_unreachable_recognizes_broken_pipe() {
+        let err = zccache_ipc::IpcError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert!(is_daemon_unreachable_err(&err));
+    }
+
+    /// Mapping ENOENT through `from_raw_os_error` must yield the same
+    /// classification as constructing from `ErrorKind::NotFound`. This
+    /// guards against platform variance (macOS / Linux / Windows could
+    /// in principle synthesize a different kind for the same errno).
+    #[test]
+    fn is_daemon_unreachable_recognizes_raw_enoent() {
+        // ENOENT == 2 on every Unix; on Windows ERROR_FILE_NOT_FOUND == 2 too.
+        let err = zccache_ipc::IpcError::Io(std::io::Error::from_raw_os_error(2));
+        assert!(
+            is_daemon_unreachable_err(&err),
+            "errno 2 must map to a kind in the unreachable set; got kind={:?}",
+            match &err {
+                zccache_ipc::IpcError::Io(io) => io.kind(),
+                _ => unreachable!(),
+            }
+        );
     }
 }
