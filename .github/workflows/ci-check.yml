@@ -23,7 +23,14 @@ jobs:
           toolchain: 1.94.1
           cache: true
       - name: Check
-        run: soldr cargo check --workspace
+        shell: bash
+        run: |
+          start=$SECONDS
+          soldr cargo check --workspace
+          status=$?
+          dur=$((SECONDS - start))
+          echo "- **${{ inputs.os }} / Check**: ${dur}s" >> "$GITHUB_STEP_SUMMARY"
+          exit $status
       - name: Stop zccache before cache save
         if: always()
         shell: bash
@@ -69,12 +76,21 @@ jobs:
           version: "0.7.14"
           toolchain: 1.94.1
           cache: true
+      # Platform Test runs unit tests in libraries and binaries only — it
+      # intentionally does NOT compile the integration test binaries under
+      # `crates/*/tests/`. Most of those binaries' tests are #[ignore]'d, but
+      # the binaries are still compiled by `cargo test --workspace`, which
+      # cost ~4m of Windows CI time per run (issue #106). Full integration
+      # coverage is provided by the `integration` workflow on Linux.
       - name: Test
         shell: bash
         run: |
           set +e
-          soldr cargo test --workspace --no-fail-fast 2>&1 | tee test-output.txt
+          start=$SECONDS
+          soldr cargo test --workspace --lib --bins --no-fail-fast 2>&1 | tee test-output.txt
           status=${PIPESTATUS[0]}
+          dur=$((SECONDS - start))
+          echo "- **${{ inputs.os }} / Test**: ${dur}s" >> "$GITHUB_STEP_SUMMARY"
           if [ $status -ne 0 ]; then
             {
               echo '## Test Failures'
