@@ -30,8 +30,8 @@ use zccache_artifact::{
     RustArtifactPlanV1, RustPlanError, RustPlanOperation, RustPlanSummary,
 };
 use zccache_cli::{
-    client_download, run_ino_convert_cached, ArchiveFormat, DownloadParams, DownloadSource,
-    InoConvertOptions, WaitMode,
+    client_download, run_ino_convert_cached, session_end_idempotent, ArchiveFormat, DownloadParams,
+    DownloadSource, InoConvertOptions, WaitMode,
 };
 use zccache_compiler::strict_paths::StrictPathsMode;
 use zccache_core::NormalizedPath;
@@ -716,7 +716,7 @@ fn main() -> ExitCode {
             endpoint,
         } => {
             let endpoint = resolve_endpoint(endpoint.as_deref());
-            run_async(cmd_session_end(&endpoint, session_id))
+            cmd_session_end(&endpoint, session_id)
         }
         Commands::SessionStatsCmd {
             session_id,
@@ -1508,78 +1508,40 @@ async fn cmd_session_start(
     }
 }
 
-async fn cmd_session_end(endpoint: &str, session_id: String) -> ExitCode {
-    let mut conn = match connect(endpoint).await {
-        Ok(c) => c,
-        Err(e) => {
-            // Daemon-gone case: mirror #137's idempotency at the connection
-            // layer. If the daemon process exited entirely (pipe / socket
-            // missing, or no listener) before soldr's at-exit
-            // `session-end` hits, treat it as success — the session is
-            // implicitly ended when the daemon dies. Other errors (timeout,
-            // protocol mismatch, etc.) still fail loudly. See issue #150.
-            if is_daemon_unreachable_err(&e) {
-                eprintln!(
-                    "session-end: daemon unreachable at {endpoint}, treating session {session_id} as ended"
-                );
-                return ExitCode::SUCCESS;
-            }
-            eprintln!("cannot connect to daemon at {endpoint}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if let Err(e) = conn
-        .send(&zccache_protocol::Request::SessionEnd {
-            session_id: session_id.clone(),
-        })
-        .await
-    {
-        eprintln!("zccache: failed to send to daemon: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    let recv_result = match conn.recv().await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("zccache: broken connection to daemon: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    match recv_result {
-        Some(zccache_protocol::Response::SessionEnded { stats }) => {
-            if let Some(s) = stats {
-                let total = s.hits + s.misses;
-                let hit_rate = if total > 0 {
-                    format!("{:.1}%", s.hits as f64 / total as f64 * 100.0)
-                } else {
-                    "n/a".to_string()
-                };
-                eprintln!(
-                    "Session {session_id} complete ({})",
-                    format_duration_ms(s.duration_ms)
-                );
-                eprintln!(
-                    "  {} compilations: {} hits, {} misses, {} non-cacheable",
-                    s.compilations, s.hits, s.misses, s.non_cacheable
-                );
-                eprintln!("  Hit rate: {hit_rate}");
-                if s.time_saved_ms > 0 {
-                    eprintln!("  Time saved: ~{}", format_duration_ms(s.time_saved_ms));
-                }
+fn cmd_session_end(endpoint: &str, session_id: String) -> ExitCode {
+    // Thin wrapper around the shared library entry point. All daemon
+    // callers (CLI, soldr, future tools) must agree on what "the daemon
+    // is gone" means — see `session_end_idempotent` for the contract
+    // and issue #159 for why this lives in the library.
+    match session_end_idempotent(endpoint, &session_id) {
+        Ok(Some(s)) => {
+            let total = s.hits + s.misses;
+            let hit_rate = if total > 0 {
+                format!("{:.1}%", s.hits as f64 / total as f64 * 100.0)
+            } else {
+                "n/a".to_string()
+            };
+            eprintln!(
+                "Session {session_id} complete ({})",
+                format_duration_ms(s.duration_ms)
+            );
+            eprintln!(
+                "  {} compilations: {} hits, {} misses, {} non-cacheable",
+                s.compilations, s.hits, s.misses, s.non_cacheable
+            );
+            eprintln!("  Hit rate: {hit_rate}");
+            if s.time_saved_ms > 0 {
+                eprintln!("  Time saved: ~{}", format_duration_ms(s.time_saved_ms));
             }
             ExitCode::SUCCESS
         }
-        Some(zccache_protocol::Response::Error { message }) => {
-            eprintln!("session-end failed: {message}");
-            ExitCode::FAILURE
-        }
-        None => {
-            eprintln!("zccache: lost connection to daemon (no response received)");
-            ExitCode::FAILURE
-        }
-        Some(other) => {
-            eprintln!("zccache: unexpected response from daemon: {other:?}");
+        // `Ok(None)` covers both:
+        //   - daemon was unreachable (already logged by the library), and
+        //   - daemon was reached but had no stats for this session.
+        // Both are no-op successes.
+        Ok(None) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("zccache: session-end failed: {e}");
             ExitCode::FAILURE
         }
     }
@@ -3638,28 +3600,6 @@ async fn connect(
     zccache_ipc::connect(endpoint).await
 }
 
-/// Is this connect-time error a "daemon process is gone entirely" error?
-///
-/// The conservative set: `NotFound` (Unix socket missing, Windows pipe
-/// missing), `ConnectionRefused` (Unix socket exists but no listener;
-/// Windows backoff helper synthesizes this when all pipe instances are
-/// permanently busy), and `BrokenPipe` (race: pipe vanished between
-/// open and use). Other errors (`TimedOut`, protocol mismatches, etc.)
-/// are NOT daemon-gone — they should still fail loudly.
-///
-/// Used by `session-end` only (issue #150) — other request types keep
-/// their existing strict error semantics.
-fn is_daemon_unreachable_err(err: &zccache_ipc::IpcError) -> bool {
-    use std::io::ErrorKind;
-    match err {
-        zccache_ipc::IpcError::Io(io) => matches!(
-            io.kind(),
-            ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::BrokenPipe
-        ),
-        _ => false,
-    }
-}
-
 fn resolve_endpoint(explicit: Option<&str>) -> String {
     if let Some(ep) = explicit {
         return ep.to_string();
@@ -3727,66 +3667,6 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Issue #150: connect-time errors that mean "daemon process is gone
-    /// entirely" must be classified as unreachable so `cmd_session_end`
-    /// can fall through to the idempotent success path. The set covers
-    /// every shape `connect()` actually returns when the pipe / socket
-    /// is missing or has no listener.
-    #[test]
-    fn is_daemon_unreachable_recognizes_not_found() {
-        let err = zccache_ipc::IpcError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
-        assert!(is_daemon_unreachable_err(&err));
-    }
-
-    #[test]
-    fn is_daemon_unreachable_recognizes_connection_refused() {
-        let err =
-            zccache_ipc::IpcError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
-        assert!(is_daemon_unreachable_err(&err));
-    }
-
-    #[test]
-    fn is_daemon_unreachable_recognizes_broken_pipe() {
-        let err = zccache_ipc::IpcError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-        assert!(is_daemon_unreachable_err(&err));
-    }
-
-    /// Mapping ENOENT through `from_raw_os_error` must yield the same
-    /// classification as constructing from `ErrorKind::NotFound`. This
-    /// guards against platform variance (macOS / Linux / Windows could
-    /// in principle synthesize a different kind for the same errno).
-    #[test]
-    fn is_daemon_unreachable_recognizes_raw_enoent() {
-        // ENOENT == 2 on every Unix; on Windows ERROR_FILE_NOT_FOUND == 2 too.
-        let err = zccache_ipc::IpcError::Io(std::io::Error::from_raw_os_error(2));
-        assert!(
-            is_daemon_unreachable_err(&err),
-            "errno 2 must map to a kind in the unreachable set; got kind={:?}",
-            match &err {
-                zccache_ipc::IpcError::Io(io) => io.kind(),
-                _ => unreachable!(),
-            }
-        );
-    }
-
-    /// Timeouts must NOT be classified as unreachable — those are real
-    /// faults and should propagate as exit 1.
-    #[test]
-    fn is_daemon_unreachable_rejects_timeout() {
-        let err = zccache_ipc::IpcError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
-        assert!(!is_daemon_unreachable_err(&err));
-    }
-
-    /// Protocol errors (malformed framing, version skew) must NOT be
-    /// classified as unreachable.
-    #[test]
-    fn is_daemon_unreachable_rejects_non_io_variants() {
-        let err = zccache_ipc::IpcError::ConnectionClosed;
-        assert!(!is_daemon_unreachable_err(&err));
-        let err = zccache_ipc::IpcError::Endpoint("bogus".into());
-        assert!(!is_daemon_unreachable_err(&err));
-    }
 
     #[test]
     fn exit_code_zero_stays_zero() {
