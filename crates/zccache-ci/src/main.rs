@@ -198,8 +198,8 @@ fn main() -> ExitCode {
         eprintln!("Pre-existing dirty files — running cargo check");
         let mut cmd = build_cmd(
             &root,
-            "uv",
-            &["run", "cargo", "check", "--workspace", "--all-targets"],
+            "soldr",
+            &["cargo", "check", "--workspace", "--all-targets"],
         );
         let outcome = runner.run("quick-check", &mut cmd);
         if let Some(code) = handle_outcome("quick-check", outcome) {
@@ -227,8 +227,8 @@ fn main() -> ExitCode {
         if is_target_installed(target) {
             let mut xcheck_cmd = build_cmd(
                 &root,
-                "cargo",
-                &["check", "--target", target, "--workspace", "--all-targets"],
+                "soldr",
+                &["cargo", "check", "--target", target, "--workspace", "--all-targets"],
             );
             let xcheck_outcome = runner.run("cross-check-linux", &mut xcheck_cmd);
             if let Some(code) = handle_outcome("cross-check-linux", xcheck_outcome) {
@@ -255,8 +255,9 @@ fn main() -> ExitCode {
     // IPC + file watcher and are effectively integration tests.
     let mut test_cmd = build_cmd(
         &root,
-        "cargo",
+        "soldr",
         &[
+            "cargo",
             "test",
             "--workspace",
             "--lib",
