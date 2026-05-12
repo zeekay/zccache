@@ -59,7 +59,7 @@ runs:
     - name: Setup Soldr
       uses: zackees/setup-soldr@v0
       with:
-        version: "0.7.14"
+        version: "0.7.16"
         toolchain: 1.94.1
         cache: true
         cache-key-suffix: ${{ inputs.cache_key }}
