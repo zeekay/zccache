@@ -21,6 +21,7 @@ Thumbs.db
 # but per-session locks/state files are not)
 .claude/scheduled_tasks.lock
 .claude/scheduled_tasks/
+.claude/worktrees/
 
 # Project-local toolchain caches (managed by soldr)
 .cargo/
@@ -28,6 +29,10 @@ Thumbs.db
 
 # zccache cache directory
 .zccache/
+
+# Local bench scratch (Stop-hook cold-cache benchmark output + helper script)
+tasks/bench-output/
+tasks/bench-stop-hook.sh
 
 # Cargo lock is checked in for binaries
 # (workspace contains binary crates)
