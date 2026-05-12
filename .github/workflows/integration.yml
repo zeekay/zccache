@@ -26,10 +26,10 @@ jobs:
     name: Integration (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: zackees/setup-soldr@v0
         with:
-          version: "0.7.14"
+          version: "0.7.16"
           toolchain: 1.94.1
           cache: true
       - name: Test (full workspace)

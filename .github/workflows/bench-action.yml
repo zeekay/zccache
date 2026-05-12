@@ -41,7 +41,7 @@ jobs:
       warm_target: ${{ steps.warm_target.outputs.ms }}
       noop: ${{ steps.noop.outputs.ms }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -106,7 +106,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -170,7 +170,7 @@ jobs:
       warm_target: ${{ steps.warm_target.outputs.ms }}
       noop: ${{ steps.noop.outputs.ms }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -239,7 +239,7 @@ jobs:
     outputs:
       restored: ${{ steps.restored.outputs.ms }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -324,7 +324,7 @@ jobs:
 
       - name: "Upload diagnostic logs"
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cached-target-diagnostics
           path: /tmp/cargo-fingerprint.log
