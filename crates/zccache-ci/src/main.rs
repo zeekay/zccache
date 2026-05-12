@@ -228,7 +228,14 @@ fn main() -> ExitCode {
             let mut xcheck_cmd = build_cmd(
                 &root,
                 "soldr",
-                &["cargo", "check", "--target", target, "--workspace", "--all-targets"],
+                &[
+                    "cargo",
+                    "check",
+                    "--target",
+                    target,
+                    "--workspace",
+                    "--all-targets",
+                ],
             );
             let xcheck_outcome = runner.run("cross-check-linux", &mut xcheck_cmd);
             if let Some(code) = handle_outcome("cross-check-linux", xcheck_outcome) {
