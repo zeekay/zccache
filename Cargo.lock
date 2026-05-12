@@ -3429,6 +3429,7 @@ version = "1.4.2"
 dependencies = [
  "bincode",
  "blake3",
+ "rayon",
  "redb",
  "serde",
  "serde_json",

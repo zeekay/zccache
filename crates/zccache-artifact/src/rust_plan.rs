@@ -5,9 +5,18 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rayon::prelude::*;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use zccache_core::{normalize_for_key, NormalizedPath};
+
+/// Upper bound on save-time worker threads. Beyond this Windows filter-driver
+/// serialization dominates and extra threads stop helping (see issue #177 and
+/// the linked soldr#272 analysis).
+const DEFAULT_RUST_PLAN_TAR_THREADS_CAP: usize = 8;
+/// Hard upper bound regardless of caller request — protects small runners from
+/// per-thread buffer blowup if someone passes a huge value.
+const MAX_RUST_PLAN_TAR_THREADS: usize = 64;
 
 /// Supported Rust artifact plan schema version.
 pub const RUST_ARTIFACT_PLAN_SCHEMA_VERSION: u32 = 1;
@@ -629,25 +638,9 @@ pub fn save_rust_plan_local(
     }
     std::fs::create_dir_all(&files_dir)?;
 
-    let mut artifacts = Vec::new();
-    for selected_file in selected {
-        let rel = selected_file.relative_path;
-        let dst = safe_join(&files_dir, &rel)?;
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(&selected_file.source_path, &dst)?;
-        let size = std::fs::metadata(&selected_file.source_path)?.len();
-        let content_hash = zccache_hash::hash_file(&selected_file.source_path)?.to_hex();
-        summary.saved_file_count += 1;
-        summary.saved_bytes += size;
-        artifacts.push(RustBundledArtifact {
-            relative_path: rel,
-            class: selected_file.class,
-            size,
-            content_hash,
-        });
-    }
+    let artifacts = bundle_selected_artifacts(&selected, &files_dir)?;
+    summary.saved_file_count += artifacts.len() as u64;
+    summary.saved_bytes += artifacts.iter().map(|a| a.size).sum::<u64>();
 
     let manifest = RustArtifactBundleManifest {
         manifest_schema_version: RUST_ARTIFACT_CACHE_SCHEMA_VERSION,
@@ -662,6 +655,105 @@ pub fn save_rust_plan_local(
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     std::fs::write(bundle_dir.join(BUNDLE_MANIFEST_NAME), manifest_bytes)?;
     Ok(summary)
+}
+
+/// Copy + stat + hash every selected artifact into `files_dir`, returning the
+/// manifest entries in input order (which `select_artifacts` has already sorted
+/// by `relative_path` for determinism). Reads `resolve_rust_plan_tar_threads()`
+/// for the parallelism setting — see issue #177 for the Windows-CI motivation.
+fn bundle_selected_artifacts(
+    selected: &[SelectedArtifact],
+    files_dir: &Path,
+) -> Result<Vec<RustBundledArtifact>, RustPlanError> {
+    bundle_selected_artifacts_with_threads(selected, files_dir, resolve_rust_plan_tar_threads())
+}
+
+/// Same as `bundle_selected_artifacts`, but with `threads` injected so tests
+/// can exercise the parallel path without racing on process-global env vars.
+fn bundle_selected_artifacts_with_threads(
+    selected: &[SelectedArtifact],
+    files_dir: &Path,
+    threads: usize,
+) -> Result<Vec<RustBundledArtifact>, RustPlanError> {
+    if threads <= 1 || selected.len() < 2 {
+        return selected
+            .iter()
+            .map(|sel| bundle_one_artifact(sel, files_dir))
+            .collect();
+    }
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|idx| format!("zccache-rust-plan-{idx}"))
+        .build()
+        .map_err(|err| {
+            RustPlanError::Io(std::io::Error::other(format!(
+                "failed to build rust-plan thread pool: {err}"
+            )))
+        })?;
+
+    pool.install(|| {
+        selected
+            .par_iter()
+            .map(|sel| bundle_one_artifact(sel, files_dir))
+            .collect()
+    })
+}
+
+fn bundle_one_artifact(
+    sel: &SelectedArtifact,
+    files_dir: &Path,
+) -> Result<RustBundledArtifact, RustPlanError> {
+    let dst = safe_join(files_dir, &sel.relative_path)?;
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&sel.source_path, &dst)?;
+    let size = std::fs::metadata(&sel.source_path)?.len();
+    let content_hash = zccache_hash::hash_file(&sel.source_path)?.to_hex();
+    Ok(RustBundledArtifact {
+        relative_path: sel.relative_path.clone(),
+        class: sel.class,
+        size,
+        content_hash,
+    })
+}
+
+/// Decide how many worker threads to use for the rust-plan save copy+hash loop.
+///
+/// Grammar (mirrors `SOLDR_TARGET_CACHE_TAR_THREADS` validated upstream by
+/// soldr#273):
+/// - unset / `auto` / empty / unparseable → vCPU-bounded, capped at 8
+/// - `1` → sequential (regression escape hatch)
+/// - positive integer N → `min(N, MAX_RUST_PLAN_TAR_THREADS)`
+///
+/// `ZCCACHE_RUST_PLAN_TAR_THREADS` takes precedence over the soldr-side var so
+/// direct zccache invocations can override without touching the soldr env.
+pub fn resolve_rust_plan_tar_threads() -> usize {
+    let raw = std::env::var("ZCCACHE_RUST_PLAN_TAR_THREADS")
+        .ok()
+        .or_else(|| std::env::var("SOLDR_TARGET_CACHE_TAR_THREADS").ok());
+    parse_rust_plan_tar_threads(raw.as_deref())
+}
+
+fn parse_rust_plan_tar_threads(raw: Option<&str>) -> usize {
+    let trimmed = raw.map(str::trim).filter(|s| !s.is_empty());
+    match trimmed {
+        None => default_rust_plan_tar_threads(),
+        Some(s) if s.eq_ignore_ascii_case("auto") => default_rust_plan_tar_threads(),
+        Some(s) => match s.parse::<usize>() {
+            Ok(0) => default_rust_plan_tar_threads(),
+            Ok(n) => n.min(MAX_RUST_PLAN_TAR_THREADS),
+            Err(_) => default_rust_plan_tar_threads(),
+        },
+    }
+}
+
+fn default_rust_plan_tar_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(DEFAULT_RUST_PLAN_TAR_THREADS_CAP)
 }
 
 /// Execute local bundle restore for a validated plan.
@@ -1834,5 +1926,76 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         let loaded = RustArtifactPlanV1::from_json_str(&format!("\u{feff}{json}")).unwrap();
         assert_eq!(loaded.schema_version, 1);
+    }
+
+    // ─── rust-plan tar thread resolver (issue #177) ──────────────────────
+
+    #[test]
+    fn tar_threads_parser_accepts_grammar_from_soldr_273() {
+        // unset / auto / empty / whitespace → default (vCPU-bounded, capped at 8)
+        let default = default_rust_plan_tar_threads();
+        assert!((1..=DEFAULT_RUST_PLAN_TAR_THREADS_CAP).contains(&default));
+        assert_eq!(parse_rust_plan_tar_threads(None), default);
+        assert_eq!(parse_rust_plan_tar_threads(Some("auto")), default);
+        assert_eq!(parse_rust_plan_tar_threads(Some("AUTO")), default);
+        assert_eq!(parse_rust_plan_tar_threads(Some("")), default);
+        assert_eq!(parse_rust_plan_tar_threads(Some("   ")), default);
+
+        // 1 → sequential escape hatch
+        assert_eq!(parse_rust_plan_tar_threads(Some("1")), 1);
+
+        // Positive integer → clamped to MAX_RUST_PLAN_TAR_THREADS
+        assert_eq!(parse_rust_plan_tar_threads(Some("4")), 4);
+        assert_eq!(
+            parse_rust_plan_tar_threads(Some("9999")),
+            MAX_RUST_PLAN_TAR_THREADS
+        );
+
+        // Garbage / 0 → default (defensive)
+        assert_eq!(parse_rust_plan_tar_threads(Some("0")), default);
+        assert_eq!(parse_rust_plan_tar_threads(Some("not-a-number")), default);
+        assert_eq!(parse_rust_plan_tar_threads(Some("-1")), default);
+    }
+
+    #[test]
+    fn parallel_bundling_matches_sequential_byte_for_byte() {
+        // `select_artifacts` pre-sorts by relative_path; with rayon's ordered
+        // `par_iter().collect()` we must end up with the same artifact list,
+        // same hashes, same sizes — regardless of thread count.
+        fn bundle_with(threads: usize) -> Vec<RustBundledArtifact> {
+            let dir = tempfile::tempdir().unwrap();
+            synthetic_target(dir.path());
+            let plan = sample_plan(dir.path(), RustPlanMode::Thin);
+
+            let mut candidates = Vec::new();
+            collect_files(plan.target_dir.as_path(), &mut candidates).unwrap();
+            candidates.sort();
+            let mut summary = RustPlanSummary::new(
+                RustPlanOperation::Save,
+                plan.mode,
+                plan.schema_version,
+                plan.cache_schema_version,
+                rust_plan_cache_key(&plan),
+                None,
+                None,
+            );
+            let selected = select_artifacts(&plan, candidates, &mut summary);
+
+            let files_dir = dir.path().join("out").join(format!("t{threads}"));
+            std::fs::create_dir_all(&files_dir).unwrap();
+            bundle_selected_artifacts_with_threads(&selected, &files_dir, threads).unwrap()
+        }
+
+        let sequential = bundle_with(1);
+        let parallel = bundle_with(4);
+
+        assert!(!sequential.is_empty());
+        assert_eq!(sequential.len(), parallel.len());
+        for (seq, par) in sequential.iter().zip(parallel.iter()) {
+            assert_eq!(seq.relative_path, par.relative_path);
+            assert_eq!(seq.size, par.size);
+            assert_eq!(seq.content_hash, par.content_hash);
+            assert_eq!(seq.class, par.class);
+        }
     }
 }
