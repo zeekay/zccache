@@ -179,3 +179,18 @@ runs:
           --binary-ext "${{ inputs.binary_ext }}" \
           --input-dir staging \
           --output-dir standalone
+
+    # The setup-soldr post-step that runs after this composite finishes will
+    # tar `$SOLDR_CACHE_DIR/cache/zccache/` for the actions/cache save. On
+    # Windows that tar fails with EBUSY on `index.redb` if the zccache daemon
+    # is still alive holding the redb exclusive lock. `zccache stop` now waits
+    # until the IPC endpoint is gone and the redb file is openable. See #182
+    # and run https://github.com/zackees/zccache/actions/runs/25765121262/job/75675819635.
+    - name: Shutdown zccache daemon before cache save
+      if: always()
+      shell: bash
+      run: |
+        # `|| true` so a never-started daemon (e.g. cold cache hit) doesn't
+        # fail the job. The bounded poll inside `zccache stop` is the real
+        # safeguard.
+        zccache stop || true

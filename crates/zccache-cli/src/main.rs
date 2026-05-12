@@ -855,6 +855,10 @@ async fn cmd_stop(endpoint: &str) -> ExitCode {
         Err(_) => {
             let Some(pid) = zccache_ipc::check_running_daemon() else {
                 eprintln!("daemon not running at {endpoint}");
+                // No daemon — but the index file might still be there from a
+                // crashed prior run. Probe once so callers (CI tar) can rely
+                // on the lock being gone after `zccache stop` returns.
+                wait_for_redb_release(endpoint).await;
                 return ExitCode::SUCCESS;
             };
 
@@ -866,6 +870,7 @@ async fn cmd_stop(endpoint: &str) -> ExitCode {
                             eprintln!(
                                 "daemon process {pid} terminated after IPC connection failed"
                             );
+                            wait_for_redb_release(endpoint).await;
                             return ExitCode::SUCCESS;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -899,6 +904,13 @@ async fn cmd_stop(endpoint: &str) -> ExitCode {
     };
     match recv_result {
         Some(zccache_protocol::Response::ShuttingDown) => {
+            // The daemon acknowledges `Shutdown` immediately and continues
+            // teardown asynchronously. On Windows the redb index lock is held
+            // until the daemon process actually exits and `Drop` fires. Wait
+            // for the IPC endpoint to drop and for `index.redb` to be
+            // openable (i.e. no exclusive share lock) so callers like the CI
+            // post-step tar do not race the daemon. See issue #182.
+            wait_for_redb_release(endpoint).await;
             eprintln!("daemon stopped");
             ExitCode::SUCCESS
         }
@@ -909,6 +921,78 @@ async fn cmd_stop(endpoint: &str) -> ExitCode {
         Some(other) => {
             eprintln!("zccache: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Default cap on how long `zccache stop` will wait after the daemon ACKs
+/// `Shutdown` for the IPC endpoint to disappear and `index.redb` to become
+/// openable. Overridable with `ZCCACHE_STOP_TIMEOUT_SECS`.
+const STOP_WAIT_DEFAULT_SECS: u64 = 10;
+/// Poll cadence inside the bounded wait loop.
+const STOP_WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Returns the bounded total wait duration for `zccache stop`, honoring
+/// `ZCCACHE_STOP_TIMEOUT_SECS` if it parses as a non-negative `u64`.
+fn stop_wait_timeout() -> std::time::Duration {
+    let secs = std::env::var("ZCCACHE_STOP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(STOP_WAIT_DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Poll until both the IPC endpoint is unreachable and `index.redb` can be
+/// opened (or does not exist). Emits a warning on timeout but never fails the
+/// caller — the worst case is that the caller (e.g. CI cache tar) sees the
+/// same error it would have seen without this wait.
+async fn wait_for_redb_release(endpoint: &str) {
+    let index_path = zccache_core::config::index_path();
+    let deadline = std::time::Instant::now() + stop_wait_timeout();
+    loop {
+        let endpoint_gone = !is_ipc_endpoint_reachable(endpoint).await;
+        let index_free = is_index_openable(index_path.as_path());
+        if endpoint_gone && index_free {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "zccache: timed out waiting for daemon teardown after stop \
+                 (endpoint_gone={endpoint_gone}, index_free={index_free}); \
+                 continuing anyway. set ZCCACHE_STOP_TIMEOUT_SECS to override."
+            );
+            return;
+        }
+        tokio::time::sleep(STOP_WAIT_POLL_INTERVAL).await;
+    }
+}
+
+/// True if a fresh `connect()` to the daemon IPC endpoint succeeds.
+async fn is_ipc_endpoint_reachable(endpoint: &str) -> bool {
+    connect(endpoint).await.is_ok()
+}
+
+/// True if `index.redb` is either absent or openable for read. On Windows,
+/// redb opens the index with exclusive share mode; any other handle opening
+/// it returns `ERROR_SHARING_VIOLATION` (raw OS error 32, surfaced as
+/// `ErrorKind::PermissionDenied` in current stable). On Unix this almost
+/// always succeeds, which is also "lock released".
+fn is_index_openable(path: &std::path::Path) -> bool {
+    match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => {
+            // ERROR_SHARING_VIOLATION (32) is the case we want to keep
+            // polling on. Anything else (PermissionDenied for ACL reasons,
+            // etc.) we also treat as "not ready" so we don't falsely report
+            // success while the daemon still holds the file.
+            if err.raw_os_error() == Some(32) || err.kind() == std::io::ErrorKind::PermissionDenied
+            {
+                return false;
+            }
+            // Any other unexpected error: treat as "ready" so we don't spin
+            // forever on a fundamentally broken cache dir.
+            true
         }
     }
 }
@@ -4400,5 +4484,136 @@ mod tests {
                  auto-recovering on protocol mismatch: {msg}"
             );
         }
+    }
+
+    /// `wait_for_redb_release` keys on `is_index_openable`. A missing index
+    /// file is the common case in CI when no daemon ever started — it must
+    /// report "ready" so the wait does not stall.
+    #[test]
+    fn index_openable_treats_missing_file_as_ready() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("does-not-exist.redb");
+        assert!(is_index_openable(&missing));
+    }
+
+    /// An ordinary index file with no exclusive lock should be reported as
+    /// openable. This is the path Unix always takes and the path Windows
+    /// takes after the daemon's `Drop` fires.
+    #[test]
+    fn index_openable_succeeds_for_unlocked_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("index.redb");
+        std::fs::write(&path, b"fake redb body").expect("write");
+        assert!(is_index_openable(&path));
+    }
+
+    /// Simulate a daemon holding the file with Windows exclusive share mode.
+    /// The probe must return false so the poll loop keeps waiting; on Unix
+    /// this open succeeds (no exclusive share semantics), so the assertion
+    /// flips. Either way we exercise the branch that gates the poll loop.
+    #[cfg(windows)]
+    #[test]
+    fn index_openable_returns_false_for_exclusive_share_lock() {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_NONE = 0, matching redb's exclusive open on Windows.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("index.redb");
+        std::fs::write(&path, b"fake redb body").expect("write");
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .expect("hold exclusive");
+        assert!(!is_index_openable(&path));
+        drop(_holder);
+        assert!(is_index_openable(&path));
+    }
+
+    /// The bounded wait loop must return promptly once both conditions are
+    /// true. Use an endpoint we know is unreachable plus a missing index
+    /// file so the very first poll satisfies the predicate.
+    #[test]
+    fn wait_for_redb_release_returns_when_both_conditions_satisfied() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Point the index probe at a non-existent file.
+        std::env::set_var("ZCCACHE_CACHE_DIR", tmp.path());
+        std::env::set_var("ZCCACHE_STOP_TIMEOUT_SECS", "2");
+
+        // An obviously-bad endpoint so `connect()` fails fast and
+        // `is_ipc_endpoint_reachable` returns false on the first probe.
+        let unreachable_endpoint = if cfg!(windows) {
+            r"\\.\pipe\zccache-test-does-not-exist-182".to_string()
+        } else {
+            tmp.path()
+                .join("does-not-exist.sock")
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let started = std::time::Instant::now();
+        rt.block_on(wait_for_redb_release(&unreachable_endpoint));
+        let elapsed = started.elapsed();
+        std::env::remove_var("ZCCACHE_STOP_TIMEOUT_SECS");
+        std::env::remove_var("ZCCACHE_CACHE_DIR");
+
+        // The first iteration of the loop should satisfy both predicates and
+        // return immediately — well under the 2s timeout we configured.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "wait_for_redb_release blocked for {elapsed:?} despite both conditions \
+             being satisfied at t=0"
+        );
+    }
+
+    /// Verify the env-var override is honored and the timeout fires when the
+    /// index file is held by a locker we never release within the budget.
+    #[cfg(windows)]
+    #[test]
+    fn wait_for_redb_release_times_out_when_index_stays_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("index.redb");
+        std::fs::write(&path, b"fake redb body").expect("write");
+        let _holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .expect("hold exclusive");
+
+        std::env::set_var("ZCCACHE_CACHE_DIR", tmp.path());
+        // 1 second timeout so the test stays fast.
+        std::env::set_var("ZCCACHE_STOP_TIMEOUT_SECS", "1");
+
+        let unreachable_endpoint = r"\\.\pipe\zccache-test-does-not-exist-182-timeout".to_string();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let started = std::time::Instant::now();
+        rt.block_on(wait_for_redb_release(&unreachable_endpoint));
+        let elapsed = started.elapsed();
+
+        std::env::remove_var("ZCCACHE_STOP_TIMEOUT_SECS");
+        std::env::remove_var("ZCCACHE_CACHE_DIR");
+        drop(_holder);
+
+        // We expect roughly the configured 1s budget — allow generous slack
+        // for CI variance. The point is: it returned, it did not hang
+        // forever, and it took at least the configured timeout.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "wait returned in {elapsed:?}, before the 1s timeout"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "wait took {elapsed:?}, exceeding reasonable slack on 1s timeout"
+        );
     }
 }
