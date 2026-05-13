@@ -305,17 +305,18 @@ jobs:
 
           echo ""
           echo "=== Cargo output ==="
-          grep -E "Compiling|Finished|Fresh" /tmp/cargo-fingerprint.log | head -20
+          grep -E "Compiling|Finished|Fresh" /tmp/cargo-fingerprint.log | head -20 || true
 
           echo ""
           echo "=== Why dirty? (fingerprint trace) ==="
-          grep -iE "dirty|stale|newer than|fingerprint.*changed|is newer" /tmp/cargo-fingerprint.log | head -20
+          grep -iE "dirty|stale|newer than|fingerprint.*changed|is newer" /tmp/cargo-fingerprint.log | head -20 || true
 
           echo ""
           echo "=== Full fingerprint trace (first 50 lines) ==="
           head -50 /tmp/cargo-fingerprint.log
 
-          COMPILING=$(grep -c "Compiling" /tmp/cargo-fingerprint.log || echo 0)
+          COMPILING=$(grep -c "Compiling" /tmp/cargo-fingerprint.log || true)
+          COMPILING=${COMPILING:-0}
           if [ "$COMPILING" -gt 0 ]; then
             echo "::warning::Recompiled $COMPILING crates (expected 0 with restored target)"
           else
