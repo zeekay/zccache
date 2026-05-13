@@ -3,7 +3,7 @@ name: Benchmark Stats
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 9 * * 1"
+    - cron: "17 9 * * *"
 
 concurrency:
   group: benchmark-stats-${{ github.ref }}
