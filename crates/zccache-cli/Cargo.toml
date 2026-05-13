@@ -34,6 +34,7 @@ zccache-download-client = { workspace = true }
 zccache-gha = { workspace = true }
 serde_json = { workspace = true }
 rayon = { workspace = true }
+jwalk = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 tempfile = { workspace = true }

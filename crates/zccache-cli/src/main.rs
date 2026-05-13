@@ -23,7 +23,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use zccache_artifact::{
     restore_rust_plan_local, rust_plan_bundle_dir, rust_plan_cache_key, save_rust_plan_local,
@@ -36,9 +36,6 @@ use zccache_cli::{
 use zccache_compiler::strict_paths::StrictPathsMode;
 use zccache_core::NormalizedPath;
 use zccache_gha::{GhaCache, GhaError};
-
-#[cfg(test)]
-use std::path::PathBuf;
 
 /// zccache -- fast local compiler cache.
 #[derive(Debug, Parser)]
@@ -246,6 +243,23 @@ enum Commands {
         /// IPC endpoint (default: platform-specific).
         #[arg(long)]
         endpoint: Option<String>,
+    },
+    /// Sum byte size of regular files under a target directory, with optional
+    /// pruning. Used by `action/cleanup/prepare-target-snapshot.sh` instead of
+    /// Python `os.walk` because jwalk parallelizes readdir+stat across cores —
+    /// big win on Windows where per-file Defender callbacks dominate the walk.
+    /// Prints total bytes as a decimal integer on stdout. See zccache#189.
+    #[command(name = "snapshot-bytes")]
+    SnapshotBytes {
+        /// Directory to walk.
+        #[arg(long)]
+        target: PathBuf,
+        /// Skip `incremental/` directories during the walk.
+        #[arg(long)]
+        prune_incremental: bool,
+        /// Skip `*/build/*/out/` directories during the walk.
+        #[arg(long)]
+        prune_build_script_out: bool,
     },
 }
 
@@ -798,6 +812,11 @@ fn main() -> ExitCode {
             let target_dir = absolute_path(&target_dir);
             cmd_warm(&target_dir, &profile)
         }
+        Commands::SnapshotBytes {
+            target,
+            prune_incremental,
+            prune_build_script_out,
+        } => cmd_snapshot_bytes(&target, prune_incremental, prune_build_script_out),
     }
 }
 
@@ -1799,6 +1818,115 @@ fn flag_truthy(value: Option<&str>) -> bool {
 
 fn env_flag_truthy(name: &str) -> bool {
     flag_truthy(std::env::var(name).ok().as_deref())
+}
+
+/// Parallel walk of `target` summing the bytes of every regular file, with
+/// optional pruning. Uses jwalk for parallel readdir + stat (rayon under the
+/// hood) — on Windows this hides per-file Defender callback latency that
+/// dominates the single-threaded `os.walk` baseline. See zccache#189.
+fn cmd_snapshot_bytes(
+    target: &Path,
+    prune_incremental: bool,
+    prune_build_script_out: bool,
+) -> ExitCode {
+    match snapshot_bytes_walk(target, prune_incremental, prune_build_script_out) {
+        Ok(total) => {
+            println!("{total}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("zccache snapshot-bytes: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn snapshot_bytes_walk(
+    target: &Path,
+    prune_incremental: bool,
+    prune_build_script_out: bool,
+) -> std::io::Result<u64> {
+    use jwalk::WalkDirGeneric;
+    use std::sync::Mutex;
+
+    if !target.exists() {
+        return Ok(0);
+    }
+
+    // Dedup by (dev, inode) so hardlinked files don't double-count.
+    let seen: Mutex<std::collections::HashSet<(u64, u64)>> = Mutex::new(Default::default());
+
+    let walker = WalkDirGeneric::<((), Option<u64>)>::new(target).process_read_dir(
+        move |_depth, parent_path, _read_dir_state, children| {
+            for child in children.iter_mut() {
+                let Ok(entry) = child.as_mut() else { continue };
+                if !entry.file_type().is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if prune_incremental && name == "incremental" {
+                    entry.read_children_path = None;
+                    continue;
+                }
+                if prune_build_script_out && name == "out" {
+                    // `*/build/*/out` — only prune if grandparent is `build`.
+                    if let Some(grandparent) = parent_path.parent() {
+                        if grandparent.file_name().and_then(|s| s.to_str()) == Some("build") {
+                            entry.read_children_path = None;
+                        }
+                    }
+                }
+            }
+        },
+    );
+
+    let mut total: u64 = 0;
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                // Tolerate per-entry stat failures the same way `os.walk` does
+                // in the bash fallback: skip and continue. We only bail on
+                // catastrophic root-level failure (handled by walker init).
+                eprintln!("zccache snapshot-bytes: skip entry: {err}");
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if let Some(key) = file_identity(&meta) {
+            let mut seen_guard = seen.lock().expect("seen mutex poisoned");
+            if !seen_guard.insert(key) {
+                continue;
+            }
+        }
+        total = total.saturating_add(meta.len());
+    }
+    Ok(total)
+}
+
+#[cfg(unix)]
+fn file_identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    // Windows file IDs require a separate Win32 call; not worth the cost just
+    // for hardlink dedup in a target/ tree. Cargo doesn't hardlink within
+    // `target/` in practice, so the dedup is a no-op here.
+    None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 fn cmd_cargo_registry_save(key: &str, cargo_home: Option<&str>) -> ExitCode {
@@ -4662,5 +4790,81 @@ mod tests {
         ] {
             assert!(!flag_truthy(Some(v)), "expected falsy: {v:?}");
         }
+    }
+
+    // ─── snapshot-bytes parallel walk (issue #189) ──────────────────────
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir -p");
+        }
+        std::fs::write(path, bytes).expect("write file");
+    }
+
+    /// Empty / missing target dir returns 0 bytes (mirrors os.walk behavior).
+    #[test]
+    fn snapshot_bytes_missing_target_is_zero() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("nope");
+        assert_eq!(snapshot_bytes_walk(&missing, true, false).unwrap(), 0);
+    }
+
+    /// Sums regular files. `--prune-incremental` removes `incremental/`
+    /// directories from the walk entirely.
+    #[test]
+    fn snapshot_bytes_prunes_incremental() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path();
+        write_file(&target.join("debug/deps/libfoo.rlib"), &[0u8; 100]);
+        write_file(&target.join("debug/incremental/foo/state.bin"), &[0u8; 999]);
+        write_file(
+            &target.join("release/incremental/bar/state.bin"),
+            &[0u8; 999],
+        );
+
+        let with_prune = snapshot_bytes_walk(target, true, false).unwrap();
+        assert_eq!(with_prune, 100, "incremental should be excluded");
+
+        let without_prune = snapshot_bytes_walk(target, false, false).unwrap();
+        assert_eq!(
+            without_prune,
+            100 + 999 + 999,
+            "without prune, all files counted"
+        );
+    }
+
+    /// `--prune-build-script-out` removes `*/build/*/out/` only. A bare `out/`
+    /// outside that pattern stays in the count.
+    #[test]
+    fn snapshot_bytes_prunes_build_script_out_only_under_build() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path();
+        write_file(
+            &target.join("debug/build/libz-sys-abc/out/native/libz.a"),
+            &[0u8; 500],
+        );
+        write_file(
+            &target.join("debug/build/libz-sys-abc/build-script-build"),
+            &[0u8; 50],
+        );
+        // `out/` that is NOT under `build/<pkg>/` should not be pruned.
+        write_file(&target.join("debug/deps/some/out/data.bin"), &[0u8; 7]);
+
+        let pruned = snapshot_bytes_walk(target, true, true).unwrap();
+        assert_eq!(
+            pruned,
+            50 + 7,
+            "only build/<pkg>/out should be pruned; deps/some/out kept"
+        );
+
+        let kept = snapshot_bytes_walk(target, true, false).unwrap();
+        assert_eq!(kept, 500 + 50 + 7);
+    }
+
+    /// Walker tolerates an entirely empty tree — returns 0, doesn't error.
+    #[test]
+    fn snapshot_bytes_empty_target_is_zero() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(snapshot_bytes_walk(tmp.path(), true, false).unwrap(), 0);
     }
 }
