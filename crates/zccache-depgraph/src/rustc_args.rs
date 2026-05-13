@@ -39,7 +39,9 @@ pub struct RustcParsedArgs {
     /// Cache-relevant `-C` codegen options (sorted).
     /// Includes: opt-level, codegen-units, target-cpu, target-feature,
     /// lto, panic, debuginfo, strip, overflow-checks, embed-bitcode.
-    /// Excludes: metadata, extra-filename, incremental.
+    /// Excludes: incremental and linker/pass-through options. Cargo metadata
+    /// and extra-filename are tracked separately because they affect rustc
+    /// artifact identity and output names.
     pub codegen_flags: Vec<String>,
     /// `--target` value (cross-compilation triple).
     pub target: Option<String>,
@@ -83,8 +85,6 @@ pub struct RustcParsedArgs {
 /// Any `-C` option NOT in this list is included in the cache key by default,
 /// which is the safe choice: unknown options are assumed to affect output.
 const EXCLUDED_CODEGEN: &[&str] = &[
-    "metadata",
-    "extra-filename",
     "incremental",
     "linker",
     "link-arg",

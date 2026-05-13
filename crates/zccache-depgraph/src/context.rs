@@ -280,6 +280,10 @@ pub struct RustcCompileContext {
     pub check_cfgs: Vec<String>,
     /// Sorted cache-relevant `-C` codegen options.
     pub codegen_flags: Vec<String>,
+    /// Cargo's `-C metadata=` disambiguator for this compilation unit.
+    pub cargo_metadata: Option<String>,
+    /// Cargo's `-C extra-filename=` suffix for output artifact names.
+    pub extra_filename: Option<String>,
     /// `--target` triple.
     pub target: Option<String>,
     /// `--cap-lints` value.
@@ -348,6 +352,8 @@ impl RustcCompileContext {
             cfgs: args.cfgs.clone(),
             check_cfgs: args.check_cfgs.clone(),
             codegen_flags: args.codegen_flags.clone(),
+            cargo_metadata: args.cargo_metadata.clone(),
+            extra_filename: args.extra_filename.clone(),
             target: args.target.clone(),
             cap_lints: args.cap_lints.clone(),
             extern_crates,
@@ -426,6 +432,18 @@ impl RustcCompileContext {
         hasher.update(b"codegen\0");
         for flag in &self.codegen_flags {
             hasher.update(flag.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        if let Some(ref metadata) = self.cargo_metadata {
+            hasher.update(b"cargo-metadata\0");
+            hasher.update(metadata.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        if let Some(ref extra_filename) = self.extra_filename {
+            hasher.update(b"extra-filename\0");
+            hasher.update(extra_filename.as_bytes());
             hasher.update(b"\0");
         }
 
@@ -686,6 +704,8 @@ mod tests {
             cfgs: Vec::new(),
             check_cfgs: Vec::new(),
             codegen_flags: Vec::new(),
+            cargo_metadata: None,
+            extra_filename: None,
             target: None,
             cap_lints: None,
             extern_crates: Vec::new(),
@@ -893,6 +913,8 @@ mod tests {
             cfgs: Vec::new(),
             check_cfgs: Vec::new(),
             codegen_flags: Vec::new(),
+            cargo_metadata: None,
+            extra_filename: None,
             target: None,
             cap_lints: None,
             extern_crates: Vec::new(),
@@ -935,6 +957,32 @@ mod tests {
         let mut ctx2 = make_rustc_context("/src/lib.rs", "2021");
         ctx2.codegen_flags = vec!["opt-level=3".to_string()];
         assert_ne!(ctx1.context_key(), ctx2.context_key());
+    }
+
+    #[test]
+    fn rustc_cargo_metadata_affects_key() {
+        let mut ctx1 = make_rustc_context("/src/lib.rs", "2021");
+        ctx1.cargo_metadata = Some("worktree-a".to_string());
+        let mut ctx2 = make_rustc_context("/src/lib.rs", "2021");
+        ctx2.cargo_metadata = Some("worktree-b".to_string());
+        assert_ne!(
+            ctx1.context_key(),
+            ctx2.context_key(),
+            "-C metadata participates in crate disambiguation and must affect the key"
+        );
+    }
+
+    #[test]
+    fn rustc_extra_filename_affects_key() {
+        let mut ctx1 = make_rustc_context("/src/lib.rs", "2021");
+        ctx1.extra_filename = Some("-aaa111".to_string());
+        let mut ctx2 = make_rustc_context("/src/lib.rs", "2021");
+        ctx2.extra_filename = Some("-bbb222".to_string());
+        assert_ne!(
+            ctx1.context_key(),
+            ctx2.context_key(),
+            "-C extra-filename controls emitted artifact names and must affect the key"
+        );
     }
 
     #[test]
@@ -1018,8 +1066,8 @@ mod tests {
             lint_flags: Vec::new(),
             unknown_flags: Vec::new(),
             out_dir: None,
-            extra_filename: None,
-            cargo_metadata: None,
+            extra_filename: Some("-abc123".to_string()),
+            cargo_metadata: Some("abc123".to_string()),
             incremental_dir: None,
             error_format: None,
             json_format: None,
@@ -1039,6 +1087,8 @@ mod tests {
         assert_eq!(ctx.extern_crates.len(), 2);
         assert_eq!(ctx.extern_crates[0].0, "log");
         assert_eq!(ctx.extern_crates[1].0, "serde");
+        assert_eq!(ctx.cargo_metadata.as_deref(), Some("abc123"));
+        assert_eq!(ctx.extra_filename.as_deref(), Some("-abc123"));
     }
 
     #[test]
