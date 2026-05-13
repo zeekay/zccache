@@ -1785,7 +1785,33 @@ fn cargo_registry_cache_dir() -> Result<NormalizedPath, String> {
         .join("cargo-registry"))
 }
 
+/// Matches setup-soldr's boolean env-var normalization: `1`, `true`, `yes`,
+/// `on` (case-insensitive) are truthy; anything else (including `None`,
+/// empty, `0`, `false`, `no`, `off`) is falsy. See zccache#184.
+fn flag_truthy(value: Option<&str>) -> bool {
+    let Some(raw) = value else { return false };
+    let trimmed = raw.trim();
+    matches!(trimmed, "1")
+        || trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
+}
+
+fn env_flag_truthy(name: &str) -> bool {
+    flag_truthy(std::env::var(name).ok().as_deref())
+}
+
 fn cmd_cargo_registry_save(key: &str, cargo_home: Option<&str>) -> ExitCode {
+    // setup-soldr#70's payload C migration: when setup-soldr owns
+    // `~/.cargo/registry` caching with fast-zstd, double-saving here just
+    // burns CPU on the same bytes. Caller signals takeover via env var.
+    if env_flag_truthy("SOLDR_SKIP_CARGO_REGISTRY_SAVE") {
+        println!(
+            "cargo-registry save: skipping (SOLDR_SKIP_CARGO_REGISTRY_SAVE=1) \
+             — caller owns the cache layer"
+        );
+        return ExitCode::SUCCESS;
+    }
     let cargo_home = match resolve_cargo_home(cargo_home) {
         Ok(p) => p,
         Err(e) => {
@@ -4615,5 +4641,26 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "wait took {elapsed:?}, exceeding reasonable slack on 1s timeout"
         );
+    }
+
+    /// Exercises both branches of the setup-soldr-compatible bool grammar.
+    /// Tests the pure function so we don't have to mutate process env vars
+    /// — that's a documented foot-gun in cargo's parallel test runner.
+    #[test]
+    fn flag_truthy_matches_setup_soldr_normalization() {
+        // Truthy variants
+        for v in ["1", "true", "True", "TRUE", "yes", "YES", "on", "On"] {
+            assert!(flag_truthy(Some(v)), "expected truthy: {v:?}");
+        }
+        // Whitespace tolerated
+        assert!(flag_truthy(Some("  true  ")));
+
+        // Falsy / "leave behavior unchanged" variants
+        assert!(!flag_truthy(None));
+        for v in [
+            "", "0", "false", "False", "no", "off", "OFF", "garbage", "2",
+        ] {
+            assert!(!flag_truthy(Some(v)), "expected falsy: {v:?}");
+        }
     }
 }
