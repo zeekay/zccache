@@ -80,10 +80,15 @@ format_bytes() {
 }
 
 # Sum every regular file under `target/`, excluding `incremental/` (and
-# optionally `*/build/*/out`). One Python process spawn — replaces the
-# previous `find | while wc -c` loop that paid 30–50ms of Git-Bash
-# process-spawn cost per file on Windows, dominating cleanup runtime
-# (~80–90s on a typical workspace target/). See zccache#189.
+# optionally `*/build/*/out`). Prefers the native `zccache snapshot-bytes`
+# subcommand (jwalk + rayon parallel walk) when the binary is on PATH —
+# that's the fast path in CI where the action has already installed
+# zccache. Falls back to a single-process Python `os.walk` for test
+# environments and local dev where zccache isn't installed yet.
+#
+# Why native: on Windows, per-file `CreateFile` + Defender callback
+# latency dominates the walk. Single-threaded `os.walk` serializes them;
+# jwalk overlaps via rayon across all cores. See zccache#189.
 #
 # Only used in full mode; hot mode already gets its candidate bytes from
 # `select-hot-target.py`'s JSON output.
@@ -93,6 +98,21 @@ snapshot_candidate_bytes() {
   if is_true "${TARGET_PRUNE_BUILD_SCRIPT_OUT:-false}"; then
     prune_build_out=1
   fi
+
+  if command -v zccache >/dev/null 2>&1; then
+    local args=(snapshot-bytes --target "$target" --prune-incremental)
+    if [ "$prune_build_out" = "1" ]; then
+      args+=(--prune-build-script-out)
+    fi
+    local total
+    if total="$(zccache "${args[@]}" 2>/dev/null)" && [ -n "$total" ]; then
+      printf '%s\n' "$total"
+      return 0
+    fi
+    # Native path errored — fall through to Python so callers still get a
+    # valid byte count and the cleanup step doesn't fail.
+  fi
+
   python - "$target" "$prune_build_out" <<'PY'
 import os
 import sys
@@ -102,7 +122,7 @@ prune_build_out = sys.argv[2] == "1"
 total = 0
 seen_inodes = set()
 for root, dirs, files in os.walk(target):
-    # Mirror the bash `find -prune` semantics: skip `incremental` and
+    # Mirror the native walker's prune semantics: skip `incremental` and
     # optionally any `out` directory that sits under a `build/<pkg>/` path.
     pruned = []
     for d in dirs:
@@ -111,7 +131,6 @@ for root, dirs, files in os.walk(target):
             continue
         if prune_build_out and d == "out":
             # `*/build/*/out` — match only if parent's parent is `build`.
-            parent = os.path.basename(root)
             grandparent = os.path.basename(os.path.dirname(root))
             if grandparent == "build":
                 pruned.append(d)

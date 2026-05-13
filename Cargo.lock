@@ -3460,6 +3460,7 @@ dependencies = [
  "blake3",
  "clap",
  "flate2",
+ "jwalk",
  "mimalloc",
  "pyo3",
  "pyo3-build-config",
