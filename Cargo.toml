@@ -106,3 +106,16 @@ libraries = [{ path = "dylints/*" }]
 # pedantic = { level = "warn", priority = -1 }
 # nursery = { level = "warn", priority = -1 }
 # unwrap_used = "warn"
+
+# Keep just enough debug info for readable stack traces (function names +
+# source-line numbers) while dropping the DWARF variable/type tables that
+# dominate `target/` size. Trade-off: in-process debuggers like rust-gdb lose
+# variable inspection. Override locally with `CARGO_PROFILE_DEV_DEBUG=full
+# cargo …` when you need full debug info for a single build.
+#
+# `profile.test` inherits from `profile.dev`, so CI test compiles pick this up
+# too. Why this matters here: `target/` ships through setup-soldr's post-job
+# cache tar on every Windows runner, and DWARF bytes are pure dead weight in
+# that pipeline.
+[profile.dev]
+debug = "line-tables-only"
