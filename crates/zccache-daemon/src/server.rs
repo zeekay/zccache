@@ -2,7 +2,7 @@
 
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -405,6 +405,7 @@ fn now_secs() -> u64 {
 /// Monotonic counter ensuring each `DaemonServer` instance gets unique
 /// artifact and depfile directories, even within the same process.
 static SERVER_INSTANCE: AtomicU64 = AtomicU64::new(0);
+static ARTIFACT_PERSIST_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl DaemonServer {
     /// Create a new daemon server bound to the given endpoint.
@@ -2249,6 +2250,41 @@ fn parse_rustc_depinfo(
     }
 }
 
+fn push_unique_output_path(paths: &mut Vec<NormalizedPath>, path: NormalizedPath) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn rustc_expected_output_paths(
+    rustc_args: &zccache_depgraph::RustcParsedArgs,
+    primary_output_path: &Path,
+    cwd: &Path,
+) -> Vec<NormalizedPath> {
+    let mut paths = vec![NormalizedPath::new(primary_output_path)];
+    let crate_name = rustc_args.crate_name.as_deref().unwrap_or("unknown");
+    let ext_suffix = rustc_args.extra_filename.as_deref().unwrap_or("");
+    let dir = rustc_args.out_dir.as_deref().unwrap_or(cwd);
+
+    for emit_type in &rustc_args.emit_types {
+        let candidate = match emit_type.as_str() {
+            "metadata" => Some(dir.join(format!("lib{crate_name}{ext_suffix}.rmeta"))),
+            "link" => Some(dir.join(format!("lib{crate_name}{ext_suffix}.rlib"))),
+            "dep-info" => Some(dir.join(format!("{crate_name}{ext_suffix}.d"))),
+            "obj" => Some(dir.join(format!("{crate_name}{ext_suffix}.o"))),
+            "asm" => Some(dir.join(format!("{crate_name}{ext_suffix}.s"))),
+            "llvm-ir" => Some(dir.join(format!("{crate_name}{ext_suffix}.ll"))),
+            "mir" => Some(dir.join(format!("{crate_name}{ext_suffix}.mir"))),
+            _ => None,
+        };
+        if let Some(path) = candidate {
+            push_unique_output_path(&mut paths, path.into());
+        }
+    }
+
+    paths
+}
+
 /// Collect all output files from a rustc compilation.
 ///
 /// Returns `(primary_output_data, all_outputs)` where `all_outputs` includes
@@ -2322,6 +2358,47 @@ fn collect_rustc_outputs(
     (primary_data, outputs)
 }
 
+fn artifact_persist_tmp_path(cache_path: &Path) -> PathBuf {
+    let counter = ARTIFACT_PERSIST_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = cache_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "artifact".into());
+    cache_path.with_file_name(format!(".{name}.tmp-{}-{counter}", std::process::id()))
+}
+
+fn persist_artifact_output(cache_path: &Path, payload: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = artifact_persist_tmp_path(cache_path);
+    let result = (|| {
+        std::fs::write(&tmp_path, payload)?;
+        replace_artifact_cache_file(&tmp_path, cache_path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn replace_artifact_cache_file(tmp_path: &Path, cache_path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp_path, cache_path)
+}
+
+#[cfg(windows)]
+fn replace_artifact_cache_file(tmp_path: &Path, cache_path: &Path) -> std::io::Result<()> {
+    match std::fs::rename(tmp_path, cache_path) {
+        Ok(()) => Ok(()),
+        Err(_) if cache_path.exists() => {
+            std::fs::remove_file(cache_path)?;
+            std::fs::rename(tmp_path, cache_path)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Write cached output to disk. Optimized syscall sequence:
 /// 1. Try hardlink directly (1 syscall — common case when output doesn't exist)
 /// 2. If output already exists: check if it's the same file (skip if so)
@@ -2363,6 +2440,124 @@ fn write_cached_output(out_path: &Path, cache_file: &Path, data: &[u8]) -> std::
     // Hardlink failed entirely (cross-device, no cache file) — copy from memory.
     // fs::write creates a new file with current mtime, so no touch needed.
     std::fs::write(out_path, data)
+}
+
+fn break_output_hardlink_before_compile(path: &Path) -> std::io::Result<()> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+
+    if hard_link_count(path)? <= 1 {
+        return Ok(());
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("output"))
+        .to_string_lossy();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+
+    let mut last_err = None;
+    for attempt in 0..32 {
+        let tmp_path = parent.join(format!(
+            ".zccache-detach-{pid}-{nonce}-{attempt}-{file_name}"
+        ));
+        let copy_result = (|| {
+            let mut src = std::fs::File::open(path)?;
+            let mut dst = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            std::io::copy(&mut src, &mut dst)?;
+            dst.sync_all()?;
+            let permissions = src.metadata()?.permissions();
+            std::fs::set_permissions(&tmp_path, permissions)?;
+            Ok::<(), std::io::Error>(())
+        })();
+
+        match copy_result {
+            Ok(()) => {
+                if let Err(e) = std::fs::remove_file(path) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(e);
+                }
+                if let Err(e) = std::fs::rename(&tmp_path, path) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(e);
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "failed to create hardlink detach temp file",
+        )
+    }))
+}
+
+#[cfg(unix)]
+fn hard_link_count(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(std::fs::metadata(path)?.nlink())
+}
+
+#[cfg(windows)]
+fn hard_link_count(path: &Path) -> std::io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        let ok = GetFileInformationByHandle(handle, &mut info);
+        let close_result = CloseHandle(handle);
+
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if close_result == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(info.nNumberOfLinks as u64)
+    }
 }
 
 /// Set output mtime to current time so build systems (cargo, make, ninja)
@@ -2715,11 +2910,13 @@ async fn handle_compile(
 
                             // Write output
                             let mut write_ok = true;
+                            let secondary_dir =
+                                req_entry.output_path.parent().unwrap_or(cwd).to_path_buf();
                             for (i, payload) in payloads.iter().enumerate() {
                                 let out_path = if i == 0 {
                                     req_entry.output_path.clone()
                                 } else {
-                                    cwd.join(&names[i]).into()
+                                    secondary_dir.join(&names[i]).into()
                                 };
                                 let cache_file =
                                     state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
@@ -3330,6 +3527,22 @@ async fn handle_compile(
         }
     };
 
+    let output_paths = if let Some(rustc_args) = rustc_args_opt.as_ref() {
+        rustc_expected_output_paths(rustc_args, &output_path, &cwd_path)
+    } else {
+        vec![output_path.clone()]
+    };
+    for path in &output_paths {
+        if let Err(e) = break_output_hardlink_before_compile(path) {
+            return Response::Error {
+                message: format!(
+                    "failed to detach hardlinked output before compile {}: {e}",
+                    path.display()
+                ),
+            };
+        }
+    }
+
     let mut cmd = tokio::process::Command::new(&compiler);
     if let Some(ref rsp) = _rsp_guard {
         cmd.arg(rsp.at_arg()).current_dir(cwd);
@@ -3634,7 +3847,7 @@ async fn handle_compile(
                         let _guard = guard;
                         for (i, payload) in payloads.iter().enumerate() {
                             let cache_path = artifact_dir.join(format!("{key_hex}_{i}"));
-                            if let Err(e) = std::fs::write(&cache_path, &**payload) {
+                            if let Err(e) = persist_artifact_output(&cache_path, payload) {
                                 tracing::warn!(
                                     path = %cache_path.display(),
                                     "failed to persist artifact output: {e}"
@@ -4225,6 +4438,19 @@ async fn handle_compile_multi(
             };
         }
     };
+
+    for unit in &unit_results {
+        if let UnitCacheResult::Miss { output_path, .. } = unit {
+            if let Err(e) = break_output_hardlink_before_compile(output_path) {
+                return Response::Error {
+                    message: format!(
+                        "failed to detach hardlinked output before compile {}: {e}",
+                        output_path.display()
+                    ),
+                };
+            }
+        }
+    }
 
     let lineage =
         crate::lineage::Lineage::current(session_client_pid(&state, &sid), Some(sid.to_string()));
@@ -5703,6 +5929,67 @@ exit /b 0
         //  but the test verifies the optimization path exists.)
         write_cached_output(&out, &cache, content).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), content.as_slice());
+    }
+
+    #[test]
+    fn persist_artifact_output_does_not_mutate_existing_hardlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("artifact-key_0");
+        let out = dir.path().join("output.rlib");
+
+        persist_artifact_output(&cache, b"first").unwrap();
+        write_cached_output(&out, &cache, b"first").unwrap();
+        assert!(
+            same_file(&out, &cache),
+            "cache hit should initially hardlink output to cache payload"
+        );
+
+        persist_artifact_output(&cache, b"second").unwrap();
+
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"first",
+            "publishing a later cache payload must not mutate existing target outputs"
+        );
+        assert_eq!(std::fs::read(&cache).unwrap(), b"second");
+        assert!(
+            !same_file(&out, &cache),
+            "cache path replacement should break the hardlink relationship"
+        );
+    }
+
+    /// Regression test for issue #197: a cache hit hardlinks the target
+    /// output to the shared artifact file. Before a later cache miss invokes
+    /// the compiler for that same target path, zccache must detach the output
+    /// from the shared cache file so an in-place compiler overwrite cannot
+    /// mutate the cache artifact used by sibling worktrees.
+    #[test]
+    fn break_output_hardlink_before_compile_prevents_cache_poisoning() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cached.rlib");
+        let out = dir.path().join("libapp.rlib");
+
+        let cached_content = b"cached artifact from worktree a";
+        let rebuilt_content = b"rebuilt artifact in worktree b";
+        std::fs::write(&cache, cached_content).unwrap();
+
+        write_cached_output(&out, &cache, cached_content).unwrap();
+        assert!(same_file(&out, &cache), "cache hit should hardlink output");
+
+        break_output_hardlink_before_compile(&out).unwrap();
+        assert!(
+            !same_file(&out, &cache),
+            "compile miss must detach output from cache hardlink first"
+        );
+
+        std::fs::write(&out, rebuilt_content).unwrap();
+
+        assert_eq!(
+            std::fs::read(&cache).unwrap(),
+            cached_content,
+            "compiler overwrite of output must not mutate shared cache artifact"
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), rebuilt_content);
     }
 
     /// Regression test for issue #15: hardlink delivery must set output mtime
