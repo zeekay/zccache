@@ -55,6 +55,10 @@ zccache --version
 
 ## Performance
 
+[![Latest zccache benchmark stats](https://raw.githubusercontent.com/zackees/zccache/benchmark-stats/benchmark.jpg)](https://zackees.github.io/zccache/)
+
+Latest rendered report: [zackees.github.io/zccache](https://zackees.github.io/zccache/)
+
 50 files per benchmark, median of 5 trials. Run it yourself: `./perf`
 
 ### Cache Hit (warm cache)
