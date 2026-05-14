@@ -46,7 +46,7 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
-          version: "0.10.0"
+          version: "v0.10.0"
 
       - name: Install benchmark tools
         shell: bash
