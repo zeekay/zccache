@@ -60,6 +60,8 @@ zccache --version
 
 [![Latest zccache C++ benchmark stats](https://raw.githubusercontent.com/zackees/zccache/benchmark-stats/benchmark-cpp.jpg)](https://github.com/zackees/zccache/tree/benchmark-stats)
 
+[![Latest zccache Emscripten benchmark stats](https://raw.githubusercontent.com/zackees/zccache/benchmark-stats/benchmark-emscripten.jpg)](https://github.com/zackees/zccache/tree/benchmark-stats)
+
 [![Latest zccache Rust benchmark stats](https://raw.githubusercontent.com/zackees/zccache/benchmark-stats/benchmark-rust.jpg)](https://github.com/zackees/zccache/tree/benchmark-stats)
 
 The benchmark images are generated from the latest scheduled run and replace

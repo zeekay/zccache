@@ -30,11 +30,17 @@ DEFAULT_OUTPUT_DIR = REPO_ROOT / "benchmark-stats"
 DEFAULT_PAGES_URL = "https://zackees.github.io/zccache/"
 DEFAULT_RAW_IMAGE_BASE_URL = "https://raw.githubusercontent.com/zackees/zccache/benchmark-stats"
 BENCHMARK_STATS_BRANCH_URL = "https://github.com/zackees/zccache/tree/benchmark-stats"
-LANGUAGES = ("c", "c++", "rust")
-LANGUAGE_LABELS = {"c": "C", "c++": "C++", "rust": "Rust"}
+LANGUAGES = ("c", "c++", "emscripten", "rust")
+LANGUAGE_LABELS = {
+    "c": "C",
+    "c++": "C++",
+    "emscripten": "Emscripten",
+    "rust": "Rust",
+}
 LANGUAGE_IMAGE_FILES = {
     "c": "benchmark-c.jpg",
     "c++": "benchmark-cpp.jpg",
+    "emscripten": "benchmark-emscripten.jpg",
     "rust": "benchmark-rust.jpg",
 }
 RATIO_COLORS = {
@@ -58,6 +64,10 @@ BENCHMARK_TESTS_BY_LANGUAGE = {
         "perf_warm_cache_zccache_vs_sccache",
         "perf_response_file",
         "perf_cpp_sibling_remap_warm",
+    ),
+    "emscripten": (
+        "perf_emcc_warm_cache_zccache_vs_sccache",
+        "perf_emcc_sibling_remap_warm",
     ),
     "rust": (
         "perf_rustc_zccache_vs_sccache",
@@ -97,6 +107,18 @@ TABLES = {
         "label": "C++ sibling git remap",
         "language": "c++",
         "bare_label": "Bare clang",
+    },
+    "## Emscripten Benchmark:": {
+        "id": "emscripten",
+        "label": "Emscripten em++",
+        "language": "emscripten",
+        "bare_label": "Bare em++",
+    },
+    "## Emscripten Sibling-Workspace Remap Benchmark:": {
+        "id": "emscripten-sibling-remap",
+        "label": "Emscripten sibling git remap",
+        "language": "emscripten",
+        "bare_label": "Bare em++",
     },
     "## Rust Benchmark:": {
         "id": "rust",
