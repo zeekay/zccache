@@ -30,6 +30,27 @@ Cross-platform differences and planned extension points.
 
 **Path separators:** Internally, all paths use the platform's native separator. Cache keys hash the **canonicalized path bytes**, so the same file always produces the same hash on a given platform. Cross-platform cache sharing is not a goal.
 
+## Path Remap Auto Precedence
+
+`ZCCACHE_PATH_REMAP=auto` injects compiler remap flags only when the daemon has
+an auto-detected or explicitly configured worktree root. For GCC/Clang-family
+compile misses, zccache injects `-ffile-prefix-map=<root>=.` and, when the
+compile cwd differs from the root, `-ffile-prefix-map=<cwd>=.`. For Rust,
+zccache injects a root-covering `--remap-path-prefix <root>=.`.
+
+User-supplied remaps remain authoritative. An exact user
+`-ffile-prefix-map=<root>=...` or Rust `--remap-path-prefix=<root>=...`
+suppresses the matching root auto-remap. An exact user
+`-ffile-prefix-map=<cwd>=...` suppresses the cwd auto-remap. The check is
+per-flag and per-path: `-fdebug-prefix-map`, `-fmacro-prefix-map`,
+`-fcoverage-prefix-map`, and `-fprofile-prefix-map` do not suppress an auto
+`-ffile-prefix-map`, because they do not all cover the same emitted path scopes.
+
+When zccache does inject an auto remap, it prepends the auto remap before the
+caller-provided arguments. This makes the auto remap a broad fallback rule:
+if the caller also provided a narrower overlapping remap, the compiler sees
+the caller's remap later and it remains the winning rule.
+
 ## File Identity
 
 `FileId` is obtained via:

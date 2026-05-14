@@ -3304,44 +3304,55 @@ fn effective_compile_args(
     worktree_root: Option<&NormalizedPath>,
     client_env: Option<&[(String, String)]>,
 ) -> Vec<String> {
-    let mut effective = expanded_args.to_vec();
     if !path_remap_auto_enabled(client_env) {
-        return effective;
+        return expanded_args.to_vec();
     }
 
     let Some(root) = worktree_root else {
-        return effective;
+        return expanded_args.to_vec();
     };
 
     let root_path = root.as_path();
     if compiler_is_rustc_like(compiler_path) {
-        if !rust_args_have_remap_for_old(&effective, root_path) {
-            effective.push("--remap-path-prefix".to_string());
-            effective.push(format!("{}=.", root_path.to_string_lossy()));
+        if rust_args_have_remap_for_old(expanded_args, root_path) {
+            return expanded_args.to_vec();
         }
+
+        let mut effective = Vec::with_capacity(expanded_args.len() + 2);
+        effective.push("--remap-path-prefix".to_string());
+        effective.push(format!("{}=.", root_path.to_string_lossy()));
+        effective.extend_from_slice(expanded_args);
         return effective;
     }
 
     if !compiler_supports_ffile_prefix_map(compiler_path) {
-        return effective;
+        return expanded_args.to_vec();
     }
 
-    if !has_ffile_prefix_map_for_old(&effective, root_path) {
-        effective.push(format!(
+    let mut auto_args = Vec::with_capacity(2);
+    if !has_ffile_prefix_map_for_old(expanded_args, root_path) {
+        auto_args.push(format!(
             "-ffile-prefix-map={}={}",
             root_path.to_string_lossy(),
             "."
         ));
     }
 
-    if !same_key_path(root_path, cwd) && !has_ffile_prefix_map_for_old(&effective, cwd) {
-        effective.push(format!(
+    if !same_key_path(root_path, cwd) && !has_ffile_prefix_map_for_old(expanded_args, cwd) {
+        auto_args.push(format!(
             "-ffile-prefix-map={}={}",
             cwd.to_string_lossy(),
             "."
         ));
     }
 
+    if auto_args.is_empty() {
+        return expanded_args.to_vec();
+    }
+
+    let mut effective = Vec::with_capacity(auto_args.len() + expanded_args.len());
+    effective.extend(auto_args);
+    effective.extend_from_slice(expanded_args);
     effective
 }
 
@@ -6807,10 +6818,79 @@ exit /b 0
         assert!(effective.contains(&"-c".to_string()));
         assert!(effective.contains(&format!("-ffile-prefix-map={}=.", root_path.display())));
         assert!(effective.contains(&format!("-ffile-prefix-map={}=.", cwd.display())));
+        assert_eq!(
+            effective[0],
+            format!("-ffile-prefix-map={}=.", root_path.display())
+        );
+        assert_eq!(
+            effective[1],
+            format!("-ffile-prefix-map={}=.", cwd.display())
+        );
     }
 
     #[test]
-    fn effective_compile_args_auto_adds_rust_root_remap() {
+    fn effective_compile_args_auto_cc_maps_are_fallbacks_before_user_maps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("workspace");
+        let subtree = root_path.join("src/generated");
+        let root = NormalizedPath::new(&root_path);
+        let env = vec![(PATH_REMAP_ENV.to_string(), "auto".to_string())];
+        let user_map = format!("-ffile-prefix-map={}=/generated", subtree.display());
+        let args = vec![
+            user_map.clone(),
+            "-c".to_string(),
+            "src/main.cc".to_string(),
+        ];
+
+        let effective = effective_compile_args(
+            &args,
+            Path::new("/usr/bin/clang++"),
+            &root_path,
+            Some(&root),
+            Some(&env),
+        );
+
+        assert_eq!(
+            effective[0],
+            format!("-ffile-prefix-map={}=.", root_path.display())
+        );
+        let user_map_pos = effective.iter().position(|arg| arg == &user_map).unwrap();
+        assert!(
+            user_map_pos > 0,
+            "user-supplied narrower map must remain after the auto root fallback"
+        );
+    }
+
+    #[test]
+    fn effective_compile_args_auto_cc_debug_map_does_not_suppress_file_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("workspace");
+        let root = NormalizedPath::new(&root_path);
+        let env = vec![(PATH_REMAP_ENV.to_string(), "auto".to_string())];
+        let debug_map = format!("-fdebug-prefix-map={}=/debug", root_path.display());
+        let args = vec![
+            debug_map.clone(),
+            "-c".to_string(),
+            "src/main.cc".to_string(),
+        ];
+
+        let effective = effective_compile_args(
+            &args,
+            Path::new("/usr/bin/clang++"),
+            &root_path,
+            Some(&root),
+            Some(&env),
+        );
+
+        assert_eq!(
+            effective[0],
+            format!("-ffile-prefix-map={}=.", root_path.display())
+        );
+        assert!(effective.contains(&debug_map));
+    }
+
+    #[test]
+    fn effective_compile_args_auto_adds_rust_root_remap_as_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         let root_path = tmp.path().join("workspace");
         let root = NormalizedPath::new(&root_path);
@@ -6830,11 +6910,43 @@ exit /b 0
         );
 
         assert_eq!(
-            &effective[effective.len() - 2..],
+            &effective[..2],
             &[
                 "--remap-path-prefix".to_string(),
                 format!("{}=.", root_path.display())
             ]
+        );
+    }
+
+    #[test]
+    fn effective_compile_args_auto_rust_remap_is_before_user_subtree_remap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("workspace");
+        let subtree = root_path.join("src/generated");
+        let root = NormalizedPath::new(&root_path);
+        let env = vec![(PATH_REMAP_ENV.to_string(), "auto".to_string())];
+        let user_remap = format!("--remap-path-prefix={}=/generated", subtree.display());
+        let args = vec![user_remap.clone(), "src/lib.rs".to_string()];
+
+        let effective = effective_compile_args(
+            &args,
+            Path::new("rustc"),
+            &root_path,
+            Some(&root),
+            Some(&env),
+        );
+
+        assert_eq!(
+            &effective[..2],
+            &[
+                "--remap-path-prefix".to_string(),
+                format!("{}=.", root_path.display())
+            ]
+        );
+        let user_remap_pos = effective.iter().position(|arg| arg == &user_remap).unwrap();
+        assert!(
+            user_remap_pos > 1,
+            "user-supplied narrower remap must remain after the auto root fallback"
         );
     }
 
