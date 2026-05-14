@@ -4718,7 +4718,11 @@ async fn handle_compile(
     }
     apply_client_env(&mut cmd, &client_env, &lineage);
     let t_compiler_process = std::time::Instant::now();
-    let compiler_priority = CompilePriority::from_client_env(client_env.as_deref());
+    let is_link_like = rustc_args_opt
+        .as_ref()
+        .is_some_and(|rustc_args| rustc_args.emit_types.iter().any(|emit| emit == "link"));
+    let compiler_priority =
+        CompilePriority::from_client_env_for_link_like(client_env.as_deref(), is_link_like);
     let compiler_priority_decision = compiler_priority.resolve_for_current_load();
     let result = crate::process::tokio_command_output_with_priority(
         &mut cmd,

@@ -9,6 +9,7 @@ use std::time::Instant;
 use std::os::windows::io::AsRawHandle;
 
 pub(crate) const COMPILE_PRIORITY_ENV: &str = "ZCCACHE_COMPILE_PRIORITY";
+pub const ZCCACHE_COMPILE_PRIORITY_LINK: &str = "ZCCACHE_COMPILE_PRIORITY_LINK";
 const AUTO_PRIORITY_SATURATED_CPU_PERCENT: f32 = 95.0;
 
 /// Priority policy for compiler/linker child processes owned by the daemon.
@@ -44,18 +45,57 @@ impl CompilePriority {
     }
 
     pub(crate) fn from_client_env(env: Option<&[(String, String)]>) -> Self {
-        if let Some(value) = env.and_then(|vars| {
-            vars.iter()
-                .find(|(key, _)| key == COMPILE_PRIORITY_ENV)
-                .map(|(_, value)| value.as_str())
-        }) {
-            return Self::parse_or_warn(value);
+        let daemon_value = std::env::var(COMPILE_PRIORITY_ENV).ok();
+        Self::from_client_env_with_daemon_env(env, daemon_value.as_deref())
+    }
+
+    fn from_client_env_with_daemon_env(
+        env: Option<&[(String, String)]>,
+        daemon_value: Option<&str>,
+    ) -> Self {
+        if let Some(value) = Self::client_env_value(env, COMPILE_PRIORITY_ENV) {
+            return Self::parse_or_warn(value, COMPILE_PRIORITY_ENV);
         }
 
-        match std::env::var(COMPILE_PRIORITY_ENV) {
-            Ok(value) => Self::parse_or_warn(&value),
-            Err(_) => Self::Auto,
+        match daemon_value {
+            Some(value) => Self::parse_or_warn(value, COMPILE_PRIORITY_ENV),
+            None => Self::Auto,
         }
+    }
+
+    pub(crate) fn from_client_env_for_link_like(
+        env: Option<&[(String, String)]>,
+        is_link_like: bool,
+    ) -> Self {
+        let daemon_link_value = std::env::var(ZCCACHE_COMPILE_PRIORITY_LINK).ok();
+        let daemon_compile_value = std::env::var(COMPILE_PRIORITY_ENV).ok();
+        Self::from_client_env_for_link_like_with_daemon_env(
+            env,
+            is_link_like,
+            daemon_link_value.as_deref(),
+            daemon_compile_value.as_deref(),
+        )
+    }
+
+    fn from_client_env_for_link_like_with_daemon_env(
+        env: Option<&[(String, String)]>,
+        is_link_like: bool,
+        daemon_link_value: Option<&str>,
+        daemon_compile_value: Option<&str>,
+    ) -> Self {
+        if is_link_like {
+            if let Some(value) = Self::client_env_value(env, ZCCACHE_COMPILE_PRIORITY_LINK) {
+                return Self::parse_or_warn(value, ZCCACHE_COMPILE_PRIORITY_LINK);
+            }
+
+            if let Some(value) = daemon_link_value {
+                return Self::parse_or_warn(value, ZCCACHE_COMPILE_PRIORITY_LINK);
+            }
+
+            return Self::Normal;
+        }
+
+        Self::from_client_env_with_daemon_env(env, daemon_compile_value)
     }
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -94,18 +134,26 @@ impl CompilePriority {
         }
     }
 
-    fn parse_or_warn(value: &str) -> Self {
+    fn parse_or_warn(value: &str, env_name: &str) -> Self {
         match Self::parse(value) {
             Ok(priority) => priority,
             Err(e) => {
                 tracing::warn!(
-                    env = COMPILE_PRIORITY_ENV,
+                    env = env_name,
                     value = %e.value,
                     "invalid compiler child priority; using low"
                 );
                 Self::Low
             }
         }
+    }
+
+    fn client_env_value<'a>(env: Option<&'a [(String, String)]>, key: &str) -> Option<&'a str> {
+        env.and_then(|vars| {
+            vars.iter()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value.as_str())
+        })
     }
 
     #[cfg(test)]
@@ -509,6 +557,96 @@ mod tests {
         let env = vec![(COMPILE_PRIORITY_ENV.to_string(), "fast".to_string())];
         assert_eq!(
             CompilePriority::from_client_env(Some(&env)),
+            CompilePriority::Low
+        );
+    }
+
+    #[test]
+    fn link_priority_env_overrides_link_like_compile_priority() {
+        let env = vec![
+            (COMPILE_PRIORITY_ENV.to_string(), "low".to_string()),
+            (
+                ZCCACHE_COMPILE_PRIORITY_LINK.to_string(),
+                "high".to_string(),
+            ),
+        ];
+
+        assert_eq!(
+            CompilePriority::from_client_env_for_link_like_with_daemon_env(
+                Some(&env),
+                true,
+                None,
+                None
+            ),
+            CompilePriority::High
+        );
+    }
+
+    #[test]
+    fn daemon_link_priority_env_overrides_link_like_compile_priority() {
+        let env = vec![(COMPILE_PRIORITY_ENV.to_string(), "low".to_string())];
+
+        assert_eq!(
+            CompilePriority::from_client_env_for_link_like_with_daemon_env(
+                Some(&env),
+                true,
+                Some("high"),
+                None
+            ),
+            CompilePriority::High
+        );
+    }
+
+    #[test]
+    fn link_like_compile_priority_defaults_to_normal_without_link_override() {
+        let env = vec![(COMPILE_PRIORITY_ENV.to_string(), "idle".to_string())];
+
+        assert_eq!(
+            CompilePriority::from_client_env_for_link_like_with_daemon_env(
+                Some(&env),
+                true,
+                None,
+                None
+            ),
+            CompilePriority::Normal
+        );
+    }
+
+    #[test]
+    fn non_link_compile_priority_preserves_existing_auto_behavior() {
+        let env = vec![
+            (
+                ZCCACHE_COMPILE_PRIORITY_LINK.to_string(),
+                "high".to_string(),
+            ),
+            (COMPILE_PRIORITY_ENV.to_string(), "auto".to_string()),
+        ];
+
+        assert_eq!(
+            CompilePriority::from_client_env_for_link_like_with_daemon_env(
+                Some(&env),
+                false,
+                Some("idle"),
+                None
+            ),
+            CompilePriority::Auto
+        );
+    }
+
+    #[test]
+    fn invalid_link_priority_env_falls_back_to_low() {
+        let env = vec![(
+            ZCCACHE_COMPILE_PRIORITY_LINK.to_string(),
+            "fast".to_string(),
+        )];
+
+        assert_eq!(
+            CompilePriority::from_client_env_for_link_like_with_daemon_env(
+                Some(&env),
+                true,
+                None,
+                None
+            ),
             CompilePriority::Low
         );
     }
