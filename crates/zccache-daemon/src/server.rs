@@ -3108,6 +3108,15 @@ fn normalize_request_path_value(value: &str, key_root: Option<&Path>) -> Option<
     None
 }
 
+fn normalize_rust_remap_path_prefix_value_for_key(
+    value: &str,
+    key_root: Option<&Path>,
+) -> Option<String> {
+    let (old, new) = value.split_once('=')?;
+    normalize_request_path_value(old, key_root)
+        .map(|normalized_old| format!("{normalized_old}={new}"))
+}
+
 const CC_PREFIX_MAP_FLAGS: &[&str] = &[
     "-ffile-prefix-map",
     "-fmacro-prefix-map",
@@ -3156,6 +3165,138 @@ fn compiler_supports_ffile_prefix_map(compiler_path: &Path) -> bool {
     )
 }
 
+fn rust_remap_value_matches_old(value: &str, old: &Path) -> bool {
+    let Some((existing_old, _)) = value.split_once('=') else {
+        return false;
+    };
+    let existing_old = Path::new(existing_old);
+    existing_old.is_absolute() && same_key_path(existing_old, old)
+}
+
+fn rust_remap_values_have_old<'a>(
+    values: impl IntoIterator<Item = &'a String>,
+    old: &Path,
+) -> bool {
+    values
+        .into_iter()
+        .any(|value| rust_remap_value_matches_old(value, old))
+}
+
+fn rust_args_have_remap_for_old(args: &[String], old: &Path) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--remap-path-prefix" {
+            if let Some(value) = args.get(i + 1) {
+                if rust_remap_value_matches_old(value, old) {
+                    return true;
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--remap-path-prefix=") {
+            if rust_remap_value_matches_old(value, old) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn compiler_is_rustc_like(compiler_path: &Path) -> bool {
+    zccache_compiler::detect_family(&compiler_path.to_string_lossy())
+        == zccache_compiler::CompilerFamily::Rustc
+}
+
+fn rustc_request_key_root(
+    args: &[String],
+    worktree_root: Option<&NormalizedPath>,
+) -> Option<NormalizedPath> {
+    let root = worktree_root?;
+    rust_args_have_remap_for_old(args, root.as_path()).then(|| root.clone())
+}
+
+fn rustc_context_key_root(
+    remap_path_prefixes: &[String],
+    worktree_root: Option<&NormalizedPath>,
+) -> Option<NormalizedPath> {
+    let root = worktree_root?;
+    rust_remap_values_have_old(remap_path_prefixes.iter(), root.as_path()).then(|| root.clone())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustRemapGate {
+    Ok,
+    Missing,
+    OldOutsideRoot,
+    Malformed,
+}
+
+impl RustRemapGate {
+    fn as_str(self) -> &'static str {
+        match self {
+            RustRemapGate::Ok => "rust_remap_gate_ok",
+            RustRemapGate::Missing => "rust_remap_missing",
+            RustRemapGate::OldOutsideRoot => "rust_remap_old_outside_root",
+            RustRemapGate::Malformed => "rust_remap_malformed",
+        }
+    }
+}
+
+fn rust_remap_gate(
+    remap_path_prefixes: &[String],
+    worktree_root: Option<&NormalizedPath>,
+) -> RustRemapGate {
+    let Some(root) = worktree_root else {
+        return RustRemapGate::Missing;
+    };
+    let root_key = zccache_core::path::normalize_for_key(root.as_path());
+    let root_child_prefix = format!("{root_key}/");
+    let mut saw_malformed = false;
+    let mut saw_external = false;
+
+    for value in remap_path_prefixes {
+        let Some((old, _new)) = value.split_once('=') else {
+            saw_malformed = true;
+            continue;
+        };
+        let old_path = Path::new(old);
+        if !old_path.is_absolute() {
+            saw_malformed = true;
+            continue;
+        }
+        let old_key = zccache_core::path::normalize_for_key(old_path);
+        if old_key == root_key {
+            return RustRemapGate::Ok;
+        }
+        if !old_key.starts_with(&root_child_prefix) {
+            saw_external = true;
+        }
+    }
+
+    if saw_malformed {
+        RustRemapGate::Malformed
+    } else if saw_external {
+        RustRemapGate::OldOutsideRoot
+    } else {
+        RustRemapGate::Missing
+    }
+}
+
+fn request_key_root(
+    compiler_path: &Path,
+    args: &[String],
+    worktree_root: Option<&NormalizedPath>,
+) -> Option<NormalizedPath> {
+    if compiler_is_rustc_like(compiler_path) {
+        rustc_request_key_root(args, worktree_root)
+    } else {
+        worktree_root.cloned()
+    }
+}
+
 fn effective_compile_args(
     expanded_args: &[String],
     compiler_path: &Path,
@@ -3164,7 +3305,7 @@ fn effective_compile_args(
     client_env: Option<&[(String, String)]>,
 ) -> Vec<String> {
     let mut effective = expanded_args.to_vec();
-    if !path_remap_auto_enabled(client_env) || !compiler_supports_ffile_prefix_map(compiler_path) {
+    if !path_remap_auto_enabled(client_env) {
         return effective;
     }
 
@@ -3173,6 +3314,18 @@ fn effective_compile_args(
     };
 
     let root_path = root.as_path();
+    if compiler_is_rustc_like(compiler_path) {
+        if !rust_args_have_remap_for_old(&effective, root_path) {
+            effective.push("--remap-path-prefix".to_string());
+            effective.push(format!("{}=.", root_path.to_string_lossy()));
+        }
+        return effective;
+    }
+
+    if !compiler_supports_ffile_prefix_map(compiler_path) {
+        return effective;
+    }
+
     if !has_ffile_prefix_map_for_old(&effective, root_path) {
         effective.push(format!(
             "-ffile-prefix-map={}={}",
@@ -3199,6 +3352,14 @@ fn normalize_request_arg(arg: &str, key_root: Option<&Path>) -> String {
 
     if let Some(normalized) = normalize_cc_prefix_map_arg_for_key(arg, Some(root)) {
         return normalized;
+    }
+
+    if let Some(value) = arg.strip_prefix("--remap-path-prefix=") {
+        if let Some(normalized) = normalize_rust_remap_path_prefix_value_for_key(value, Some(root))
+        {
+            return format!("--remap-path-prefix={normalized}");
+        }
+        return arg.to_string();
     }
 
     if let Some(normalized) = normalize_request_path_value(arg, Some(root)) {
@@ -3565,10 +3726,25 @@ fn request_fingerprint(
     let compiler = zccache_core::path::normalize_for_key(compiler);
     h.update(compiler.as_bytes());
     h.update(&[0]);
-    for arg in args {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--remap-path-prefix" {
+            h.update(arg.as_bytes());
+            h.update(&[0]);
+            if let Some(value) = args.get(i + 1) {
+                let value = normalize_rust_remap_path_prefix_value_for_key(value, key_root)
+                    .unwrap_or_else(|| value.clone());
+                h.update(value.as_bytes());
+                h.update(&[0]);
+            }
+            i += 2;
+            continue;
+        }
         let arg = normalize_request_arg(arg, key_root);
         h.update(arg.as_bytes());
         h.update(&[0]);
+        i += 1;
     }
     let cwd = normalize_path_for_request_key(cwd, key_root);
     h.update(cwd.as_bytes());
@@ -3733,6 +3909,8 @@ async fn handle_compile(
         worktree_root.as_ref(),
         client_env.as_deref(),
     );
+    let request_cache_key_root =
+        request_key_root(compiler_path, &effective_args, worktree_root.as_ref());
 
     // Snap the journal clock once so all file hashes in this request see a
     // consistent view (avoids per-file current_clock() syscalls).
@@ -3748,16 +3926,20 @@ async fn handle_compile(
             compiler_path,
             &effective_args,
             cwd,
-            worktree_root.as_deref(),
+            request_cache_key_root.as_deref(),
             client_env.as_deref(),
         );
         if let Some(req_entry) = state.request_cache.get(&request_fp) {
-            if request_cache_entry_matches_root(&req_entry, worktree_root.as_ref()) {
+            if request_cache_entry_matches_root(&req_entry, request_cache_key_root.as_ref()) {
                 if let Some(fh_entry) = state.fast_hit_cache.get(&req_entry.context_key) {
                     let artifact_key_hex = &fh_entry.artifact_key_hex;
-                    let source_path = req_entry.source_path.resolve(worktree_root.as_deref());
-                    let output_path = req_entry.output_path.resolve(worktree_root.as_deref());
-                    let same_root = req_entry.root.as_ref() == worktree_root.as_ref();
+                    let source_path = req_entry
+                        .source_path
+                        .resolve(request_cache_key_root.as_deref());
+                    let output_path = req_entry
+                        .output_path
+                        .resolve(request_cache_key_root.as_deref());
+                    let same_root = req_entry.root.as_ref() == request_cache_key_root.as_ref();
                     let inputs_match = if same_root {
                         context_files_fresh(
                             state,
@@ -3769,7 +3951,7 @@ async fn handle_compile(
                         request_cache_artifact_matches(
                             state,
                             &req_entry,
-                            worktree_root.as_ref(),
+                            request_cache_key_root.as_ref(),
                             artifact_key_hex,
                             snap_clock,
                         )
@@ -3949,7 +4131,6 @@ async fn handle_compile(
     let parse_args_ns = t0.elapsed().as_nanos() as u64;
 
     let cwd_path: NormalizedPath = cwd.into();
-    let key_root = worktree_root.as_ref().unwrap_or(&cwd_path);
     let source_path = if compilation.source_file.is_absolute() {
         compilation.source_file.clone()
     } else {
@@ -3971,12 +4152,13 @@ async fn handle_compile(
         env_slice,
         &state.compiler_hash_cache,
     );
+    let default_key_root = worktree_root.clone().unwrap_or_else(|| cwd_path.clone());
     let (ctx, dep_flags, rustc_args_opt, context_key, worktree_equivalent_context) =
         match build_result {
             BuildContextResult::Cc { ctx, dep_flags } => {
                 let registration = state
                     .dep_graph
-                    .register_with_root_result(ctx.clone(), Some(key_root.clone()));
+                    .register_with_root_result(ctx.clone(), Some(default_key_root.clone()));
                 (
                     ctx,
                     dep_flags,
@@ -3990,11 +4172,20 @@ async fn handle_compile(
                 compat_ctx,
                 rustc_args,
             } => {
-                let key = rustc_ctx.context_key_with_root(Some(key_root));
+                let remap_gate =
+                    rust_remap_gate(&rustc_args.remap_path_prefixes, worktree_root.as_ref());
+                write_session_log(
+                    &state.sessions,
+                    &sid,
+                    &format!("[DIAG] {}", remap_gate.as_str()),
+                );
+                let rustc_key_root =
+                    rustc_context_key_root(&rustc_args.remap_path_prefixes, worktree_root.as_ref());
+                let key = rustc_ctx.context_key_with_root(rustc_key_root.as_deref());
                 let registration = state.dep_graph.register_with_key_and_root_result(
                     key,
                     compat_ctx.clone(),
-                    Some(key_root.clone()),
+                    rustc_key_root.clone(),
                 );
                 (
                     compat_ctx,
@@ -4110,7 +4301,7 @@ async fn handle_compile(
                                 compiler_path,
                                 &effective_args,
                                 cwd,
-                                Some(key_root.as_path()),
+                                request_cache_key_root.as_deref(),
                                 client_env.as_deref(),
                             );
                             let input_paths =
@@ -4122,7 +4313,7 @@ async fn handle_compile(
                                     &source_path,
                                     &output_path,
                                     input_paths,
-                                    Some(key_root),
+                                    request_cache_key_root.as_ref(),
                                 ),
                             );
 
@@ -4386,7 +4577,7 @@ async fn handle_compile(
                             compiler_path,
                             &effective_args,
                             cwd,
-                            Some(key_root.as_path()),
+                            request_cache_key_root.as_deref(),
                             client_env.as_deref(),
                         );
                         let input_paths =
@@ -4398,7 +4589,7 @@ async fn handle_compile(
                                 &source_path,
                                 &output_path,
                                 input_paths,
-                                Some(key_root),
+                                request_cache_key_root.as_ref(),
                             ),
                         );
 
@@ -6518,6 +6709,74 @@ exit /b 0
     }
 
     #[test]
+    fn request_fingerprint_normalizes_rust_remap_detached_old_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("workspace-a");
+        let root_b = tmp.path().join("workspace-b");
+        let args_a = vec![
+            "--remap-path-prefix".to_string(),
+            format!("{}=.", root_a.display()),
+        ];
+        let args_b = vec![
+            "--remap-path-prefix".to_string(),
+            format!("{}=.", root_b.display()),
+        ];
+
+        let a = request_fingerprint(Path::new("rustc"), &args_a, &root_a, Some(&root_a), None);
+        let b = request_fingerprint(Path::new("rustc"), &args_b, &root_b, Some(&root_b), None);
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn request_fingerprint_normalizes_rust_remap_equals_old_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("workspace-a");
+        let root_b = tmp.path().join("workspace-b");
+        let args_a = vec![format!("--remap-path-prefix={}=.", root_a.display())];
+        let args_b = vec![format!("--remap-path-prefix={}=.", root_b.display())];
+
+        let a = request_fingerprint(Path::new("rustc"), &args_a, &root_a, Some(&root_a), None);
+        let b = request_fingerprint(Path::new("rustc"), &args_b, &root_b, Some(&root_b), None);
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn request_fingerprint_preserves_rust_remap_new_prefixes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("workspace-a");
+        let root_b = tmp.path().join("workspace-b");
+        let args_a = vec![format!("--remap-path-prefix={}=.", root_a.display())];
+        let args_b = vec![format!("--remap-path-prefix={}=/src", root_b.display())];
+
+        let a = request_fingerprint(Path::new("rustc"), &args_a, &root_a, Some(&root_a), None);
+        let b = request_fingerprint(Path::new("rustc"), &args_b, &root_b, Some(&root_b), None);
+
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn request_fingerprint_keeps_malformed_rust_remap_detached_values_distinct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("workspace-a");
+        let root_b = tmp.path().join("workspace-b");
+        let args_a = vec![
+            "--remap-path-prefix".to_string(),
+            root_a.to_string_lossy().into_owned(),
+        ];
+        let args_b = vec![
+            "--remap-path-prefix".to_string(),
+            root_b.to_string_lossy().into_owned(),
+        ];
+
+        let a = request_fingerprint(Path::new("rustc"), &args_a, &root_a, Some(&root_a), None);
+        let b = request_fingerprint(Path::new("rustc"), &args_b, &root_b, Some(&root_b), None);
+
+        assert_ne!(a, b);
+    }
+
+    #[test]
     fn effective_compile_args_auto_adds_root_and_cwd_maps() {
         let tmp = tempfile::tempdir().unwrap();
         let root_path = tmp.path().join("workspace");
@@ -6537,6 +6796,57 @@ exit /b 0
         assert!(effective.contains(&"-c".to_string()));
         assert!(effective.contains(&format!("-ffile-prefix-map={}=.", root_path.display())));
         assert!(effective.contains(&format!("-ffile-prefix-map={}=.", cwd.display())));
+    }
+
+    #[test]
+    fn effective_compile_args_auto_adds_rust_root_remap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("workspace");
+        let root = NormalizedPath::new(&root_path);
+        let env = vec![(PATH_REMAP_ENV.to_string(), "auto".to_string())];
+        let args = vec![
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            "src/lib.rs".to_string(),
+        ];
+
+        let effective = effective_compile_args(
+            &args,
+            Path::new("rustc"),
+            &root_path,
+            Some(&root),
+            Some(&env),
+        );
+
+        assert_eq!(
+            &effective[effective.len() - 2..],
+            &[
+                "--remap-path-prefix".to_string(),
+                format!("{}=.", root_path.display())
+            ]
+        );
+    }
+
+    #[test]
+    fn effective_compile_args_auto_keeps_existing_rust_root_remap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("workspace");
+        let root = NormalizedPath::new(&root_path);
+        let env = vec![(PATH_REMAP_ENV.to_string(), "auto".to_string())];
+        let args = vec![
+            format!("--remap-path-prefix={}=/src", root_path.display()),
+            "src/lib.rs".to_string(),
+        ];
+
+        let effective = effective_compile_args(
+            &args,
+            Path::new("clippy-driver"),
+            &root_path,
+            Some(&root),
+            Some(&env),
+        );
+
+        assert_eq!(effective, args);
     }
 
     #[test]

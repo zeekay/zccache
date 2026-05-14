@@ -295,16 +295,18 @@ export ZCCACHE_WORKTREE_ROOT="$PWD"
 RUSTC_WRAPPER=zccache cargo build
 ```
 
-For the planned path-remap feature, the common setup should be just:
+For Rust projects, use the same path-remap directive:
 
 ```bash
 export ZCCACHE_PATH_REMAP=auto
+RUSTC_WRAPPER=zccache cargo build
 ```
 
-In auto mode, zccache should discover the Git worktree root automatically on
-macOS, Linux, and Windows. Set `ZCCACHE_WORKTREE_ROOT` only as an advanced
-override for non-Git checkouts or unusual build layouts where automatic root
-detection is not reliable.
+In auto mode, zccache discovers the Git worktree root automatically on macOS,
+Linux, and Windows, then adds a root-covering rustc `--remap-path-prefix=...=.`
+when needed. Set `ZCCACHE_WORKTREE_ROOT` only as an advanced override for
+non-Git checkouts or unusual build layouts where automatic root detection is
+not reliable.
 
 `ZCCACHE_PATH_REMAP=auto` tells zccache to apply compiler-specific path remaps
 when it can prove they are safe, such as C/C++ `-ffile-prefix-map`, Rust

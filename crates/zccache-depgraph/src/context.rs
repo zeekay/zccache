@@ -1133,6 +1133,20 @@ mod tests {
     }
 
     #[test]
+    fn rustc_context_key_with_root_normalizes_root_remap_left_side() {
+        let mut ctx_a = make_rustc_context("/workspace-a/crates/demo/src/lib.rs", "2021");
+        ctx_a.remap_path_prefixes = vec!["/workspace-a=.".to_string()];
+        let mut ctx_b = make_rustc_context("/workspace-b/crates/demo/src/lib.rs", "2021");
+        ctx_b.remap_path_prefixes = vec!["/workspace-b=.".to_string()];
+
+        assert_eq!(
+            ctx_a.context_key_with_root(Some(Path::new("/workspace-a"))),
+            ctx_b.context_key_with_root(Some(Path::new("/workspace-b"))),
+            "root-covering remaps should hash equivalently across roots"
+        );
+    }
+
+    #[test]
     fn rustc_context_key_with_root_keeps_external_remap_left_sides_distinct() {
         let mut ctx_a = make_rustc_context("/workspace-a/crates/demo/src/lib.rs", "2021");
         ctx_a.remap_path_prefixes = vec!["/external-a=/src".to_string()];
@@ -1157,6 +1171,34 @@ mod tests {
             ctx_a.context_key_with_root(Some(Path::new("/workspace-a"))),
             ctx_b.context_key_with_root(Some(Path::new("/workspace-b"))),
             "only the remap left side is root-normalized"
+        );
+    }
+
+    #[test]
+    fn rustc_context_key_with_root_preserves_remap_right_side() {
+        let mut ctx_a = make_rustc_context("/workspace-a/crates/demo/src/lib.rs", "2021");
+        ctx_a.remap_path_prefixes = vec!["/workspace-a=.".to_string()];
+        let mut ctx_b = make_rustc_context("/workspace-b/crates/demo/src/lib.rs", "2021");
+        ctx_b.remap_path_prefixes = vec!["/workspace-b=/src".to_string()];
+
+        assert_ne!(
+            ctx_a.context_key_with_root(Some(Path::new("/workspace-a"))),
+            ctx_b.context_key_with_root(Some(Path::new("/workspace-b"))),
+            "different remap new prefixes must remain cache-significant"
+        );
+    }
+
+    #[test]
+    fn rustc_context_key_with_root_keeps_malformed_remaps_distinct() {
+        let mut ctx_a = make_rustc_context("/workspace-a/crates/demo/src/lib.rs", "2021");
+        ctx_a.remap_path_prefixes = vec!["/workspace-a".to_string()];
+        let mut ctx_b = make_rustc_context("/workspace-b/crates/demo/src/lib.rs", "2021");
+        ctx_b.remap_path_prefixes = vec!["/workspace-b".to_string()];
+
+        assert_ne!(
+            ctx_a.context_key_with_root(Some(Path::new("/workspace-a"))),
+            ctx_b.context_key_with_root(Some(Path::new("/workspace-b"))),
+            "malformed remap values should not be root-normalized"
         );
     }
 

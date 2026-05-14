@@ -72,13 +72,24 @@ async fn compile(
     args: &[&str],
     cwd: &std::path::Path,
 ) -> (i32, bool) {
+    compile_with_env(client, session_id, compiler, args, cwd, None).await
+}
+
+async fn compile_with_env(
+    client: &mut ClientConn,
+    session_id: &str,
+    compiler: &str,
+    args: &[&str],
+    cwd: &std::path::Path,
+    env: Option<Vec<(String, String)>>,
+) -> (i32, bool) {
     client
         .send(&Request::Compile {
             session_id: session_id.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_path_buf().into(),
             compiler: NormalizedPath::new(compiler),
-            env: None,
+            env,
         })
         .await
         .unwrap();
@@ -90,6 +101,10 @@ async fn compile(
         Some(Response::Error { message }) => panic!("compile error: {message}"),
         other => panic!("unexpected response: {other:?}"),
     }
+}
+
+fn path_remap_auto_env() -> Vec<(String, String)> {
+    vec![("ZCCACHE_PATH_REMAP".to_string(), "auto".to_string())]
 }
 
 fn init_git_root(root: &std::path::Path) -> bool {
@@ -146,13 +161,63 @@ fn remove_file_if_exists(path: &std::path::Path) {
     }
 }
 
-async fn compile_worktree_dep(
+fn write_path_sensitive_lib(root: &std::path::Path, value: i32) -> std::path::PathBuf {
+    let src_dir = root.join("src");
+    let target_dir = root.join("target");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let src = src_dir.join("lib.rs");
+    std::fs::write(
+        &src,
+        format!(
+            "#[used]\npub static SOURCE_FILE: &str = file!();\npub fn value() -> i32 {{ {value} }}\n"
+        ),
+    )
+    .unwrap();
+    src
+}
+
+fn bytes_contain_path(bytes: &[u8], path: &std::path::Path) -> bool {
+    let haystack = String::from_utf8_lossy(bytes);
+    let path = path.to_string_lossy();
+    haystack.contains(path.as_ref()) || haystack.contains(&path.replace('\\', "/"))
+}
+
+async fn compile_path_sensitive_lib(
     client: &mut ClientConn,
     session_id: &str,
     compiler: &str,
     root: &std::path::Path,
+    extra_args: &[String],
+    env: Option<Vec<(String, String)>>,
 ) -> (i32, bool) {
-    compile(
+    let src = root.join("src/lib.rs");
+    let output = root.join("target/libpathremap.rlib");
+    let src = src.to_string_lossy().to_string();
+    let output = output.to_string_lossy().to_string();
+    let mut args = vec![
+        "--edition".to_string(),
+        "2021".to_string(),
+        "--crate-type".to_string(),
+        "lib".to_string(),
+        "--crate-name".to_string(),
+        "pathremap".to_string(),
+        "--emit=link".to_string(),
+    ];
+    args.extend(extra_args.iter().cloned());
+    args.extend([src, "-o".to_string(), output]);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    compile_with_env(client, session_id, compiler, &arg_refs, root, env).await
+}
+
+async fn compile_worktree_dep_with_env(
+    client: &mut ClientConn,
+    session_id: &str,
+    compiler: &str,
+    root: &std::path::Path,
+    env: Option<Vec<(String, String)>>,
+) -> (i32, bool) {
+    compile_with_env(
         client,
         session_id,
         compiler,
@@ -169,17 +234,19 @@ async fn compile_worktree_dep(
             "target/libdep.rlib",
         ],
         root,
+        env,
     )
     .await
 }
 
-async fn compile_worktree_app(
+async fn compile_worktree_app_with_env(
     client: &mut ClientConn,
     session_id: &str,
     compiler: &str,
     root: &std::path::Path,
+    env: Option<Vec<(String, String)>>,
 ) -> (i32, bool) {
-    compile(
+    compile_with_env(
         client,
         session_id,
         compiler,
@@ -198,6 +265,7 @@ async fn compile_worktree_app(
             "target/libapp.rlib",
         ],
         root,
+        env,
     )
     .await
 }
@@ -722,20 +790,38 @@ async fn test_rustc_sibling_git_worktree_equivalent_cache_sharing() {
         let app_a = root_a.join("target/libapp.rlib");
         let app_b = root_b.join("target/libapp.rlib");
 
-        let (exit_code, cached) =
-            compile_worktree_dep(&mut client_a, &session_a, &rustc_str, &root_a).await;
+        let (exit_code, cached) = compile_worktree_dep_with_env(
+            &mut client_a,
+            &session_a,
+            &rustc_str,
+            &root_a,
+            Some(path_remap_auto_env()),
+        )
+        .await;
         assert_eq!(exit_code, 0, "A dependency compile should succeed");
         assert!(!cached, "A dependency compile should be a cold miss");
         assert!(dep_a.exists(), "A dependency output should exist");
 
-        let (exit_code, cached) =
-            compile_worktree_app(&mut client_a, &session_a, &rustc_str, &root_a).await;
+        let (exit_code, cached) = compile_worktree_app_with_env(
+            &mut client_a,
+            &session_a,
+            &rustc_str,
+            &root_a,
+            Some(path_remap_auto_env()),
+        )
+        .await;
         assert_eq!(exit_code, 0, "A app compile should succeed");
         assert!(!cached, "A app compile should be a cold miss");
         let app_a_original = std::fs::read(&app_a).unwrap();
 
-        let (exit_code, cached) =
-            compile_worktree_dep(&mut client_b, &session_b, &rustc_str, &root_b).await;
+        let (exit_code, cached) = compile_worktree_dep_with_env(
+            &mut client_b,
+            &session_b,
+            &rustc_str,
+            &root_b,
+            Some(path_remap_auto_env()),
+        )
+        .await;
         assert_eq!(
             exit_code, 0,
             "B equivalent dependency compile should succeed"
@@ -746,8 +832,14 @@ async fn test_rustc_sibling_git_worktree_equivalent_cache_sharing() {
         );
         assert!(dep_b.exists(), "B dependency output should be restored");
 
-        let (exit_code, cached) =
-            compile_worktree_app(&mut client_b, &session_b, &rustc_str, &root_b).await;
+        let (exit_code, cached) = compile_worktree_app_with_env(
+            &mut client_b,
+            &session_b,
+            &rustc_str,
+            &root_b,
+            Some(path_remap_auto_env()),
+        )
+        .await;
         assert_eq!(exit_code, 0, "B equivalent app compile should succeed");
         assert!(
             cached,
@@ -758,8 +850,14 @@ async fn test_rustc_sibling_git_worktree_equivalent_cache_sharing() {
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         write_worktree_project(&root_b, 7, 2);
         remove_file_if_exists(&app_b);
-        let (exit_code, cached) =
-            compile_worktree_app(&mut client_b, &session_b, &rustc_str, &root_b).await;
+        let (exit_code, cached) = compile_worktree_app_with_env(
+            &mut client_b,
+            &session_b,
+            &rustc_str,
+            &root_b,
+            Some(path_remap_auto_env()),
+        )
+        .await;
         assert_eq!(
             exit_code, 0,
             "B app compile after source edit should succeed"
@@ -771,16 +869,28 @@ async fn test_rustc_sibling_git_worktree_equivalent_cache_sharing() {
         remove_file_if_exists(&dep_b);
         remove_file_if_exists(&app_b);
 
-        let (exit_code, cached) =
-            compile_worktree_dep(&mut client_b, &session_b, &rustc_str, &root_b).await;
+        let (exit_code, cached) = compile_worktree_dep_with_env(
+            &mut client_b,
+            &session_b,
+            &rustc_str,
+            &root_b,
+            Some(path_remap_auto_env()),
+        )
+        .await;
         assert_eq!(
             exit_code, 0,
             "B dependency compile after dependency edit should succeed"
         );
         assert!(!cached, "B dependency edit should miss");
 
-        let (exit_code, cached) =
-            compile_worktree_app(&mut client_b, &session_b, &rustc_str, &root_b).await;
+        let (exit_code, cached) = compile_worktree_app_with_env(
+            &mut client_b,
+            &session_b,
+            &rustc_str,
+            &root_b,
+            Some(path_remap_auto_env()),
+        )
+        .await;
         assert_eq!(
             exit_code, 0,
             "B app compile after dependency edit should succeed"
@@ -791,8 +901,14 @@ async fn test_rustc_sibling_git_worktree_equivalent_cache_sharing() {
         );
 
         remove_file_if_exists(&app_a);
-        let (exit_code, cached) =
-            compile_worktree_app(&mut client_a, &session_a, &rustc_str, &root_a).await;
+        let (exit_code, cached) = compile_worktree_app_with_env(
+            &mut client_a,
+            &session_a,
+            &rustc_str,
+            &root_a,
+            Some(path_remap_auto_env()),
+        )
+        .await;
         assert_eq!(exit_code, 0, "A original app compile should still succeed");
         assert!(
             cached,
@@ -802,6 +918,183 @@ async fn test_rustc_sibling_git_worktree_equivalent_cache_sharing() {
             std::fs::read(&app_a).unwrap(),
             app_a_original,
             "A cached output should remain byte-identical after B misses"
+        );
+
+        shutdown.notify_one();
+        server_handle.await.unwrap();
+    })
+    .await;
+}
+
+/// Issue #229: auto-remap should make path-sensitive Rust outputs stable
+/// enough to share across sibling Git roots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore] // integration-level: starts real daemon with IPC + rustc
+async fn test_rustc_path_remap_auto_file_macro_hits_across_sibling_git_roots() {
+    let rustc = match zccache_test_support::find_rustc() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping test: rustc not found");
+            return;
+        }
+    };
+
+    zccache_test_support::test_timeout(async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("worktree-a");
+        let root_b = tmp.path().join("worktree-b");
+
+        if !init_git_root(&root_a) || !init_git_root(&root_b) {
+            return;
+        }
+
+        write_path_sensitive_lib(&root_a, 7);
+        write_path_sensitive_lib(&root_b, 7);
+
+        let (endpoint, server_handle, shutdown) = start_daemon().await;
+        let mut client_a = zccache_ipc::connect(&endpoint).await.unwrap();
+        let mut client_b = zccache_ipc::connect(&endpoint).await.unwrap();
+        let session_a = start_session_in(&mut client_a, &root_a).await;
+        let session_b = start_session_in(&mut client_b, &root_b).await;
+
+        let rustc_str = rustc.to_string_lossy().to_string();
+        let output_a = root_a.join("target/libpathremap.rlib");
+        let output_b = root_b.join("target/libpathremap.rlib");
+
+        let (exit_code, cached) = compile_path_sensitive_lib(
+            &mut client_a,
+            &session_a,
+            &rustc_str,
+            &root_a,
+            &[],
+            Some(path_remap_auto_env()),
+        )
+        .await;
+        assert_eq!(exit_code, 0, "A path-sensitive compile should succeed");
+        assert!(!cached, "A path-sensitive compile should be a cold miss");
+        let bytes_a = std::fs::read(&output_a).unwrap();
+        assert!(
+            !bytes_contain_path(&bytes_a, &root_a),
+            "auto-remap output should not embed A's physical root"
+        );
+
+        let (exit_code, cached) = compile_path_sensitive_lib(
+            &mut client_b,
+            &session_b,
+            &rustc_str,
+            &root_b,
+            &[],
+            Some(path_remap_auto_env()),
+        )
+        .await;
+        assert_eq!(exit_code, 0, "B equivalent compile should succeed");
+        assert!(
+            cached,
+            "B equivalent compile should hit A's root-remapped cache entry"
+        );
+        let bytes_b = std::fs::read(&output_b).unwrap();
+        assert_eq!(bytes_a, bytes_b, "restored output should be byte-identical");
+        assert!(
+            !bytes_contain_path(&bytes_b, &root_a) && !bytes_contain_path(&bytes_b, &root_b),
+            "restored output should contain the mapped path, not either physical root"
+        );
+
+        shutdown.notify_one();
+        server_handle.await.unwrap();
+    })
+    .await;
+}
+
+/// Issue #229: without a root-covering Rust remap, path-sensitive outputs must
+/// not share across sibling roots. Different remap destination prefixes must
+/// also remain cache-significant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore] // integration-level: starts real daemon with IPC + rustc
+async fn test_rustc_path_remap_conservative_cross_root_misses() {
+    let rustc = match zccache_test_support::find_rustc() {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping test: rustc not found");
+            return;
+        }
+    };
+
+    zccache_test_support::test_timeout(async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("worktree-a");
+        let root_b = tmp.path().join("worktree-b");
+
+        if !init_git_root(&root_a) || !init_git_root(&root_b) {
+            return;
+        }
+
+        write_path_sensitive_lib(&root_a, 7);
+        write_path_sensitive_lib(&root_b, 7);
+
+        let (endpoint, server_handle, shutdown) = start_daemon().await;
+        let mut client_a = zccache_ipc::connect(&endpoint).await.unwrap();
+        let mut client_b = zccache_ipc::connect(&endpoint).await.unwrap();
+        let session_a = start_session_in(&mut client_a, &root_a).await;
+        let session_b = start_session_in(&mut client_b, &root_b).await;
+        let rustc_str = rustc.to_string_lossy().to_string();
+        let output_b = root_b.join("target/libpathremap.rlib");
+
+        let (exit_code, cached) =
+            compile_path_sensitive_lib(&mut client_a, &session_a, &rustc_str, &root_a, &[], None)
+                .await;
+        assert_eq!(exit_code, 0, "A no-remap compile should succeed");
+        assert!(!cached, "A no-remap compile should be a cold miss");
+
+        let (exit_code, cached) =
+            compile_path_sensitive_lib(&mut client_b, &session_b, &rustc_str, &root_b, &[], None)
+                .await;
+        assert_eq!(exit_code, 0, "B no-remap compile should succeed");
+        assert!(
+            !cached,
+            "B no-remap compile should miss instead of sharing path-sensitive output"
+        );
+        let no_remap_b = std::fs::read(&output_b).unwrap();
+        assert!(
+            bytes_contain_path(&no_remap_b, &root_b),
+            "no-remap B output should be compiled for B's physical root"
+        );
+
+        remove_file_if_exists(&root_a.join("target/libpathremap.rlib"));
+        remove_file_if_exists(&output_b);
+        let remap_a = vec![format!(
+            "--remap-path-prefix={}=/stable-a",
+            root_a.display()
+        )];
+        let remap_b = vec![format!(
+            "--remap-path-prefix={}=/stable-b",
+            root_b.display()
+        )];
+
+        let (exit_code, cached) = compile_path_sensitive_lib(
+            &mut client_a,
+            &session_a,
+            &rustc_str,
+            &root_a,
+            &remap_a,
+            None,
+        )
+        .await;
+        assert_eq!(exit_code, 0, "A manual-remap compile should succeed");
+        assert!(!cached, "A manual-remap compile should miss");
+
+        let (exit_code, cached) = compile_path_sensitive_lib(
+            &mut client_b,
+            &session_b,
+            &rustc_str,
+            &root_b,
+            &remap_b,
+            None,
+        )
+        .await;
+        assert_eq!(exit_code, 0, "B manual-remap compile should succeed");
+        assert!(
+            !cached,
+            "different --remap-path-prefix destinations must not share"
         );
 
         shutdown.notify_one();
