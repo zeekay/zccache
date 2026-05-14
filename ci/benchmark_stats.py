@@ -48,6 +48,12 @@ BENCHMARK_COMMAND = [
 
 
 TABLES = {
+    "## C Benchmark:": {
+        "id": "c-inline",
+        "label": "C inline args",
+        "language": "c",
+        "bare_label": "Bare clang",
+    },
     "## Benchmark:": {
         "id": "cpp-inline",
         "label": "C++ inline args",
