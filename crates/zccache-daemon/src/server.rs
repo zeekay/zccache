@@ -21,6 +21,7 @@ use zccache_watcher::{NotifyWatcher, SettleBuffer, SettledEvent};
 
 use crate::compile_journal::{extract_outcome, CompileJournal, JournalContext, JournalEntry};
 use crate::fingerprint::FingerprintManager;
+use crate::process::CompilePriority;
 use crate::stats::{HitPhases, MissPhases, PhaseProfiler, StatsCollector};
 
 /// RAII guard that decrements `in_flight_bytes` on drop, even during panic unwind.
@@ -1845,7 +1846,8 @@ async fn run_tool_passthrough(
 
     apply_client_env_sync(&mut cmd, env.as_deref(), lineage);
 
-    match crate::process::command_output(&mut cmd) {
+    let priority = CompilePriority::from_client_env(env.as_deref());
+    match crate::process::command_output_with_priority(&mut cmd, priority) {
         Ok(output) => Response::LinkResult {
             exit_code: output.status.code().unwrap_or(1),
             stdout: Arc::new(output.stdout),
@@ -1927,7 +1929,8 @@ async fn run_post_link_deploy_hook(
         "running post-link deploy hook"
     );
 
-    match crate::process::command_output(&mut cmd) {
+    let priority = CompilePriority::from_client_env(env);
+    match crate::process::command_output_with_priority(&mut cmd, priority) {
         Ok(out) if out.status.success() => {
             tracing::debug!(
                 program = %program,
@@ -3133,6 +3136,7 @@ async fn handle_compile(
 
     // Discover system includes for this compiler (cached per compiler path)
     let t_system_includes = std::time::Instant::now();
+    let compiler_priority = CompilePriority::from_client_env(client_env.as_deref());
     let system_includes = {
         let mut cache = state.system_includes.lock().await;
         let lineage_for_probe = lineage.clone();
@@ -3143,7 +3147,7 @@ async fn handle_compile(
                     let mut cmd = std::process::Command::new(c);
                     cmd.args(&disc_args);
                     lineage_for_probe.apply_to_sync(&mut cmd, None);
-                    crate::process::command_output(&mut cmd)
+                    crate::process::command_output_with_priority(&mut cmd, compiler_priority)
                 };
                 match output {
                     Ok(out) => {
@@ -3738,7 +3742,9 @@ async fn handle_compile(
     }
     apply_client_env(&mut cmd, &client_env, &lineage);
     let t_compiler_process = std::time::Instant::now();
-    let result = crate::process::tokio_command_output(&mut cmd).await;
+    let compiler_priority = CompilePriority::from_client_env(client_env.as_deref());
+    let result =
+        crate::process::tokio_command_output_with_priority(&mut cmd, compiler_priority).await;
     let compiler_process_ns = t_compiler_process.elapsed().as_nanos() as u64;
 
     let output = match result {
@@ -4798,7 +4804,9 @@ async fn handle_compile_multi(
         cmd.args(&compiler_args).current_dir(&cwd_path);
     }
     apply_client_env(&mut cmd, &client_env, &lineage);
-    let result = crate::process::tokio_command_output(&mut cmd).await;
+    let compiler_priority = CompilePriority::from_client_env(client_env.as_deref());
+    let result =
+        crate::process::tokio_command_output_with_priority(&mut cmd, compiler_priority).await;
 
     let output = match result {
         Ok(o) => o,
@@ -5054,7 +5062,9 @@ async fn run_compiler_direct(
         cmd.args(args).current_dir(cwd);
     }
     apply_client_env(&mut cmd, client_env, &lineage);
-    let result = crate::process::tokio_command_output(&mut cmd).await;
+    let compiler_priority = CompilePriority::from_client_env(client_env.as_deref());
+    let result =
+        crate::process::tokio_command_output_with_priority(&mut cmd, compiler_priority).await;
 
     match result {
         Ok(output) => {
