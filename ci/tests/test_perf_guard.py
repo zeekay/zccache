@@ -313,8 +313,12 @@ def test_benchmark_language_commands_are_filtered():
     assert [command[-4] for command in cpp_commands] == [
         "perf_warm_cache_zccache_vs_sccache",
         "perf_response_file",
+        "perf_cpp_sibling_remap_warm",
     ]
-    assert [command[-4] for command in rust_commands] == ["perf_rustc_zccache_vs_sccache"]
+    assert [command[-4] for command in rust_commands] == [
+        "perf_rustc_zccache_vs_sccache",
+        "perf_rustc_sibling_remap_warm",
+    ]
 
 
 def test_prebuilt_benchmark_binary_commands_are_filtered():
@@ -331,6 +335,13 @@ def test_prebuilt_benchmark_binary_commands_are_filtered():
         [
             "perf_bench_test",
             "perf_response_file",
+            "--nocapture",
+            "--ignored",
+            "--test-threads=1",
+        ],
+        [
+            "perf_bench_test",
+            "perf_cpp_sibling_remap_warm",
             "--nocapture",
             "--ignored",
             "--test-threads=1",

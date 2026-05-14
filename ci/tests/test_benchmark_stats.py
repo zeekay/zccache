@@ -33,6 +33,18 @@ SAMPLE_LOG = """
 |:---------|----------:|--------:|--------:|-----------:|--------------:|
 | Build, Cold | 8.165s | 9.634s | 41.624s | 4.3x slower | 5.1x slower |
 | Build, Warm | 7.018s | 8.236s | **0.123s** | **67x faster** | **57x faster** |
+
+## C++ Sibling-Workspace Remap Benchmark: 50 .cpp files, 5 warm trials
+
+| Scenario | Bare clang | sccache | zccache | vs sccache | vs bare clang |
+|:---------|----------:|--------:|--------:|-----------:|--------------:|
+| Sibling-workspace, Warm | 11.812s | 1.602s | **0.052s** | **31x faster** | **227x faster** |
+
+## Rust Sibling-Workspace Remap Benchmark: 50 .rs files, 5 warm trials
+
+| Scenario | Bare rustc | sccache | zccache | vs sccache | vs bare rustc |
+|:---------|----------:|--------:|--------:|-----------:|--------------:|
+| Sibling-workspace, Warm | 7.142s | 8.301s | **0.127s** | **65x faster** | **56x faster** |
 """
 
 
@@ -62,12 +74,14 @@ def sample_payload():
 def test_parse_benchmark_log_extracts_all_tables():
     rows = benchmark_stats.parse_benchmark_log(SAMPLE_LOG)
 
-    assert len(rows) == 8
+    assert len(rows) == 10
     assert {row["benchmark"] for row in rows} == {
         "c-inline",
         "cpp-inline",
         "cpp-response-file",
+        "cpp-sibling-remap",
         "rust",
+        "rust-sibling-remap",
     }
 
     c_warm = [row for row in rows if row["benchmark"] == "c-inline" and row["mode"] == "warm"][0]
@@ -78,6 +92,16 @@ def test_parse_benchmark_log_extracts_all_tables():
     assert rust_warm["language"] == "rust"
     assert rust_warm["zccache_seconds"] == 0.123
     assert rust_warm["zccache_vs_sccache_ratio"] == 66.959
+
+    cpp_remap = [row for row in rows if row["benchmark"] == "cpp-sibling-remap"][0]
+    assert cpp_remap["mode"] == "warm"
+    assert cpp_remap["language"] == "c++"
+    assert cpp_remap["zccache_seconds"] == 0.052
+
+    rust_remap = [row for row in rows if row["benchmark"] == "rust-sibling-remap"][0]
+    assert rust_remap["mode"] == "warm"
+    assert rust_remap["language"] == "rust"
+    assert rust_remap["zccache_seconds"] == 0.127
 
 
 def test_group_results_by_language_returns_expected_buckets():
@@ -91,7 +115,7 @@ def test_group_results_by_language_returns_expected_buckets():
         "C++",
         "Rust",
     }
-    assert [len(groups[language]) for language in groups] == [2, 4, 2]
+    assert [len(groups[language]) for language in groups] == [2, 5, 3]
 
 
 def test_render_html_links_json_stats_and_language_images_only():
