@@ -51,6 +51,8 @@ class ScenarioStatus:
     best_ratio: float | None = None
     best_attempt: int | None = None
     attempts_seen: int = 0
+    best_zccache_seconds: float | None = None
+    best_baseline_seconds: float | None = None
 
     @property
     def passed(self) -> bool:
@@ -182,15 +184,22 @@ def evaluate_attempts(
             bare_floor = cold_bare_threshold if mode == "cold" else bare_threshold
             sccache_floor = cold_sccache_threshold if mode == "cold" else sccache_threshold
             comparisons = (
-                ("bare", str(row["bare_label"]), row.get("zccache_vs_bare_ratio"), bare_floor),
+                (
+                    "bare",
+                    str(row["bare_label"]),
+                    row.get("zccache_vs_bare_ratio"),
+                    bare_floor,
+                    row.get("bare_seconds"),
+                ),
                 (
                     "sccache",
                     "sccache",
                     row.get("zccache_vs_sccache_ratio"),
                     sccache_floor,
+                    row.get("sccache_seconds"),
                 ),
             )
-            for baseline, baseline_label, ratio, ratio_threshold in comparisons:
+            for baseline, baseline_label, ratio, ratio_threshold, baseline_seconds in comparisons:
                 key = ScenarioKey(str(row["benchmark"]), str(row["scenario"]), baseline)
                 status = statuses.get(key)
                 if status is None:
@@ -211,6 +220,10 @@ def evaluate_attempts(
                     if status.best_ratio is None or ratio > status.best_ratio:
                         status.best_ratio = float(ratio)
                         status.best_attempt = attempt_index
+                        if isinstance(row.get("zccache_seconds"), int | float):
+                            status.best_zccache_seconds = float(row["zccache_seconds"])
+                        if isinstance(baseline_seconds, int | float):
+                            status.best_baseline_seconds = float(baseline_seconds)
 
     missing = [
         f"{language} {mode}"
@@ -237,6 +250,14 @@ def evaluate_attempts(
     )
 
 
+def _format_seconds(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    if value >= 1.0:
+        return f"{value:.3f}s"
+    return f"{value * 1000:.1f}ms"
+
+
 def format_report(
     report: GuardReport,
     bare_threshold: float,
@@ -252,17 +273,19 @@ def format_report(
         f"Cold bare threshold: bare compiler / zccache >= {cold_bare_threshold:.2f}x",
         f"Cold sccache threshold: pinned sccache / zccache >= {cold_sccache_threshold:.2f}x",
         "",
-        "| Status | Language | Benchmark | Scenario | Baseline | Best ratio | Threshold | Attempt | Seen |",
-        "|---|---|---|---|---|---:|---:|---:|---:|",
+        "| Status | Language | Benchmark | Scenario | Baseline | zccache | baseline | Ratio | Threshold | Attempt | Seen |",
+        "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for status in report.statuses:
         state = "PASS" if status.passed else "FAIL"
         ratio = "n/a" if status.best_ratio is None else f"{status.best_ratio:.3f}x"
+        zc_time = _format_seconds(status.best_zccache_seconds)
+        bl_time = _format_seconds(status.best_baseline_seconds)
         attempt = "n/a" if status.best_attempt is None else str(status.best_attempt)
         lines.append(
             "| "
             f"{state} | {status.language} | {status.benchmark_label} | "
-            f"{status.scenario} | {status.baseline_label} | {ratio} | "
+            f"{status.scenario} | {status.baseline_label} | {zc_time} | {bl_time} | {ratio} | "
             f"{status.threshold:.2f}x | {attempt} | {status.attempts_seen} |"
         )
 
@@ -281,10 +304,12 @@ def format_report(
 
 def _format_status_check(status: ScenarioStatus) -> str:
     actual = "n/a" if status.best_ratio is None else f"{status.best_ratio:.3f}x"
+    zc_time = _format_seconds(status.best_zccache_seconds)
+    bl_time = _format_seconds(status.best_baseline_seconds)
     return (
         f"{status.language} {status.benchmark_label} / {status.scenario} "
         f"vs {status.baseline_label}: expected >= {status.threshold:.2f}x, "
-        f"actual {actual}"
+        f"actual {actual} (zccache {zc_time} vs baseline {bl_time})"
     )
 
 

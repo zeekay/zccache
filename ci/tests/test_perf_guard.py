@@ -161,7 +161,9 @@ def test_report_marks_failed_rows():
     report = perf_guard.evaluate_attempts([rows(FAILING_RUST_LOG)], threshold=1.5)
     markdown = perf_guard.format_report(report, 1.5, 1.5, 1.5, 1.5)
 
-    assert "| FAIL | rust | Rust rustc | Build, Cold | Bare rustc | 1.286x | 1.50x | 1 | 1 |" in markdown
+    assert (
+        "| FAIL | rust | Rust rustc | Build, Cold | Bare rustc | 7.000s | 9.000s | 1.286x | 1.50x | 1 | 1 |"
+    ) in markdown
     assert "### Benchmark summary" in markdown
     assert "#### Failed checks" in markdown
     assert "#### Passed checks" in markdown
@@ -178,11 +180,13 @@ def test_benchmark_summary_lists_passes_and_failures():
     assert "- Failed benchmark attempts: none" in summary
     assert (
         "- FAIL: c++ C++ inline args / Single-file, Cold vs sccache: "
-        "expected >= 1.50x, actual 1.250x (best attempt 1; seen 1)"
+        "expected >= 1.50x, actual 1.250x (zccache 4.000s vs baseline 5.000s) "
+        "(best attempt 1; seen 1)"
     ) in summary
     assert (
         "- PASS: c C inline args / Single-file, Warm vs Bare clang: "
-        "expected >= 1.50x, actual 3.000x (best attempt 1; seen 1)"
+        "expected >= 1.50x, actual 3.000x (zccache 1.000s vs baseline 3.000s) "
+        "(best attempt 1; seen 1)"
     ) in summary
 
 
@@ -197,7 +201,7 @@ def test_final_status_explains_pass_with_weakest_check():
     assert final_status == (
         "PERF GUARD OK: all checks meet configured floors; weakest check "
         "c C inline args / Single-file, Cold vs Bare clang: expected >= 0.85x, "
-        "actual 0.909x."
+        "actual 0.909x (zccache 3.300s vs baseline 3.000s)."
     )
 
 
@@ -208,7 +212,8 @@ def test_final_status_explains_worst_failed_floor():
 
     assert final_status == (
         "PERF GUARD FAILED: 1 check below floor; worst c++ C++ inline args / "
-        "Single-file, Cold vs sccache: expected >= 1.50x, actual 1.250x."
+        "Single-file, Cold vs sccache: expected >= 1.50x, actual 1.250x "
+        "(zccache 4.000s vs baseline 5.000s)."
     )
 
 
