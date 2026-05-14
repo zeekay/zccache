@@ -59,19 +59,25 @@ BENCHMARK_BASE_COMMAND = [
     "perf_bench_test",
 ]
 BENCHMARK_TESTS_BY_LANGUAGE = {
-    "c": ("perf_c_zccache_vs_bare",),
+    "c": (
+        "perf_c_zccache_vs_bare",
+        "perf_c_archive_link",
+    ),
     "c++": (
         "perf_warm_cache_zccache_vs_sccache",
         "perf_response_file",
         "perf_cpp_sibling_remap_warm",
+        "perf_cpp_driver_link",
     ),
     "emscripten": (
         "perf_emcc_warm_cache_zccache_vs_sccache",
         "perf_emcc_sibling_remap_warm",
+        "perf_emcc_link",
     ),
     "rust": (
         "perf_rustc_zccache_vs_sccache",
         "perf_rustc_sibling_remap_warm",
+        "perf_rust_workspace_link",
     ),
 }
 BENCHMARK_COMMAND = [
@@ -89,6 +95,12 @@ TABLES = {
         "label": "C inline args",
         "language": "c",
         "bare_label": "Bare clang",
+    },
+    "## C Static-Library Link Benchmark:": {
+        "id": "c-static-library-link",
+        "label": "C static-library link",
+        "language": "c",
+        "bare_label": "Bare ar",
     },
     "## Benchmark:": {
         "id": "cpp-inline",
@@ -108,6 +120,12 @@ TABLES = {
         "language": "c++",
         "bare_label": "Bare clang",
     },
+    "## C++ Driver-Link Benchmark:": {
+        "id": "cpp-driver-link",
+        "label": "C++ driver link",
+        "language": "c++",
+        "bare_label": "Bare clang++",
+    },
     "## Emscripten Benchmark:": {
         "id": "emscripten",
         "label": "Emscripten em++",
@@ -120,6 +138,12 @@ TABLES = {
         "language": "emscripten",
         "bare_label": "Bare em++",
     },
+    "## Emscripten Link Benchmark:": {
+        "id": "emscripten-link",
+        "label": "Emscripten link",
+        "language": "emscripten",
+        "bare_label": "Bare em++",
+    },
     "## Rust Benchmark:": {
         "id": "rust",
         "label": "Rust rustc",
@@ -129,6 +153,12 @@ TABLES = {
     "## Rust Sibling-Workspace Remap Benchmark:": {
         "id": "rust-sibling-remap",
         "label": "Rust sibling git remap",
+        "language": "rust",
+        "bare_label": "Bare rustc",
+    },
+    "## Rust Workspace Link Benchmark:": {
+        "id": "rust-workspace-link",
+        "label": "Rust workspace link",
         "language": "rust",
         "bare_label": "Bare rustc",
     },

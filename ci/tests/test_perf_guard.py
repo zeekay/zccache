@@ -395,20 +395,26 @@ def test_benchmark_language_commands_are_filtered():
     cpp_commands = benchmark_stats.benchmark_commands_for_language("c++")
     rust_commands = benchmark_stats.benchmark_commands_for_language("rust")
 
-    assert [command[-4] for command in c_commands] == ["perf_c_zccache_vs_bare"]
+    assert [command[-4] for command in c_commands] == [
+        "perf_c_zccache_vs_bare",
+        "perf_c_archive_link",
+    ]
     assert [command[-4] for command in cpp_commands] == [
         "perf_warm_cache_zccache_vs_sccache",
         "perf_response_file",
         "perf_cpp_sibling_remap_warm",
+        "perf_cpp_driver_link",
     ]
     em_commands = benchmark_stats.benchmark_commands_for_language("emscripten")
     assert [command[-4] for command in em_commands] == [
         "perf_emcc_warm_cache_zccache_vs_sccache",
         "perf_emcc_sibling_remap_warm",
+        "perf_emcc_link",
     ]
     assert [command[-4] for command in rust_commands] == [
         "perf_rustc_zccache_vs_sccache",
         "perf_rustc_sibling_remap_warm",
+        "perf_rust_workspace_link",
     ]
 
 
@@ -433,6 +439,13 @@ def test_prebuilt_benchmark_binary_commands_are_filtered():
         [
             "perf_bench_test",
             "perf_cpp_sibling_remap_warm",
+            "--nocapture",
+            "--ignored",
+            "--test-threads=1",
+        ],
+        [
+            "perf_bench_test",
+            "perf_cpp_driver_link",
             "--nocapture",
             "--ignored",
             "--test-threads=1",

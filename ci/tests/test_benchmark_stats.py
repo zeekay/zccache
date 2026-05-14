@@ -13,6 +13,13 @@ SAMPLE_LOG = """
 | Single-file, Cold | 3.000s | — | 2.000s | — | 1.5x faster |
 | Single-file, Warm | 3.000s | — | **0.050s** | — | **60x faster** |
 
+## C Static-Library Link Benchmark: 50 .o inputs, 5 warm trials
+
+| Scenario | Bare ar | sccache | zccache | vs sccache | vs Bare ar |
+|:---------|----------:|--------:|--------:|-----------:|--------------:|
+| Static archive, Cold | 0.900s | 0.920s | 0.950s | 1.0x slower | 1.1x slower |
+| Static archive, Warm | 0.890s | 0.910s | **0.040s** | **23x faster** | **22x faster** |
+
 ## Benchmark: 50 C++ files, 5 warm trials
 
 | Scenario | Bare Clang | sccache | zccache | vs sccache | vs bare clang |
@@ -41,6 +48,13 @@ SAMPLE_LOG = """
 | Sibling-workspace no __FILE__, Warm | 11.812s | 1.602s | **1.602s** | **1.0x faster** | **7.4x faster** |
 | Sibling-workspace with __FILE__, Warm | 11.812s | 1.602s | **0.052s** | **31x faster** | **227x faster** |
 
+## C++ Driver-Link Benchmark: 50 .cpp objects, 5 warm trials
+
+| Scenario | Bare clang++ | sccache | zccache | vs sccache | vs Bare clang++ |
+|:---------|----------:|--------:|--------:|-----------:|--------------:|
+| Driver link, Cold | 2.500s | 2.600s | 2.700s | 1.0x slower | 1.1x slower |
+| Driver link, Warm | 2.480s | 2.610s | **0.060s** | **44x faster** | **41x faster** |
+
 ## Rust Sibling-Workspace Remap Benchmark: 50 .rs files, 5 warm trials
 
 | Scenario | Bare rustc | sccache | zccache | vs sccache | vs bare rustc |
@@ -59,6 +73,22 @@ SAMPLE_LOG = """
 | Scenario | Bare em++ | sccache | zccache | vs sccache | vs bare em++ |
 |:---------|---------:|--------:|--------:|-----------:|-------------:|
 | Sibling-workspace, Warm | 13.654s | 1.712s | **0.063s** | **27x faster** | **217x faster** |
+
+## Emscripten Link Benchmark: 50 .cpp objects, 5 warm trials
+
+| Scenario | Bare em++ | sccache | zccache | vs sccache | vs Bare em++ |
+|:---------|---------:|--------:|--------:|-----------:|-------------:|
+| HTML link, Cold | 6.500s | 6.600s | 6.800s | 1.0x slower | 1.0x slower |
+| HTML link, Warm | 6.450s | 6.550s | **0.070s** | **94x faster** | **92x faster** |
+| Wasm link, Cold | 4.500s | 4.600s | 4.700s | 1.0x slower | 1.0x slower |
+| Wasm link, Warm | 4.450s | 4.550s | **0.065s** | **70x faster** | **68x faster** |
+
+## Rust Workspace Link Benchmark: 50 .rlib inputs, 5 warm trials
+
+| Scenario | Bare rustc | sccache | zccache | vs sccache | vs Bare rustc |
+|:---------|----------:|--------:|--------:|-----------:|--------------:|
+| Workspace staticlib link, Cold | 5.500s | 5.700s | 5.900s | 1.0x slower | 1.1x slower |
+| Workspace staticlib link, Warm | 5.450s | 5.650s | **0.080s** | **71x faster** | **68x faster** |
 """
 
 
@@ -88,21 +118,30 @@ def sample_payload():
 def test_parse_benchmark_log_extracts_all_tables():
     rows = benchmark_stats.parse_benchmark_log(SAMPLE_LOG)
 
-    assert len(rows) == 14
+    assert len(rows) == 24
     assert {row["benchmark"] for row in rows} == {
         "c-inline",
+        "c-static-library-link",
+        "cpp-driver-link",
         "cpp-inline",
         "cpp-response-file",
         "cpp-sibling-remap",
         "emscripten",
+        "emscripten-link",
         "emscripten-sibling-remap",
         "rust",
+        "rust-workspace-link",
         "rust-sibling-remap",
     }
 
     c_warm = [row for row in rows if row["benchmark"] == "c-inline" and row["mode"] == "warm"][0]
     assert c_warm["language"] == "c"
     assert c_warm["zccache_vs_bare_ratio"] == 60.0
+
+    c_link = [row for row in rows if row["benchmark"] == "c-static-library-link"]
+    assert [row["mode"] for row in c_link] == ["cold", "warm"]
+    assert c_link[1]["bare_label"] == "Bare ar"
+    assert c_link[1]["zccache_seconds"] == 0.04
 
     rust_warm = [row for row in rows if row["scenario"] == "Build, Warm"][0]
     assert rust_warm["language"] == "rust"
@@ -117,6 +156,10 @@ def test_parse_benchmark_log_extracts_all_tables():
     assert all(row["mode"] == "warm" for row in cpp_remaps)
     assert all(row["language"] == "c++" for row in cpp_remaps)
     assert [row["zccache_vs_sccache_ratio"] for row in cpp_remaps] == [1.0, 30.808]
+
+    cpp_link = [row for row in rows if row["benchmark"] == "cpp-driver-link"]
+    assert [row["scenario"] for row in cpp_link] == ["Driver link, Cold", "Driver link, Warm"]
+    assert cpp_link[1]["bare_label"] == "Bare clang++"
 
     rust_remap = [row for row in rows if row["benchmark"] == "rust-sibling-remap"][0]
     assert rust_remap["mode"] == "warm"
@@ -135,6 +178,18 @@ def test_parse_benchmark_log_extracts_all_tables():
     assert em_remap["language"] == "emscripten"
     assert em_remap["zccache_seconds"] == 0.063
 
+    em_link = [row for row in rows if row["benchmark"] == "emscripten-link"]
+    assert [row["scenario"] for row in em_link] == [
+        "HTML link, Cold",
+        "HTML link, Warm",
+        "Wasm link, Cold",
+        "Wasm link, Warm",
+    ]
+
+    rust_link = [row for row in rows if row["benchmark"] == "rust-workspace-link"]
+    assert [row["mode"] for row in rust_link] == ["cold", "warm"]
+    assert rust_link[1]["scenario"] == "Workspace staticlib link, Warm"
+
 
 def test_group_results_by_language_returns_expected_buckets():
     rows = benchmark_stats.parse_benchmark_log(SAMPLE_LOG)
@@ -148,7 +203,7 @@ def test_group_results_by_language_returns_expected_buckets():
         "Emscripten",
         "Rust",
     }
-    assert [len(groups[language]) for language in groups] == [2, 6, 3, 3]
+    assert [len(groups[language]) for language in groups] == [4, 8, 7, 5]
 
 
 def test_render_html_links_json_stats_and_language_images_only():
@@ -189,6 +244,16 @@ def test_image_rows_cover_c_cpp_and_rust_stats():
         for row in image_rows
     )
     assert any("Rust rustc - Build, Warm" == row["scenario"] for row in image_rows)
+    assert any(
+        "C static-library link - Static archive, Warm" == row["scenario"]
+        for row in image_rows
+    )
+    assert any("C++ driver link - Driver link, Warm" == row["scenario"] for row in image_rows)
+    assert any("Emscripten link - Wasm link, Warm" == row["scenario"] for row in image_rows)
+    assert any(
+        "Rust workspace link - Workspace staticlib link, Warm" == row["scenario"]
+        for row in image_rows
+    )
 
 
 def test_write_outputs_creates_timestamped_benchmark_image(tmp_path):
