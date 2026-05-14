@@ -24,6 +24,29 @@ type ClientConn = zccache_ipc::IpcClientConnection;
 const NUM_FILES: usize = 50;
 const WARM_TRIALS: usize = 5;
 
+struct EnvVarGuard {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set_path(name: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::env::set_var(self.name, previous);
+        } else {
+            std::env::remove_var(self.name);
+        }
+    }
+}
+
 async fn start_daemon() -> (
     String,
     tokio::task::JoinHandle<()>,
@@ -2970,6 +2993,8 @@ async fn measure_cpp_sibling_remap_mode(
     };
 
     eprintln!("  [3/3] zccache (prime: workspace A, warm: workspace B, remap=auto)");
+    let zccache_cache_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let _zccache_cache_guard = EnvVarGuard::set_path("ZCCACHE_CACHE_DIR", zccache_cache_dir.path());
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
 
