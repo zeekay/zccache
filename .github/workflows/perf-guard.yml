@@ -45,6 +45,8 @@ jobs:
           target-cache: false
 
       - uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: "0.10.0"
 
       - name: Install benchmark tools
         shell: bash
@@ -59,7 +61,8 @@ jobs:
           set -euo pipefail
           python3 -m ci.perf_guard \
             --run-benchmarks \
-            --threshold 1.5 \
+            --bare-threshold 1.5 \
+            --sccache-threshold 1.5 \
             --attempts 3 \
             --output-dir perf-guard-output
 

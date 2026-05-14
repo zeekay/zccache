@@ -1,4 +1,4 @@
-"""Fail CI when zccache performance drops below the bare-compiler floor."""
+"""Fail CI when zccache performance drops below compiler-cache speed floors."""
 
 from __future__ import annotations
 
@@ -16,7 +16,9 @@ from ci import benchmark_stats
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "perf-guard-output"
-DEFAULT_THRESHOLD = 1.5
+DEFAULT_BARE_THRESHOLD = 1.5
+DEFAULT_SCCACHE_THRESHOLD = 1.5
+DEFAULT_THRESHOLD = DEFAULT_BARE_THRESHOLD
 DEFAULT_ATTEMPTS = 3
 REQUIRED_LANGUAGES = ("c", "c++", "rust")
 REQUIRED_MODES = ("cold", "warm")
@@ -26,6 +28,7 @@ REQUIRED_MODES = ("cold", "warm")
 class ScenarioKey:
     benchmark: str
     scenario: str
+    baseline: str
 
 
 @dataclass
@@ -35,7 +38,9 @@ class ScenarioStatus:
     language: str
     mode: str
     scenario: str
-    bare_label: str
+    baseline: str
+    baseline_label: str
+    threshold: float
     best_ratio: float | None = None
     best_attempt: int | None = None
     attempts_seen: int = 0
@@ -43,8 +48,6 @@ class ScenarioStatus:
     @property
     def passed(self) -> bool:
         return self.best_ratio is not None and self.best_ratio >= self.threshold
-
-    threshold: float = DEFAULT_THRESHOLD
 
 
 @dataclass
@@ -103,9 +106,14 @@ def _required_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def evaluate_attempts(
     attempts: list[list[dict[str, Any]]],
     *,
-    threshold: float = DEFAULT_THRESHOLD,
+    threshold: float | None = None,
+    bare_threshold: float = DEFAULT_BARE_THRESHOLD,
+    sccache_threshold: float = DEFAULT_SCCACHE_THRESHOLD,
     command_failures: list[int] | None = None,
 ) -> GuardReport:
+    if threshold is not None:
+        bare_threshold = threshold
+        sccache_threshold = threshold
     statuses: dict[ScenarioKey, ScenarioStatus] = {}
     language_modes: set[tuple[str, str]] = set()
 
@@ -114,26 +122,36 @@ def evaluate_attempts(
             language = str(row["language"])
             mode = str(row["mode"])
             language_modes.add((language, mode))
-            key = ScenarioKey(str(row["benchmark"]), str(row["scenario"]))
-            status = statuses.get(key)
-            if status is None:
-                status = ScenarioStatus(
-                    key=key,
-                    benchmark_label=str(row["benchmark_label"]),
-                    language=language,
-                    mode=mode,
-                    scenario=str(row["scenario"]),
-                    bare_label=str(row["bare_label"]),
-                    threshold=threshold,
-                )
-                statuses[key] = status
-            status.attempts_seen += 1
+            comparisons = (
+                ("bare", str(row["bare_label"]), row.get("zccache_vs_bare_ratio"), bare_threshold),
+                (
+                    "sccache",
+                    "sccache",
+                    row.get("zccache_vs_sccache_ratio"),
+                    sccache_threshold,
+                ),
+            )
+            for baseline, baseline_label, ratio, ratio_threshold in comparisons:
+                key = ScenarioKey(str(row["benchmark"]), str(row["scenario"]), baseline)
+                status = statuses.get(key)
+                if status is None:
+                    status = ScenarioStatus(
+                        key=key,
+                        benchmark_label=str(row["benchmark_label"]),
+                        language=language,
+                        mode=mode,
+                        scenario=str(row["scenario"]),
+                        baseline=baseline,
+                        baseline_label=baseline_label,
+                        threshold=ratio_threshold,
+                    )
+                    statuses[key] = status
+                status.attempts_seen += 1
 
-            ratio = row.get("zccache_vs_bare_ratio")
-            if isinstance(ratio, int | float):
-                if status.best_ratio is None or ratio > status.best_ratio:
-                    status.best_ratio = float(ratio)
-                    status.best_attempt = attempt_index
+                if isinstance(ratio, int | float):
+                    if status.best_ratio is None or ratio > status.best_ratio:
+                        status.best_ratio = float(ratio)
+                        status.best_attempt = attempt_index
 
     missing = [
         f"{language} {mode}"
@@ -144,7 +162,13 @@ def evaluate_attempts(
 
     ordered = sorted(
         statuses.values(),
-        key=lambda item: (item.language, item.benchmark_label, item.mode, item.scenario),
+        key=lambda item: (
+            item.language,
+            item.benchmark_label,
+            item.mode,
+            item.scenario,
+            item.baseline,
+        ),
     )
     return GuardReport(
         statuses=ordered,
@@ -154,14 +178,19 @@ def evaluate_attempts(
     )
 
 
-def format_report(report: GuardReport, threshold: float) -> str:
+def format_report(
+    report: GuardReport,
+    bare_threshold: float,
+    sccache_threshold: float,
+) -> str:
     lines = [
         "## zccache perf guard",
         "",
-        f"Threshold: bare compiler / zccache >= {threshold:.2f}x",
+        f"Bare threshold: bare compiler / zccache >= {bare_threshold:.2f}x",
+        f"sccache threshold: pinned sccache / zccache >= {sccache_threshold:.2f}x",
         "",
-        "| Status | Language | Benchmark | Scenario | Best ratio | Attempt | Seen |",
-        "|---|---|---|---|---:|---:|---:|",
+        "| Status | Language | Benchmark | Scenario | Baseline | Best ratio | Threshold | Attempt | Seen |",
+        "|---|---|---|---|---|---:|---:|---:|---:|",
     ]
     for status in report.statuses:
         state = "PASS" if status.passed else "FAIL"
@@ -170,7 +199,8 @@ def format_report(report: GuardReport, threshold: float) -> str:
         lines.append(
             "| "
             f"{state} | {status.language} | {status.benchmark_label} | "
-            f"{status.scenario} | {ratio} | {attempt} | {status.attempts_seen} |"
+            f"{status.scenario} | {status.baseline_label} | {ratio} | "
+            f"{status.threshold:.2f}x | {attempt} | {status.attempts_seen} |"
         )
 
     if report.missing_requirements:
@@ -197,7 +227,12 @@ def _load_input_log(path: Path) -> list[list[dict[str, Any]]]:
     return [benchmark_stats.parse_benchmark_log(text)]
 
 
-def _run_attempts(output_dir: Path, attempts: int) -> tuple[list[list[dict[str, Any]]], list[int]]:
+def _run_attempts(
+    output_dir: Path,
+    attempts: int,
+    bare_threshold: float,
+    sccache_threshold: float,
+) -> tuple[list[list[dict[str, Any]]], list[int]]:
     parsed_attempts: list[list[dict[str, Any]]] = []
     command_failures: list[int] = []
 
@@ -210,7 +245,12 @@ def _run_attempts(output_dir: Path, attempts: int) -> tuple[list[list[dict[str, 
         if returncode != 0:
             command_failures.append(attempt)
 
-        interim = evaluate_attempts(parsed_attempts, command_failures=command_failures)
+        interim = evaluate_attempts(
+            parsed_attempts,
+            bare_threshold=bare_threshold,
+            sccache_threshold=sccache_threshold,
+            command_failures=command_failures,
+        )
         if returncode == 0 and interim.passed:
             break
 
@@ -222,12 +262,19 @@ def main() -> int:
     parser.add_argument("--input-log", type=Path, help="Evaluate a saved benchmark log.")
     parser.add_argument("--run-benchmarks", action="store_true", help="Run perf benchmarks.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
+    parser.add_argument("--threshold", type=float, help="Set both thresholds to this value.")
+    parser.add_argument("--bare-threshold", type=float, default=DEFAULT_BARE_THRESHOLD)
+    parser.add_argument("--sccache-threshold", type=float, default=DEFAULT_SCCACHE_THRESHOLD)
     parser.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS)
     args = parser.parse_args()
 
-    if args.threshold <= 0:
-        parser.error("--threshold must be greater than zero")
+    if args.threshold is not None:
+        args.bare_threshold = args.threshold
+        args.sccache_threshold = args.threshold
+    if args.bare_threshold <= 0:
+        parser.error("--bare-threshold must be greater than zero")
+    if args.sccache_threshold <= 0:
+        parser.error("--sccache-threshold must be greater than zero")
     if args.attempts < 1:
         parser.error("--attempts must be at least 1")
     if bool(args.input_log) == bool(args.run_benchmarks):
@@ -238,14 +285,20 @@ def main() -> int:
         attempts = _load_input_log(args.input_log)
         command_failures: list[int] = []
     else:
-        attempts, command_failures = _run_attempts(args.output_dir, args.attempts)
+        attempts, command_failures = _run_attempts(
+            args.output_dir,
+            args.attempts,
+            args.bare_threshold,
+            args.sccache_threshold,
+        )
 
     report = evaluate_attempts(
         attempts,
-        threshold=args.threshold,
+        bare_threshold=args.bare_threshold,
+        sccache_threshold=args.sccache_threshold,
         command_failures=command_failures,
     )
-    markdown = format_report(report, args.threshold)
+    markdown = format_report(report, args.bare_threshold, args.sccache_threshold)
     report_path = args.output_dir / "perf-guard-summary.md"
     report_path.write_text(markdown, encoding="utf-8")
     print(markdown)
