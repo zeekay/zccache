@@ -12,18 +12,13 @@ use std::os::windows::io::AsRawHandle;
 pub(crate) const COMPILE_PRIORITY_ENV: &str = "ZCCACHE_COMPILE_PRIORITY";
 
 /// Priority policy for compiler/linker child processes owned by the daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum CompilePriority {
     Normal,
+    #[default]
     Low,
     Idle,
     High,
-}
-
-impl Default for CompilePriority {
-    fn default() -> Self {
-        Self::Low
-    }
 }
 
 impl CompilePriority {
