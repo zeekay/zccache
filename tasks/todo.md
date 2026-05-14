@@ -55,3 +55,33 @@ Shared libraries (.so, .dylib, .dll) and executables are Phase 2.
   - test_ar_non_cacheable_passthrough: ar t → passthrough with output
   - test_link_stats_in_status: verify DaemonStatus.total_links increments
   - Also fixed: daemon_start tests now #[ignore] (were causing flaky failures)
+
+---
+
+# Sibling Git Workspace + Path Remap Auto Benchmarks
+
+Add benchmark scenarios that exercise `ZCCACHE_PATH_REMAP=auto` across sibling
+git workspaces. Compare warm-state performance against bare compiler and
+sccache. Cold rows are intentionally omitted — the new feature only changes
+warm-state cache identity.
+
+## Scope
+
+- C++ (clang++, 50 files): single-file warm.
+- Rust (rustc, build emit-link, 50 files): warm only.
+- Each benchmark sets up two sibling git roots (`workspace-a` / `workspace-b`),
+  primes zccache from workspace A, then measures warm trials in workspace B.
+- Bare and sccache run warm trials in workspace B using their normal
+  same-workspace warm semantics (they cannot share across sibling roots).
+
+## Plan
+
+- [x] Step 1: Add `perf_cpp_sibling_remap_warm` test
+      (`crates/zccache-daemon/tests/perf_bench_test.rs`). Verified locally:
+      zccache 0.695s vs bare 11.353s (16x) vs sccache 1.420s (2x).
+- [x] Step 2: Add `perf_rustc_sibling_remap_warm` test. Verified locally:
+      zccache 0.195s vs bare 5.909s (30x) vs sccache 7.447s (38x).
+- [x] Step 3: Update `ci/benchmark_stats.py` TABLES dict and
+      `BENCHMARK_TESTS_BY_LANGUAGE`. Updated `ci/tests/test_perf_guard.py`
+      and `ci/tests/test_benchmark_stats.py` fixtures/assertions.
+- [x] Step 4: Verified pytest passes (37/37 + 1 skipped) and clippy clean.

@@ -54,8 +54,15 @@ BENCHMARK_BASE_COMMAND = [
 ]
 BENCHMARK_TESTS_BY_LANGUAGE = {
     "c": ("perf_c_zccache_vs_bare",),
-    "c++": ("perf_warm_cache_zccache_vs_sccache", "perf_response_file"),
-    "rust": ("perf_rustc_zccache_vs_sccache",),
+    "c++": (
+        "perf_warm_cache_zccache_vs_sccache",
+        "perf_response_file",
+        "perf_cpp_sibling_remap_warm",
+    ),
+    "rust": (
+        "perf_rustc_zccache_vs_sccache",
+        "perf_rustc_sibling_remap_warm",
+    ),
 }
 BENCHMARK_COMMAND = [
     *BENCHMARK_BASE_COMMAND,
@@ -85,9 +92,21 @@ TABLES = {
         "language": "c++",
         "bare_label": "Bare clang",
     },
+    "## C++ Sibling-Workspace Remap Benchmark:": {
+        "id": "cpp-sibling-remap",
+        "label": "C++ sibling git remap",
+        "language": "c++",
+        "bare_label": "Bare clang",
+    },
     "## Rust Benchmark:": {
         "id": "rust",
         "label": "Rust rustc",
+        "language": "rust",
+        "bare_label": "Bare rustc",
+    },
+    "## Rust Sibling-Workspace Remap Benchmark:": {
+        "id": "rust-sibling-remap",
+        "label": "Rust sibling git remap",
         "language": "rust",
         "bare_label": "Bare rustc",
     },
