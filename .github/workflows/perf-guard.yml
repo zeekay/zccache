@@ -123,6 +123,8 @@ jobs:
             --language "${{ matrix.language }}" \
             --bare-threshold 1.5 \
             --sccache-threshold 1.5 \
+            --cold-bare-threshold 0.85 \
+            --cold-sccache-threshold 1.0 \
             --attempts 3 \
             --benchmark-binary "$PWD/perf-guard-bin/perf_bench_test" \
             --output-dir perf-guard-output

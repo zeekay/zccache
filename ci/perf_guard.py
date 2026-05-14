@@ -17,9 +17,13 @@ from ci import benchmark_stats
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "perf-guard-output"
-DEFAULT_BARE_THRESHOLD = 1.5
-DEFAULT_SCCACHE_THRESHOLD = 1.5
-DEFAULT_THRESHOLD = DEFAULT_BARE_THRESHOLD
+DEFAULT_WARM_BARE_THRESHOLD = 1.5
+DEFAULT_WARM_SCCACHE_THRESHOLD = 1.5
+DEFAULT_COLD_BARE_THRESHOLD = 0.85
+DEFAULT_COLD_SCCACHE_THRESHOLD = 1.0
+DEFAULT_BARE_THRESHOLD = DEFAULT_WARM_BARE_THRESHOLD
+DEFAULT_SCCACHE_THRESHOLD = DEFAULT_WARM_SCCACHE_THRESHOLD
+DEFAULT_THRESHOLD = DEFAULT_WARM_BARE_THRESHOLD
 DEFAULT_ATTEMPTS = 3
 REQUIRED_LANGUAGES = ("c", "c++", "rust")
 REQUIRED_MODES = ("cold", "warm")
@@ -147,12 +151,16 @@ def evaluate_attempts(
     threshold: float | None = None,
     bare_threshold: float = DEFAULT_BARE_THRESHOLD,
     sccache_threshold: float = DEFAULT_SCCACHE_THRESHOLD,
+    cold_bare_threshold: float = DEFAULT_COLD_BARE_THRESHOLD,
+    cold_sccache_threshold: float = DEFAULT_COLD_SCCACHE_THRESHOLD,
     command_failures: list[int] | None = None,
     languages: tuple[str, ...] = REQUIRED_LANGUAGES,
 ) -> GuardReport:
     if threshold is not None:
         bare_threshold = threshold
         sccache_threshold = threshold
+        cold_bare_threshold = threshold
+        cold_sccache_threshold = threshold
     statuses: dict[ScenarioKey, ScenarioStatus] = {}
     language_modes: set[tuple[str, str]] = set()
 
@@ -161,13 +169,15 @@ def evaluate_attempts(
             language = str(row["language"])
             mode = str(row["mode"])
             language_modes.add((language, mode))
+            bare_floor = cold_bare_threshold if mode == "cold" else bare_threshold
+            sccache_floor = cold_sccache_threshold if mode == "cold" else sccache_threshold
             comparisons = (
-                ("bare", str(row["bare_label"]), row.get("zccache_vs_bare_ratio"), bare_threshold),
+                ("bare", str(row["bare_label"]), row.get("zccache_vs_bare_ratio"), bare_floor),
                 (
                     "sccache",
                     "sccache",
                     row.get("zccache_vs_sccache_ratio"),
-                    sccache_threshold,
+                    sccache_floor,
                 ),
             )
             for baseline, baseline_label, ratio, ratio_threshold in comparisons:
@@ -221,12 +231,16 @@ def format_report(
     report: GuardReport,
     bare_threshold: float,
     sccache_threshold: float,
+    cold_bare_threshold: float = DEFAULT_COLD_BARE_THRESHOLD,
+    cold_sccache_threshold: float = DEFAULT_COLD_SCCACHE_THRESHOLD,
 ) -> str:
     lines = [
         "## zccache perf guard",
         "",
-        f"Bare threshold: bare compiler / zccache >= {bare_threshold:.2f}x",
-        f"sccache threshold: pinned sccache / zccache >= {sccache_threshold:.2f}x",
+        f"Warm bare threshold: bare compiler / zccache >= {bare_threshold:.2f}x",
+        f"Warm sccache threshold: pinned sccache / zccache >= {sccache_threshold:.2f}x",
+        f"Cold bare threshold: bare compiler / zccache >= {cold_bare_threshold:.2f}x",
+        f"Cold sccache threshold: pinned sccache / zccache >= {cold_sccache_threshold:.2f}x",
         "",
         "| Status | Language | Benchmark | Scenario | Baseline | Best ratio | Threshold | Attempt | Seen |",
         "|---|---|---|---|---|---:|---:|---:|---:|",
@@ -258,6 +272,9 @@ def format_report_json(
     bare_threshold: float,
     sccache_threshold: float,
     languages: tuple[str, ...] = REQUIRED_LANGUAGES,
+    *,
+    cold_bare_threshold: float = DEFAULT_COLD_BARE_THRESHOLD,
+    cold_sccache_threshold: float = DEFAULT_COLD_SCCACHE_THRESHOLD,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -266,6 +283,8 @@ def format_report_json(
         "thresholds": {
             "bare": bare_threshold,
             "sccache": sccache_threshold,
+            "cold_bare": cold_bare_threshold,
+            "cold_sccache": cold_sccache_threshold,
         },
         "attempt_count": report.attempt_count,
         "command_failures": report.command_failures,
@@ -324,10 +343,20 @@ def write_report_json(
     bare_threshold: float,
     sccache_threshold: float,
     languages: tuple[str, ...] = REQUIRED_LANGUAGES,
+    *,
+    cold_bare_threshold: float = DEFAULT_COLD_BARE_THRESHOLD,
+    cold_sccache_threshold: float = DEFAULT_COLD_SCCACHE_THRESHOLD,
 ) -> None:
     _write_json(
         output_dir / "perf-guard-summary.json",
-        format_report_json(report, bare_threshold, sccache_threshold, languages),
+        format_report_json(
+            report,
+            bare_threshold,
+            sccache_threshold,
+            languages,
+            cold_bare_threshold=cold_bare_threshold,
+            cold_sccache_threshold=cold_sccache_threshold,
+        ),
     )
 
 
@@ -349,6 +378,8 @@ def _run_attempts(
     attempts: int,
     bare_threshold: float,
     sccache_threshold: float,
+    cold_bare_threshold: float,
+    cold_sccache_threshold: float,
     languages: tuple[str, ...],
     benchmark_language: str | None,
     benchmark_binary: Path | None,
@@ -377,6 +408,8 @@ def _run_attempts(
             parsed_attempts,
             bare_threshold=bare_threshold,
             sccache_threshold=sccache_threshold,
+            cold_bare_threshold=cold_bare_threshold,
+            cold_sccache_threshold=cold_sccache_threshold,
             command_failures=command_failures,
             languages=languages,
         )
@@ -391,9 +424,31 @@ def main() -> int:
     parser.add_argument("--input-log", type=Path, help="Evaluate a saved benchmark log.")
     parser.add_argument("--run-benchmarks", action="store_true", help="Run perf benchmarks.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--threshold", type=float, help="Set both thresholds to this value.")
-    parser.add_argument("--bare-threshold", type=float, default=DEFAULT_BARE_THRESHOLD)
-    parser.add_argument("--sccache-threshold", type=float, default=DEFAULT_SCCACHE_THRESHOLD)
+    parser.add_argument("--threshold", type=float, help="Set all thresholds to this value.")
+    parser.add_argument(
+        "--bare-threshold",
+        type=float,
+        default=DEFAULT_BARE_THRESHOLD,
+        help="Warm-row bare compiler / zccache floor.",
+    )
+    parser.add_argument(
+        "--sccache-threshold",
+        type=float,
+        default=DEFAULT_SCCACHE_THRESHOLD,
+        help="Warm-row pinned sccache / zccache floor.",
+    )
+    parser.add_argument(
+        "--cold-bare-threshold",
+        type=float,
+        default=DEFAULT_COLD_BARE_THRESHOLD,
+        help="Cold-row bare compiler / zccache floor.",
+    )
+    parser.add_argument(
+        "--cold-sccache-threshold",
+        type=float,
+        default=DEFAULT_COLD_SCCACHE_THRESHOLD,
+        help="Cold-row pinned sccache / zccache floor.",
+    )
     parser.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS)
     parser.add_argument(
         "--benchmark-binary",
@@ -410,10 +465,16 @@ def main() -> int:
     if args.threshold is not None:
         args.bare_threshold = args.threshold
         args.sccache_threshold = args.threshold
+        args.cold_bare_threshold = args.threshold
+        args.cold_sccache_threshold = args.threshold
     if args.bare_threshold <= 0:
         parser.error("--bare-threshold must be greater than zero")
     if args.sccache_threshold <= 0:
         parser.error("--sccache-threshold must be greater than zero")
+    if args.cold_bare_threshold <= 0:
+        parser.error("--cold-bare-threshold must be greater than zero")
+    if args.cold_sccache_threshold <= 0:
+        parser.error("--cold-sccache-threshold must be greater than zero")
     if args.attempts < 1:
         parser.error("--attempts must be at least 1")
     if bool(args.input_log) == bool(args.run_benchmarks):
@@ -442,6 +503,8 @@ def main() -> int:
             args.attempts,
             args.bare_threshold,
             args.sccache_threshold,
+            args.cold_bare_threshold,
+            args.cold_sccache_threshold,
             languages,
             args.language,
             args.benchmark_binary,
@@ -451,10 +514,18 @@ def main() -> int:
         attempts,
         bare_threshold=args.bare_threshold,
         sccache_threshold=args.sccache_threshold,
+        cold_bare_threshold=args.cold_bare_threshold,
+        cold_sccache_threshold=args.cold_sccache_threshold,
         command_failures=command_failures,
         languages=languages,
     )
-    markdown = format_report(report, args.bare_threshold, args.sccache_threshold)
+    markdown = format_report(
+        report,
+        args.bare_threshold,
+        args.sccache_threshold,
+        args.cold_bare_threshold,
+        args.cold_sccache_threshold,
+    )
     report_path = args.output_dir / "perf-guard-summary.md"
     report_path.write_text(markdown, encoding="utf-8")
     write_report_json(
@@ -463,6 +534,8 @@ def main() -> int:
         args.bare_threshold,
         args.sccache_threshold,
         languages,
+        cold_bare_threshold=args.cold_bare_threshold,
+        cold_sccache_threshold=args.cold_sccache_threshold,
     )
     print(markdown)
     _append_step_summary(markdown)
