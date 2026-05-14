@@ -141,6 +141,139 @@ jobs:
           path: perf-guard-output
           if-no-files-found: warn
 
+      # When the perf guard regresses, re-run the language's benchmarks under
+      # `perf record` and turn the captured stacks into a flamegraph + top-N
+      # report. The dev test binary is already built with
+      # debug = "line-tables-only" (see [profile.dev] in Cargo.toml), so the
+      # captured samples resolve to zccache_* function names + source lines.
+      # This step is best-effort — its `exit 0` keeps the job moving on to
+      # `Print perf guard result`, which is what actually fails the job.
+      - name: Profile failing perf guard run
+        id: profile_failure
+        if: steps.perf_guard.outputs.status != '0'
+        shell: bash
+        run: |
+          set +e
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            linux-tools-common \
+            linux-tools-generic \
+            "linux-tools-$(uname -r)" \
+            || sudo apt-get install -y -qq linux-tools-common linux-tools-generic
+          cargo install inferno --locked --quiet
+
+          # Allow `perf record` to capture without elevated privileges.
+          echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid >/dev/null
+          echo 0 | sudo tee /proc/sys/kernel/kptr_restrict >/dev/null
+
+          mkdir -p perf-profile-output
+          pushd perf-profile-output >/dev/null
+
+          # Which tests belong to the failing language? `benchmark_stats`
+          # already encodes that mapping — re-use it instead of duplicating
+          # the list in YAML.
+          TEST_NAMES="$(python3 -c "from ci import benchmark_stats; \
+            print(' '.join(benchmark_stats.BENCHMARK_TESTS_BY_LANGUAGE['${{ matrix.language }}']))")"
+
+          for test_name in $TEST_NAMES; do
+            echo "::group::perf record: $test_name"
+            perf record \
+              -F 999 \
+              -g --call-graph dwarf \
+              -o "$test_name.perf.data" \
+              -- ../perf-guard-bin/perf_bench_test "$test_name" \
+                --nocapture --ignored --test-threads=1
+            record_status=$?
+            echo "perf record exit: $record_status"
+
+            if [[ -f "$test_name.perf.data" ]]; then
+              perf script -i "$test_name.perf.data" > "$test_name.script.txt" 2>/dev/null
+              if [[ -s "$test_name.script.txt" ]]; then
+                inferno-collapse-perf < "$test_name.script.txt" > "$test_name.collapsed.txt"
+                if [[ -s "$test_name.collapsed.txt" ]]; then
+                  inferno-flamegraph < "$test_name.collapsed.txt" > "$test_name.flamegraph.svg"
+
+                  # Top 20 hot stacks (inclusive sample count).
+                  # Folded format: "frame1;frame2;...;frameN COUNT"
+                  sort -rn -k2 -t' ' "$test_name.collapsed.txt" \
+                    | head -20 > "$test_name.top20-stacks.txt"
+
+                  # Top 20 hot leaf functions (self-time).
+                  awk -F';' '{
+                    n = split($NF, parts, " ")
+                    leaf = parts[1]
+                    cnt = parts[2] + 0
+                    tot[leaf] += cnt
+                  }
+                  END {
+                    for (k in tot) print tot[k], k
+                  }' "$test_name.collapsed.txt" \
+                    | sort -rn | head -20 > "$test_name.top20-self.txt"
+
+                  # Daemon-side hot leaves, restricted to zccache_* symbols.
+                  grep -E '^[0-9]+ (zccache|_ZN.*zccache)' "$test_name.top20-self.txt" \
+                    > "$test_name.top20-zccache.txt" || true
+                fi
+              fi
+            fi
+            echo "::endgroup::"
+          done
+
+          popd >/dev/null
+
+          # Compact step-summary so the failure reason and the hot frames
+          # are visible at a glance in the GitHub Actions UI.
+          {
+            echo "## Profiler results: ${{ matrix.label }} speed floor"
+            echo ""
+            echo "Full data (perf.data, flamegraph SVGs, folded stacks, top-N tables) is in the"
+            echo "\`perf-profile-${{ matrix.artifact }}\` artifact."
+            echo ""
+            shopt -s nullglob
+            for top_self in perf-profile-output/*.top20-self.txt; do
+              [[ -f "$top_self" ]] || continue
+              base="$(basename "$top_self" .top20-self.txt)"
+              echo "### $base"
+              echo ""
+              echo "**Top leaf functions (self samples × function):**"
+              echo ""
+              echo '```'
+              head -20 "$top_self"
+              echo '```'
+              echo ""
+              top_zc="perf-profile-output/$base.top20-zccache.txt"
+              if [[ -s "$top_zc" ]]; then
+                echo "**zccache-only leaves (filtered):**"
+                echo ""
+                echo '```'
+                head -20 "$top_zc"
+                echo '```'
+                echo ""
+              fi
+              top_stacks="perf-profile-output/$base.top20-stacks.txt"
+              if [[ -s "$top_stacks" ]]; then
+                echo "**Top 20 hot stacks (inclusive samples × full stack):**"
+                echo ""
+                echo '```'
+                head -20 "$top_stacks"
+                echo '```'
+                echo ""
+              fi
+            done
+            shopt -u nullglob
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit 0
+
+      - name: Upload profile artifacts
+        if: steps.perf_guard.outputs.status != '0'
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-profile-${{ matrix.artifact }}
+          path: perf-profile-output
+          if-no-files-found: warn
+
       - name: Print perf guard result
         if: always()
         shell: bash
