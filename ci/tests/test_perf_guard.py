@@ -1,3 +1,5 @@
+import json
+
 from ci import benchmark_stats, perf_guard
 
 
@@ -123,3 +125,52 @@ def test_report_marks_failed_rows():
     markdown = perf_guard.format_report(report, 1.5, 1.5)
 
     assert "| FAIL | rust | Rust rustc | Build, Cold | Bare rustc | 1.286x | 1.50x | 1 | 1 |" in markdown
+
+
+def test_report_json_marks_thresholds_and_failed_statuses():
+    report = perf_guard.evaluate_attempts([rows(FAILING_RUST_LOG)], threshold=1.5)
+    payload = perf_guard.format_report_json(report, 1.5, 1.5)
+
+    assert payload["schema_version"] == 1
+    assert payload["passed"] is False
+    assert payload["thresholds"] == {"bare": 1.5, "sccache": 1.5}
+    failing = [
+        status
+        for status in payload["statuses"]
+        if status["language"] == "rust"
+        and status["scenario"] == "Build, Cold"
+        and not status["passed"]
+    ]
+    assert {status["baseline"] for status in failing} == {"bare", "sccache"}
+
+
+def test_report_json_passed_is_boolean_when_no_rows_parse():
+    report = perf_guard.evaluate_attempts([[]], threshold=1.5)
+    payload = perf_guard.format_report_json(report, 1.5, 1.5)
+
+    assert payload["passed"] is False
+
+
+def test_writes_perf_guard_json_artifacts(tmp_path):
+    parsed_rows = rows(PASSING_LOG)
+    report = perf_guard.evaluate_attempts([parsed_rows], threshold=1.5)
+
+    perf_guard.write_attempt_json(
+        tmp_path,
+        1,
+        parsed_rows,
+        0,
+        source="unit-test",
+    )
+    perf_guard.write_report_json(tmp_path, report, 1.5, 1.5)
+
+    attempt_payload = json.loads((tmp_path / "attempt-1.json").read_text(encoding="utf-8"))
+    summary_payload = json.loads(
+        (tmp_path / "perf-guard-summary.json").read_text(encoding="utf-8")
+    )
+
+    assert attempt_payload["source"] == "unit-test"
+    assert attempt_payload["returncode"] == 0
+    assert attempt_payload["row_count"] == len(parsed_rows)
+    assert summary_payload["passed"] is True
+    assert all(status["passed"] for status in summary_payload["statuses"])

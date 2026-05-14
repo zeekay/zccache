@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -62,7 +63,7 @@ class GuardReport:
         return (
             not self.missing_requirements
             and len(self.command_failures) < self.attempt_count
-            and self.statuses
+            and bool(self.statuses)
             and all(status.passed for status in self.statuses)
         )
 
@@ -214,6 +215,79 @@ def format_report(
     return "\n".join(lines) + "\n"
 
 
+def format_report_json(
+    report: GuardReport,
+    bare_threshold: float,
+    sccache_threshold: float,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "passed": report.passed,
+        "thresholds": {
+            "bare": bare_threshold,
+            "sccache": sccache_threshold,
+        },
+        "attempt_count": report.attempt_count,
+        "command_failures": report.command_failures,
+        "missing_requirements": report.missing_requirements,
+        "statuses": [
+            {
+                "passed": status.passed,
+                "benchmark": status.key.benchmark,
+                "benchmark_label": status.benchmark_label,
+                "language": status.language,
+                "mode": status.mode,
+                "scenario": status.scenario,
+                "baseline": status.baseline,
+                "baseline_label": status.baseline_label,
+                "threshold": status.threshold,
+                "best_ratio": status.best_ratio,
+                "best_attempt": status.best_attempt,
+                "attempts_seen": status.attempts_seen,
+            }
+            for status in report.statuses
+        ],
+    }
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def write_attempt_json(
+    output_dir: Path,
+    attempt: int,
+    rows: list[dict[str, Any]],
+    returncode: int | None,
+    *,
+    source: str,
+) -> None:
+    _write_json(
+        output_dir / f"attempt-{attempt}.json",
+        {
+            "schema_version": 1,
+            "attempt": attempt,
+            "source": source,
+            "returncode": returncode,
+            "row_count": len(rows),
+            "rows": rows,
+        },
+    )
+
+
+def write_report_json(
+    output_dir: Path,
+    report: GuardReport,
+    bare_threshold: float,
+    sccache_threshold: float,
+) -> None:
+    _write_json(
+        output_dir / "perf-guard-summary.json",
+        format_report_json(report, bare_threshold, sccache_threshold),
+    )
+
+
 def _append_step_summary(markdown: str) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
@@ -242,6 +316,13 @@ def _run_attempts(
         returncode, output = run_benchmarks_once(log_path)
         rows = benchmark_stats.parse_benchmark_log(output)
         parsed_attempts.append(rows)
+        write_attempt_json(
+            output_dir,
+            attempt,
+            rows,
+            returncode,
+            source="benchmark-run",
+        )
         if returncode != 0:
             command_failures.append(attempt)
 
@@ -283,6 +364,13 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.input_log:
         attempts = _load_input_log(args.input_log)
+        write_attempt_json(
+            args.output_dir,
+            1,
+            attempts[0],
+            None,
+            source="input-log",
+        )
         command_failures: list[int] = []
     else:
         attempts, command_failures = _run_attempts(
@@ -301,6 +389,7 @@ def main() -> int:
     markdown = format_report(report, args.bare_threshold, args.sccache_threshold)
     report_path = args.output_dir / "perf-guard-summary.md"
     report_path.write_text(markdown, encoding="utf-8")
+    write_report_json(args.output_dir, report, args.bare_threshold, args.sccache_threshold)
     print(markdown)
     _append_step_summary(markdown)
 
