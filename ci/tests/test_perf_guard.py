@@ -110,6 +110,18 @@ def test_missing_required_language_mode_fails():
     assert report.missing_requirements == ["c cold", "c warm"]
 
 
+def test_language_filter_requires_only_selected_language():
+    report = perf_guard.evaluate_attempts(
+        [rows(MISSING_C_LOG)],
+        threshold=1.5,
+        languages=("rust",),
+    )
+
+    assert report.passed
+    assert not report.missing_requirements
+    assert {status.language for status in report.statuses} == {"rust"}
+
+
 def test_all_command_failures_fail_even_when_rows_parse():
     report = perf_guard.evaluate_attempts(
         [rows(PASSING_LOG), rows(PASSING_LOG)],
@@ -133,6 +145,7 @@ def test_report_json_marks_thresholds_and_failed_statuses():
 
     assert payload["schema_version"] == 1
     assert payload["passed"] is False
+    assert payload["languages"] == ["c", "c++", "rust"]
     assert payload["thresholds"] == {"bare": 1.5, "sccache": 1.5}
     failing = [
         status
@@ -161,8 +174,9 @@ def test_writes_perf_guard_json_artifacts(tmp_path):
         parsed_rows,
         0,
         source="unit-test",
+        language="c",
     )
-    perf_guard.write_report_json(tmp_path, report, 1.5, 1.5)
+    perf_guard.write_report_json(tmp_path, report, 1.5, 1.5, ("c",))
 
     attempt_payload = json.loads((tmp_path / "attempt-1.json").read_text(encoding="utf-8"))
     summary_payload = json.loads(
@@ -170,7 +184,22 @@ def test_writes_perf_guard_json_artifacts(tmp_path):
     )
 
     assert attempt_payload["source"] == "unit-test"
+    assert attempt_payload["language"] == "c"
     assert attempt_payload["returncode"] == 0
     assert attempt_payload["row_count"] == len(parsed_rows)
     assert summary_payload["passed"] is True
+    assert summary_payload["languages"] == ["c"]
     assert all(status["passed"] for status in summary_payload["statuses"])
+
+
+def test_benchmark_language_commands_are_filtered():
+    c_commands = benchmark_stats.benchmark_commands_for_language("c")
+    cpp_commands = benchmark_stats.benchmark_commands_for_language("c++")
+    rust_commands = benchmark_stats.benchmark_commands_for_language("rust")
+
+    assert [command[-4] for command in c_commands] == ["perf_c_zccache_vs_bare"]
+    assert [command[-4] for command in cpp_commands] == [
+        "perf_warm_cache_zccache_vs_sccache",
+        "perf_response_file",
+    ]
+    assert [command[-4] for command in rust_commands] == ["perf_rustc_zccache_vs_sccache"]
