@@ -20,6 +20,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--binary-ext", default="", help="Executable suffix, e.g. .exe")
     parser.add_argument("--input-dir", type=Path, required=True, help="Directory containing built binaries")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory to write archives into")
+    parser.add_argument(
+        "--debug-input-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional directory with per-binary debug symbol files "
+            "(.dwp/.dSYM/.pdb). When set, an additional <root>-debug archive is "
+            "produced alongside the regular binary archive."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -67,6 +77,41 @@ def write_zip(stage_dir: Path, archive_base: Path) -> Path:
     return archive_path
 
 
+def stage_debug_tree(
+    version: str,
+    target: str,
+    debug_input_dir: Path,
+    output_dir: Path,
+) -> tuple[Path, Path] | None:
+    """Stage debug-symbol sidecars into <root>-debug for a separate archive.
+
+    Copies anything present in the debug input dir (.dwp/.dSYM/.pdb). Returns
+    None when the input dir is empty so the caller can skip packaging an empty
+    archive.
+    """
+    if not debug_input_dir.exists():
+        return None
+    entries = [path for path in debug_input_dir.iterdir() if not path.name.startswith(".")]
+    if not entries:
+        return None
+
+    tag = normalize_version(version)
+    root_name = f"zccache-{tag}-{target}-debug"
+    stage_dir = output_dir / root_name
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir)
+    stage_dir.mkdir(parents=True)
+
+    for entry in entries:
+        target_path = stage_dir / entry.name
+        if entry.is_dir():
+            shutil.copytree(entry, target_path)
+        else:
+            shutil.copy2(entry, target_path)
+
+    return stage_dir, output_dir / root_name
+
+
 def main() -> None:
     args = parse_args()
     output_dir = args.output_dir.resolve()
@@ -86,6 +131,21 @@ def main() -> None:
         archive = write_tarball(stage_dir, archive_base)
 
     print(archive)
+
+    if args.debug_input_dir is not None:
+        debug_staged = stage_debug_tree(
+            version=args.version,
+            target=args.target,
+            debug_input_dir=args.debug_input_dir.resolve(),
+            output_dir=output_dir,
+        )
+        if debug_staged is not None:
+            debug_stage_dir, debug_archive_base = debug_staged
+            if args.binary_ext == ".exe":
+                debug_archive = write_zip(debug_stage_dir, debug_archive_base)
+            else:
+                debug_archive = write_tarball(debug_stage_dir, debug_archive_base)
+            print(debug_archive)
 
 
 if __name__ == "__main__":
