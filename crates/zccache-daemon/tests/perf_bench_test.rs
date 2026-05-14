@@ -736,15 +736,34 @@ fn fmt_dur(d: Duration) -> String {
 }
 
 fn print_trials(label: &str, times: &[Duration]) {
+    print_trials_per(label, times, None);
+}
+
+/// Like `print_trials` but also reports per-call latency when `files_per_trial`
+/// is known. Useful when a single trial sums N sequential cache lookups so the
+/// reader can see whether the per-call cost is in the expected ~1ms range or
+/// taking a slow path.
+fn print_trials_per(label: &str, times: &[Duration], files_per_trial: Option<usize>) {
     let med = median(times);
     let min = times.iter().min().unwrap();
     let max = times.iter().max().unwrap();
-    eprintln!(
-        "        {label:<14}{} ({} \u{2013} {})",
-        fmt_dur(med),
-        fmt_dur(*min),
-        fmt_dur(*max),
-    );
+    if let Some(n) = files_per_trial {
+        let per_call_ms = (med.as_secs_f64() / n as f64) * 1000.0;
+        eprintln!(
+            "        {label:<14}{} ({} \u{2013} {}) -> {:.2} ms/call \u{00d7} {n}",
+            fmt_dur(med),
+            fmt_dur(*min),
+            fmt_dur(*max),
+            per_call_ms,
+        );
+    } else {
+        eprintln!(
+            "        {label:<14}{} ({} \u{2013} {})",
+            fmt_dur(med),
+            fmt_dur(*min),
+            fmt_dur(*max),
+        );
+    }
 }
 
 fn fmt_ratio(baseline: Duration, test: Duration, bold: bool) -> String {
@@ -2262,7 +2281,7 @@ async fn perf_cpp_sibling_remap_warm() {
     for _ in 0..WARM_TRIALS {
         bl_warm.push(baseline_single(&compiler, &workspace_b, &sources));
     }
-    print_trials("warm:", &bl_warm);
+    print_trials_per("warm:", &bl_warm, Some(NUM_FILES));
     eprintln!();
 
     // ── sccache warm in workspace B ────────────────────────────────────
@@ -2293,7 +2312,7 @@ async fn perf_cpp_sibling_remap_warm() {
                 &sources,
             ));
         }
-        print_trials("warm:", &warm);
+        print_trials_per("warm:", &warm, Some(NUM_FILES));
         let _ = std::process::Command::new(&sccache_bin)
             .arg("--stop-server")
             .stdout(std::process::Stdio::null())
@@ -2355,7 +2374,7 @@ async fn perf_cpp_sibling_remap_warm() {
             .await,
         );
     }
-    print_trials("warm:", &zc_warm);
+    print_trials_per("warm:", &zc_warm, Some(NUM_FILES));
 
     end_zccache_session(&mut client, session_b).await;
     shutdown.notify_one();
@@ -2437,7 +2456,7 @@ async fn perf_rustc_sibling_remap_warm() {
     for _ in 0..RUSTC_WARM_TRIALS {
         bl_warm.push(run_rustc_batch(&rc, &workspace_b, &srcs, rustc_args_for));
     }
-    print_trials("warm:", &bl_warm);
+    print_trials_per("warm:", &bl_warm, Some(RUSTC_NUM_FILES));
     eprintln!();
 
     // ── sccache warm in workspace B ────────────────────────────────────
@@ -2469,7 +2488,7 @@ async fn perf_rustc_sibling_remap_warm() {
                 rustc_args_for,
             ));
         }
-        print_trials("warm:", &warm);
+        print_trials_per("warm:", &warm, Some(RUSTC_NUM_FILES));
         let _ = std::process::Command::new(&scc_bin)
             .arg("--stop-server")
             .stdout(std::process::Stdio::null())
@@ -2531,7 +2550,7 @@ async fn perf_rustc_sibling_remap_warm() {
             .await,
         );
     }
-    print_trials("warm:", &zc_warm);
+    print_trials_per("warm:", &zc_warm, Some(RUSTC_NUM_FILES));
 
     end_zccache_session(&mut cl, session_b).await;
     sd.notify_one();
@@ -2883,7 +2902,7 @@ async fn perf_emcc_sibling_remap_warm() {
     for _ in 0..WARM_TRIALS {
         bl_warm.push(baseline_single(&compiler, &workspace_b, &sources));
     }
-    print_trials("warm:", &bl_warm);
+    print_trials_per("warm:", &bl_warm, Some(NUM_FILES));
     eprintln!();
 
     // ── sccache em++ warm in workspace B ──────────────────────────────
@@ -2914,7 +2933,7 @@ async fn perf_emcc_sibling_remap_warm() {
                 &sources,
             ));
         }
-        print_trials("warm:", &warm);
+        print_trials_per("warm:", &warm, Some(NUM_FILES));
         let _ = std::process::Command::new(&sccache_bin)
             .arg("--stop-server")
             .stdout(std::process::Stdio::null())
@@ -2972,7 +2991,7 @@ async fn perf_emcc_sibling_remap_warm() {
             .await,
         );
     }
-    print_trials("warm:", &zc_warm);
+    print_trials_per("warm:", &zc_warm, Some(NUM_FILES));
 
     end_zccache_session(&mut client, session_b).await;
     shutdown.notify_one();
