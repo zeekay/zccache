@@ -115,9 +115,10 @@ jobs:
         run: chmod +x perf-guard-bin/perf_bench_test
 
       - name: Run perf regression guard
+        id: perf_guard
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
           python3 -m ci.perf_guard \
             --run-benchmarks \
             --language "${{ matrix.language }}" \
@@ -128,6 +129,9 @@ jobs:
             --attempts 3 \
             --benchmark-binary "$PWD/perf-guard-bin/perf_bench_test" \
             --output-dir perf-guard-output
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Upload perf guard artifacts
         if: always()
@@ -136,3 +140,31 @@ jobs:
           name: perf-guard-${{ matrix.artifact }}-output
           path: perf-guard-output
           if-no-files-found: warn
+
+      - name: Print perf guard result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          summary_path="perf-guard-output/perf-guard-summary.md"
+          result_path="perf-guard-output/perf-guard-result.txt"
+          status="${{ steps.perf_guard.outputs.status }}"
+          if [[ -f "$summary_path" ]]; then
+            cat "$summary_path"
+          fi
+          if [[ -f "$result_path" ]]; then
+            result="$(cat "$result_path")"
+          else
+            result="PERF GUARD FAILED: no perf guard result was produced."
+            status=1
+          fi
+          if [[ -z "$status" ]]; then
+            status=1
+          fi
+          if [[ "$status" != "0" ]]; then
+            echo "::error title=Perf guard failed::$result"
+            echo "$result"
+            exit 1
+          fi
+          echo "::notice title=Perf guard ok::$result"
+          echo "$result"
