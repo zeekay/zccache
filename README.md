@@ -443,6 +443,8 @@ A few things worth knowing:
   `-fcoverage-prefix-map`, and `-fprofile-prefix-map` do not. If cwd differs
   from the detected root and you have not supplied a matching
   `-ffile-prefix-map=<cwd>=.`, zccache may still inject one for that path.
+  Auto-injected remaps are fallback remaps placed before user-supplied remaps,
+  so a narrower overlapping user remap remains the later, winning rule.
 - Same-content guarantee. Cross-worktree hits validate content hashes for
   every input. If two worktrees have diverged on a file, the second compile
   misses and recompiles — the cache cannot be poisoned across siblings (the
