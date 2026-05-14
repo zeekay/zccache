@@ -295,6 +295,25 @@ export ZCCACHE_WORKTREE_ROOT="$PWD"
 RUSTC_WRAPPER=zccache cargo build
 ```
 
+For the planned path-remap feature, the common setup should be just:
+
+```bash
+export ZCCACHE_PATH_REMAP=auto
+```
+
+In auto mode, zccache should discover the Git worktree root automatically on
+macOS, Linux, and Windows. Set `ZCCACHE_WORKTREE_ROOT` only as an advanced
+override for non-Git checkouts or unusual build layouts where automatic root
+detection is not reliable.
+
+`ZCCACHE_PATH_REMAP=auto` tells zccache to apply compiler-specific path remaps
+when it can prove they are safe, such as C/C++ `-ffile-prefix-map`, Rust
+`--remap-path-prefix`, and platform equivalents. The goal is to make emitted
+source paths, debug paths, and macro paths stable across equivalent worktrees
+without requiring every build generator to spell those flags correctly. Physical
+paths that build tools need for dependency tracking, such as Ninja depfiles,
+must remain usable for the current checkout.
+
 The override should point at the logical project root shared by equivalent
 worktrees. Paths under that root may be normalized for cache identity. Paths
 outside that root remain absolute unless zccache has a specific safe rule for
@@ -673,6 +692,12 @@ path or across the same invocation. `absolute` also requires path flags such as
 `-I`, `-isystem`, `-include`, and `-include-pch` to be forward-slash absolute
 paths without `/./` or `/../` segments. Violations exit non-zero with the
 offending flag and full caller command.
+
+**Path remap auto mode:** Planned C/C++ worktree sharing uses
+`ZCCACHE_PATH_REMAP=auto` to let zccache inject and key compiler path remaps
+internally for clang/gcc/emcc builds. This keeps Ninja, Meson, CMake, and Make
+commands simple while allowing sibling checkouts to share artifacts when
+compiler-visible source/debug paths are equivalent.
 
 **Single-roundtrip IPC:** In drop-in mode, zccache sends a single
 `CompileEphemeral` message that combines session creation, compilation, and
