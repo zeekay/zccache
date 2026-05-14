@@ -156,6 +156,28 @@ fn normalize_remap_path_prefix_for_key(remap: &str, key_root: Option<&Path>) -> 
     }
 }
 
+fn normalize_cxx_prefix_map_flag_for_key(flag: &str, key_root: Option<&Path>) -> String {
+    const PREFIX_MAP_FLAGS: [&str; 5] = [
+        "-ffile-prefix-map=",
+        "-fdebug-prefix-map=",
+        "-fmacro-prefix-map=",
+        "-fcoverage-prefix-map=",
+        "-fprofile-prefix-map=",
+    ];
+
+    for prefix in PREFIX_MAP_FLAGS {
+        if let Some(remap) = flag.strip_prefix(prefix) {
+            return format!(
+                "{}{}",
+                prefix,
+                normalize_remap_path_prefix_for_key(remap, key_root)
+            );
+        }
+    }
+
+    flag.to_string()
+}
+
 /// Compute the context key for a C/C++ compilation context.
 ///
 /// When `key_root` is provided, paths under that root are hashed relative to it
@@ -201,6 +223,7 @@ pub fn compute_context_key(ctx: &CompileContext, key_root: Option<&Path>) -> Con
 
     hasher.update(b"flags\0");
     for flag in &ctx.flags {
+        let flag = normalize_cxx_prefix_map_flag_for_key(flag, key_root);
         hasher.update(flag.as_bytes());
         hasher.update(b"\0");
     }
@@ -213,6 +236,7 @@ pub fn compute_context_key(ctx: &CompileContext, key_root: Option<&Path>) -> Con
 
     hasher.update(b"unknown\0");
     for flag in &ctx.unknown_flags {
+        let flag = normalize_cxx_prefix_map_flag_for_key(flag, key_root);
         hasher.update(flag.as_bytes());
         hasher.update(b"\0");
     }
@@ -851,6 +875,72 @@ mod tests {
         let key_b = compute_context_key(&ctx_b, Some(Path::new("/workspace-b")));
 
         assert_eq!(key_a, key_b);
+    }
+
+    #[test]
+    fn cxx_context_key_with_root_normalizes_file_prefix_map_roots() {
+        let mut ctx_a = make_context("/workspace-a/src/main.cpp", &[], &[]);
+        ctx_a.flags = vec!["-ffile-prefix-map=/workspace-a=.".to_string()];
+        let mut ctx_b = make_context("/workspace-b/src/main.cpp", &[], &[]);
+        ctx_b.flags = vec!["-ffile-prefix-map=/workspace-b=.".to_string()];
+
+        assert_eq!(
+            compute_context_key(&ctx_a, Some(Path::new("/workspace-a"))),
+            compute_context_key(&ctx_b, Some(Path::new("/workspace-b"))),
+            "equivalent file-prefix-map old prefixes under the key root should match"
+        );
+    }
+
+    #[test]
+    fn cxx_context_key_with_root_preserves_file_prefix_map_new_prefixes() {
+        let mut ctx_a = make_context("/workspace-a/src/main.cpp", &[], &[]);
+        ctx_a.flags = vec!["-ffile-prefix-map=/workspace-a=.".to_string()];
+        let mut ctx_b = make_context("/workspace-b/src/main.cpp", &[], &[]);
+        ctx_b.flags = vec!["-ffile-prefix-map=/workspace-b=/src".to_string()];
+
+        assert_ne!(
+            compute_context_key(&ctx_a, Some(Path::new("/workspace-a"))),
+            compute_context_key(&ctx_b, Some(Path::new("/workspace-b"))),
+            "different file-prefix-map new prefixes should remain key-significant"
+        );
+    }
+
+    #[test]
+    fn cxx_context_key_with_root_keeps_external_file_prefix_map_old_prefixes_distinct() {
+        let mut ctx_a = make_context("/workspace-a/src/main.cpp", &[], &[]);
+        ctx_a.flags = vec!["-ffile-prefix-map=/external-a=.".to_string()];
+        let mut ctx_b = make_context("/workspace-b/src/main.cpp", &[], &[]);
+        ctx_b.flags = vec!["-ffile-prefix-map=/external-b=.".to_string()];
+
+        assert_ne!(
+            compute_context_key(&ctx_a, Some(Path::new("/workspace-a"))),
+            compute_context_key(&ctx_b, Some(Path::new("/workspace-b"))),
+            "file-prefix-map old prefixes outside the key root should keep absolute identity"
+        );
+    }
+
+    #[test]
+    fn cxx_context_key_with_root_normalizes_prefix_maps_in_unknown_flags() {
+        let mut ctx_a = make_context("/workspace-a/src/main.cpp", &[], &[]);
+        ctx_a.unknown_flags = vec![
+            "-fcoverage-prefix-map=/workspace-a=/coverage".to_string(),
+            "-fdebug-prefix-map=/workspace-a=/debug".to_string(),
+            "-fmacro-prefix-map=/workspace-a=/macro".to_string(),
+            "-fprofile-prefix-map=/workspace-a=/profile".to_string(),
+        ];
+        let mut ctx_b = make_context("/workspace-b/src/main.cpp", &[], &[]);
+        ctx_b.unknown_flags = vec![
+            "-fcoverage-prefix-map=/workspace-b=/coverage".to_string(),
+            "-fdebug-prefix-map=/workspace-b=/debug".to_string(),
+            "-fmacro-prefix-map=/workspace-b=/macro".to_string(),
+            "-fprofile-prefix-map=/workspace-b=/profile".to_string(),
+        ];
+
+        assert_eq!(
+            compute_context_key(&ctx_a, Some(Path::new("/workspace-a"))),
+            compute_context_key(&ctx_b, Some(Path::new("/workspace-b"))),
+            "C/C++ prefix-map flags should normalize under unknown_flags"
+        );
     }
 
     #[test]

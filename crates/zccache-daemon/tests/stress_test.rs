@@ -63,13 +63,24 @@ async fn compile(
     args: &[&str],
     cwd: &str,
 ) -> (i32, bool) {
+    compile_with_env(client, session_id, compiler, args, cwd, None).await
+}
+
+async fn compile_with_env(
+    client: &mut ClientConn,
+    session_id: &str,
+    compiler: &str,
+    args: &[&str],
+    cwd: &str,
+    env: Option<Vec<(String, String)>>,
+) -> (i32, bool) {
     client
         .send(&Request::Compile {
             session_id: session_id.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.to_string().into(),
             compiler: compiler.to_string().into(),
-            env: None,
+            env,
         })
         .await
         .unwrap();
@@ -80,6 +91,28 @@ async fn compile(
         Some(Response::Error { message }) => panic!("compile error: {message}"),
         other => panic!("expected CompileResult, got: {other:?}"),
     }
+}
+
+fn client_env_with_path_remap_auto() -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            let value = value.into_string().ok()?;
+            let root_var = key.eq_ignore_ascii_case("ZCCACHE_WORKTREE_ROOT");
+            let remap_var = key.eq_ignore_ascii_case("ZCCACHE_PATH_REMAP");
+            (!root_var && !remap_var).then_some((key, value))
+        })
+        .collect();
+    env.push(("ZCCACHE_PATH_REMAP".to_string(), "auto".to_string()));
+    env
+}
+
+fn bytes_contain(haystack: &[u8], needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -841,6 +874,98 @@ async fn adversarial_workspace_rename_hits_cache() {
         std::fs::read(&obj_a).unwrap(),
         std::fs::read(&obj_b).unwrap()
     );
+
+    shutdown.notify_one();
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore] // integration: spawns clang twice, run with --full
+async fn path_remap_auto_compiles_file_macro_stably_across_git_roots() {
+    let clang = match zccache_test_support::find_clang() {
+        Some(p) => p,
+        None => return,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_a = tmp.path().join("workspace-a");
+    let ws_b = tmp.path().join("workspace-b");
+    let src_rel = std::path::Path::new("src").join("main.cpp");
+    let obj_rel = std::path::Path::new("build").join("main.o");
+    for ws in [&ws_a, &ws_b] {
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(ws.join("build")).unwrap();
+        std::fs::write(
+            ws.join(&src_rel),
+            "const char* source_file = __FILE__;\nint main() { return source_file[0] == 0; }\n",
+        )
+        .unwrap();
+    }
+    let log = tmp.path().join("path-remap-auto.log");
+
+    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let env = client_env_with_path_remap_auto();
+
+    let mut client_a = zccache_ipc::connect(&endpoint).await.unwrap();
+    let cwd_a = ws_a.to_string_lossy().into_owned();
+    let (sid_a, comp_a) =
+        start_session(&mut client_a, &clang, &cwd_a, &log.to_string_lossy()).await;
+    let src_a = ws_a.join(&src_rel);
+    let obj_a = ws_a.join(&obj_rel);
+    let (ec, cached) = compile_with_env(
+        &mut client_a,
+        &sid_a,
+        &comp_a,
+        &[
+            "-g0",
+            "-c",
+            &src_a.to_string_lossy(),
+            "-o",
+            &obj_a.to_string_lossy(),
+        ],
+        &cwd_a,
+        Some(env.clone()),
+    )
+    .await;
+    assert_eq!(ec, 0);
+    assert!(!cached);
+    let obj_a_bytes = std::fs::read(&obj_a).unwrap();
+    assert!(
+        !bytes_contain(&obj_a_bytes, &ws_a.to_string_lossy()),
+        "auto path remap should keep root A out of __FILE__ object bytes"
+    );
+    assert!(
+        !bytes_contain(&obj_a_bytes, &ws_a.to_string_lossy().replace('\\', "/")),
+        "auto path remap should keep slash-normalized root A out of __FILE__ object bytes"
+    );
+
+    let mut client_b = zccache_ipc::connect(&endpoint).await.unwrap();
+    let cwd_b = ws_b.to_string_lossy().into_owned();
+    let (sid_b, comp_b) =
+        start_session(&mut client_b, &clang, &cwd_b, &log.to_string_lossy()).await;
+    let src_b = ws_b.join(&src_rel);
+    let obj_b = ws_b.join(&obj_rel);
+    let (ec, cached) = compile_with_env(
+        &mut client_b,
+        &sid_b,
+        &comp_b,
+        &[
+            "-g0",
+            "-c",
+            &src_b.to_string_lossy(),
+            "-o",
+            &obj_b.to_string_lossy(),
+        ],
+        &cwd_b,
+        Some(env),
+    )
+    .await;
+    assert_eq!(ec, 0);
+    assert!(
+        cached,
+        "ZCCACHE_PATH_REMAP=auto should make equivalent __FILE__ compiles hit"
+    );
+    assert_eq!(obj_a_bytes, std::fs::read(&obj_b).unwrap());
 
     shutdown.notify_one();
     server_handle.await.unwrap();
