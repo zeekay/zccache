@@ -90,10 +90,6 @@ impl CompilerHashCache {
         }
     }
 
-    fn clear(&self) {
-        self.entries.clear();
-    }
-
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
@@ -133,19 +129,27 @@ impl CompilerHashCache {
 }
 
 #[derive(Clone)]
+pub(crate) enum CachedPayload {
+    /// Payload bytes already resident in memory.
+    Bytes(Arc<Vec<u8>>),
+    /// Payload bytes are available in a cache file.
+    File(NormalizedPath),
+}
+
+#[derive(Clone)]
 /// Cached compilation artifact with lazy payload loading.
 ///
 /// Metadata (output names, sizes, stdout, stderr, exit code) is always in
-/// memory after startup.  Output payloads (`{key}_0` file bytes) are loaded
-/// lazily on the first cache hit to avoid reading gigabytes at startup.
+/// memory after startup. Output payloads are either already in memory or are
+/// represented by cache files so hits can hardlink without eager reads.
 pub(crate) struct CachedArtifact {
     pub(crate) meta: ArtifactIndex,
     /// Arc-wrapped stdout/stderr for cheap IPC response clones.
     pub(crate) stdout: Arc<Vec<u8>>,
     pub(crate) stderr: Arc<Vec<u8>>,
-    /// Lazily-loaded output payloads. `None` = not yet loaded from disk.
+    /// Lazily-resolved output payloads. `None` = not yet checked on disk.
     /// Arc-wrapped so cache-hit clones are O(1) refcount bumps.
-    pub(crate) payloads: Option<Arc<[Arc<Vec<u8>>]>>,
+    pub(crate) payloads: Option<Arc<[CachedPayload]>>,
     /// When this artifact was last used (inserted or returned as a hit).
     pub(crate) last_used: std::time::Instant,
 }
@@ -172,14 +176,32 @@ impl CachedArtifact {
                 artifact
                     .outputs
                     .iter()
-                    .map(|o| Arc::clone(&o.data))
+                    .map(|o| CachedPayload::Bytes(Arc::clone(&o.data)))
                     .collect::<Vec<_>>(),
             )),
             last_used: std::time::Instant::now(),
         }
     }
 
-    /// Create from index metadata (lazy — payloads not loaded yet).
+    /// Create from index metadata and already-created payload files.
+    fn from_file_payloads(meta: ArtifactIndex, payloads: Vec<NormalizedPath>) -> Self {
+        let stdout = Arc::clone(&meta.stdout);
+        let stderr = Arc::clone(&meta.stderr);
+        Self {
+            meta,
+            stdout,
+            stderr,
+            payloads: Some(Arc::from(
+                payloads
+                    .into_iter()
+                    .map(CachedPayload::File)
+                    .collect::<Vec<_>>(),
+            )),
+            last_used: std::time::Instant::now(),
+        }
+    }
+
+    /// Create from index metadata (lazy payloads not loaded yet).
     fn from_index(meta: ArtifactIndex) -> Self {
         let stdout = Arc::clone(&meta.stdout);
         let stderr = Arc::clone(&meta.stderr);
@@ -201,15 +223,24 @@ fn ensure_payloads<'a>(
     cached: &'a mut CachedArtifact,
     artifact_dir: &Path,
     key_hex: &str,
-) -> Option<&'a [Arc<Vec<u8>>]> {
+) -> Option<&'a [CachedPayload]> {
     if cached.payloads.is_none() {
         let mut payloads = Vec::with_capacity(cached.meta.output_names.len());
         for i in 0..cached.meta.output_names.len() {
             let path = artifact_dir.join(format!("{key_hex}_{i}"));
-            match std::fs::read(&path) {
-                Ok(data) => payloads.push(Arc::new(data)),
-                Err(_) => return None,
+            let meta = std::fs::metadata(&path).ok()?;
+            if !meta.is_file() {
+                return None;
             }
+            if cached
+                .meta
+                .output_sizes
+                .get(i)
+                .is_some_and(|expected| *expected != meta.len())
+            {
+                return None;
+            }
+            payloads.push(CachedPayload::File(path.into()));
         }
         cached.payloads = Some(Arc::from(payloads));
     }
@@ -1335,7 +1366,6 @@ async fn handle_clear(state: &SharedState) -> Response {
     state.fast_hit_cache.clear();
     state.request_cache.clear();
     state.rsp_cache.clear();
-    state.compiler_hash_cache.clear();
     state.watched_raw_dirs.clear();
     state.system_includes.lock().await.clear();
     state.watched_dirs.lock().await.clear();
@@ -1571,7 +1601,7 @@ async fn handle_link_ephemeral(
                     std::fs::create_dir_all(parent).ok();
                 }
                 let cache_file = state.artifact_dir.join(format!("{key_hex}_{i}"));
-                if write_cached_output(&target, &cache_file, payload).is_err() {
+                if write_cached_payload(&target, &cache_file, payload).is_err() {
                     write_ok = false;
                     break;
                 }
@@ -2323,6 +2353,13 @@ fn push_unique_output_path(paths: &mut Vec<NormalizedPath>, path: NormalizedPath
     }
 }
 
+#[derive(Clone)]
+struct RustcOutputFile {
+    name: String,
+    path: NormalizedPath,
+    size: u64,
+}
+
 fn rustc_expected_output_paths(
     rustc_args: &zccache_depgraph::RustcParsedArgs,
     primary_output_path: &Path,
@@ -2352,23 +2389,25 @@ fn rustc_expected_output_paths(
     paths
 }
 
-/// Collect all output files from a rustc compilation.
-///
-/// Returns `(primary_output_data, all_outputs)` where `all_outputs` includes
-/// the primary output and any additional files (rmeta, dep-info).
-fn collect_rustc_outputs(
+/// Collect output file metadata from a rustc compilation without reading bytes.
+fn collect_rustc_output_files(
     rustc_args: &zccache_depgraph::RustcParsedArgs,
     primary_output_path: &Path,
     cwd: &Path,
-) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
-    let primary_data = std::fs::read(primary_output_path).unwrap_or_default();
+) -> Vec<RustcOutputFile> {
+    let Ok(primary_meta) = std::fs::metadata(primary_output_path) else {
+        return Vec::new();
+    };
     let primary_name = primary_output_path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-
-    let mut outputs: Vec<(String, Vec<u8>)> = vec![(primary_name, primary_data.clone())];
+    let mut outputs = vec![RustcOutputFile {
+        name: primary_name,
+        path: NormalizedPath::new(primary_output_path),
+        size: primary_meta.len(),
+    }];
 
     // Find additional outputs based on --emit types
     let crate_name = rustc_args.crate_name.as_deref().unwrap_or("unknown");
@@ -2414,15 +2453,21 @@ fn collect_rustc_outputs(
                 .to_string_lossy()
                 .into_owned();
             // Avoid duplicates
-            if !outputs.iter().any(|(n, _)| n == &name) {
-                if let Ok(data) = std::fs::read(&path) {
-                    outputs.push((name, data));
+            if !outputs.iter().any(|existing| existing.name == name) {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if meta.is_file() {
+                        outputs.push(RustcOutputFile {
+                            name,
+                            path: path.into(),
+                            size: meta.len(),
+                        });
+                    }
                 }
             }
         }
     }
 
-    (primary_data, outputs)
+    outputs
 }
 
 fn artifact_persist_tmp_path(cache_path: &Path) -> PathBuf {
@@ -2442,6 +2487,25 @@ fn persist_artifact_output(cache_path: &Path, payload: &[u8]) -> std::io::Result
     let result = (|| {
         std::fs::write(&tmp_path, payload)?;
         replace_artifact_cache_file(&tmp_path, cache_path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+fn persist_artifact_file(cache_path: &Path, source_path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let tmp_path = artifact_persist_tmp_path(cache_path);
+    let result = (|| match std::fs::hard_link(source_path, &tmp_path) {
+        Ok(()) => replace_artifact_cache_file(&tmp_path, cache_path),
+        Err(_) => {
+            std::fs::copy(source_path, &tmp_path)?;
+            replace_artifact_cache_file(&tmp_path, cache_path)
+        }
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
@@ -2507,6 +2571,36 @@ fn write_cached_output(out_path: &Path, cache_file: &Path, data: &[u8]) -> std::
     // Hardlink failed entirely (cross-device, no cache file) — copy from memory.
     // fs::write creates a new file with current mtime, so no touch needed.
     std::fs::write(out_path, data)
+}
+
+fn write_cached_file(out_path: &Path, cache_file: &Path) -> std::io::Result<()> {
+    if std::fs::hard_link(cache_file, out_path).is_ok() {
+        touch_mtime(out_path);
+        return Ok(());
+    }
+    if same_file(out_path, cache_file) {
+        touch_mtime(out_path);
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(out_path);
+    if std::fs::hard_link(cache_file, out_path).is_ok() {
+        touch_mtime(out_path);
+        return Ok(());
+    }
+    std::fs::copy(cache_file, out_path)?;
+    touch_mtime(out_path);
+    Ok(())
+}
+
+fn write_cached_payload(
+    out_path: &Path,
+    cache_file: &Path,
+    payload: &CachedPayload,
+) -> std::io::Result<()> {
+    match payload {
+        CachedPayload::Bytes(data) => write_cached_output(out_path, cache_file, data),
+        CachedPayload::File(path) => write_cached_file(out_path, path),
+    }
 }
 
 fn break_output_hardlink_before_compile(path: &Path) -> std::io::Result<()> {
@@ -2987,7 +3081,7 @@ async fn handle_compile(
                                 };
                                 let cache_file =
                                     state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                                if write_cached_output(&out_path, &cache_file, payload).is_err() {
+                                if write_cached_payload(&out_path, &cache_file, payload).is_err() {
                                     write_ok = false;
                                     break;
                                 }
@@ -3197,7 +3291,7 @@ async fn handle_compile(
                             };
                             let cache_file =
                                 state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                            if write_cached_output(&out_path, &cache_file, payload).is_err() {
+                            if write_cached_payload(&out_path, &cache_file, payload).is_err() {
                                 write_ok = false;
                                 break;
                             }
@@ -3449,7 +3543,7 @@ async fn handle_compile(
                             secondary_dir.join(&names[i]).into()
                         };
                         let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                        if write_cached_output(&out_path, &cache_file, payload).is_err() {
+                        if write_cached_payload(&out_path, &cache_file, payload).is_err() {
                             write_ok = false;
                             break;
                         }
@@ -3668,12 +3762,17 @@ async fn handle_compile(
         // to wait for a watcher event.
         state.cache_system.apply_changes(vec![output_path.clone()]);
 
-        // Read the output file(s)
+        // Capture output metadata. Rust payload bytes are snapshotted into
+        // cache files after the artifact key is known, avoiding foreground
+        // reads of .rlib/.rmeta/.d on cold misses.
         let (output_data, rustc_all_outputs) = if is_rustc {
-            let (primary, all) =
-                collect_rustc_outputs(rustc_args_opt.as_ref().unwrap(), &output_path, &cwd_path);
-            if primary.is_empty() {
-                tracing::warn!("failed to read output file {}", output_path.display());
+            let all = collect_rustc_output_files(
+                rustc_args_opt.as_ref().unwrap(),
+                &output_path,
+                &cwd_path,
+            );
+            if all.is_empty() {
+                tracing::warn!("failed to stat output file {}", output_path.display());
                 return Response::CompileResult {
                     exit_code,
                     stdout: Arc::clone(&stdout),
@@ -3681,7 +3780,7 @@ async fn handle_compile(
                     cached: false,
                 };
             }
-            (primary, Some(all))
+            (Vec::new(), Some(all))
         } else {
             match std::fs::read(&output_path) {
                 Ok(data) => (data, None),
@@ -3860,21 +3959,55 @@ async fn handle_compile(
             }
 
             // Build artifact — multi-output for Rustc, single output for C/C++.
-            let artifact = if let Some(ref all_outputs) = rustc_all_outputs {
-                ArtifactData {
-                    outputs: all_outputs
-                        .iter()
-                        .map(|(name, data)| ArtifactOutput {
-                            name: name.clone(),
-                            data: Arc::new(data.clone()),
-                        })
-                        .collect(),
-                    stdout: Arc::clone(&stdout),
-                    stderr: Arc::clone(&stderr),
-                    exit_code,
+            if let Some(ref all_outputs) = rustc_all_outputs {
+                let artifact_bytes: u64 = all_outputs.iter().map(|o| o.size).sum();
+                let output_names: Vec<String> =
+                    all_outputs.iter().map(|o| o.name.clone()).collect();
+                let output_sizes: Vec<u64> = all_outputs.iter().map(|o| o.size).collect();
+                let payload_paths: Vec<NormalizedPath> = (0..all_outputs.len())
+                    .map(|i| state.artifact_dir.join(format!("{artifact_key_hex}_{i}")))
+                    .collect();
+
+                let mut snapshot_ok = true;
+                for (output, cache_path) in all_outputs.iter().zip(payload_paths.iter()) {
+                    if let Err(e) = persist_artifact_file(cache_path, &output.path) {
+                        snapshot_ok = false;
+                        tracing::warn!(
+                            source = %output.path.display(),
+                            cache = %cache_path.display(),
+                            "failed to snapshot rustc output: {e}"
+                        );
+                        break;
+                    }
                 }
+
+                if snapshot_ok {
+                    let meta = ArtifactIndex::new(
+                        output_names,
+                        output_sizes,
+                        Arc::clone(&stdout),
+                        Arc::clone(&stderr),
+                        exit_code,
+                    );
+                    if let Err(e) = state.artifact_store.insert(&artifact_key_hex, &meta) {
+                        tracing::warn!(
+                            key = %artifact_key_hex,
+                            "failed to persist artifact index: {e}"
+                        );
+                    }
+                    let cached = CachedArtifact::from_file_payloads(meta, payload_paths);
+                    state.artifacts.insert(artifact_key_hex, cached);
+                }
+
+                let latency_ns = compile_start.elapsed().as_nanos() as u64;
+                let recorded_bytes = if snapshot_ok { artifact_bytes } else { 0 };
+                state.stats.record_miss(latency_ns, recorded_bytes);
+                let src = source_path.clone();
+                record_session_stat(&state.sessions, &sid, move |t| {
+                    t.record_miss(src, recorded_bytes);
+                });
             } else {
-                ArtifactData {
+                let artifact = ArtifactData {
                     outputs: vec![ArtifactOutput {
                         name: output_path
                             .file_name()
@@ -3886,65 +4019,66 @@ async fn handle_compile(
                     stdout: Arc::clone(&stdout),
                     stderr: Arc::clone(&stderr),
                     exit_code,
-                }
-            };
-
-            let artifact_bytes: u64 = artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
-
-            // Build CachedArtifact once (no deep copies — all Arc clones).
-            let cached = CachedArtifact::from_artifact_data(&artifact);
-
-            // Spawn disk persistence to background (meta.clone() is cheap — Arc fields only).
-            {
-                let artifact_dir = state.artifact_dir.clone();
-                let key_hex = artifact_key_hex.clone();
-                let persist_meta = cached.meta.clone();
-                let payloads: Vec<Arc<Vec<u8>>> = artifact
-                    .outputs
-                    .iter()
-                    .map(|o| Arc::clone(&o.data))
-                    .collect();
-                let payload_size: usize = payloads.iter().map(|p| p.len()).sum();
-                state
-                    .in_flight_bytes
-                    .fetch_add(payload_size, Ordering::Relaxed);
-                let guard = InFlightGuard {
-                    state: Arc::clone(state_arc),
-                    size: payload_size,
                 };
-                let sem = Arc::clone(&state.persist_semaphore);
-                let state_ref = Arc::clone(state_arc);
-                tokio::spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
-                    tokio::task::spawn_blocking(move || {
-                        let _guard = guard;
-                        for (i, payload) in payloads.iter().enumerate() {
-                            let cache_path = artifact_dir.join(format!("{key_hex}_{i}"));
-                            if let Err(e) = persist_artifact_output(&cache_path, payload) {
-                                tracing::warn!(
-                                    path = %cache_path.display(),
-                                    "failed to persist artifact output: {e}"
-                                );
+
+                let artifact_bytes: u64 =
+                    artifact.outputs.iter().map(|o| o.data.len() as u64).sum();
+
+                // Build CachedArtifact once (no deep copies — all Arc clones).
+                let cached = CachedArtifact::from_artifact_data(&artifact);
+
+                // Spawn disk persistence to background (meta.clone() is cheap — Arc fields only).
+                {
+                    let artifact_dir = state.artifact_dir.clone();
+                    let key_hex = artifact_key_hex.clone();
+                    let persist_meta = cached.meta.clone();
+                    let payloads: Vec<Arc<Vec<u8>>> = artifact
+                        .outputs
+                        .iter()
+                        .map(|o| Arc::clone(&o.data))
+                        .collect();
+                    let payload_size: usize = payloads.iter().map(|p| p.len()).sum();
+                    state
+                        .in_flight_bytes
+                        .fetch_add(payload_size, Ordering::Relaxed);
+                    let guard = InFlightGuard {
+                        state: Arc::clone(state_arc),
+                        size: payload_size,
+                    };
+                    let sem = Arc::clone(&state.persist_semaphore);
+                    let state_ref = Arc::clone(state_arc);
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire().await.unwrap();
+                        tokio::task::spawn_blocking(move || {
+                            let _guard = guard;
+                            for (i, payload) in payloads.iter().enumerate() {
+                                let cache_path = artifact_dir.join(format!("{key_hex}_{i}"));
+                                if let Err(e) = persist_artifact_output(&cache_path, payload) {
+                                    tracing::warn!(
+                                        path = %cache_path.display(),
+                                        "failed to persist artifact output: {e}"
+                                    );
+                                }
                             }
-                        }
-                        state_ref
-                            .artifact_store
-                            .insert(&key_hex, &persist_meta)
-                            .ok();
-                    })
-                    .await
-                    .ok();
+                            state_ref
+                                .artifact_store
+                                .insert(&key_hex, &persist_meta)
+                                .ok();
+                        })
+                        .await
+                        .ok();
+                    });
+                }
+
+                state.artifacts.insert(artifact_key_hex, cached);
+
+                let latency_ns = compile_start.elapsed().as_nanos() as u64;
+                state.stats.record_miss(latency_ns, artifact_bytes);
+                let src = source_path.clone();
+                record_session_stat(&state.sessions, &sid, move |t| {
+                    t.record_miss(src, artifact_bytes);
                 });
             }
-
-            state.artifacts.insert(artifact_key_hex, cached);
-
-            let latency_ns = compile_start.elapsed().as_nanos() as u64;
-            state.stats.record_miss(latency_ns, artifact_bytes);
-            let src = source_path.clone();
-            record_session_stat(&state.sessions, &sid, move |t| {
-                t.record_miss(src, artifact_bytes);
-            });
         }
         let artifact_store_ns = t_store.elapsed().as_nanos() as u64;
 
@@ -4141,7 +4275,7 @@ fn check_unit_cache(
                             };
                             let cache_file =
                                 state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                            let _ = write_cached_output(&out_path, &cache_file, payload);
+                            let _ = write_cached_payload(&out_path, &cache_file, payload);
                         }
 
                         state.stats.record_hit(0, artifact_bytes);
@@ -4248,7 +4382,7 @@ fn check_unit_cache(
                         cwd_path.join(&names[i]).into()
                     };
                     let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                    let _ = write_cached_output(&out_path, &cache_file, payload);
+                    let _ = write_cached_payload(&out_path, &cache_file, payload);
                 }
 
                 state.stats.record_hit(0, artifact_bytes);
