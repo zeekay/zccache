@@ -140,6 +140,22 @@ fn normalize_key_path(path: &Path, key_root: Option<&Path>) -> String {
     normalize_for_key(path)
 }
 
+fn normalize_remap_path_prefix_for_key(remap: &str, key_root: Option<&Path>) -> String {
+    let Some(root) = key_root else {
+        return remap.to_string();
+    };
+    let Some((from, to)) = remap.split_once('=') else {
+        return remap.to_string();
+    };
+
+    let from_path = Path::new(from);
+    if from_path.strip_prefix(root).is_ok() {
+        format!("{}={}", normalize_key_path(from_path, key_root), to)
+    } else {
+        remap.to_string()
+    }
+}
+
 /// Compute the context key for a C/C++ compilation context.
 ///
 /// When `key_root` is provided, paths under that root are hashed relative to it
@@ -370,6 +386,16 @@ impl RustcCompileContext {
     /// Uses a different domain tag from C/C++ to avoid collisions.
     #[must_use]
     pub fn context_key(&self) -> ContextKey {
+        self.context_key_with_root(None)
+    }
+
+    /// Compute the context key, optionally normalizing project-local paths.
+    ///
+    /// When `key_root` is provided, source paths and safe path-bearing key
+    /// fields under that root are hashed relative to it so equivalent
+    /// workspaces can share cache keys across root-directory renames.
+    #[must_use]
+    pub fn context_key_with_root(&self, key_root: Option<&Path>) -> ContextKey {
         let mut hasher = blake3::Hasher::new();
 
         hasher.update(b"zccache-rustc-context-key-v2\0");
@@ -381,8 +407,8 @@ impl RustcCompileContext {
             hasher.update(b"\0");
         }
 
-        // Source file (absolute path).
-        let source_file = normalize_for_key(&self.source_file);
+        // Source file.
+        let source_file = normalize_key_path(&self.source_file, key_root);
         hasher.update(source_file.as_bytes());
         hasher.update(b"\0");
 
@@ -493,9 +519,22 @@ impl RustcCompileContext {
 
         // --remap-path-prefix values (sorted, affect embedded paths in output).
         hasher.update(b"remap\0");
-        for remap in &self.remap_path_prefixes {
-            hasher.update(remap.as_bytes());
-            hasher.update(b"\0");
+        if key_root.is_some() {
+            let mut remap_path_prefixes: Vec<String> = self
+                .remap_path_prefixes
+                .iter()
+                .map(|remap| normalize_remap_path_prefix_for_key(remap, key_root))
+                .collect();
+            remap_path_prefixes.sort();
+            for remap in &remap_path_prefixes {
+                hasher.update(remap.as_bytes());
+                hasher.update(b"\0");
+            }
+        } else {
+            for remap in &self.remap_path_prefixes {
+                hasher.update(remap.as_bytes());
+                hasher.update(b"\0");
+            }
         }
 
         // CARGO_* environment variables (sorted, affect env!() macro output).
@@ -529,7 +568,27 @@ pub fn compute_rustc_artifact_key<P: AsRef<Path> + Ord>(
     file_hashes: &mut [(P, ContentHash)],
     extern_hashes: &mut [(String, ContentHash)],
 ) -> ArtifactKey {
-    file_hashes.sort_by(|a, b| a.0.cmp(&b.0));
+    compute_rustc_artifact_key_with_root(context_key, file_hashes, extern_hashes, None)
+}
+
+/// Compute the rustc artifact key, optionally normalizing project-local files.
+///
+/// When `key_root` is provided, source and dependency file paths under that
+/// root are hashed relative to it. Extern hashes remain keyed by crate name.
+pub fn compute_rustc_artifact_key_with_root<P: AsRef<Path> + Ord>(
+    context_key: &ContextKey,
+    file_hashes: &mut [(P, ContentHash)],
+    extern_hashes: &mut [(String, ContentHash)],
+    key_root: Option<&Path>,
+) -> ArtifactKey {
+    if key_root.is_some() {
+        file_hashes.sort_by(|a, b| {
+            normalize_key_path(a.0.as_ref(), key_root)
+                .cmp(&normalize_key_path(b.0.as_ref(), key_root))
+        });
+    } else {
+        file_hashes.sort_by(|a, b| a.0.cmp(&b.0));
+    }
     extern_hashes.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut hasher = blake3::Hasher::new();
@@ -539,7 +598,7 @@ pub fn compute_rustc_artifact_key<P: AsRef<Path> + Ord>(
 
     // Source + dependency file hashes.
     for (path, hash) in file_hashes.iter() {
-        let path = normalize_for_key(path.as_ref());
+        let path = normalize_key_path(path.as_ref(), key_root);
         hasher.update(path.as_bytes());
         hasher.update(b"\0");
         hasher.update(hash.as_bytes());
@@ -935,6 +994,83 @@ mod tests {
     }
 
     #[test]
+    fn rustc_context_key_delegates_to_rootless_helper() {
+        let ctx = make_rustc_context("/src/lib.rs", "2021");
+        assert_eq!(ctx.context_key(), ctx.context_key_with_root(None));
+    }
+
+    #[test]
+    fn rustc_context_key_with_root_matches_equivalent_roots() {
+        let ctx_a = make_rustc_context("/workspace-a/crates/demo/src/lib.rs", "2021");
+        let ctx_b = make_rustc_context("/workspace-b/crates/demo/src/lib.rs", "2021");
+
+        assert_ne!(
+            ctx_a.context_key(),
+            ctx_b.context_key(),
+            "rootless rustc context keys should keep the existing absolute-path behavior"
+        );
+        assert_eq!(
+            ctx_a.context_key_with_root(Some(Path::new("/workspace-a"))),
+            ctx_b.context_key_with_root(Some(Path::new("/workspace-b"))),
+            "source paths under equivalent roots should hash relative to those roots"
+        );
+    }
+
+    #[test]
+    fn rustc_context_key_with_root_keeps_external_sources_distinct() {
+        let ctx_a = make_rustc_context("/external-a/generated/lib.rs", "2021");
+        let ctx_b = make_rustc_context("/external-b/generated/lib.rs", "2021");
+
+        assert_ne!(
+            ctx_a.context_key_with_root(Some(Path::new("/workspace-a"))),
+            ctx_b.context_key_with_root(Some(Path::new("/workspace-b"))),
+            "sources outside the supplied roots must retain absolute path identity"
+        );
+    }
+
+    #[test]
+    fn rustc_context_key_with_root_normalizes_remap_left_side_under_root() {
+        let mut ctx_a = make_rustc_context("/workspace-a/crates/demo/src/lib.rs", "2021");
+        ctx_a.remap_path_prefixes = vec!["/workspace-a=/src".to_string()];
+        let mut ctx_b = make_rustc_context("/workspace-b/crates/demo/src/lib.rs", "2021");
+        ctx_b.remap_path_prefixes = vec!["/workspace-b=/src".to_string()];
+
+        assert_eq!(
+            ctx_a.context_key_with_root(Some(Path::new("/workspace-a"))),
+            ctx_b.context_key_with_root(Some(Path::new("/workspace-b"))),
+            "remap left sides under the root should hash relative to the root"
+        );
+    }
+
+    #[test]
+    fn rustc_context_key_with_root_keeps_external_remap_left_sides_distinct() {
+        let mut ctx_a = make_rustc_context("/workspace-a/crates/demo/src/lib.rs", "2021");
+        ctx_a.remap_path_prefixes = vec!["/external-a=/src".to_string()];
+        let mut ctx_b = make_rustc_context("/workspace-b/crates/demo/src/lib.rs", "2021");
+        ctx_b.remap_path_prefixes = vec!["/external-b=/src".to_string()];
+
+        assert_ne!(
+            ctx_a.context_key_with_root(Some(Path::new("/workspace-a"))),
+            ctx_b.context_key_with_root(Some(Path::new("/workspace-b"))),
+            "remap left sides outside the root should keep absolute path identity"
+        );
+    }
+
+    #[test]
+    fn rustc_context_key_with_root_does_not_normalize_remap_right_side() {
+        let mut ctx_a = make_rustc_context("/workspace-a/crates/demo/src/lib.rs", "2021");
+        ctx_a.remap_path_prefixes = vec!["/workspace-a=/workspace-a".to_string()];
+        let mut ctx_b = make_rustc_context("/workspace-b/crates/demo/src/lib.rs", "2021");
+        ctx_b.remap_path_prefixes = vec!["/workspace-b=/workspace-b".to_string()];
+
+        assert_ne!(
+            ctx_a.context_key_with_root(Some(Path::new("/workspace-a"))),
+            ctx_b.context_key_with_root(Some(Path::new("/workspace-b"))),
+            "only the remap left side is root-normalized"
+        );
+    }
+
+    #[test]
     fn rustc_different_edition_different_key() {
         let k1 = make_rustc_context("/src/lib.rs", "2021").context_key();
         let k2 = make_rustc_context("/src/lib.rs", "2024").context_key();
@@ -1243,5 +1379,57 @@ mod tests {
             &mut [("serde".to_string(), ext_hash)],
         );
         assert_eq!(ak1, ak2);
+    }
+
+    #[test]
+    fn rustc_artifact_key_with_root_matches_equivalent_source_and_dependency_paths() {
+        let ctx_a = make_rustc_context("/workspace-a/crates/demo/src/lib.rs", "2021");
+        let ctx_b = make_rustc_context("/workspace-b/crates/demo/src/lib.rs", "2021");
+        let root_a = Path::new("/workspace-a");
+        let root_b = Path::new("/workspace-b");
+
+        let ck_a = ctx_a.context_key_with_root(Some(root_a));
+        let ck_b = ctx_b.context_key_with_root(Some(root_b));
+        assert_eq!(ck_a, ck_b);
+
+        let src_hash = zccache_hash::hash_bytes(b"source");
+        let dep_hash = zccache_hash::hash_bytes(b"dependency");
+        let ext_hash = zccache_hash::hash_bytes(b"extern");
+
+        let ak_a = compute_rustc_artifact_key_with_root(
+            &ck_a,
+            &mut [
+                (
+                    NormalizedPath::from("/workspace-a/crates/demo/src/lib.rs"),
+                    src_hash,
+                ),
+                (
+                    NormalizedPath::from("/workspace-a/crates/demo/src/generated.rs"),
+                    dep_hash,
+                ),
+            ],
+            &mut [("serde".to_string(), ext_hash)],
+            Some(root_a),
+        );
+        let ak_b = compute_rustc_artifact_key_with_root(
+            &ck_b,
+            &mut [
+                (
+                    NormalizedPath::from("/workspace-b/crates/demo/src/generated.rs"),
+                    dep_hash,
+                ),
+                (
+                    NormalizedPath::from("/workspace-b/crates/demo/src/lib.rs"),
+                    src_hash,
+                ),
+            ],
+            &mut [("serde".to_string(), ext_hash)],
+            Some(root_b),
+        );
+
+        assert_eq!(
+            ak_a, ak_b,
+            "source and dependency files under equivalent roots should hash relative to those roots"
+        );
     }
 }

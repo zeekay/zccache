@@ -111,6 +111,26 @@ pub struct DepGraph {
     misses: AtomicU64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ContextRegistration {
+    pub key: ContextKey,
+    pub rebased_from_equivalent_root: bool,
+}
+
+fn rebase_project_path(
+    path: &NormalizedPath,
+    old_root: Option<&NormalizedPath>,
+    new_root: Option<&NormalizedPath>,
+) -> NormalizedPath {
+    match (old_root, new_root) {
+        (Some(old_root), Some(new_root)) => path
+            .strip_prefix(old_root)
+            .map(|relative| new_root.join(relative))
+            .unwrap_or_else(|_| path.clone()),
+        _ => path.clone(),
+    }
+}
+
 impl DepGraph {
     /// Create a new empty dependency graph.
     #[must_use]
@@ -137,8 +157,16 @@ impl DepGraph {
         ctx: CompileContext,
         key_root: Option<NormalizedPath>,
     ) -> ContextKey {
+        self.register_with_root_result(ctx, key_root).key
+    }
+
+    pub fn register_with_root_result(
+        &self,
+        ctx: CompileContext,
+        key_root: Option<NormalizedPath>,
+    ) -> ContextRegistration {
         let key = compute_context_key(&ctx, key_root.as_deref());
-        self.register_with_key_and_root(key, ctx, key_root)
+        self.register_with_key_and_root_result(key, ctx, key_root)
     }
 
     /// Register a compilation context with a precomputed key.
@@ -156,19 +184,60 @@ impl DepGraph {
         ctx: CompileContext,
         key_root: Option<NormalizedPath>,
     ) -> ContextKey {
-        self.contexts.entry(key).or_insert_with(|| ContextEntry {
-            context: ctx,
-            key_root,
-            resolved_includes: Vec::new(),
-            unresolved_includes: Vec::new(),
-            has_computed_includes: false,
-            artifact_key: None,
-            last_file_hashes: Vec::new(),
-            last_accessed: Instant::now(),
-            state: ContextState::Cold,
-        });
+        self.register_with_key_and_root_result(key, ctx, key_root)
+            .key
+    }
 
-        key
+    pub fn register_with_key_and_root_result(
+        &self,
+        key: ContextKey,
+        ctx: CompileContext,
+        key_root: Option<NormalizedPath>,
+    ) -> ContextRegistration {
+        let mut rebased_from_equivalent_root = false;
+        self.contexts
+            .entry(key)
+            .and_modify(|entry| {
+                if entry.context.source_file != ctx.source_file || entry.key_root != key_root {
+                    let old_root = entry.key_root.clone();
+                    rebased_from_equivalent_root =
+                        old_root.is_some() && key_root.is_some() && old_root != key_root;
+                    entry.resolved_includes = entry
+                        .resolved_includes
+                        .iter()
+                        .map(|path| rebase_project_path(path, old_root.as_ref(), key_root.as_ref()))
+                        .collect();
+                    entry.last_file_hashes = entry
+                        .last_file_hashes
+                        .iter()
+                        .map(|(path, hash)| {
+                            (
+                                rebase_project_path(path, old_root.as_ref(), key_root.as_ref()),
+                                *hash,
+                            )
+                        })
+                        .collect();
+                    entry.context = ctx.clone();
+                    entry.key_root = key_root.clone();
+                }
+                entry.last_accessed = Instant::now();
+            })
+            .or_insert_with(|| ContextEntry {
+                context: ctx,
+                key_root,
+                resolved_includes: Vec::new(),
+                unresolved_includes: Vec::new(),
+                has_computed_includes: false,
+                artifact_key: None,
+                last_file_hashes: Vec::new(),
+                last_accessed: Instant::now(),
+                state: ContextState::Cold,
+            });
+
+        ContextRegistration {
+            key,
+            rebased_from_equivalent_root,
+        }
     }
 
     /// Returns `true` if the context has never been updated (no artifact key).

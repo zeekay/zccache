@@ -263,6 +263,51 @@ daemon state, and the default daemon endpoint. Separate cache roots therefore
 use separate daemon instances unless `ZCCACHE_ENDPOINT` is explicitly set.
 Relative override paths are normalized against the current working directory.
 
+### Worktree cache sharing
+
+zccache can share cache entries across sibling Git worktrees when the compile is
+equivalent. This targets multi-agent workflows where several checkouts of the
+same repository build the same Rust crates under different absolute paths. The
+daemon detects the enclosing Git root for each compile request, normalizes
+project-local source, dependency, cwd, and safe path arguments relative to that
+root, and writes cache hits back to the output paths requested by the current
+worktree.
+
+Set `ZCCACHE_WORKTREE_ROOT` when automatic Git-root detection is not reliable
+or when a wrapper/test needs to define the normalization root explicitly:
+
+```bash
+export ZCCACHE_WORKTREE_ROOT="$PWD"
+RUSTC_WRAPPER=zccache cargo build
+```
+
+The override should point at the logical project root shared by equivalent
+worktrees. Paths under that root may be normalized for cache identity. Paths
+outside that root remain absolute unless zccache has a specific safe rule for
+them, so toolchain files, sysroots, generated files outside the checkout, and
+other external inputs do not accidentally become shared.
+
+Worktree sharing is intentionally conservative. If zccache cannot prove that a
+compile is root-equivalent, it falls back to the existing path-specific cache key
+or records a miss. Diagnostics and session logs distinguish normal same-root
+hits from worktree-equivalent hits and report conservative reasons such as:
+
+- `git_root_unavailable` - no Git root and no explicit `ZCCACHE_WORKTREE_ROOT`.
+- `path_outside_root` - an input path is outside the detected/overridden root.
+- `path_sensitive_arg` - flags such as `--remap-path-prefix`, debug path flags,
+  or unknown absolute path-bearing options could affect emitted output.
+- `content_hash_mismatch` - root-relative paths match but file contents differ.
+- `toolchain_mismatch` - the compiler or relevant toolchain inputs differ.
+- `unsupported_language` - the invocation is not covered by the worktree-aware
+  normalization rules.
+
+The supported worktree-equivalent paths are Rust `rustc` compilation, including
+dependency artifacts used through `--extern`, and C/C++ compilation through the
+existing depgraph context/artifact keys. The request-level fast path only serves
+cross-root hits after validating the current worktree's recorded input hashes;
+otherwise zccache falls back to the normal depgraph check or a path-specific
+miss.
+
 ### Strict path validation
 
 Use `--strict-paths` or `ZCCACHE_STRICT_PATHS` to fail fast when compiler path

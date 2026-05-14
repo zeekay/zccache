@@ -58,6 +58,8 @@ const EPHEMERAL_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_s
 const REQUEST_CACHE_MAX_ENTRIES: usize = 4096;
 const RSP_CACHE_MAX_ENTRIES: usize = 1024;
 const RUST_MISS_PROFILE_ENV: &str = "ZCCACHE_PROFILE_RUST_MISS";
+const WORKTREE_ROOT_ENV: &str = "ZCCACHE_WORKTREE_ROOT";
+const REQUEST_ROOT_MARKER: &str = "$ZCCACHE_WORKTREE_ROOT";
 
 #[derive(Clone)]
 struct RspDependency {
@@ -389,9 +391,42 @@ struct SharedState {
 /// Pre-computed compile request data for the request-level fast path.
 struct RequestCacheEntry {
     context_key: ContextKey,
-    source_path: NormalizedPath,
-    output_path: NormalizedPath,
+    root: Option<NormalizedPath>,
+    source_path: CachedRequestPath,
+    output_path: CachedRequestPath,
+    input_paths: Vec<CachedRequestPath>,
+    cross_root_shareable: bool,
     cached_at: std::time::Instant,
+}
+
+#[derive(Clone)]
+enum CachedRequestPath {
+    RootRelative(NormalizedPath),
+    Absolute(NormalizedPath),
+}
+
+impl CachedRequestPath {
+    fn capture(path: &Path, key_root: Option<&Path>) -> Self {
+        if let Some(root) = key_root {
+            if let Ok(relative) = path.strip_prefix(root) {
+                return Self::RootRelative(NormalizedPath::new(relative));
+            }
+        }
+        Self::Absolute(NormalizedPath::new(path))
+    }
+
+    fn resolve(&self, key_root: Option<&Path>) -> NormalizedPath {
+        match (self, key_root) {
+            (Self::RootRelative(relative), Some(root)) => root.join(relative).into(),
+            (Self::RootRelative(relative), None) | (Self::Absolute(relative), _) => {
+                relative.clone()
+            }
+        }
+    }
+
+    fn is_root_relative(&self) -> bool {
+        matches!(self, Self::RootRelative(_))
+    }
 }
 
 /// The daemon server that listens for IPC connections.
@@ -2958,25 +2993,226 @@ fn context_files_fresh(
     true
 }
 
+fn client_env_value<'a>(client_env: Option<&'a [(String, String)]>, name: &str) -> Option<&'a str> {
+    client_env?
+        .iter()
+        .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_worktree_root(
+    cwd: &Path,
+    client_env: Option<&[(String, String)]>,
+) -> Option<NormalizedPath> {
+    if let Some(value) = client_env_value(client_env, WORKTREE_ROOT_ENV) {
+        let configured = Path::new(value);
+        let root = if configured.is_absolute() {
+            configured.to_path_buf()
+        } else {
+            cwd.join(configured)
+        };
+        if root.is_dir() {
+            return Some(root.into());
+        }
+    }
+
+    find_git_root(cwd)
+}
+
+fn find_git_root(cwd: &Path) -> Option<NormalizedPath> {
+    for candidate in cwd.ancestors() {
+        let dot_git = candidate.join(".git");
+        if dot_git.is_dir() || dot_git.is_file() {
+            return Some(candidate.into());
+        }
+    }
+    None
+}
+
+fn normalize_path_for_request_key(path: &Path, key_root: Option<&Path>) -> String {
+    if let Some(root) = key_root {
+        if let Ok(relative) = path.strip_prefix(root) {
+            let relative = zccache_core::path::normalize_for_key(relative);
+            if relative.is_empty() {
+                return REQUEST_ROOT_MARKER.to_string();
+            }
+            return format!("{REQUEST_ROOT_MARKER}/{relative}");
+        }
+    }
+    zccache_core::path::normalize_for_key(path)
+}
+
+fn normalize_request_path_value(value: &str, key_root: Option<&Path>) -> Option<String> {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return Some(normalize_path_for_request_key(path, key_root));
+    }
+    None
+}
+
+fn normalize_request_arg(arg: &str, key_root: Option<&Path>) -> String {
+    let Some(root) = key_root else {
+        return arg.to_string();
+    };
+
+    if let Some(normalized) = normalize_request_path_value(arg, Some(root)) {
+        return normalized;
+    }
+
+    if let Some(rest) = arg.strip_prefix("-I").filter(|rest| !rest.is_empty()) {
+        if let Some(normalized) = normalize_request_path_value(rest, Some(root)) {
+            return format!("-I{normalized}");
+        }
+    }
+
+    if let Some((left, right)) = arg.split_once('=') {
+        if let Some(normalized_left) = normalize_request_path_value(left, Some(root)) {
+            return format!("{normalized_left}={right}");
+        }
+        if let Some(normalized_right) = normalize_request_path_value(right, Some(root)) {
+            return format!("{left}={normalized_right}");
+        }
+    }
+
+    arg.to_string()
+}
+
+fn request_env_fingerprint_vars(client_env: Option<&[(String, String)]>) -> Vec<(&str, &str)> {
+    let mut vars: Vec<(&str, &str)> = client_env
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, value)| {
+            let key = key.as_str();
+            let include = key.starts_with("CARGO_")
+                && key != "CARGO_MAKEFLAGS"
+                && key != "CARGO_INCREMENTAL"
+                && key != "CARGO_MANIFEST_DIR"
+                && key != "CARGO_MANIFEST_PATH";
+            include.then_some((key, value.as_str()))
+        })
+        .collect();
+    vars.sort_unstable();
+    vars
+}
+
 /// Compute a fast fingerprint of a compile request for the request-level cache.
 ///
 /// Streams bytes directly into blake3 without intermediate buffer allocation.
 /// Zero-alloc: ~100ns for 10 args, ~500ns for 300 args.
 /// Callers should pass the fully expanded argv so response-file content
 /// changes also invalidate the request-level fast path.
-fn request_fingerprint(compiler: &Path, args: &[String], cwd: &Path) -> ContentHash {
+fn request_fingerprint(
+    compiler: &Path,
+    args: &[String],
+    cwd: &Path,
+    key_root: Option<&Path>,
+    client_env: Option<&[(String, String)]>,
+) -> ContentHash {
     let mut h = zccache_hash::StreamHasher::new();
-    h.update(b"zccache-request-v1\0");
+    h.update(b"zccache-request-v2\0");
     let compiler = zccache_core::path::normalize_for_key(compiler);
     h.update(compiler.as_bytes());
     h.update(&[0]);
     for arg in args {
+        let arg = normalize_request_arg(arg, key_root);
         h.update(arg.as_bytes());
         h.update(&[0]);
     }
-    let cwd = zccache_core::path::normalize_for_key(cwd);
+    let cwd = normalize_path_for_request_key(cwd, key_root);
     h.update(cwd.as_bytes());
+    h.update(&[0]);
+    for (key, value) in request_env_fingerprint_vars(client_env) {
+        h.update(key.as_bytes());
+        h.update(b"=");
+        h.update(value.as_bytes());
+        h.update(&[0]);
+    }
     h.finalize()
+}
+
+fn request_cache_input_paths(
+    state: &SharedState,
+    context_key: &ContextKey,
+    source_path: &NormalizedPath,
+    ctx: &CompileContext,
+) -> Vec<NormalizedPath> {
+    let mut paths = Vec::new();
+    paths.push(source_path.clone());
+    if let Some(includes) = state.dep_graph.get_includes(context_key) {
+        paths.extend(includes.iter().cloned());
+    }
+    paths.extend(ctx.force_includes.iter().cloned());
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn request_cache_entry(
+    context_key: ContextKey,
+    source_path: &NormalizedPath,
+    output_path: &NormalizedPath,
+    input_paths: Vec<NormalizedPath>,
+    key_root: Option<&NormalizedPath>,
+) -> RequestCacheEntry {
+    let root = key_root.cloned();
+    let root_path = key_root.map(|root| root.as_path());
+    let source_path = CachedRequestPath::capture(source_path, root_path);
+    let output_path = CachedRequestPath::capture(output_path, root_path);
+    let input_paths: Vec<CachedRequestPath> = input_paths
+        .iter()
+        .map(|path| CachedRequestPath::capture(path, root_path))
+        .collect();
+    let cross_root_shareable = root.is_some()
+        && source_path.is_root_relative()
+        && output_path.is_root_relative()
+        && input_paths.iter().all(CachedRequestPath::is_root_relative);
+
+    RequestCacheEntry {
+        context_key,
+        root,
+        source_path,
+        output_path,
+        input_paths,
+        cross_root_shareable,
+        cached_at: std::time::Instant::now(),
+    }
+}
+
+fn request_cache_entry_matches_root(
+    entry: &RequestCacheEntry,
+    key_root: Option<&NormalizedPath>,
+) -> bool {
+    if entry.root.as_ref() == key_root {
+        return true;
+    }
+    entry.cross_root_shareable && entry.root.is_some() && key_root.is_some()
+}
+
+fn request_cache_artifact_matches(
+    state: &SharedState,
+    entry: &RequestCacheEntry,
+    key_root: Option<&NormalizedPath>,
+    expected_artifact_key_hex: &str,
+    clock: Clock,
+) -> bool {
+    let Some(root) = key_root else {
+        return false;
+    };
+    let mut file_hashes = Vec::with_capacity(entry.input_paths.len());
+    for cached_path in &entry.input_paths {
+        let path = cached_path.resolve(Some(root));
+        let Ok(hash) = hash_file(&state.cache_system, &path, clock) else {
+            return false;
+        };
+        file_hashes.push((path, hash));
+    }
+
+    let artifact_key = zccache_depgraph::compute_artifact_key(
+        &entry.context_key,
+        &mut file_hashes,
+        Some(root.as_path()),
+    );
+    artifact_key.hash().to_hex() == expected_artifact_key_hex
 }
 
 fn strict_paths_mode_from_client_env(
@@ -3037,71 +3273,123 @@ async fn handle_compile(
         return compile_failure_stderr(err.diagnostic(&compiler, &expanded_args));
     }
 
+    let worktree_root = resolve_worktree_root(cwd, client_env.as_deref());
+
+    // Snap the journal clock once so all file hashes in this request see a
+    // consistent view (avoids per-file current_clock() syscalls).
+    let snap_clock = state.cache_system.current_clock();
+
     // ── Ultra-fast request-level cache ────────────────────────────────
     // If we've seen this exact (compiler, args, cwd) before AND the fast-hit
     // cache still holds a valid entry, skip ALL heavy work: system include
     // discovery, watch_directories, response file expansion, arg parsing,
     // context building, and dep_graph registration.
     if state.watcher_active.load(Ordering::Acquire) {
-        let request_fp = request_fingerprint(compiler_path, &expanded_args, cwd);
+        let request_fp = request_fingerprint(
+            compiler_path,
+            &expanded_args,
+            cwd,
+            worktree_root.as_deref(),
+            client_env.as_deref(),
+        );
         if let Some(req_entry) = state.request_cache.get(&request_fp) {
-            if let Some(fh_entry) = state.fast_hit_cache.get(&req_entry.context_key) {
-                if cache_entry_fresh_at(compile_start, fh_entry.cached_at, FAST_HIT_MAX_AGE)
-                    && context_files_fresh(
-                        state,
-                        &req_entry.context_key,
-                        &req_entry.source_path,
-                        fh_entry.clock,
-                    )
-                {
+            if request_cache_entry_matches_root(&req_entry, worktree_root.as_ref()) {
+                if let Some(fh_entry) = state.fast_hit_cache.get(&req_entry.context_key) {
                     let artifact_key_hex = &fh_entry.artifact_key_hex;
-                    if let Some(mut cached_ref) = state.artifacts.get_mut(artifact_key_hex) {
-                        cached_ref.last_used = std::time::Instant::now();
-                        let loaded =
-                            ensure_payloads(&mut cached_ref, &state.artifact_dir, artifact_key_hex)
-                                .is_some();
-                        if loaded {
-                            let payloads = Arc::clone(cached_ref.payloads.as_ref().unwrap());
-                            let names = Arc::clone(&cached_ref.meta.output_names);
-                            let exit_code = cached_ref.meta.exit_code;
-                            let stdout = cached_ref.stdout.clone();
-                            let stderr = cached_ref.stderr.clone();
-                            let artifact_bytes: u64 = cached_ref.meta.total_size;
-                            // Drop the DashMap reference before doing more work
-                            drop(cached_ref);
+                    let source_path = req_entry.source_path.resolve(worktree_root.as_deref());
+                    let output_path = req_entry.output_path.resolve(worktree_root.as_deref());
+                    let same_root = req_entry.root.as_ref() == worktree_root.as_ref();
+                    let inputs_match = if same_root {
+                        context_files_fresh(
+                            state,
+                            &req_entry.context_key,
+                            &source_path,
+                            fh_entry.clock,
+                        )
+                    } else {
+                        request_cache_artifact_matches(
+                            state,
+                            &req_entry,
+                            worktree_root.as_ref(),
+                            artifact_key_hex,
+                            snap_clock,
+                        )
+                    };
+                    if cache_entry_fresh_at(compile_start, fh_entry.cached_at, FAST_HIT_MAX_AGE)
+                        && cache_entry_fresh_at(
+                            compile_start,
+                            req_entry.cached_at,
+                            EPHEMERAL_CACHE_MAX_AGE,
+                        )
+                        && inputs_match
+                    {
+                        if let Some(mut cached_ref) = state.artifacts.get_mut(artifact_key_hex) {
+                            cached_ref.last_used = std::time::Instant::now();
+                            let loaded = ensure_payloads(
+                                &mut cached_ref,
+                                &state.artifact_dir,
+                                artifact_key_hex,
+                            )
+                            .is_some();
+                            if loaded {
+                                let payloads = Arc::clone(cached_ref.payloads.as_ref().unwrap());
+                                let names = Arc::clone(&cached_ref.meta.output_names);
+                                let exit_code = cached_ref.meta.exit_code;
+                                let stdout = cached_ref.stdout.clone();
+                                let stderr = cached_ref.stderr.clone();
+                                let artifact_bytes: u64 = cached_ref.meta.total_size;
+                                // Drop the DashMap reference before doing more work
+                                drop(cached_ref);
 
-                            // Write output
-                            let mut write_ok = true;
-                            let secondary_dir =
-                                req_entry.output_path.parent().unwrap_or(cwd).to_path_buf();
-                            for (i, payload) in payloads.iter().enumerate() {
-                                let out_path = if i == 0 {
-                                    req_entry.output_path.clone()
-                                } else {
-                                    secondary_dir.join(&names[i]).into()
-                                };
-                                let cache_file =
-                                    state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                                if write_cached_payload(&out_path, &cache_file, payload).is_err() {
-                                    write_ok = false;
-                                    break;
+                                // Write output
+                                let mut write_ok = true;
+                                let secondary_dir =
+                                    output_path.parent().unwrap_or(cwd).to_path_buf();
+                                for (i, payload) in payloads.iter().enumerate() {
+                                    let out_path = if i == 0 {
+                                        output_path.clone()
+                                    } else {
+                                        secondary_dir.join(&names[i]).into()
+                                    };
+                                    let cache_file =
+                                        state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                                    if write_cached_payload(&out_path, &cache_file, payload)
+                                        .is_err()
+                                    {
+                                        write_ok = false;
+                                        break;
+                                    }
                                 }
-                            }
-                            if write_ok {
-                                state.stats.record_compilation();
-                                let latency_ns = compile_start.elapsed().as_nanos() as u64;
-                                state.stats.record_hit(latency_ns, artifact_bytes);
-                                let src = req_entry.source_path.clone();
-                                record_session_stat(&state.sessions, &sid, move |t| {
-                                    t.record_hit(src, latency_ns, artifact_bytes);
-                                });
+                                if write_ok {
+                                    state.stats.record_compilation();
+                                    let latency_ns = compile_start.elapsed().as_nanos() as u64;
+                                    state.stats.record_hit(latency_ns, artifact_bytes);
+                                    let src = source_path.clone();
+                                    record_session_stat(&state.sessions, &sid, move |t| {
+                                        t.record_hit(src, latency_ns, artifact_bytes);
+                                    });
+                                    write_session_log(
+                                        &state.sessions,
+                                        &sid,
+                                        &format!(
+                                            "[{}] {} -> {}",
+                                            if same_root {
+                                                "HIT_REQUEST"
+                                            } else {
+                                                "HIT_WORKTREE_REQUEST"
+                                            },
+                                            source_path.display(),
+                                            output_path.display()
+                                        ),
+                                    );
 
-                                return Response::CompileResult {
-                                    exit_code,
-                                    stdout,
-                                    stderr,
-                                    cached: true,
-                                };
+                                    return Response::CompileResult {
+                                        exit_code,
+                                        stdout,
+                                        stderr,
+                                        cached: true,
+                                    };
+                                }
                             }
                         }
                     }
@@ -3109,10 +3397,6 @@ async fn handle_compile(
             }
         }
     }
-
-    // Snap the journal clock once so all file hashes in this request see a
-    // consistent view (avoids per-file current_clock() syscalls).
-    let snap_clock = state.cache_system.current_clock();
 
     state.stats.record_compilation();
 
@@ -3194,6 +3478,7 @@ async fn handle_compile(
                 original_args,
                 source_indices,
                 cwd.into(),
+                worktree_root.clone(),
                 system_includes,
                 client_env,
                 compile_start,
@@ -3204,6 +3489,7 @@ async fn handle_compile(
     let parse_args_ns = t0.elapsed().as_nanos() as u64;
 
     let cwd_path: NormalizedPath = cwd.into();
+    let key_root = worktree_root.as_ref().unwrap_or(&cwd_path);
     let source_path = if compilation.source_file.is_absolute() {
         compilation.source_file.clone()
     } else {
@@ -3225,27 +3511,40 @@ async fn handle_compile(
         env_slice,
         &state.compiler_hash_cache,
     );
-    let (ctx, dep_flags, rustc_args_opt, context_key) = match build_result {
-        BuildContextResult::Cc { ctx, dep_flags } => {
-            let key = state
-                .dep_graph
-                .register_with_root(ctx.clone(), Some(cwd_path.clone()));
-            (ctx, dep_flags, None, key)
-        }
-        BuildContextResult::Rustc {
-            rustc_ctx,
-            compat_ctx,
-            rustc_args,
-        } => {
-            let key = rustc_ctx.context_key();
-            state.dep_graph.register_with_key_and_root(
-                key,
-                compat_ctx.clone(),
-                Some(cwd_path.clone()),
-            );
-            (compat_ctx, UserDepFlags::default(), Some(rustc_args), key)
-        }
-    };
+    let (ctx, dep_flags, rustc_args_opt, context_key, worktree_equivalent_context) =
+        match build_result {
+            BuildContextResult::Cc { ctx, dep_flags } => {
+                let registration = state
+                    .dep_graph
+                    .register_with_root_result(ctx.clone(), Some(key_root.clone()));
+                (
+                    ctx,
+                    dep_flags,
+                    None,
+                    registration.key,
+                    registration.rebased_from_equivalent_root,
+                )
+            }
+            BuildContextResult::Rustc {
+                rustc_ctx,
+                compat_ctx,
+                rustc_args,
+            } => {
+                let key = rustc_ctx.context_key_with_root(Some(key_root));
+                let registration = state.dep_graph.register_with_key_and_root_result(
+                    key,
+                    compat_ctx.clone(),
+                    Some(key_root.clone()),
+                );
+                (
+                    compat_ctx,
+                    UserDepFlags::default(),
+                    Some(rustc_args),
+                    registration.key,
+                    registration.rebased_from_equivalent_root,
+                )
+            }
+        };
     let is_rustc = rustc_args_opt.is_some();
     let rust_profile_enabled = is_rustc && std::env::var_os(RUST_MISS_PROFILE_ENV).is_some();
     let rust_profile_mode = rustc_args_opt
@@ -3335,22 +3634,36 @@ async fn handle_compile(
                                 &state.sessions,
                                 &sid,
                                 &format!(
-                                    "[HIT_FAST] {} -> {}",
+                                    "[{}] {} -> {}",
+                                    if worktree_equivalent_context {
+                                        "HIT_WORKTREE_FAST"
+                                    } else {
+                                        "HIT_FAST"
+                                    },
                                     source_path.display(),
                                     output_path.display()
                                 ),
                             );
                             let bookkeeping_ns = t7.elapsed().as_nanos() as u64;
 
-                            let rfp = request_fingerprint(compiler_path, &expanded_args, cwd);
+                            let rfp = request_fingerprint(
+                                compiler_path,
+                                &expanded_args,
+                                cwd,
+                                Some(key_root.as_path()),
+                                client_env.as_deref(),
+                            );
+                            let input_paths =
+                                request_cache_input_paths(state, &context_key, &source_path, &ctx);
                             state.request_cache.insert(
                                 rfp,
-                                RequestCacheEntry {
+                                request_cache_entry(
                                     context_key,
-                                    source_path: source_path.clone(),
-                                    output_path: output_path.clone(),
-                                    cached_at: std::time::Instant::now(),
-                                },
+                                    &source_path,
+                                    &output_path,
+                                    input_paths,
+                                    Some(key_root),
+                                ),
                             );
 
                             let total_ns = compile_start.elapsed().as_nanos() as u64;
@@ -3586,7 +3899,12 @@ async fn handle_compile(
                             &state.sessions,
                             &sid,
                             &format!(
-                                "[HIT] {} -> {}",
+                                "[{}] {} -> {}",
+                                if worktree_equivalent_context {
+                                    "HIT_WORKTREE"
+                                } else {
+                                    "HIT"
+                                },
                                 source_path.display(),
                                 output_path.display()
                             ),
@@ -3604,15 +3922,24 @@ async fn handle_compile(
                             },
                         );
 
-                        let rfp = request_fingerprint(compiler_path, &expanded_args, cwd);
+                        let rfp = request_fingerprint(
+                            compiler_path,
+                            &expanded_args,
+                            cwd,
+                            Some(key_root.as_path()),
+                            client_env.as_deref(),
+                        );
+                        let input_paths =
+                            request_cache_input_paths(state, &context_key, &source_path, &ctx);
                         state.request_cache.insert(
                             rfp,
-                            RequestCacheEntry {
+                            request_cache_entry(
                                 context_key,
-                                source_path: source_path.clone(),
-                                output_path: output_path.clone(),
-                                cached_at: std::time::Instant::now(),
-                            },
+                                &source_path,
+                                &output_path,
+                                input_paths,
+                                Some(key_root),
+                            ),
                         );
 
                         // Record phase profile
@@ -4318,6 +4645,7 @@ fn check_unit_cache(
     state: &SharedState,
     compilation: &zccache_compiler::CacheableCompilation,
     cwd_path: &Path,
+    key_root: &NormalizedPath,
     system_includes: &[NormalizedPath],
     shared_base: Option<&CompileContext>,
     cache_now: Instant,
@@ -4362,7 +4690,7 @@ fn check_unit_cache(
     let t_ctx = t0.elapsed();
     let context_key = state
         .dep_graph
-        .register_with_root(ctx.clone(), Some(cwd_path.into()));
+        .register_with_root(ctx.clone(), Some(key_root.clone()));
     let t_register = t0.elapsed();
 
     // ── Ultra-fast path: per-file freshness skip ────────────────────
@@ -4565,6 +4893,7 @@ async fn handle_compile_multi(
     original_args: Arc<[String]>,
     source_indices: Vec<usize>,
     cwd_path: NormalizedPath,
+    worktree_root: Option<NormalizedPath>,
     system_includes: Vec<NormalizedPath>,
     client_env: Option<Vec<(String, String)>>,
     compile_start: Instant,
@@ -4572,6 +4901,7 @@ async fn handle_compile_multi(
     let snap_clock = state.cache_system.current_clock();
     let mut all_stdout = Vec::new();
     let mut all_stderr = Vec::new();
+    let key_root = worktree_root.as_ref().unwrap_or(&cwd_path).clone();
 
     // ── Pre-parse shared args once for all units ─────────────────────
     // All units share the same original_args (via Arc) — only source/output
@@ -4599,6 +4929,7 @@ async fn handle_compile_multi(
     for (idx, compilation) in compilations.iter().enumerate() {
         let state = Arc::clone(&state);
         let cwd_path = cwd_path.clone();
+        let key_root = key_root.clone();
         let system_includes = system_includes.clone();
         let compilation = compilation.clone();
         let shared_base = Arc::clone(&shared_base);
@@ -4610,6 +4941,7 @@ async fn handle_compile_multi(
                     &state,
                     &compilation,
                     &cwd_path,
+                    &key_root,
                     &system_includes,
                     Some(&shared_base),
                     cache_now,
@@ -5100,10 +5432,16 @@ mod tests {
     }
 
     fn test_request_entry(cached_at: std::time::Instant) -> RequestCacheEntry {
+        let context_key = test_context_key("/tmp/source.c");
+        let source_path: NormalizedPath = "/tmp/source.c".into();
+        let output_path: NormalizedPath = "/tmp/source.o".into();
         RequestCacheEntry {
-            context_key: test_context_key("/tmp/source.c"),
-            source_path: "/tmp/source.c".into(),
-            output_path: "/tmp/source.o".into(),
+            context_key,
+            root: None,
+            source_path: CachedRequestPath::capture(&source_path, None),
+            output_path: CachedRequestPath::capture(&output_path, None),
+            input_paths: vec![CachedRequestPath::capture(&source_path, None)],
+            cross_root_shareable: false,
             cached_at,
         }
     }
@@ -5527,13 +5865,141 @@ exit /b 0
             Path::new(r"C:\LLVM\bin\clang++.exe"),
             &args,
             Path::new(r"C:\Work\Project"),
+            None,
+            None,
         );
         let b = request_fingerprint(
             Path::new("c:/llvm/bin/clang++.exe"),
             &args,
             Path::new("c:/work/project"),
+            None,
+            None,
         );
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn find_git_root_detects_git_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let nested = root.join("crates/demo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(find_git_root(&nested), Some(root.into()));
+    }
+
+    #[test]
+    fn resolve_worktree_root_prefers_client_env_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("repo/subdir");
+        let override_root = tmp.path().join("override-root");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&override_root).unwrap();
+        std::fs::create_dir_all(tmp.path().join("repo/.git")).unwrap();
+        let env = vec![(
+            WORKTREE_ROOT_ENV.to_string(),
+            override_root.to_string_lossy().into_owned(),
+        )];
+
+        assert_eq!(
+            resolve_worktree_root(&cwd, Some(&env)),
+            Some(override_root.into())
+        );
+    }
+
+    #[test]
+    fn request_fingerprint_matches_equivalent_roots_for_safe_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("workspace-a");
+        let root_b = tmp.path().join("workspace-b");
+        let include_a = root_a.join("include");
+        let include_b = root_b.join("include");
+        let source_a = root_a.join("src/main.cpp");
+        let source_b = root_b.join("src/main.cpp");
+        let output_a = root_a.join("build/main.o");
+        let output_b = root_b.join("build/main.o");
+
+        let args_a = vec![
+            "-I".to_string(),
+            include_a.to_string_lossy().into_owned(),
+            "-c".to_string(),
+            source_a.to_string_lossy().into_owned(),
+            "-o".to_string(),
+            output_a.to_string_lossy().into_owned(),
+        ];
+        let args_b = vec![
+            "-I".to_string(),
+            include_b.to_string_lossy().into_owned(),
+            "-c".to_string(),
+            source_b.to_string_lossy().into_owned(),
+            "-o".to_string(),
+            output_b.to_string_lossy().into_owned(),
+        ];
+
+        let a = request_fingerprint(
+            Path::new("/usr/bin/clang++"),
+            &args_a,
+            &root_a,
+            Some(&root_a),
+            None,
+        );
+        let b = request_fingerprint(
+            Path::new("/usr/bin/clang++"),
+            &args_b,
+            &root_b,
+            Some(&root_b),
+            None,
+        );
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn request_fingerprint_keeps_external_paths_distinct() {
+        let args_a = vec!["-I".to_string(), "/external-a/include".to_string()];
+        let args_b = vec!["-I".to_string(), "/external-b/include".to_string()];
+
+        let a = request_fingerprint(
+            Path::new("/usr/bin/clang++"),
+            &args_a,
+            Path::new("/workspace-a"),
+            Some(Path::new("/workspace-a")),
+            None,
+        );
+        let b = request_fingerprint(
+            Path::new("/usr/bin/clang++"),
+            &args_b,
+            Path::new("/workspace-b"),
+            Some(Path::new("/workspace-b")),
+            None,
+        );
+
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn request_fingerprint_includes_rust_key_env() {
+        let args = vec!["src/lib.rs".to_string()];
+        let env_a = vec![("CARGO_PKG_VERSION".to_string(), "1.0.0".to_string())];
+        let env_b = vec![("CARGO_PKG_VERSION".to_string(), "1.0.1".to_string())];
+
+        let a = request_fingerprint(
+            Path::new("/usr/bin/rustc"),
+            &args,
+            Path::new("/workspace"),
+            Some(Path::new("/workspace")),
+            Some(&env_a),
+        );
+        let b = request_fingerprint(
+            Path::new("/usr/bin/rustc"),
+            &args,
+            Path::new("/workspace"),
+            Some(Path::new("/workspace")),
+            Some(&env_b),
+        );
+
+        assert_ne!(a, b);
     }
 
     #[tokio::test]
