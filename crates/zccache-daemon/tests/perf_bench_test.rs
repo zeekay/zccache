@@ -823,6 +823,596 @@ fn fmt_ratio(baseline: Duration, test: Duration, bold: bool) -> String {
 
 // ── Main benchmark ──────────────────────────────────────────────────────
 
+// -- Link/archive benchmark helpers -----------------------------------------
+
+fn find_archiver() -> Option<NormalizedPath> {
+    zccache_test_support::find_on_path("ar")
+        .or_else(|| zccache_test_support::find_on_path("llvm-ar"))
+}
+
+fn bench_exe_name(stem: &str) -> String {
+    if cfg!(windows) {
+        format!("{stem}.exe")
+    } else {
+        stem.to_string()
+    }
+}
+
+fn remove_path_if_exists(path: &Path) {
+    if path.is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn remove_output_and_sidecars(output: &Path) {
+    remove_path_if_exists(output);
+    let Some(parent) = output.parent() else {
+        return;
+    };
+    let Some(stem) = output.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
+    for ext in [
+        "a", "data", "dSYM", "exe", "html", "js", "lib", "map", "pdb", "wasm",
+    ] {
+        remove_path_if_exists(&parent.join(format!("{stem}.{ext}")));
+    }
+}
+
+fn clean_link_outputs(cwd: &Path, outputs: &[String]) {
+    for output in outputs {
+        let path = Path::new(output);
+        if path.is_absolute() {
+            remove_output_and_sidecars(path);
+        } else {
+            remove_output_and_sidecars(&cwd.join(path));
+        }
+    }
+}
+
+fn command_failure(description: &str, output: &std::process::Output) -> String {
+    format!(
+        "{description} failed with status {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn try_run_tool(tool: &Path, args: &[String], cwd: &Path, description: &str) -> Result<(), String> {
+    let output = std::process::Command::new(tool)
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to run {description}: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_failure(description, &output))
+    }
+}
+
+fn run_tool_timed(tool: &Path, args: &[String], cwd: &Path, description: &str) -> Duration {
+    let start = Instant::now();
+    let output = std::process::Command::new(tool)
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {description}: {e}"));
+    let elapsed = start.elapsed();
+    assert!(
+        output.status.success(),
+        "{}",
+        command_failure(description, &output)
+    );
+    elapsed
+}
+
+fn try_run_sccache_tool_timed(
+    sccache: &Path,
+    tool: &Path,
+    args: &[String],
+    cwd: &Path,
+    description: &str,
+) -> Result<Duration, String> {
+    let start = Instant::now();
+    let output = std::process::Command::new(sccache)
+        .arg(tool)
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to run {description}: {e}"))?;
+    let elapsed = start.elapsed();
+    if output.status.success() {
+        Ok(elapsed)
+    } else {
+        Err(command_failure(description, &output))
+    }
+}
+
+fn start_fresh_sccache(sccache: &Path, cache_dir: &Path) -> String {
+    let cache_dir_str = cache_dir.to_string_lossy().into_owned();
+    std::env::set_var("SCCACHE_DIR", &cache_dir_str);
+    let _ = std::process::Command::new(sccache)
+        .arg("--stop-server")
+        .env("SCCACHE_DIR", &cache_dir_str)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    clear_dir_contents(cache_dir);
+    let _ = std::process::Command::new(sccache)
+        .arg("--start-server")
+        .env("SCCACHE_DIR", &cache_dir_str)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    cache_dir_str
+}
+
+fn stop_sccache(sccache: &Path) {
+    let _ = std::process::Command::new(sccache)
+        .arg("--stop-server")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    std::env::remove_var("SCCACHE_DIR");
+}
+
+async fn clear_zccache(client: &mut ClientConn) {
+    client.send(&Request::Clear).await.unwrap();
+    match client.recv().await.unwrap() {
+        Some(Response::Cleared { .. }) => {}
+        other => panic!("expected Cleared, got: {other:?}"),
+    }
+}
+
+async fn run_zccache_link_timed(
+    client: &mut ClientConn,
+    tool: &Path,
+    args: &[String],
+    cwd: &Path,
+    expected_cached: bool,
+    description: &str,
+) -> Duration {
+    let start = Instant::now();
+    client
+        .send(&Request::LinkEphemeral {
+            client_pid: std::process::id(),
+            tool: tool.to_string_lossy().into_owned().into(),
+            args: args.to_vec(),
+            cwd: cwd.to_string_lossy().into_owned().into(),
+            env: None,
+        })
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    match client.recv().await.unwrap() {
+        Some(Response::LinkResult {
+            exit_code,
+            stderr,
+            cached,
+            warning,
+            ..
+        }) => {
+            assert_eq!(
+                exit_code,
+                0,
+                "{description} failed:\n{}",
+                String::from_utf8_lossy(&stderr)
+            );
+            assert_eq!(
+                cached, expected_cached,
+                "{description} cached={cached}, expected {expected_cached}; warning={warning:?}"
+            );
+        }
+        other => panic!("expected LinkResult, got: {other:?}"),
+    }
+    elapsed
+}
+
+struct LinkBenchResult {
+    scenario: &'static str,
+    bare_cold: Duration,
+    bare_warm: Duration,
+    sccache_cold: Option<Duration>,
+    sccache_warm: Option<Vec<Duration>>,
+    zccache_cold: Duration,
+    zccache_warm: Vec<Duration>,
+}
+
+async fn measure_ephemeral_link_scenario(
+    scenario: &'static str,
+    tool: &Path,
+    args: &[String],
+    outputs: &[String],
+    bare_dir: &Path,
+    sccache_dir: &Path,
+    zccache_dir: &Path,
+) -> LinkBenchResult {
+    eprintln!("  Scenario: {scenario}");
+    eprintln!();
+
+    eprintln!("  [1/3] Bare {}", tool.display());
+    clean_link_outputs(bare_dir, outputs);
+    let _ = run_tool_timed(tool, args, bare_dir, "bare link warmup");
+    clean_link_outputs(bare_dir, outputs);
+    let bare_cold = run_tool_timed(tool, args, bare_dir, "bare cold link");
+    eprintln!("        cold: {}", fmt_dur(bare_cold));
+    let mut bare_warm = Vec::with_capacity(WARM_TRIALS);
+    for _ in 0..WARM_TRIALS {
+        clean_link_outputs(bare_dir, outputs);
+        bare_warm.push(run_tool_timed(tool, args, bare_dir, "bare warm link"));
+    }
+    print_trials("warm:", &bare_warm);
+    eprintln!();
+
+    let (sccache_cold, sccache_warm) = if let Some(sccache_bin) = find_sccache() {
+        let sc_cache_dir = zccache_test_support::temp_cache_dir().unwrap();
+        let _cache_dir = start_fresh_sccache(&sccache_bin, sc_cache_dir.path());
+        eprintln!("  [2/3] sccache ({})", sccache_bin.display());
+
+        clean_link_outputs(sccache_dir, outputs);
+        let cold = match try_run_sccache_tool_timed(
+            &sccache_bin,
+            tool,
+            args,
+            sccache_dir,
+            "sccache cold link",
+        ) {
+            Ok(duration) => duration,
+            Err(error) => {
+                eprintln!(
+                    "        sccache link passthrough failed; using direct tool as no-cache baseline\n        {}",
+                    error.lines().next().unwrap_or("unknown failure")
+                );
+                run_tool_timed(tool, args, sccache_dir, "direct no-cache cold link")
+            }
+        };
+        eprintln!("        cold: {}", fmt_dur(cold));
+
+        let mut passthrough_supported = true;
+        let mut warm = Vec::with_capacity(WARM_TRIALS);
+        for _ in 0..WARM_TRIALS {
+            clean_link_outputs(sccache_dir, outputs);
+            let duration = if passthrough_supported {
+                match try_run_sccache_tool_timed(
+                    &sccache_bin,
+                    tool,
+                    args,
+                    sccache_dir,
+                    "sccache warm link",
+                ) {
+                    Ok(duration) => duration,
+                    Err(_) => {
+                        passthrough_supported = false;
+                        run_tool_timed(tool, args, sccache_dir, "direct no-cache warm link")
+                    }
+                }
+            } else {
+                run_tool_timed(tool, args, sccache_dir, "direct no-cache warm link")
+            };
+            warm.push(duration);
+        }
+        print_trials("warm:", &warm);
+        stop_sccache(&sccache_bin);
+        eprintln!();
+        (Some(cold), Some(warm))
+    } else {
+        eprintln!("  [2/3] sccache: not found, skipping");
+        eprintln!();
+        (None, None)
+    };
+
+    eprintln!("  [3/3] zccache");
+    clean_link_outputs(zccache_dir, outputs);
+    let _ = run_tool_timed(tool, args, zccache_dir, "zccache linker warmup");
+    clean_link_outputs(zccache_dir, outputs);
+
+    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+    clear_zccache(&mut client).await;
+
+    let zccache_cold = run_zccache_link_timed(
+        &mut client,
+        tool,
+        args,
+        zccache_dir,
+        false,
+        "zccache cold link",
+    )
+    .await;
+    eprintln!("        cold: {}", fmt_dur(zccache_cold));
+    let mut zccache_warm = Vec::with_capacity(WARM_TRIALS);
+    for _ in 0..WARM_TRIALS {
+        clean_link_outputs(zccache_dir, outputs);
+        zccache_warm.push(
+            run_zccache_link_timed(
+                &mut client,
+                tool,
+                args,
+                zccache_dir,
+                true,
+                "zccache warm link",
+            )
+            .await,
+        );
+    }
+    print_trials("warm:", &zccache_warm);
+    shutdown.notify_one();
+    server_handle.await.unwrap();
+    eprintln!();
+
+    LinkBenchResult {
+        scenario,
+        bare_cold,
+        bare_warm: median(&bare_warm),
+        sccache_cold,
+        sccache_warm,
+        zccache_cold,
+        zccache_warm,
+    }
+}
+
+fn print_link_benchmark_table(title: &str, bare_label: &str, results: &[LinkBenchResult]) {
+    let dash = "\u{2014}";
+    eprintln!();
+    eprintln!("{title}");
+    eprintln!();
+    eprintln!("| Scenario | {bare_label} | sccache | zccache | vs sccache | vs {bare_label} |");
+    eprintln!("|:---------|----------:|--------:|--------:|-----------:|--------------:|");
+    for result in results {
+        let cold_sccache = result.sccache_cold.map(fmt_dur);
+        let cold_vs_sccache = result
+            .sccache_cold
+            .map(|duration| fmt_ratio(duration, result.zccache_cold, false));
+        let cold_vs_bare = fmt_ratio(result.bare_cold, result.zccache_cold, false);
+        eprintln!(
+            "| {}, Cold | {} | {} | {} | {} | {} |",
+            result.scenario,
+            fmt_dur(result.bare_cold),
+            cold_sccache.as_deref().unwrap_or(dash),
+            fmt_dur(result.zccache_cold),
+            cold_vs_sccache.as_deref().unwrap_or(dash),
+            cold_vs_bare,
+        );
+
+        let zccache_warm = median(&result.zccache_warm);
+        let warm_sccache = result
+            .sccache_warm
+            .as_ref()
+            .map(|times| fmt_dur(median(times)));
+        let warm_vs_sccache = result
+            .sccache_warm
+            .as_ref()
+            .map(|times| fmt_ratio(median(times), zccache_warm, true));
+        let warm_vs_bare = fmt_ratio(result.bare_warm, zccache_warm, true);
+        eprintln!(
+            "| {}, Warm | {} | {} | **{}** | {} | {} |",
+            result.scenario,
+            fmt_dur(result.bare_warm),
+            warm_sccache.as_deref().unwrap_or(dash),
+            fmt_dur(zccache_warm),
+            warm_vs_sccache.as_deref().unwrap_or(dash),
+            warm_vs_bare,
+        );
+    }
+    eprintln!();
+    eprintln!(
+        "> **Cold** = first link/archive with an empty zccache. **Warm** = median of {WARM_TRIALS} subsequent cached output restores."
+    );
+    eprintln!();
+}
+
+fn fake_archive_object_names() -> Vec<String> {
+    (0..NUM_FILES).map(|i| format!("unit_{i:03}.o")).collect()
+}
+
+fn prepare_fake_archive_inputs(dir: &Path) -> Vec<String> {
+    clear_dir_contents(dir);
+    let names = fake_archive_object_names();
+    for (i, name) in names.iter().enumerate() {
+        let mut content = Vec::with_capacity(4096);
+        for n in 0..128 {
+            content.extend_from_slice(format!("fake c object {i:03} record {n:03}\n").as_bytes());
+        }
+        std::fs::write(dir.join(name), content).unwrap();
+    }
+    names
+}
+
+fn archive_link_args(output: &str, objects: &[String]) -> Vec<String> {
+    let mut args = vec!["rcsD".to_string(), output.to_string()];
+    args.extend(objects.iter().cloned());
+    args
+}
+
+fn prepare_cpp_link_inputs(compiler: &str, dir: &Path) -> Result<Vec<String>, String> {
+    clear_dir_contents(dir);
+    generate_project(dir);
+    std::fs::write(dir.join("main.cpp"), "int main() { return 0; }\n").unwrap();
+
+    let mut objects = Vec::with_capacity(NUM_FILES + 1);
+    for src in source_names() {
+        let obj = src.replace(".cpp", ".o");
+        let args = vec![
+            "-c".to_string(),
+            src.clone(),
+            "-o".to_string(),
+            obj.clone(),
+            "-Iinclude".to_string(),
+            "-O2".to_string(),
+            "-std=c++17".to_string(),
+        ];
+        try_run_tool(Path::new(compiler), &args, dir, "compile C++ link input")?;
+        objects.push(obj);
+    }
+    let args = vec![
+        "-c".to_string(),
+        "main.cpp".to_string(),
+        "-o".to_string(),
+        "main.o".to_string(),
+        "-O2".to_string(),
+        "-std=c++17".to_string(),
+    ];
+    try_run_tool(
+        Path::new(compiler),
+        &args,
+        dir,
+        "compile C++ main link input",
+    )?;
+    objects.push("main.o".to_string());
+    Ok(objects)
+}
+
+fn driver_link_args(output: &str, objects: &[String]) -> Vec<String> {
+    let mut args = vec!["-o".to_string(), output.to_string()];
+    args.extend(objects.iter().cloned());
+    args
+}
+
+fn rust_final_output_name() -> String {
+    if cfg!(windows) {
+        "rust_link_app.lib".to_string()
+    } else {
+        "librust_link_app.a".to_string()
+    }
+}
+
+fn rust_rlib_path(index: usize) -> String {
+    format!("deps/libunit_{index:03}-unit_{index:03}.rlib")
+}
+
+fn rust_final_link_args(output: &str) -> Vec<String> {
+    let mut args = vec![
+        "--edition".to_string(),
+        "2021".to_string(),
+        "--crate-type".to_string(),
+        "staticlib".to_string(),
+        "--crate-name".to_string(),
+        "rust_link_app".to_string(),
+        "--emit=link".to_string(),
+        "-C".to_string(),
+        "metadata=rust_link_app".to_string(),
+        "-L".to_string(),
+        "dependency=deps".to_string(),
+        "lib.rs".to_string(),
+        "-o".to_string(),
+        output.to_string(),
+    ];
+    for i in 0..RUSTC_NUM_FILES {
+        args.push("--extern".to_string());
+        args.push(format!("unit_{i:03}={}", rust_rlib_path(i)));
+    }
+    args
+}
+
+fn prepare_rust_link_inputs(rustc: &str, dir: &Path) -> Result<(), String> {
+    clear_dir_contents(dir);
+    generate_rust_project(dir);
+    let srcs = rust_source_names();
+    run_rustc_batch(rustc, dir, &srcs, rustc_args_for);
+    for i in 0..RUSTC_NUM_FILES {
+        let rlib = dir.join(rust_rlib_path(i));
+        if !rlib.exists() {
+            return Err(format!("expected rlib missing: {}", rlib.display()));
+        }
+    }
+
+    let mut lib_rs = String::new();
+    for i in 0..RUSTC_NUM_FILES {
+        lib_rs.push_str(&format!("extern crate unit_{i:03};\n"));
+    }
+    lib_rs.push_str(
+        "\n#[no_mangle]\npub extern \"C\" fn zccache_link_entry() -> f64 {\n    let mut acc = 0.0_f64;\n",
+    );
+    for i in 0..RUSTC_NUM_FILES {
+        lib_rs.push_str(&format!("    acc += unit_{i:03}::compute_{i:03}({i});\n"));
+    }
+    lib_rs.push_str("    acc\n}\n");
+    std::fs::write(dir.join("lib.rs"), lib_rs).unwrap();
+    Ok(())
+}
+
+fn clean_rust_final_output(cwd: &Path, output: &str) {
+    clean_link_outputs(cwd, &[output.to_string()]);
+}
+
+fn run_rust_final_link_timed(
+    rustc: &Path,
+    args: &[String],
+    cwd: &Path,
+    output: &str,
+    description: &str,
+) -> Duration {
+    clean_rust_final_output(cwd, output);
+    run_tool_timed(rustc, args, cwd, description)
+}
+
+fn try_run_sccache_rust_final_link_timed(
+    sccache: &Path,
+    rustc: &Path,
+    args: &[String],
+    cwd: &Path,
+    output: &str,
+    description: &str,
+) -> Result<Duration, String> {
+    clean_rust_final_output(cwd, output);
+    try_run_sccache_tool_timed(sccache, rustc, args, cwd, description)
+}
+
+async fn run_zccache_rust_final_link_timed(
+    client: &mut ClientConn,
+    session_id: &str,
+    rustc: &Path,
+    args: &[String],
+    cwd: &Path,
+    output: &str,
+    expected_cached: bool,
+) -> Duration {
+    clean_rust_final_output(cwd, output);
+    let start = Instant::now();
+    client
+        .send(&Request::Compile {
+            session_id: session_id.to_string(),
+            args: args.to_vec(),
+            cwd: cwd.to_string_lossy().into_owned().into(),
+            compiler: rustc.to_string_lossy().into_owned().into(),
+            env: None,
+        })
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    match client.recv().await.unwrap() {
+        Some(Response::CompileResult {
+            exit_code,
+            stderr,
+            cached,
+            ..
+        }) => {
+            assert_eq!(
+                exit_code,
+                0,
+                "zccache Rust link failed:\n{}",
+                String::from_utf8_lossy(&stderr)
+            );
+            assert_eq!(
+                cached, expected_cached,
+                "zccache Rust link cached={cached}, expected {expected_cached}"
+            );
+        }
+        other => panic!("expected CompileResult, got: {other:?}"),
+    }
+    elapsed
+}
+
 #[tokio::test]
 #[ignore] // Run explicitly: soldr cargo test -p zccache-daemon --test perf_bench_test -- perf_c_zccache_vs_bare --nocapture --ignored
 async fn perf_c_zccache_vs_bare() {
@@ -3116,4 +3706,439 @@ async fn perf_emcc_sibling_remap_warm() {
         "> Sibling-workspace = two adjacent git roots; zccache primed from workspace A, warm trials measured in workspace B with `ZCCACHE_PATH_REMAP=auto`. Bare/sccache run their normal same-workspace warm trials in workspace B."
     );
     eprintln!();
+}
+
+#[tokio::test]
+#[ignore] // Run explicitly: soldr cargo test -p zccache-daemon --test perf_bench_test -- perf_c_archive_link --nocapture --ignored
+async fn perf_c_archive_link() {
+    let archiver = match find_archiver() {
+        Some(path) => path,
+        None => {
+            eprintln!("SKIP: neither ar nor llvm-ar found on PATH");
+            return;
+        }
+    };
+    let output = "libzccache_link_bench.a".to_string();
+    let outputs = vec![output.clone()];
+
+    let bare_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let sccache_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let zccache_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let objects = prepare_fake_archive_inputs(bare_dir.path());
+    prepare_fake_archive_inputs(sccache_dir.path());
+    prepare_fake_archive_inputs(zccache_dir.path());
+    let args = archive_link_args(&output, &objects);
+
+    if let Err(error) = try_run_tool(&archiver, &args, bare_dir.path(), "probe ar rcsD") {
+        eprintln!(
+            "SKIP: archiver does not support deterministic archive benchmark\n{}",
+            error
+        );
+        return;
+    }
+    clean_link_outputs(bare_dir.path(), &outputs);
+
+    eprintln!();
+    eprintln!("================================================================");
+    eprintln!("  C STATIC-LIBRARY LINK BENCHMARK");
+    eprintln!("  {NUM_FILES} .o inputs | {WARM_TRIALS} warm trials");
+    eprintln!("  Archiver: {}", archiver.display());
+    eprintln!("================================================================");
+    eprintln!();
+
+    let result = measure_ephemeral_link_scenario(
+        "Static archive",
+        &archiver,
+        &args,
+        &outputs,
+        bare_dir.path(),
+        sccache_dir.path(),
+        zccache_dir.path(),
+    )
+    .await;
+    print_link_benchmark_table(
+        &format!(
+            "## C Static-Library Link Benchmark: {NUM_FILES} .o inputs, {WARM_TRIALS} warm trials"
+        ),
+        "Bare ar",
+        &[result],
+    );
+}
+
+#[tokio::test]
+#[ignore] // Run explicitly: soldr cargo test -p zccache-daemon --test perf_bench_test -- perf_cpp_driver_link --nocapture --ignored
+async fn perf_cpp_driver_link() {
+    let compiler_path = match zccache_test_support::find_clang() {
+        Some(path) => path,
+        None => {
+            eprintln!("SKIP: no C++ compiler found");
+            return;
+        }
+    };
+    let compiler = compiler_path.to_string_lossy().to_string();
+    let output = bench_exe_name("cpp_link_app");
+    let outputs = vec![output.clone()];
+
+    let bare_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let sccache_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let zccache_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let objects = match prepare_cpp_link_inputs(&compiler, bare_dir.path()) {
+        Ok(objects) => objects,
+        Err(error) => {
+            eprintln!("SKIP: failed to prepare C++ link inputs\n{error}");
+            return;
+        }
+    };
+    if let Err(error) = prepare_cpp_link_inputs(&compiler, sccache_dir.path()) {
+        eprintln!("SKIP: failed to prepare C++ sccache link inputs\n{error}");
+        return;
+    }
+    if let Err(error) = prepare_cpp_link_inputs(&compiler, zccache_dir.path()) {
+        eprintln!("SKIP: failed to prepare C++ zccache link inputs\n{error}");
+        return;
+    }
+    let args = driver_link_args(&output, &objects);
+    if let Err(error) = try_run_tool(
+        Path::new(&compiler),
+        &args,
+        bare_dir.path(),
+        "probe C++ link",
+    ) {
+        eprintln!("SKIP: C++ compiler-driver link is not available\n{error}");
+        return;
+    }
+    clean_link_outputs(bare_dir.path(), &outputs);
+
+    eprintln!();
+    eprintln!("================================================================");
+    eprintln!("  C++ DRIVER-LINK BENCHMARK");
+    eprintln!("  {NUM_FILES} .cpp objects + main.o | {WARM_TRIALS} warm trials");
+    eprintln!("  Compiler: {compiler}");
+    eprintln!("================================================================");
+    eprintln!();
+
+    let result = measure_ephemeral_link_scenario(
+        "Driver link",
+        Path::new(&compiler),
+        &args,
+        &outputs,
+        bare_dir.path(),
+        sccache_dir.path(),
+        zccache_dir.path(),
+    )
+    .await;
+    print_link_benchmark_table(
+        &format!(
+            "## C++ Driver-Link Benchmark: {NUM_FILES} .cpp objects, {WARM_TRIALS} warm trials"
+        ),
+        "Bare clang++",
+        &[result],
+    );
+}
+
+#[tokio::test]
+#[ignore] // Run explicitly: soldr cargo test -p zccache-daemon --test perf_bench_test -- perf_emcc_link --nocapture --ignored
+async fn perf_emcc_link() {
+    let compiler_path = match find_empp() {
+        Some(path) => path,
+        None => {
+            eprintln!("SKIP: em++ not found (install emsdk and source emsdk_env)");
+            return;
+        }
+    };
+    let compiler = compiler_path.to_string_lossy().to_string();
+
+    let bare_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let sccache_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let zccache_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let objects = match prepare_cpp_link_inputs(&compiler, bare_dir.path()) {
+        Ok(objects) => objects,
+        Err(error) => {
+            eprintln!("SKIP: failed to prepare Emscripten link inputs\n{error}");
+            return;
+        }
+    };
+    if let Err(error) = prepare_cpp_link_inputs(&compiler, sccache_dir.path()) {
+        eprintln!("SKIP: failed to prepare Emscripten sccache link inputs\n{error}");
+        return;
+    }
+    if let Err(error) = prepare_cpp_link_inputs(&compiler, zccache_dir.path()) {
+        eprintln!("SKIP: failed to prepare Emscripten zccache link inputs\n{error}");
+        return;
+    }
+
+    let html_output = "em_link_app.html".to_string();
+    let wasm_output = "em_link_app.wasm".to_string();
+    let html_outputs = vec![html_output.clone()];
+    let wasm_outputs = vec![wasm_output.clone()];
+    let html_args = driver_link_args(&html_output, &objects);
+    let wasm_args = driver_link_args(&wasm_output, &objects);
+    if let Err(error) = try_run_tool(
+        Path::new(&compiler),
+        &html_args,
+        bare_dir.path(),
+        "probe em++ html link",
+    ) {
+        eprintln!("SKIP: Emscripten HTML link is not available\n{error}");
+        return;
+    }
+    clean_link_outputs(bare_dir.path(), &html_outputs);
+    if let Err(error) = try_run_tool(
+        Path::new(&compiler),
+        &wasm_args,
+        bare_dir.path(),
+        "probe em++ wasm link",
+    ) {
+        eprintln!("SKIP: Emscripten Wasm link is not available\n{error}");
+        return;
+    }
+    clean_link_outputs(bare_dir.path(), &wasm_outputs);
+
+    eprintln!();
+    eprintln!("================================================================");
+    eprintln!("  EMSCRIPTEN LINK BENCHMARK");
+    eprintln!("  {NUM_FILES} .cpp objects + main.o | {WARM_TRIALS} warm trials");
+    eprintln!("  Compiler: {compiler}");
+    eprintln!("================================================================");
+    eprintln!();
+
+    let html = measure_ephemeral_link_scenario(
+        "HTML link",
+        Path::new(&compiler),
+        &html_args,
+        &html_outputs,
+        bare_dir.path(),
+        sccache_dir.path(),
+        zccache_dir.path(),
+    )
+    .await;
+    let wasm = measure_ephemeral_link_scenario(
+        "Wasm link",
+        Path::new(&compiler),
+        &wasm_args,
+        &wasm_outputs,
+        bare_dir.path(),
+        sccache_dir.path(),
+        zccache_dir.path(),
+    )
+    .await;
+    print_link_benchmark_table(
+        &format!(
+            "## Emscripten Link Benchmark: {NUM_FILES} .cpp objects, {WARM_TRIALS} warm trials"
+        ),
+        "Bare em++",
+        &[html, wasm],
+    );
+}
+
+#[tokio::test]
+#[ignore] // Run explicitly: soldr cargo test -p zccache-daemon --test perf_bench_test -- perf_rust_workspace_link --nocapture --ignored
+async fn perf_rust_workspace_link() {
+    let rustc_path = match zccache_test_support::find_rustc() {
+        Some(path) => path,
+        None => {
+            eprintln!("SKIP: rustc not found");
+            return;
+        }
+    };
+    let rustc = rustc_path.to_string_lossy().to_string();
+    let output = rust_final_output_name();
+    let args = rust_final_link_args(&output);
+
+    let bare_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let sccache_dir = zccache_test_support::temp_cache_dir().unwrap();
+    let zccache_dir = zccache_test_support::temp_cache_dir().unwrap();
+    if let Err(error) = prepare_rust_link_inputs(&rustc, bare_dir.path()) {
+        eprintln!("SKIP: failed to prepare Rust link inputs\n{error}");
+        return;
+    }
+    if let Err(error) = prepare_rust_link_inputs(&rustc, sccache_dir.path()) {
+        eprintln!("SKIP: failed to prepare Rust sccache link inputs\n{error}");
+        return;
+    }
+    if let Err(error) = prepare_rust_link_inputs(&rustc, zccache_dir.path()) {
+        eprintln!("SKIP: failed to prepare Rust zccache link inputs\n{error}");
+        return;
+    }
+    if let Err(error) = try_run_tool(
+        Path::new(&rustc),
+        &args,
+        bare_dir.path(),
+        "probe Rust staticlib link",
+    ) {
+        eprintln!("SKIP: Rust staticlib link is not available\n{error}");
+        return;
+    }
+    clean_rust_final_output(bare_dir.path(), &output);
+
+    eprintln!();
+    eprintln!("================================================================");
+    eprintln!("  RUST WORKSPACE LINK BENCHMARK");
+    eprintln!("  {RUSTC_NUM_FILES} .rlib inputs | {RUSTC_WARM_TRIALS} warm trials");
+    eprintln!("  Compiler: {rustc}");
+    eprintln!("================================================================");
+    eprintln!();
+
+    eprintln!("  [1/3] Bare rustc");
+    let _ = run_rust_final_link_timed(
+        Path::new(&rustc),
+        &args,
+        bare_dir.path(),
+        &output,
+        "bare Rust link warmup",
+    );
+    let bare_cold = run_rust_final_link_timed(
+        Path::new(&rustc),
+        &args,
+        bare_dir.path(),
+        &output,
+        "bare Rust cold link",
+    );
+    eprintln!("        cold: {}", fmt_dur(bare_cold));
+    let mut bare_warm = Vec::with_capacity(RUSTC_WARM_TRIALS);
+    for _ in 0..RUSTC_WARM_TRIALS {
+        bare_warm.push(run_rust_final_link_timed(
+            Path::new(&rustc),
+            &args,
+            bare_dir.path(),
+            &output,
+            "bare Rust warm link",
+        ));
+    }
+    print_trials("warm:", &bare_warm);
+    eprintln!();
+
+    let (sccache_cold, sccache_warm) = if let Some(sccache_bin) = find_sccache() {
+        let sc_cache_dir = zccache_test_support::temp_cache_dir().unwrap();
+        let _cache_dir = start_fresh_sccache(&sccache_bin, sc_cache_dir.path());
+        eprintln!("  [2/3] sccache ({})", sccache_bin.display());
+        let cold = match try_run_sccache_rust_final_link_timed(
+            &sccache_bin,
+            Path::new(&rustc),
+            &args,
+            sccache_dir.path(),
+            &output,
+            "sccache Rust cold link",
+        ) {
+            Ok(duration) => duration,
+            Err(error) => {
+                eprintln!(
+                    "        sccache Rust link passthrough failed; using direct rustc as no-cache baseline\n        {}",
+                    error.lines().next().unwrap_or("unknown failure")
+                );
+                run_rust_final_link_timed(
+                    Path::new(&rustc),
+                    &args,
+                    sccache_dir.path(),
+                    &output,
+                    "direct Rust no-cache cold link",
+                )
+            }
+        };
+        eprintln!("        cold: {}", fmt_dur(cold));
+        let mut passthrough_supported = true;
+        let mut warm = Vec::with_capacity(RUSTC_WARM_TRIALS);
+        for _ in 0..RUSTC_WARM_TRIALS {
+            let duration = if passthrough_supported {
+                match try_run_sccache_rust_final_link_timed(
+                    &sccache_bin,
+                    Path::new(&rustc),
+                    &args,
+                    sccache_dir.path(),
+                    &output,
+                    "sccache Rust warm link",
+                ) {
+                    Ok(duration) => duration,
+                    Err(_) => {
+                        passthrough_supported = false;
+                        run_rust_final_link_timed(
+                            Path::new(&rustc),
+                            &args,
+                            sccache_dir.path(),
+                            &output,
+                            "direct Rust no-cache warm link",
+                        )
+                    }
+                }
+            } else {
+                run_rust_final_link_timed(
+                    Path::new(&rustc),
+                    &args,
+                    sccache_dir.path(),
+                    &output,
+                    "direct Rust no-cache warm link",
+                )
+            };
+            warm.push(duration);
+        }
+        print_trials("warm:", &warm);
+        stop_sccache(&sccache_bin);
+        eprintln!();
+        (Some(cold), Some(warm))
+    } else {
+        eprintln!("  [2/3] sccache: not found, skipping");
+        eprintln!();
+        (None, None)
+    };
+
+    eprintln!("  [3/3] zccache");
+    let _ = run_rust_final_link_timed(
+        Path::new(&rustc),
+        &args,
+        zccache_dir.path(),
+        &output,
+        "zccache Rust linker warmup",
+    );
+    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+    clear_zccache(&mut client).await;
+    let zccache_cwd = zccache_dir.path().to_string_lossy().into_owned();
+    let session_id = start_zccache_session(&mut client, &zccache_cwd).await;
+    let zccache_cold = run_zccache_rust_final_link_timed(
+        &mut client,
+        &session_id,
+        Path::new(&rustc),
+        &args,
+        zccache_dir.path(),
+        &output,
+        false,
+    )
+    .await;
+    eprintln!("        cold: {}", fmt_dur(zccache_cold));
+    let mut zccache_warm = Vec::with_capacity(RUSTC_WARM_TRIALS);
+    for _ in 0..RUSTC_WARM_TRIALS {
+        zccache_warm.push(
+            run_zccache_rust_final_link_timed(
+                &mut client,
+                &session_id,
+                Path::new(&rustc),
+                &args,
+                zccache_dir.path(),
+                &output,
+                true,
+            )
+            .await,
+        );
+    }
+    print_trials("warm:", &zccache_warm);
+    end_zccache_session(&mut client, session_id).await;
+    shutdown.notify_one();
+    server_handle.await.unwrap();
+
+    let result = LinkBenchResult {
+        scenario: "Workspace staticlib link",
+        bare_cold,
+        bare_warm: median(&bare_warm),
+        sccache_cold,
+        sccache_warm,
+        zccache_cold,
+        zccache_warm,
+    };
+    print_link_benchmark_table(
+        &format!(
+            "## Rust Workspace Link Benchmark: {RUSTC_NUM_FILES} .rlib inputs, {RUSTC_WARM_TRIALS} warm trials"
+        ),
+        "Bare rustc",
+        &[result],
+    );
 }
