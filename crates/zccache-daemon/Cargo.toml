@@ -29,6 +29,7 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+sysinfo = "0.33"
 zccache-core = { workspace = true }
 zccache-protocol = { workspace = true }
 zccache-ipc = { workspace = true }

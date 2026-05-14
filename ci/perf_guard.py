@@ -135,7 +135,7 @@ def run_benchmarks_once(
 def _benchmark_env(cache_dir: Path, language: str | None) -> dict[str, str]:
     env = os.environ.copy()
     env["ZCCACHE_CACHE_DIR"] = str(cache_dir)
-    env["ZCCACHE_COMPILE_PRIORITY"] = "high"
+    env["ZCCACHE_COMPILE_PRIORITY"] = "auto"
     if language == "rust":
         env["ZCCACHE_PROFILE_RUST_MISS"] = "1"
     env.pop("RUSTC_WRAPPER", None)

@@ -3521,6 +3521,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sysinfo",
  "tempfile",
  "thiserror",
  "tikv-jemallocator",

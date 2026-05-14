@@ -2,28 +2,37 @@
 
 use std::io;
 use std::process::Output;
-
-#[cfg(windows)]
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
 pub(crate) const COMPILE_PRIORITY_ENV: &str = "ZCCACHE_COMPILE_PRIORITY";
+const AUTO_PRIORITY_SATURATED_CPU_PERCENT: f32 = 95.0;
 
 /// Priority policy for compiler/linker child processes owned by the daemon.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum CompilePriority {
-    Normal,
     #[default]
+    Auto,
+    Normal,
     Low,
     Idle,
     High,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompilePriorityDecision {
+    pub(crate) requested: CompilePriority,
+    pub(crate) effective: CompilePriority,
+    pub(crate) cpu_usage_percent: Option<f32>,
+}
+
 impl CompilePriority {
     pub(crate) fn parse(value: &str) -> Result<Self, CompilePriorityParseError> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
             "normal" => Ok(Self::Normal),
             "low" => Ok(Self::Low),
             "idle" => Ok(Self::Idle),
@@ -45,16 +54,43 @@ impl CompilePriority {
 
         match std::env::var(COMPILE_PRIORITY_ENV) {
             Ok(value) => Self::parse_or_warn(&value),
-            Err(_) => Self::Low,
+            Err(_) => Self::Auto,
         }
     }
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Normal => "normal",
             Self::Low => "low",
             Self::Idle => "idle",
             Self::High => "high",
+        }
+    }
+
+    pub(crate) fn resolve_for_current_load(self) -> CompilePriorityDecision {
+        let cpu_usage_percent = matches!(self, Self::Auto)
+            .then(current_cpu_usage_percent)
+            .flatten();
+        self.resolve_with_cpu_usage(cpu_usage_percent)
+    }
+
+    fn resolve_with_cpu_usage(self, cpu_usage_percent: Option<f32>) -> CompilePriorityDecision {
+        let effective = match self {
+            Self::Auto => Self::auto_effective_priority(cpu_usage_percent),
+            priority => priority,
+        };
+        CompilePriorityDecision {
+            requested: self,
+            effective,
+            cpu_usage_percent,
+        }
+    }
+
+    fn auto_effective_priority(cpu_usage_percent: Option<f32>) -> Self {
+        match cpu_usage_percent {
+            Some(cpu) if cpu >= AUTO_PRIORITY_SATURATED_CPU_PERCENT => Self::Low,
+            Some(_) | None => Self::Normal,
         }
     }
 
@@ -76,14 +112,14 @@ impl CompilePriority {
     fn parse_optional(value: Option<&str>) -> Result<Self, CompilePriorityParseError> {
         match value {
             Some(value) => Self::parse(value),
-            None => Ok(Self::Low),
+            None => Ok(Self::Auto),
         }
     }
 
     #[cfg(unix)]
     fn unix_nice_value(self) -> Option<i32> {
         match self {
-            Self::Normal => None,
+            Self::Auto | Self::Normal => None,
             Self::Low => Some(10),
             Self::Idle => Some(19),
             // Higher priorities commonly require extra privileges; failures are
@@ -99,12 +135,52 @@ impl CompilePriority {
         };
 
         match self {
-            Self::Normal => None,
+            Self::Auto | Self::Normal => None,
             Self::Low => Some(BELOW_NORMAL_PRIORITY_CLASS),
             Self::Idle => Some(IDLE_PRIORITY_CLASS),
             Self::High => Some(HIGH_PRIORITY_CLASS),
         }
     }
+}
+
+struct CpuUsageMonitor {
+    system: sysinfo::System,
+    last_refresh: Option<Instant>,
+    last_usage_percent: Option<f32>,
+}
+
+impl CpuUsageMonitor {
+    fn new() -> Self {
+        let mut system = sysinfo::System::new();
+        system.refresh_cpu_usage();
+        Self {
+            system,
+            last_refresh: Some(Instant::now()),
+            last_usage_percent: None,
+        }
+    }
+
+    fn sample(&mut self) -> Option<f32> {
+        let now = Instant::now();
+        if self
+            .last_refresh
+            .is_some_and(|last| now.duration_since(last) < sysinfo::MINIMUM_CPU_UPDATE_INTERVAL)
+        {
+            return self.last_usage_percent;
+        }
+
+        self.system.refresh_cpu_usage();
+        self.last_refresh = Some(now);
+        let usage = self.system.global_cpu_usage().clamp(0.0, 100.0);
+        self.last_usage_percent = Some(usage);
+        self.last_usage_percent
+    }
+}
+
+fn current_cpu_usage_percent() -> Option<f32> {
+    static CPU_USAGE_MONITOR: OnceLock<Mutex<CpuUsageMonitor>> = OnceLock::new();
+    let monitor = CPU_USAGE_MONITOR.get_or_init(|| Mutex::new(CpuUsageMonitor::new()));
+    monitor.lock().ok().and_then(|mut monitor| monitor.sample())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +193,9 @@ pub(crate) fn command_output_with_priority(
     cmd: &mut std::process::Command,
     priority: CompilePriority,
 ) -> io::Result<Output> {
+    let decision = priority.resolve_for_current_load();
+    let priority = decision.effective;
+
     #[cfg(windows)]
     {
         use std::process::Stdio;
@@ -159,6 +238,9 @@ pub(crate) async fn tokio_command_output_with_priority(
     cmd: &mut tokio::process::Command,
     priority: CompilePriority,
 ) -> io::Result<Output> {
+    let decision = priority.resolve_for_current_load();
+    let priority = decision.effective;
+
     #[cfg(windows)]
     {
         use std::process::Stdio;
@@ -336,6 +418,10 @@ mod tests {
     #[test]
     fn parse_compile_priority_values() {
         assert_eq!(
+            CompilePriority::parse("auto").unwrap(),
+            CompilePriority::Auto
+        );
+        assert_eq!(
             CompilePriority::parse("normal").unwrap(),
             CompilePriority::Normal
         );
@@ -353,6 +439,7 @@ mod tests {
 
     #[test]
     fn formats_compile_priority_for_profiles() {
+        assert_eq!(CompilePriority::Auto.as_str(), "auto");
         assert_eq!(CompilePriority::Normal.as_str(), "normal");
         assert_eq!(CompilePriority::Low.as_str(), "low");
         assert_eq!(CompilePriority::Idle.as_str(), "idle");
@@ -360,11 +447,52 @@ mod tests {
     }
 
     #[test]
-    fn absent_compile_priority_defaults_to_low() {
+    fn absent_compile_priority_defaults_to_auto() {
         assert_eq!(
             CompilePriority::parse_optional(None).unwrap(),
+            CompilePriority::Auto
+        );
+    }
+
+    #[test]
+    fn auto_priority_uses_normal_until_cpu_is_saturated() {
+        assert_eq!(
+            CompilePriority::auto_effective_priority(None),
+            CompilePriority::Normal
+        );
+        assert_eq!(
+            CompilePriority::auto_effective_priority(Some(94.9)),
+            CompilePriority::Normal
+        );
+        assert_eq!(
+            CompilePriority::auto_effective_priority(Some(95.0)),
             CompilePriority::Low
         );
+        assert_eq!(
+            CompilePriority::auto_effective_priority(Some(100.0)),
+            CompilePriority::Low
+        );
+    }
+
+    #[test]
+    fn auto_priority_decision_records_effective_priority() {
+        let decision = CompilePriority::Auto.resolve_with_cpu_usage(Some(96.0));
+        assert_eq!(decision.requested, CompilePriority::Auto);
+        assert_eq!(decision.effective, CompilePriority::Low);
+        assert_eq!(decision.cpu_usage_percent, Some(96.0));
+    }
+
+    #[test]
+    fn auto_priority_can_sample_current_load() {
+        let decision = CompilePriority::Auto.resolve_for_current_load();
+        assert_eq!(decision.requested, CompilePriority::Auto);
+        assert!(matches!(
+            decision.effective,
+            CompilePriority::Normal | CompilePriority::Low
+        ));
+        if let Some(cpu_usage_percent) = decision.cpu_usage_percent {
+            assert!((0.0..=100.0).contains(&cpu_usage_percent));
+        }
     }
 
     #[test]
@@ -388,6 +516,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_priority_mapping_is_explicit() {
+        assert_eq!(CompilePriority::Auto.unix_nice_value(), None);
         assert_eq!(CompilePriority::Normal.unix_nice_value(), None);
         assert_eq!(CompilePriority::Low.unix_nice_value(), Some(10));
         assert_eq!(CompilePriority::Idle.unix_nice_value(), Some(19));
@@ -401,6 +530,7 @@ mod tests {
             BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS,
         };
 
+        assert_eq!(CompilePriority::Auto.windows_priority_class(), None);
         assert_eq!(CompilePriority::Normal.windows_priority_class(), None);
         assert_eq!(
             CompilePriority::Low.windows_priority_class(),
