@@ -56,6 +56,16 @@ MISSING_C_LOG = """
 """
 
 
+NEAR_BARE_COLD_C_LOG = """
+## C Benchmark: 50 .c files, 5 warm trials
+
+| Scenario | Bare clang | sccache | zccache | vs sccache | vs bare clang |
+|:---------|----------:|--------:|--------:|-----------:|--------------:|
+| Single-file, Cold | 3.000s | 4.000s | 3.300s | 1.2x faster | 1.1x slower |
+| Single-file, Warm | 3.000s | 2.000s | **0.100s** | **20x faster** | **30x faster** |
+"""
+
+
 def rows(log: str):
     return benchmark_stats.parse_benchmark_log(log)
 
@@ -85,6 +95,20 @@ def test_sccache_threshold_is_enforced_separately_from_bare():
     failing = [status for status in report.statuses if not status.passed]
     assert [(status.language, status.scenario, status.baseline) for status in failing] == [
         ("c++", "Single-file, Cold", "sccache")
+    ]
+
+
+def test_default_cold_thresholds_allow_near_bare_misses():
+    report = perf_guard.evaluate_attempts(
+        [rows(NEAR_BARE_COLD_C_LOG)],
+        languages=("c",),
+    )
+
+    assert report.passed
+    cold_statuses = [status for status in report.statuses if status.mode == "cold"]
+    assert [(status.baseline, status.threshold) for status in cold_statuses] == [
+        ("bare", 0.85),
+        ("sccache", 1.0),
     ]
 
 
@@ -135,19 +159,30 @@ def test_all_command_failures_fail_even_when_rows_parse():
 
 def test_report_marks_failed_rows():
     report = perf_guard.evaluate_attempts([rows(FAILING_RUST_LOG)], threshold=1.5)
-    markdown = perf_guard.format_report(report, 1.5, 1.5)
+    markdown = perf_guard.format_report(report, 1.5, 1.5, 1.5, 1.5)
 
     assert "| FAIL | rust | Rust rustc | Build, Cold | Bare rustc | 1.286x | 1.50x | 1 | 1 |" in markdown
 
 
 def test_report_json_marks_thresholds_and_failed_statuses():
     report = perf_guard.evaluate_attempts([rows(FAILING_RUST_LOG)], threshold=1.5)
-    payload = perf_guard.format_report_json(report, 1.5, 1.5)
+    payload = perf_guard.format_report_json(
+        report,
+        1.5,
+        1.5,
+        cold_bare_threshold=1.5,
+        cold_sccache_threshold=1.5,
+    )
 
     assert payload["schema_version"] == 1
     assert payload["passed"] is False
     assert payload["languages"] == ["c", "c++", "rust"]
-    assert payload["thresholds"] == {"bare": 1.5, "sccache": 1.5}
+    assert payload["thresholds"] == {
+        "bare": 1.5,
+        "sccache": 1.5,
+        "cold_bare": 1.5,
+        "cold_sccache": 1.5,
+    }
     failing = [
         status
         for status in payload["statuses"]
@@ -177,7 +212,15 @@ def test_writes_perf_guard_json_artifacts(tmp_path):
         source="unit-test",
         language="c",
     )
-    perf_guard.write_report_json(tmp_path, report, 1.5, 1.5, ("c",))
+    perf_guard.write_report_json(
+        tmp_path,
+        report,
+        1.5,
+        1.5,
+        ("c",),
+        cold_bare_threshold=1.5,
+        cold_sccache_threshold=1.5,
+    )
 
     attempt_payload = json.loads((tmp_path / "attempt-1.json").read_text(encoding="utf-8"))
     summary_payload = json.loads(
