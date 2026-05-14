@@ -273,6 +273,20 @@ project-local source, dependency, cwd, and safe path arguments relative to that
 root, and writes cache hits back to the output paths requested by the current
 worktree.
 
+For C/C++ projects, enable compiler path remapping so path-sensitive outputs
+such as `__FILE__`, debug/source paths, and compatible link search paths can
+share cache entries across equivalent Git roots:
+
+```bash
+export ZCCACHE_PATH_REMAP=auto
+```
+
+In auto mode, zccache discovers the enclosing Git root and internally adds
+root/cwd `-ffile-prefix-map=...=.` arguments for GCC/Clang-family compile
+misses. The original build files do not need to inject those flags themselves.
+For link requests, zccache normalizes proven workspace-local input/search paths
+for cache identity while preserving physical output and runtime-facing paths.
+
 Set `ZCCACHE_WORKTREE_ROOT` when automatic Git-root detection is not reliable
 or when a wrapper/test needs to define the normalization root explicitly:
 

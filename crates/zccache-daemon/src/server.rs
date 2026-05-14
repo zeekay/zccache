@@ -60,7 +60,10 @@ const REQUEST_CACHE_MAX_ENTRIES: usize = 4096;
 const RSP_CACHE_MAX_ENTRIES: usize = 1024;
 const RUST_MISS_PROFILE_ENV: &str = "ZCCACHE_PROFILE_RUST_MISS";
 const WORKTREE_ROOT_ENV: &str = "ZCCACHE_WORKTREE_ROOT";
+const PATH_REMAP_ENV: &str = "ZCCACHE_PATH_REMAP";
 const REQUEST_ROOT_MARKER: &str = "$ZCCACHE_WORKTREE_ROOT";
+const LINK_PATH_REMAP_AUTO_KEY_FLAG: &str = "zccache:path-remap=auto";
+const LINK_PATH_REMAP_ROOT_SPECIFIC_FLAG: &str = "zccache:path-remap=root-specific";
 
 #[derive(Clone)]
 struct RspDependency {
@@ -1495,6 +1498,12 @@ async fn handle_link_ephemeral(
     use zccache_compiler::parse_linker::{parse_linker_invocation, ParsedLinkerInvocation};
 
     state.stats.record_link();
+    let worktree_root = resolve_worktree_root(cwd, env.as_deref());
+    let link_path_remap_key_root = if path_remap_auto_enabled(env.as_deref()) {
+        worktree_root.as_deref()
+    } else {
+        None
+    };
 
     // 1. Parse the tool invocation — try archiver first, then linker
     struct ParsedTool {
@@ -1573,13 +1582,33 @@ async fn handle_link_ephemeral(
 
     // 4. Hash all input files
     let cwd_path = std::path::Path::new(cwd);
+    let link_key_plan = build_link_path_remap_key_plan(
+        &parsed_tool.cache_relevant_flags,
+        cwd_path,
+        link_path_remap_key_root,
+    );
     let mut key_builder = zccache_hash::link_cache_key::LinkCacheKeyBuilder::new().tool(tool_hash);
 
-    for flag in &parsed_tool.cache_relevant_flags {
+    if link_path_remap_key_root.is_some() {
+        key_builder = key_builder.flag(LINK_PATH_REMAP_AUTO_KEY_FLAG);
+    }
+    if link_key_plan.root_specific {
+        let root_identity = link_path_remap_key_root
+            .map(zccache_core::path::normalize_for_key)
+            .unwrap_or_default();
+        key_builder = key_builder.flag(format!(
+            "{LINK_PATH_REMAP_ROOT_SPECIFIC_FLAG}:{root_identity}"
+        ));
+    }
+    for flag in &link_key_plan.flags {
         key_builder = key_builder.flag(flag);
     }
 
-    for input in &parsed_tool.input_files {
+    for input in parsed_tool
+        .input_files
+        .iter()
+        .chain(link_key_plan.extra_input_files.iter())
+    {
         let input_path = if input.is_absolute() {
             input.clone()
         } else {
@@ -3024,6 +3053,11 @@ fn client_env_value<'a>(client_env: Option<&'a [(String, String)]>, name: &str) 
         .filter(|value| !value.is_empty())
 }
 
+fn path_remap_auto_enabled(client_env: Option<&[(String, String)]>) -> bool {
+    client_env_value(client_env, PATH_REMAP_ENV)
+        .is_some_and(|value| value.eq_ignore_ascii_case("auto"))
+}
+
 fn resolve_worktree_root(
     cwd: &Path,
     client_env: Option<&[(String, String)]>,
@@ -3074,10 +3108,98 @@ fn normalize_request_path_value(value: &str, key_root: Option<&Path>) -> Option<
     None
 }
 
+const CC_PREFIX_MAP_FLAGS: &[&str] = &[
+    "-ffile-prefix-map",
+    "-fmacro-prefix-map",
+    "-fdebug-prefix-map",
+    "-fcoverage-prefix-map",
+    "-fprofile-prefix-map",
+];
+
+fn split_cc_prefix_map_arg(arg: &str) -> Option<(&'static str, &str, &str)> {
+    for flag in CC_PREFIX_MAP_FLAGS {
+        if let Some(rest) = arg
+            .strip_prefix(*flag)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            if let Some((old, new)) = rest.split_once('=') {
+                return Some((*flag, old, new));
+            }
+        }
+    }
+    None
+}
+
+fn normalize_cc_prefix_map_arg_for_key(arg: &str, key_root: Option<&Path>) -> Option<String> {
+    let (flag, old, new) = split_cc_prefix_map_arg(arg)?;
+    normalize_request_path_value(old, key_root)
+        .map(|normalized_old| format!("{flag}={normalized_old}={new}"))
+}
+
+fn same_key_path(left: &Path, right: &Path) -> bool {
+    zccache_core::path::normalize_for_key(left) == zccache_core::path::normalize_for_key(right)
+}
+
+fn has_ffile_prefix_map_for_old(args: &[String], old: &Path) -> bool {
+    args.iter().any(|arg| {
+        let Some((flag, existing_old, _)) = split_cc_prefix_map_arg(arg) else {
+            return false;
+        };
+        flag == "-ffile-prefix-map" && same_key_path(Path::new(existing_old), old)
+    })
+}
+
+fn compiler_supports_ffile_prefix_map(compiler_path: &Path) -> bool {
+    matches!(
+        zccache_compiler::detect_family(&compiler_path.to_string_lossy()),
+        zccache_compiler::CompilerFamily::Clang | zccache_compiler::CompilerFamily::Gcc
+    )
+}
+
+fn effective_compile_args(
+    expanded_args: &[String],
+    compiler_path: &Path,
+    cwd: &Path,
+    worktree_root: Option<&NormalizedPath>,
+    client_env: Option<&[(String, String)]>,
+) -> Vec<String> {
+    let mut effective = expanded_args.to_vec();
+    if !path_remap_auto_enabled(client_env) || !compiler_supports_ffile_prefix_map(compiler_path) {
+        return effective;
+    }
+
+    let Some(root) = worktree_root else {
+        return effective;
+    };
+
+    let root_path = root.as_path();
+    if !has_ffile_prefix_map_for_old(&effective, root_path) {
+        effective.push(format!(
+            "-ffile-prefix-map={}={}",
+            root_path.to_string_lossy(),
+            "."
+        ));
+    }
+
+    if !same_key_path(root_path, cwd) && !has_ffile_prefix_map_for_old(&effective, cwd) {
+        effective.push(format!(
+            "-ffile-prefix-map={}={}",
+            cwd.to_string_lossy(),
+            "."
+        ));
+    }
+
+    effective
+}
+
 fn normalize_request_arg(arg: &str, key_root: Option<&Path>) -> String {
     let Some(root) = key_root else {
         return arg.to_string();
     };
+
+    if let Some(normalized) = normalize_cc_prefix_map_arg_for_key(arg, Some(root)) {
+        return normalized;
+    }
 
     if let Some(normalized) = normalize_request_path_value(arg, Some(root)) {
         return normalized;
@@ -3086,6 +3208,12 @@ fn normalize_request_arg(arg: &str, key_root: Option<&Path>) -> String {
     if let Some(rest) = arg.strip_prefix("-I").filter(|rest| !rest.is_empty()) {
         if let Some(normalized) = normalize_request_path_value(rest, Some(root)) {
             return format!("-I{normalized}");
+        }
+    }
+
+    if let Some(rest) = arg.strip_prefix("-L").filter(|rest| !rest.is_empty()) {
+        if let Some(normalized) = normalize_request_path_value(rest, Some(root)) {
+            return format!("-L{normalized}");
         }
     }
 
@@ -3099,6 +3227,306 @@ fn normalize_request_arg(arg: &str, key_root: Option<&Path>) -> String {
     }
 
     arg.to_string()
+}
+
+fn normalize_link_path_value_for_key(value: &str, key_root: Option<&Path>) -> String {
+    let Some(root) = key_root else {
+        return value.to_string();
+    };
+
+    normalize_request_path_value(value, Some(root)).unwrap_or_else(|| value.to_string())
+}
+
+fn normalize_link_flag_atom_for_key(atom: &str, key_root: Option<&Path>) -> String {
+    let Some(root) = key_root else {
+        return atom.to_string();
+    };
+
+    if let Some(normalized) = normalize_cc_prefix_map_arg_for_key(atom, Some(root)) {
+        return normalized;
+    }
+
+    if let Some(rest) = atom.strip_prefix("-L").filter(|rest| !rest.is_empty()) {
+        if let Some(normalized) = normalize_request_path_value(rest, Some(root)) {
+            return format!("-L{normalized}");
+        }
+    }
+
+    for prefix in [
+        "--library-path=",
+        "--version-script=",
+        "--script=",
+        "--sysroot=",
+    ] {
+        if let Some(rest) = atom.strip_prefix(prefix) {
+            if let Some(normalized) = normalize_request_path_value(rest, Some(root)) {
+                return format!("{prefix}{normalized}");
+            }
+        }
+    }
+
+    for prefix in ["/LIBPATH:", "/DEF:"] {
+        if atom
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        {
+            let rest = &atom[prefix.len()..];
+            if let Some(normalized) = normalize_request_path_value(rest, Some(root)) {
+                return format!("{}{normalized}", &atom[..prefix.len()]);
+            }
+        }
+    }
+
+    if let Some((left, right)) = atom.split_once('=') {
+        if let Some(normalized_right) = normalize_request_path_value(right, Some(root)) {
+            return format!("{left}={normalized_right}");
+        }
+    }
+
+    atom.to_string()
+}
+
+fn normalize_wl_flag_for_key(flag: &str, key_root: Option<&Path>) -> String {
+    let mut parts: Vec<String> = flag.split(',').map(|part| part.to_string()).collect();
+
+    let mut i = 1;
+    while i < parts.len() {
+        let normalize = matches!(
+            parts[i].as_str(),
+            "-L" | "-T" | "--script" | "--version-script" | "--library-path" | "--sysroot"
+        );
+        if normalize && i + 1 < parts.len() {
+            parts[i + 1] = normalize_link_path_value_for_key(&parts[i + 1], key_root);
+            i += 2;
+            continue;
+        }
+        parts[i] = normalize_link_flag_atom_for_key(&parts[i], key_root);
+        i += 1;
+    }
+
+    parts.join(",")
+}
+
+fn normalize_link_cache_flag_for_key(flag: &str, key_root: Option<&Path>) -> String {
+    if flag.starts_with("-Wl,") {
+        normalize_wl_flag_for_key(flag, key_root)
+    } else {
+        normalize_link_flag_atom_for_key(flag, key_root)
+    }
+}
+
+fn normalize_link_cache_flags_for_key(flags: &[String], key_root: Option<&Path>) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(flags.len());
+    let mut previous_path_flag = false;
+
+    for flag in flags {
+        if previous_path_flag {
+            normalized.push(normalize_link_path_value_for_key(flag, key_root));
+            previous_path_flag = false;
+            continue;
+        }
+
+        normalized.push(normalize_link_cache_flag_for_key(flag, key_root));
+        previous_path_flag = matches!(
+            flag.as_str(),
+            "-L" | "-T" | "--script" | "--version-script" | "--library-path" | "-isysroot"
+        ) || flag.eq_ignore_ascii_case("/DEF");
+    }
+
+    normalized
+}
+
+#[derive(Debug, Default)]
+struct LinkSearchAnalysis {
+    search_dirs: Vec<NormalizedPath>,
+    lib_names: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct LinkPathRemapKeyPlan {
+    flags: Vec<String>,
+    extra_input_files: Vec<NormalizedPath>,
+    root_specific: bool,
+}
+
+fn link_path_to_absolute(path: &Path, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn path_is_under_root(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root).is_ok()
+}
+
+fn push_link_search_dir(analysis: &mut LinkSearchAnalysis, value: &str) {
+    analysis.search_dirs.push(NormalizedPath::new(value));
+}
+
+fn push_link_lib_name(analysis: &mut LinkSearchAnalysis, value: &str) {
+    if !value.is_empty() {
+        analysis.lib_names.push(value.to_string());
+    }
+}
+
+fn analyze_link_search_flags(flags: &[String]) -> LinkSearchAnalysis {
+    let mut analysis = LinkSearchAnalysis::default();
+    let mut previous_search_dir_flag = false;
+
+    for flag in flags {
+        if previous_search_dir_flag {
+            push_link_search_dir(&mut analysis, flag);
+            previous_search_dir_flag = false;
+            continue;
+        }
+
+        match flag.as_str() {
+            "-L" | "--library-path" => {
+                previous_search_dir_flag = true;
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some(rest) = flag.strip_prefix("-L").filter(|rest| !rest.is_empty()) {
+            push_link_search_dir(&mut analysis, rest);
+            continue;
+        }
+        if let Some(rest) = flag.strip_prefix("--library-path=") {
+            push_link_search_dir(&mut analysis, rest);
+            continue;
+        }
+        if let Some(rest) = flag.strip_prefix("-l").filter(|rest| !rest.is_empty()) {
+            push_link_lib_name(&mut analysis, rest);
+            continue;
+        }
+
+        if let Some(rest) = flag.strip_prefix("-Wl,") {
+            let parts: Vec<&str> = rest.split(',').collect();
+            let mut i = 0;
+            while i < parts.len() {
+                match parts[i] {
+                    "-L" | "--library-path" => {
+                        if i + 1 < parts.len() {
+                            push_link_search_dir(&mut analysis, parts[i + 1]);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    "-l" => {
+                        if i + 1 < parts.len() {
+                            push_link_lib_name(&mut analysis, parts[i + 1]);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    part => {
+                        if let Some(rest) = part.strip_prefix("-L").filter(|s| !s.is_empty()) {
+                            push_link_search_dir(&mut analysis, rest);
+                        } else if let Some(rest) = part
+                            .strip_prefix("--library-path=")
+                            .filter(|s| !s.is_empty())
+                        {
+                            push_link_search_dir(&mut analysis, rest);
+                        } else if let Some(rest) = part.strip_prefix("-l").filter(|s| !s.is_empty())
+                        {
+                            push_link_lib_name(&mut analysis, rest);
+                        }
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+
+    analysis
+}
+
+fn link_library_candidate_names(lib: &str) -> Vec<String> {
+    if let Some(exact) = lib.strip_prefix(':') {
+        return vec![exact.to_string()];
+    }
+
+    vec![
+        format!("lib{lib}.a"),
+        format!("lib{lib}.so"),
+        format!("lib{lib}.dylib"),
+        format!("{lib}.lib"),
+        format!("lib{lib}.dll.a"),
+        format!("{lib}.dll.a"),
+    ]
+}
+
+fn resolve_link_library(
+    lib: &str,
+    search_dirs: &[NormalizedPath],
+    cwd: &Path,
+) -> Option<NormalizedPath> {
+    let candidate_names = link_library_candidate_names(lib);
+    for dir in search_dirs {
+        let abs_dir = link_path_to_absolute(dir.as_path(), cwd);
+        for name in &candidate_names {
+            let candidate = abs_dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate.into());
+            }
+        }
+    }
+    None
+}
+
+fn build_link_path_remap_key_plan(
+    flags: &[String],
+    cwd: &Path,
+    key_root: Option<&Path>,
+) -> LinkPathRemapKeyPlan {
+    let analysis = analyze_link_search_flags(flags);
+    let normalized_flags = normalize_link_cache_flags_for_key(flags, key_root);
+    let Some(root) = key_root else {
+        return LinkPathRemapKeyPlan {
+            flags: normalized_flags,
+            ..Default::default()
+        };
+    };
+
+    let root_local_search = analysis.search_dirs.iter().any(|dir| {
+        let abs_dir = link_path_to_absolute(dir.as_path(), cwd);
+        path_is_under_root(&abs_dir, root)
+    });
+    let mut extra_input_files = Vec::new();
+    let mut root_specific = false;
+
+    if root_local_search && analysis.lib_names.is_empty() {
+        root_specific = true;
+    }
+
+    for lib in &analysis.lib_names {
+        match resolve_link_library(lib, &analysis.search_dirs, cwd) {
+            Some(path) => {
+                let abs_path = link_path_to_absolute(path.as_path(), cwd);
+                if path_is_under_root(&abs_path, root) {
+                    extra_input_files.push(abs_path.into());
+                } else if root_local_search {
+                    root_specific = true;
+                }
+            }
+            None if root_local_search => {
+                root_specific = true;
+            }
+            None => {}
+        }
+    }
+
+    extra_input_files.sort();
+    extra_input_files.dedup();
+
+    LinkPathRemapKeyPlan {
+        flags: normalized_flags,
+        extra_input_files,
+        root_specific,
+    }
 }
 
 fn request_env_fingerprint_vars(client_env: Option<&[(String, String)]>) -> Vec<(&str, &str)> {
@@ -3298,6 +3726,13 @@ async fn handle_compile(
     }
 
     let worktree_root = resolve_worktree_root(cwd, client_env.as_deref());
+    let effective_args = effective_compile_args(
+        &expanded_args,
+        compiler_path,
+        cwd,
+        worktree_root.as_ref(),
+        client_env.as_deref(),
+    );
 
     // Snap the journal clock once so all file hashes in this request see a
     // consistent view (avoids per-file current_clock() syscalls).
@@ -3311,7 +3746,7 @@ async fn handle_compile(
     if state.watcher_active.load(Ordering::Acquire) {
         let request_fp = request_fingerprint(
             compiler_path,
-            &expanded_args,
+            &effective_args,
             cwd,
             worktree_root.as_deref(),
             client_env.as_deref(),
@@ -3479,7 +3914,7 @@ async fn handle_compile(
     // ── Phase: expand response files + parse args ─────────────────────
     let t0 = std::time::Instant::now();
     let compiler_str = compiler.to_str().unwrap_or("");
-    let parsed = zccache_compiler::parse_invocation(compiler_str, &expanded_args);
+    let parsed = zccache_compiler::parse_invocation(compiler_str, &effective_args);
     let compilation = match parsed {
         zccache_compiler::ParsedInvocation::Cacheable(c) => c,
         zccache_compiler::ParsedInvocation::NonCacheable { reason } => {
@@ -3673,7 +4108,7 @@ async fn handle_compile(
 
                             let rfp = request_fingerprint(
                                 compiler_path,
-                                &expanded_args,
+                                &effective_args,
                                 cwd,
                                 Some(key_root.as_path()),
                                 client_env.as_deref(),
@@ -3949,7 +4384,7 @@ async fn handle_compile(
 
                         let rfp = request_fingerprint(
                             compiler_path,
-                            &expanded_args,
+                            &effective_args,
                             cwd,
                             Some(key_root.as_path()),
                             client_env.as_deref(),
@@ -4045,9 +4480,9 @@ async fn handle_compile(
     // Only allocates when extra_args is non-empty.
     let combined_args;
     let rsp_args: &[String] = if extra_args.is_empty() {
-        &expanded_args
+        &effective_args
     } else {
-        combined_args = [expanded_args.as_slice(), extra_args.as_slice()].concat();
+        combined_args = [effective_args.as_slice(), extra_args.as_slice()].concat();
         &combined_args
     };
 
@@ -4085,7 +4520,7 @@ async fn handle_compile(
     if let Some(ref rsp) = _rsp_guard {
         cmd.arg(rsp.at_arg()).current_dir(cwd);
     } else {
-        cmd.args(&expanded_args).current_dir(cwd);
+        cmd.args(&effective_args).current_dir(cwd);
         if !extra_args.is_empty() {
             cmd.args(&extra_args);
         }
@@ -6054,6 +6489,96 @@ exit /b 0
         );
 
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn request_fingerprint_normalizes_cc_prefix_map_old_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("workspace-a");
+        let root_b = tmp.path().join("workspace-b");
+        let args_a = vec![format!("-ffile-prefix-map={}=.", root_a.display())];
+        let args_b = vec![format!("-ffile-prefix-map={}=.", root_b.display())];
+
+        let a = request_fingerprint(
+            Path::new("/usr/bin/clang++"),
+            &args_a,
+            &root_a,
+            Some(&root_a),
+            None,
+        );
+        let b = request_fingerprint(
+            Path::new("/usr/bin/clang++"),
+            &args_b,
+            &root_b,
+            Some(&root_b),
+            None,
+        );
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn effective_compile_args_auto_adds_root_and_cwd_maps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_path = tmp.path().join("workspace");
+        let cwd = root_path.join("build");
+        let root = NormalizedPath::new(&root_path);
+        let env = vec![(PATH_REMAP_ENV.to_string(), "auto".to_string())];
+        let args = vec!["-c".to_string(), "src/main.cc".to_string()];
+
+        let effective = effective_compile_args(
+            &args,
+            Path::new("/usr/bin/clang++"),
+            &cwd,
+            Some(&root),
+            Some(&env),
+        );
+
+        assert!(effective.contains(&"-c".to_string()));
+        assert!(effective.contains(&format!("-ffile-prefix-map={}=.", root_path.display())));
+        assert!(effective.contains(&format!("-ffile-prefix-map={}=.", cwd.display())));
+    }
+
+    #[test]
+    fn link_flag_normalization_keeps_outputs_root_specific() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace-a");
+        let lib = root.join("lib");
+        let version_map = root.join("link/version.map");
+        let more_lib = root.join("more-lib");
+        let wasm_map = root.join("link/wasm.map");
+        let app_map = root.join("build/app.map");
+        let app_lib = root.join("build/app.lib");
+        let app_pdb = root.join("build/app.pdb");
+        let app_def = root.join("link/app.def");
+        let flags = vec![
+            "-L".to_string(),
+            lib.to_string_lossy().into_owned(),
+            "--version-script".to_string(),
+            version_map.to_string_lossy().into_owned(),
+            format!(
+                "-Wl,-L,{},--version-script,{}",
+                more_lib.display(),
+                wasm_map.display()
+            ),
+            format!("-Wl,-Map,{}", app_map.display()),
+            format!("/IMPLIB:{}", app_lib.display()),
+            format!("/PDB:{}", app_pdb.display()),
+            format!("/DEF:{}", app_def.display()),
+        ];
+
+        let normalized = normalize_link_cache_flags_for_key(&flags, Some(&root));
+
+        assert_eq!(normalized[1], "$ZCCACHE_WORKTREE_ROOT/lib");
+        assert_eq!(normalized[3], "$ZCCACHE_WORKTREE_ROOT/link/version.map");
+        assert_eq!(
+            normalized[4],
+            "-Wl,-L,$ZCCACHE_WORKTREE_ROOT/more-lib,--version-script,$ZCCACHE_WORKTREE_ROOT/link/wasm.map"
+        );
+        assert_eq!(normalized[5], format!("-Wl,-Map,{}", app_map.display()));
+        assert_eq!(normalized[6], format!("/IMPLIB:{}", app_lib.display()));
+        assert_eq!(normalized[7], format!("/PDB:{}", app_pdb.display()));
+        assert_eq!(normalized[8], "/DEF:$ZCCACHE_WORKTREE_ROOT/link/app.def");
     }
 
     #[test]

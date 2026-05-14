@@ -28,6 +28,110 @@ fn write_fake_objects(dir: &std::path::Path, names: &[&str]) {
     }
 }
 
+fn run_test_command(cmd: &mut std::process::Command, description: &str) -> Result<(), String> {
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to run {description}: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "{description} failed with status {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+fn setup_equivalent_c_root(
+    compiler: &std::path::Path,
+    archiver: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("build")).unwrap();
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(
+        root.join("src/main.c"),
+        "int dep(void);\nint main(void) { return dep(); }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("src/dep.c"), "int dep(void) { return 0; }\n").unwrap();
+
+    let mut cmd = std::process::Command::new(compiler);
+    cmd.args(["-g0", "-c", "src/main.c", "-o", "build/main.o"])
+        .current_dir(root);
+    run_test_command(&mut cmd, "compile test object")?;
+
+    let mut cmd = std::process::Command::new(compiler);
+    cmd.args(["-g0", "-c", "src/dep.c", "-o", "build/dep.o"])
+        .current_dir(root);
+    run_test_command(&mut cmd, "compile test library object")?;
+
+    let mut cmd = std::process::Command::new(archiver);
+    cmd.args(["rcsD", "lib/libdep.a", "build/dep.o"])
+        .current_dir(root);
+    if run_test_command(&mut cmd, "archive test library").is_ok() {
+        return Ok(());
+    }
+
+    let mut cmd = std::process::Command::new(archiver);
+    cmd.args(["rcs", "lib/libdep.a", "build/dep.o"])
+        .current_dir(root);
+    run_test_command(&mut cmd, "archive test library")
+}
+
+fn linked_binary_name(stem: &str) -> String {
+    if cfg!(windows) {
+        format!("{stem}.exe")
+    } else {
+        stem.to_string()
+    }
+}
+
+fn compiler_driver_link_args(root: &std::path::Path, output: &std::path::Path) -> Vec<String> {
+    vec![
+        "-o".to_string(),
+        output.to_string_lossy().into_owned(),
+        "build/main.o".to_string(),
+        format!("-L{}", root.join("lib").to_string_lossy()),
+        "-ldep".to_string(),
+    ]
+}
+
+fn compiler_driver_link_is_feasible(
+    compiler: &std::path::Path,
+    archiver: &std::path::Path,
+) -> Result<(), String> {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    setup_equivalent_c_root(compiler, archiver, &root)?;
+
+    let output = root.join("build").join(linked_binary_name("probe"));
+    let args = compiler_driver_link_args(&root, &output);
+    let mut cmd = std::process::Command::new(compiler);
+    cmd.args(&args).current_dir(&root);
+    run_test_command(&mut cmd, "probe compiler-driver link")?;
+    std::fs::remove_file(output).ok();
+    Ok(())
+}
+
+fn client_env_with_path_remap_auto() -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            let value = value.into_string().ok()?;
+            let zccache_root_var = key.eq_ignore_ascii_case("ZCCACHE_WORKTREE_ROOT");
+            let zccache_remap_var = key.eq_ignore_ascii_case("ZCCACHE_PATH_REMAP");
+            (!zccache_root_var && !zccache_remap_var).then_some((key, value))
+        })
+        .collect();
+    env.push(("ZCCACHE_PATH_REMAP".to_string(), "auto".to_string()));
+    env
+}
+
 #[tokio::test]
 #[ignore] // Integration test — starts a real daemon. Run with `test --full`.
 async fn test_ar_cache_miss_then_hit() {
@@ -130,6 +234,161 @@ async fn test_ar_cache_miss_then_hit() {
     assert_eq!(
         first_contents, second_contents,
         "cached archive should be byte-identical"
+    );
+
+    shutdown.notify_one();
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore] // Integration test — starts a real daemon + compiler driver. Run with `test --full`.
+async fn test_link_path_remap_auto_hits_across_sibling_git_roots() {
+    let archiver = match zccache_test_support::find_on_path("ar")
+        .or_else(|| zccache_test_support::find_on_path("llvm-ar"))
+    {
+        Some(path) => path,
+        None => {
+            eprintln!("skipping test: neither ar nor llvm-ar found on PATH");
+            return;
+        }
+    };
+    let mut skipped = Vec::new();
+    let mut selected_compiler = None;
+    for name in ["clang", "gcc"] {
+        let Some(path) = zccache_test_support::find_on_path(name) else {
+            skipped.push(format!("{name}: not found on PATH"));
+            continue;
+        };
+        match compiler_driver_link_is_feasible(&path, &archiver) {
+            Ok(()) => {
+                selected_compiler = Some(path);
+                break;
+            }
+            Err(e) => skipped.push(format!("{name}: {e}")),
+        }
+    }
+
+    let compiler_path = match selected_compiler {
+        Some(path) => path,
+        None => {
+            eprintln!(
+                "skipping test: no usable clang/gcc compiler-driver link found\n{}",
+                skipped.join("\n")
+            );
+            return;
+        }
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root_a = tmp.path().join("workspace-a");
+    let root_b = tmp.path().join("workspace-b");
+    setup_equivalent_c_root(&compiler_path, &archiver, &root_a).unwrap();
+    setup_equivalent_c_root(&compiler_path, &archiver, &root_b).unwrap();
+
+    let object_a = std::fs::read(root_a.join("build/main.o")).unwrap();
+    let object_b = std::fs::read(root_b.join("build/main.o")).unwrap();
+    if object_a != object_b {
+        eprintln!("skipping test: compiler produced root-specific object bytes");
+        return;
+    }
+    let lib_a = std::fs::read(root_a.join("lib/libdep.a")).unwrap();
+    let lib_b = std::fs::read(root_b.join("lib/libdep.a")).unwrap();
+    if lib_a != lib_b {
+        eprintln!("skipping test: archiver produced root-specific library bytes");
+        return;
+    }
+
+    let output_a = root_a.join("build").join(linked_binary_name("app"));
+    let output_b = root_b.join("build").join(linked_binary_name("app"));
+    assert_ne!(
+        output_a, output_b,
+        "test must use distinct physical output paths"
+    );
+
+    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+
+    // Clear persisted artifacts to ensure test isolation from prior runs.
+    client.send(&Request::Clear).await.unwrap();
+    let _: Option<Response> = client.recv().await.unwrap();
+
+    let remap_env = client_env_with_path_remap_auto();
+
+    // First root: populate the link cache. The absolute -L path is under root A.
+    client
+        .send(&Request::LinkEphemeral {
+            client_pid: std::process::id(),
+            tool: compiler_path.to_string_lossy().into_owned().into(),
+            args: compiler_driver_link_args(&root_a, &output_a),
+            cwd: root_a.to_string_lossy().into_owned().into(),
+            env: Some(remap_env.clone()),
+        })
+        .await
+        .unwrap();
+
+    let resp = client.recv().await.unwrap();
+    match resp {
+        Some(Response::LinkResult {
+            exit_code,
+            cached,
+            warning,
+            ..
+        }) => {
+            assert_eq!(exit_code, 0, "first compiler-driver link should succeed");
+            assert!(!cached, "first link in root A should be a cache miss");
+            assert!(
+                warning.is_none(),
+                "deterministic compiler-driver link should not warn"
+            );
+        }
+        other => panic!("expected LinkResult, got: {other:?}"),
+    }
+
+    assert!(output_a.exists(), "root A output should exist after miss");
+    assert!(
+        !output_b.exists(),
+        "root B output should not exist before its link"
+    );
+    let first_contents = std::fs::read(&output_a).unwrap();
+
+    // Second root: same object bytes and root-equivalent -L path should hit.
+    client
+        .send(&Request::LinkEphemeral {
+            client_pid: std::process::id(),
+            tool: compiler_path.to_string_lossy().into_owned().into(),
+            args: compiler_driver_link_args(&root_b, &output_b),
+            cwd: root_b.to_string_lossy().into_owned().into(),
+            env: Some(remap_env),
+        })
+        .await
+        .unwrap();
+
+    let resp = client.recv().await.unwrap();
+    match resp {
+        Some(Response::LinkResult {
+            exit_code, cached, ..
+        }) => {
+            assert_eq!(exit_code, 0, "cached compiler-driver link should succeed");
+            assert!(
+                cached,
+                "ZCCACHE_PATH_REMAP=auto should make root-equivalent -L flags hit"
+            );
+        }
+        other => panic!("expected LinkResult, got: {other:?}"),
+    }
+
+    assert!(
+        output_a.exists(),
+        "cache hit in root B should preserve root A output"
+    );
+    assert!(
+        output_b.exists(),
+        "cache hit should restore output at root B's physical path"
+    );
+    assert_eq!(
+        first_contents,
+        std::fs::read(&output_b).unwrap(),
+        "root B hit should restore the cached root A link output"
     );
 
     shutdown.notify_one();
