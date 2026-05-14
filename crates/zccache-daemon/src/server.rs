@@ -57,6 +57,7 @@ const FAST_HIT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60)
 const EPHEMERAL_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
 const REQUEST_CACHE_MAX_ENTRIES: usize = 4096;
 const RSP_CACHE_MAX_ENTRIES: usize = 1024;
+const RUST_MISS_PROFILE_ENV: &str = "ZCCACHE_PROFILE_RUST_MISS";
 
 #[derive(Clone)]
 struct RspDependency {
@@ -3131,6 +3132,7 @@ async fn handle_compile(
         crate::lineage::Lineage::current(session_client_pid(state, &sid), Some(session_id.into()));
 
     // Discover system includes for this compiler (cached per compiler path)
+    let t_system_includes = std::time::Instant::now();
     let system_includes = {
         let mut cache = state.system_includes.lock().await;
         let lineage_for_probe = lineage.clone();
@@ -3156,9 +3158,12 @@ async fn handle_compile(
             })
             .to_vec()
     };
+    let system_includes_ns = t_system_includes.elapsed().as_nanos() as u64;
 
     // Watch system include directories
+    let t_system_watch = std::time::Instant::now();
     watch_directories(state, &system_includes).await;
+    let system_watch_ns = t_system_watch.elapsed().as_nanos() as u64;
 
     state.sessions.touch(&sid);
 
@@ -3242,6 +3247,17 @@ async fn handle_compile(
         }
     };
     let is_rustc = rustc_args_opt.is_some();
+    let rust_profile_enabled = is_rustc && std::env::var_os(RUST_MISS_PROFILE_ENV).is_some();
+    let rust_profile_mode = rustc_args_opt
+        .as_ref()
+        .map(|rustc_args| {
+            if rustc_args.emit_types.iter().any(|emit| emit == "link") {
+                "build"
+            } else {
+                "check"
+            }
+        })
+        .unwrap_or("other");
     let build_context_ns = t1.elapsed().as_nanos() as u64;
 
     // ── Ultra-fast path: per-file freshness skip ────────────────────
@@ -3651,6 +3667,7 @@ async fn handle_compile(
     );
 
     // ── Phase: compiler exec (with depfile injection) ────────────────
+    let pre_exec_ns = compile_start.elapsed().as_nanos() as u64;
     let t_exec = std::time::Instant::now();
     let supports_depfile = compilation.family.supports_depfile();
     let (mut extra_args, mut depfile_strategy) = zccache_depgraph::depfile::prepare_depfile(
@@ -3720,7 +3737,9 @@ async fn handle_compile(
         }
     }
     apply_client_env(&mut cmd, &client_env, &lineage);
+    let t_compiler_process = std::time::Instant::now();
     let result = crate::process::tokio_command_output(&mut cmd).await;
+    let compiler_process_ns = t_compiler_process.elapsed().as_nanos() as u64;
 
     let output = match result {
         Ok(o) => o,
@@ -3731,7 +3750,9 @@ async fn handle_compile(
         }
     };
     let compiler_exec_ns = t_exec.elapsed().as_nanos() as u64;
+    let compiler_prep_ns = compiler_exec_ns.saturating_sub(compiler_process_ns);
 
+    let t_post_exec = std::time::Instant::now();
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = Arc::new(output.stdout);
 
@@ -3748,6 +3769,7 @@ async fn handle_compile(
         (None, output.stderr)
     };
     let stderr = Arc::new(stderr_bytes);
+    let post_exec_ns = t_post_exec.elapsed().as_nanos() as u64;
 
     if exit_code != 0 {
         state.stats.record_error();
@@ -3760,11 +3782,14 @@ async fn handle_compile(
         // cache system so any compilation that depends on this output
         // (e.g. via -include-pch) sees the change immediately — no need
         // to wait for a watcher event.
+        let t_apply_changes = std::time::Instant::now();
         state.cache_system.apply_changes(vec![output_path.clone()]);
+        let apply_changes_ns = t_apply_changes.elapsed().as_nanos() as u64;
 
         // Capture output metadata. Rust payload bytes are snapshotted into
         // cache files after the artifact key is known, avoiding foreground
         // reads of .rlib/.rmeta/.d on cold misses.
+        let t_collect_outputs = std::time::Instant::now();
         let (output_data, rustc_all_outputs) = if is_rustc {
             let all = collect_rustc_output_files(
                 rustc_args_opt.as_ref().unwrap(),
@@ -3795,6 +3820,13 @@ async fn handle_compile(
                 }
             }
         };
+        let collect_outputs_ns = t_collect_outputs.elapsed().as_nanos() as u64;
+        let rust_output_count = rustc_all_outputs.as_ref().map_or(1, Vec::len);
+        let rust_output_bytes: u64 = rustc_all_outputs
+            .as_ref()
+            .map_or(output_data.len() as u64, |all| {
+                all.iter().map(|output| output.size).sum()
+            });
 
         // ── Phase: include scan (depfile or fallback) ────────────────
         let t_scan = std::time::Instant::now();
@@ -3857,11 +3889,14 @@ async fn handle_compile(
             .chain(scan_result.resolved.iter().cloned())
             .chain(ctx.force_includes.iter().cloned())
             .collect();
+        let t_register_tracked = std::time::Instant::now();
         state.cache_system.register_tracked(&tracked_paths);
+        let register_tracked_ns = t_register_tracked.elapsed().as_nanos() as u64;
 
         // Collect directories to watch. The actual watch_directories call
         // (which involves expensive canonicalize() on Windows) is deferred
         // to a background task to avoid blocking the response.
+        let t_dep_dirs = std::time::Instant::now();
         let dep_dirs: Vec<NormalizedPath> = {
             let mut dirs = HashSet::new();
             if let Some(parent) = source_path.parent() {
@@ -3880,6 +3915,7 @@ async fn handle_compile(
             }
             dirs.into_iter().collect()
         };
+        let dep_dirs_ns = t_dep_dirs.elapsed().as_nanos() as u64;
 
         // ── Phase: hash all files (parallel) ─────────────────────────
         // Hash source + resolved headers + force-includes using rayon
@@ -3935,7 +3971,13 @@ async fn handle_compile(
             hash_map.get(&path).copied()
         };
         let include_count = scan_result.resolved.len();
-        if let Some(artifact_key) = state.dep_graph.update(&context_key, scan_result, get_hash) {
+        let t_depgraph_update = std::time::Instant::now();
+        let artifact_key_result = state.dep_graph.update(&context_key, scan_result, get_hash);
+        let depgraph_update_ns = t_depgraph_update.elapsed().as_nanos() as u64;
+        let mut artifact_build_ns = 0;
+        let mut persist_enqueue_ns = 0;
+        let mut artifact_insert_stats_ns = 0;
+        if let Some(artifact_key) = artifact_key_result {
             let artifact_key_hex = artifact_key.hash().to_hex();
             let ctx_hex = &context_key.hash().to_hex()[..8];
             write_session_log(
@@ -3959,6 +4001,7 @@ async fn handle_compile(
             }
 
             // Build artifact — multi-output for Rustc, single output for C/C++.
+            let t_artifact_build = std::time::Instant::now();
             if let Some(ref all_outputs) = rustc_all_outputs {
                 let artifact_bytes: u64 = all_outputs.iter().map(|o| o.size).sum();
                 let output_names: Vec<String> =
@@ -3980,7 +4023,9 @@ async fn handle_compile(
                         break;
                     }
                 }
+                artifact_build_ns = t_artifact_build.elapsed().as_nanos() as u64;
 
+                let t_artifact_insert_stats = std::time::Instant::now();
                 if snapshot_ok {
                     let meta = ArtifactIndex::new(
                         output_names,
@@ -4006,6 +4051,7 @@ async fn handle_compile(
                 record_session_stat(&state.sessions, &sid, move |t| {
                     t.record_miss(src, recorded_bytes);
                 });
+                artifact_insert_stats_ns = t_artifact_insert_stats.elapsed().as_nanos() as u64;
             } else {
                 let artifact = ArtifactData {
                     outputs: vec![ArtifactOutput {
@@ -4026,6 +4072,8 @@ async fn handle_compile(
 
                 // Build CachedArtifact once (no deep copies — all Arc clones).
                 let cached = CachedArtifact::from_artifact_data(&artifact);
+                artifact_build_ns = t_artifact_build.elapsed().as_nanos() as u64;
+                let t_persist_enqueue = std::time::Instant::now();
 
                 // Spawn disk persistence to background (meta.clone() is cheap — Arc fields only).
                 {
@@ -4069,7 +4117,9 @@ async fn handle_compile(
                         .ok();
                     });
                 }
+                persist_enqueue_ns = t_persist_enqueue.elapsed().as_nanos() as u64;
 
+                let t_artifact_insert_stats = std::time::Instant::now();
                 state.artifacts.insert(artifact_key_hex, cached);
 
                 let latency_ns = compile_start.elapsed().as_nanos() as u64;
@@ -4078,6 +4128,7 @@ async fn handle_compile(
                 record_session_stat(&state.sessions, &sid, move |t| {
                     t.record_miss(src, artifact_bytes);
                 });
+                artifact_insert_stats_ns = t_artifact_insert_stats.elapsed().as_nanos() as u64;
             }
         }
         let artifact_store_ns = t_store.elapsed().as_nanos() as u64;
@@ -4095,6 +4146,79 @@ async fn handle_compile(
         // Defer expensive watch_directories to background — canonicalize()
         // on Windows costs ~1-5ms per directory. This doesn't affect cache
         // correctness; it only delays watcher-based invalidation setup.
+        if rust_profile_enabled {
+            let pre_exec_measured_ns = system_includes_ns
+                .saturating_add(system_watch_ns)
+                .saturating_add(parse_args_ns)
+                .saturating_add(build_context_ns)
+                .saturating_add(hash_source_ns)
+                .saturating_add(hash_headers_ns)
+                .saturating_add(depgraph_check_ns);
+            let pre_exec_other_ns = pre_exec_ns.saturating_sub(pre_exec_measured_ns);
+            let artifact_store_measured_ns = depgraph_update_ns
+                .saturating_add(artifact_build_ns)
+                .saturating_add(persist_enqueue_ns)
+                .saturating_add(artifact_insert_stats_ns);
+            let artifact_store_other_ns =
+                artifact_store_ns.saturating_sub(artifact_store_measured_ns);
+            let accounted_ns = pre_exec_ns
+                .saturating_add(compiler_prep_ns)
+                .saturating_add(compiler_process_ns)
+                .saturating_add(post_exec_ns)
+                .saturating_add(apply_changes_ns)
+                .saturating_add(collect_outputs_ns)
+                .saturating_add(include_scan_ns)
+                .saturating_add(register_tracked_ns)
+                .saturating_add(dep_dirs_ns)
+                .saturating_add(hash_all_ns)
+                .saturating_add(artifact_store_ns);
+            let unaccounted_ns = total_ns.saturating_sub(accounted_ns);
+            eprintln!(
+                concat!(
+                    "zccache_rust_miss_profile ",
+                    "mode={} total_ns={} pre_exec_ns={} system_includes_ns={} ",
+                    "system_watch_ns={} parse_args_ns={} build_context_ns={} ",
+                    "hash_source_ns={} hash_headers_ns={} depgraph_check_ns={} ",
+                    "pre_exec_other_ns={} compiler_prep_ns={} compiler_process_ns={} ",
+                    "post_exec_ns={} apply_changes_ns={} collect_outputs_ns={} ",
+                    "outputs={} output_bytes={} include_scan_ns={} ",
+                    "register_tracked_ns={} dep_dirs_ns={} hash_all_ns={} ",
+                    "artifact_store_ns={} depgraph_update_ns={} artifact_build_ns={} ",
+                    "persist_enqueue_ns={} artifact_insert_stats_ns={} ",
+                    "artifact_store_other_ns={} unaccounted_ns={}"
+                ),
+                rust_profile_mode,
+                total_ns,
+                pre_exec_ns,
+                system_includes_ns,
+                system_watch_ns,
+                parse_args_ns,
+                build_context_ns,
+                hash_source_ns,
+                hash_headers_ns,
+                depgraph_check_ns,
+                pre_exec_other_ns,
+                compiler_prep_ns,
+                compiler_process_ns,
+                post_exec_ns,
+                apply_changes_ns,
+                collect_outputs_ns,
+                rust_output_count,
+                rust_output_bytes,
+                include_scan_ns,
+                register_tracked_ns,
+                dep_dirs_ns,
+                hash_all_ns,
+                artifact_store_ns,
+                depgraph_update_ns,
+                artifact_build_ns,
+                persist_enqueue_ns,
+                artifact_insert_stats_ns,
+                artifact_store_other_ns,
+                unaccounted_ns,
+            );
+        }
+
         {
             let bg_state = Arc::clone(state_arc);
             tokio::spawn(async move {
