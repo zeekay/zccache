@@ -264,7 +264,103 @@ def format_report(
         lines.extend(["", "### Failed benchmark attempts", ""])
         lines.extend(f"- Attempt {attempt}" for attempt in report.command_failures)
 
+    lines.extend(["", format_benchmark_summary(report).rstrip()])
+
     return "\n".join(lines) + "\n"
+
+
+def _format_status_check(status: ScenarioStatus) -> str:
+    actual = "n/a" if status.best_ratio is None else f"{status.best_ratio:.3f}x"
+    return (
+        f"{status.language} {status.benchmark_label} / {status.scenario} "
+        f"vs {status.baseline_label}: expected >= {status.threshold:.2f}x, "
+        f"actual {actual}"
+    )
+
+
+def _format_status_summary_line(status: ScenarioStatus) -> str:
+    attempt = "n/a" if status.best_attempt is None else str(status.best_attempt)
+    state = "PASS" if status.passed else "FAIL"
+    return (
+        f"- {state}: {_format_status_check(status)} "
+        f"(best attempt {attempt}; seen {status.attempts_seen})"
+    )
+
+
+def format_benchmark_summary(report: GuardReport) -> str:
+    passed = [status for status in report.statuses if status.passed]
+    failed = [status for status in report.statuses if not status.passed]
+    lines = [
+        "### Benchmark summary",
+        "",
+        f"- Passed checks: {len(passed)}",
+        f"- Failed checks: {len(failed)}",
+    ]
+
+    if report.missing_requirements:
+        lines.append(f"- Missing coverage: {', '.join(report.missing_requirements)}")
+    else:
+        lines.append("- Missing coverage: none")
+
+    if report.command_failures:
+        attempts = ", ".join(str(attempt) for attempt in report.command_failures)
+        lines.append(f"- Failed benchmark attempts: {attempts}")
+    else:
+        lines.append("- Failed benchmark attempts: none")
+
+    if failed:
+        lines.extend(["", "#### Failed checks", ""])
+        lines.extend(_format_status_summary_line(status) for status in failed)
+
+    if passed:
+        lines.extend(["", "#### Passed checks", ""])
+        lines.extend(_format_status_summary_line(status) for status in passed)
+
+    return "\n".join(lines) + "\n"
+
+
+def format_final_status(report: GuardReport) -> str:
+    if report.passed:
+        weakest = min(
+            report.statuses,
+            key=lambda status: (
+                float("inf")
+                if status.best_ratio is None
+                else status.best_ratio / status.threshold
+            ),
+        )
+        return (
+            "PERF GUARD OK: all checks meet configured floors; weakest check "
+            f"{_format_status_check(weakest)}."
+        )
+
+    failed_statuses = [status for status in report.statuses if not status.passed]
+    if failed_statuses:
+        worst = min(
+            failed_statuses,
+            key=lambda status: (
+                -1.0 if status.best_ratio is None else status.best_ratio / status.threshold
+            ),
+        )
+        count = len(failed_statuses)
+        return (
+            f"PERF GUARD FAILED: {count} check{'s' if count != 1 else ''} "
+            f"below floor; worst {_format_status_check(worst)}."
+        )
+
+    if report.missing_requirements:
+        missing = ", ".join(report.missing_requirements)
+        return f"PERF GUARD FAILED: missing required benchmark coverage for {missing}."
+
+    if report.command_failures:
+        attempts = ", ".join(str(attempt) for attempt in report.command_failures)
+        return (
+            "PERF GUARD FAILED: benchmark command failed on all "
+            f"{report.attempt_count} attempt{'s' if report.attempt_count != 1 else ''} "
+            f"({attempts})."
+        )
+
+    return "PERF GUARD FAILED: no benchmark rows were parsed."
 
 
 def format_report_json(
@@ -358,6 +454,11 @@ def write_report_json(
             cold_sccache_threshold=cold_sccache_threshold,
         ),
     )
+
+
+def write_final_status(output_dir: Path, final_status: str) -> None:
+    path = output_dir / "perf-guard-result.txt"
+    path.write_text(final_status + "\n", encoding="utf-8")
 
 
 def _append_step_summary(markdown: str) -> None:
@@ -526,8 +627,9 @@ def main() -> int:
         args.cold_bare_threshold,
         args.cold_sccache_threshold,
     )
+    final_status = format_final_status(report)
     report_path = args.output_dir / "perf-guard-summary.md"
-    report_path.write_text(markdown, encoding="utf-8")
+    report_path.write_text(markdown + "\n" + final_status + "\n", encoding="utf-8")
     write_report_json(
         args.output_dir,
         report,
@@ -537,8 +639,10 @@ def main() -> int:
         cold_bare_threshold=args.cold_bare_threshold,
         cold_sccache_threshold=args.cold_sccache_threshold,
     )
+    write_final_status(args.output_dir, final_status)
     print(markdown)
-    _append_step_summary(markdown)
+    print(final_status)
+    _append_step_summary(markdown + "\n" + final_status + "\n")
 
     return 0 if report.passed else 1
 

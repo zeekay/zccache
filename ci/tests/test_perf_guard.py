@@ -162,6 +162,64 @@ def test_report_marks_failed_rows():
     markdown = perf_guard.format_report(report, 1.5, 1.5, 1.5, 1.5)
 
     assert "| FAIL | rust | Rust rustc | Build, Cold | Bare rustc | 1.286x | 1.50x | 1 | 1 |" in markdown
+    assert "### Benchmark summary" in markdown
+    assert "#### Failed checks" in markdown
+    assert "#### Passed checks" in markdown
+
+
+def test_benchmark_summary_lists_passes_and_failures():
+    report = perf_guard.evaluate_attempts([rows(FAILING_SCCACHE_LOG)], threshold=1.5)
+
+    summary = perf_guard.format_benchmark_summary(report)
+
+    assert "- Passed checks: 11" in summary
+    assert "- Failed checks: 1" in summary
+    assert "- Missing coverage: none" in summary
+    assert "- Failed benchmark attempts: none" in summary
+    assert (
+        "- FAIL: c++ C++ inline args / Single-file, Cold vs sccache: "
+        "expected >= 1.50x, actual 1.250x (best attempt 1; seen 1)"
+    ) in summary
+    assert (
+        "- PASS: c C inline args / Single-file, Warm vs Bare clang: "
+        "expected >= 1.50x, actual 3.000x (best attempt 1; seen 1)"
+    ) in summary
+
+
+def test_final_status_explains_pass_with_weakest_check():
+    report = perf_guard.evaluate_attempts(
+        [rows(NEAR_BARE_COLD_C_LOG)],
+        languages=("c",),
+    )
+
+    final_status = perf_guard.format_final_status(report)
+
+    assert final_status == (
+        "PERF GUARD OK: all checks meet configured floors; weakest check "
+        "c C inline args / Single-file, Cold vs Bare clang: expected >= 0.85x, "
+        "actual 0.909x."
+    )
+
+
+def test_final_status_explains_worst_failed_floor():
+    report = perf_guard.evaluate_attempts([rows(FAILING_SCCACHE_LOG)], threshold=1.5)
+
+    final_status = perf_guard.format_final_status(report)
+
+    assert final_status == (
+        "PERF GUARD FAILED: 1 check below floor; worst c++ C++ inline args / "
+        "Single-file, Cold vs sccache: expected >= 1.50x, actual 1.250x."
+    )
+
+
+def test_final_status_explains_missing_coverage():
+    report = perf_guard.evaluate_attempts([rows(MISSING_C_LOG)], threshold=1.5)
+
+    final_status = perf_guard.format_final_status(report)
+
+    assert final_status == (
+        "PERF GUARD FAILED: missing required benchmark coverage for c cold, c warm."
+    )
 
 
 def test_report_json_marks_thresholds_and_failed_statuses():
@@ -234,6 +292,16 @@ def test_writes_perf_guard_json_artifacts(tmp_path):
     assert summary_payload["passed"] is True
     assert summary_payload["languages"] == ["c"]
     assert all(status["passed"] for status in summary_payload["statuses"])
+
+
+def test_writes_perf_guard_final_status_artifact(tmp_path):
+    final_status = "PERF GUARD OK: all checks meet configured floors."
+
+    perf_guard.write_final_status(tmp_path, final_status)
+
+    assert (tmp_path / "perf-guard-result.txt").read_text(encoding="utf-8") == (
+        final_status + "\n"
+    )
 
 
 def test_benchmark_language_commands_are_filtered():
