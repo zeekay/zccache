@@ -343,6 +343,68 @@ cross-root hits after validating the current worktree's recorded input hashes;
 otherwise zccache falls back to the normal depgraph check or a path-specific
 miss.
 
+#### Sub-agent / parallel-worktree recipe
+
+The typical multi-agent workflow runs one sub-agent per `git worktree`, all
+checked out from the same repository under sibling paths. Without remap, every
+worktree has different absolute compile inputs, so each agent pays full compile
+cost even when source contents are identical. With `ZCCACHE_PATH_REMAP=auto`
+exported once at the orchestrator level, every sub-agent's compile in every
+worktree shares the same logical cache.
+
+1. Create the worktrees. Anything `git worktree add` produces (or a sibling
+   `git clone`) works — zccache auto-detects each enclosing Git root:
+
+   ```bash
+   git worktree add ../agent-a -b agent-a main
+   git worktree add ../agent-b -b agent-b main
+   git worktree add ../agent-c -b agent-c main
+   ```
+
+2. Export the remap directive once, before launching the agents. Every
+   sub-process inherits it; no per-worktree configuration is required:
+
+   ```bash
+   export ZCCACHE_PATH_REMAP=auto
+   export RUSTC_WRAPPER=zccache              # Rust projects
+   # For C/C++, point your build to zccache (e.g. CMAKE_C_COMPILER_LAUNCHER=zccache).
+   ```
+
+3. Launch sub-agents in their own worktrees in parallel. The first agent to
+   compile a unit populates the cache; the others get worktree-equivalent
+   hits even though their absolute paths differ:
+
+   ```bash
+   (cd ../agent-a && agent-runner ...) &
+   (cd ../agent-b && agent-runner ...) &
+   (cd ../agent-c && agent-runner ...) &
+   wait
+   ```
+
+4. Verify it is working. `zccache status` reports worktree-equivalent hits
+   separately from same-root hits, and per-session logs include the gate
+   reason if a request fell back (`path_outside_root`,
+   `content_hash_mismatch`, `toolchain_mismatch`, etc. — see the list above).
+
+A few things worth knowing:
+
+- One daemon, one cache. All worktrees share the same zccache daemon and
+  artifact store by default — do not set `ZCCACHE_CACHE_DIR` per worktree, or
+  you defeat the sharing.
+- Auto-detection finds the worktree root via `.git` (file or directory), so
+  `git worktree`-linked checkouts and plain clones both work. Use
+  `ZCCACHE_WORKTREE_ROOT="$PWD"` only when detection is unreliable (non-Git
+  checkouts or unusual layouts).
+- Same-content guarantee. Cross-worktree hits validate content hashes for
+  every input. If two worktrees have diverged on a file, the second compile
+  misses and recompiles — the cache cannot be poisoned across siblings (the
+  invariant fixed in #197).
+- Measured win. The
+  [`perf_cpp_sibling_remap_warm` / `perf_rustc_sibling_remap_warm`](crates/zccache-daemon/tests/perf_bench_test.rs)
+  benchmarks (introduced in #238) confirm warm-state hits across sibling
+  worktrees run an order of magnitude faster than bare compiles and sccache
+  even though sccache cannot share across sibling roots at all.
+
 ### Strict path validation
 
 Use `--strict-paths` or `ZCCACHE_STRICT_PATHS` to fail fast when compiler path
