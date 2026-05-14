@@ -113,7 +113,17 @@ def test_image_rows_cover_c_cpp_and_rust_stats():
     assert {row["language"] for row in image_rows} == {"C", "C++", "Rust"}
     assert any("C inline args - Single-file, Warm" == row["scenario"] for row in image_rows)
     assert any(
+        row["compact_label"] == "inline args"
+        and row["compact_scenario"] == "Single-file"
+        for row in image_rows
+    )
+    assert any(
         "C++ response files - Single-file RSP, Cold" == row["scenario"]
+        for row in image_rows
+    )
+    assert any(
+        row["compact_label"] == "response files"
+        and row["compact_scenario"] == "Single-file RSP"
         for row in image_rows
     )
     assert any("Rust rustc - Build, Warm" == row["scenario"] for row in image_rows)
@@ -157,3 +167,10 @@ def test_ratio_tone_and_color_classify_faster_slower_and_neutral():
     assert benchmark_stats.ratio_tone(None) == "neutral"
     assert benchmark_stats.ratio_tone(1.0) == "neutral"
     assert benchmark_stats.ratio_color(None) == benchmark_stats.RATIO_COLORS["neutral"]
+
+
+def test_percent_delta_format_covers_faster_slower_and_missing():
+    assert benchmark_stats._format_percent_delta(1.25) == "25.0% faster"
+    assert benchmark_stats._format_percent_delta(0.8) == "25.0% slower"
+    assert benchmark_stats._format_percent_delta(1.0) == "0.0%"
+    assert benchmark_stats._format_percent_delta(None) == "n/a"

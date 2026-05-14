@@ -307,6 +307,16 @@ def _format_ratio(value: float | None) -> str:
     return f"{1 / value:.1f}x slower"
 
 
+def _format_percent_delta(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    if value == 1:
+        return "0.0%"
+    if value > 1:
+        return f"{(value - 1) * 100:.1f}% faster"
+    return f"{(1 / value - 1) * 100:.1f}% slower"
+
+
 def ratio_tone(value: float | None) -> str:
     if value is None or value == 1:
         return "neutral"
@@ -572,17 +582,32 @@ def _truncate_to_width(draw: Any, value: str, font: Any, max_width: int) -> str:
     return value.rstrip() + ellipsis
 
 
+def _compact_benchmark_label(language: str, label: str) -> str:
+    prefix = f"{LANGUAGE_LABELS.get(language, language)} "
+    if label.startswith(prefix):
+        return label[len(prefix) :]
+    return label
+
+
+def _compact_scenario(value: str) -> str:
+    return re.sub(r",\s*(Cold|Warm)\b", "", value)
+
+
 def build_image_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
             "language": LANGUAGE_LABELS.get(str(row["language"]), str(row["language"])),
             "scenario": f"{row['benchmark_label']} - {row['scenario']}",
+            "compact_label": _compact_benchmark_label(row["language"], row["benchmark_label"]),
+            "compact_scenario": _compact_scenario(row["scenario"]),
             "mode": row["mode"],
             "bare": _format_seconds(row["bare_seconds"]),
             "sccache": _format_seconds(row["sccache_seconds"]),
             "zccache": _format_seconds(row["zccache_seconds"]),
             "vs_sccache": _format_ratio(row["zccache_vs_sccache_ratio"]),
             "vs_bare": _format_ratio(row["zccache_vs_bare_ratio"]),
+            "vs_sccache_percent": _format_percent_delta(row["zccache_vs_sccache_ratio"]),
+            "vs_bare_percent": _format_percent_delta(row["zccache_vs_bare_ratio"]),
             "zccache_vs_sccache_ratio": row["zccache_vs_sccache_ratio"],
             "zccache_vs_bare_ratio": row["zccache_vs_bare_ratio"],
         }
@@ -605,29 +630,32 @@ def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> N
 
     rows = build_image_rows(group_results_by_language(payload["results"])[language])
     title = f"zccache {LANGUAGE_LABELS[language]} benchmarks"
-    width = 1240
-    margin = 32
-    row_h = 36
-    section_h = 30
-    header_h = 38
-    table_y = 134
-    footer_h = 58
+    width = 900
+    margin = 20
+    row_h = 76
+    section_h = 28
+    header_h = 34
+    table_y = 106
+    footer_h = 44
     section_count = 2
     rendered_row_count = max(1, len(rows))
     height = max(
-        420,
+        390,
         table_y + header_h + section_h * section_count + row_h * rendered_row_count + footer_h,
     )
-    scale = 2
+    scale = 4
     image = Image.new("RGB", (width * scale, height * scale), "#0d1117")
     draw = ImageDraw.Draw(image)
-    title_font = _font(30 * scale, bold=True)
-    subtitle_font = _font(13 * scale)
-    header_font = _font(13 * scale, bold=True)
+    title_font = _font(26 * scale, bold=True)
+    subtitle_font = _font(11 * scale)
+    header_font = _font(12 * scale, bold=True)
     section_font = _font(14 * scale, bold=True)
-    row_font = _font(13 * scale)
-    row_bold_font = _font(13 * scale, bold=True)
-    small_font = _font(12 * scale)
+    row_font = _font(12 * scale)
+    row_bold_font = _font(12 * scale, bold=True)
+    scenario_font = _font(13 * scale, bold=True)
+    delta_font = _font(12 * scale)
+    delta_bold_font = _font(14 * scale, bold=True)
+    small_font = _font(10 * scale)
 
     def box(values: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
         return tuple(value * scale for value in values)
@@ -635,9 +663,34 @@ def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> N
     def point(x: int, y: int) -> tuple[int, int]:
         return x * scale, y * scale
 
+    def draw_fit(
+        x: int,
+        y: int,
+        value: str,
+        font: Any,
+        fill: str,
+        max_width: int,
+    ) -> None:
+        draw.text(
+            point(x, y),
+            _truncate_to_width(draw, value, font, max_width * scale),
+            font=font,
+            fill=fill,
+        )
+
+    def draw_delta(x: int, y: int, value: str, ratio: float | None, max_width: int) -> None:
+        color = ratio_color(ratio)
+        if value == "n/a":
+            draw_fit(x, y + 19, value, delta_bold_font, color, max_width)
+            return
+        amount, _, direction = value.partition(" ")
+        draw_fit(x, y + 12, amount, delta_bold_font, color, max_width)
+        if direction:
+            draw_fit(x, y + 38, direction, delta_font, color, max_width)
+
     draw.rectangle(box((0, 0, width, height)), fill="#0d1117")
-    draw.rectangle(box((0, 0, width, 106)), fill="#161b22")
-    draw.text(point(margin, 24), title, font=title_font, fill="#f0f6fc")
+    draw.rectangle(box((0, 0, width, 84)), fill="#161b22")
+    draw.text(point(margin, 20), title, font=title_font, fill="#f0f6fc")
     metadata = payload["metadata"]
     sha = (metadata.get("git_sha") or "n/a")[:12]
     runner = metadata.get("runner", {}).get("platform") or "n/a"
@@ -646,7 +699,7 @@ def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> N
         f"sha {sha} | runner {runner}"
     )
     draw.text(
-        point(margin, 72),
+        point(margin, 60),
         _truncate_to_width(draw, metadata_line, subtitle_font, (width - margin * 2) * scale),
         font=subtitle_font,
         fill="#8b949e",
@@ -654,9 +707,9 @@ def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> N
 
     x0, y0 = margin, table_y
     table_w = width - margin * 2
-    headers = ["Scenario", "Bare", "sccache", "zccache", "vs sccache", "vs bare"]
-    widths = [470, 120, 120, 120, 150, 150]
-    padding_x = 14
+    headers = ["Scenario", "Times", "vs sccache", "vs bare"]
+    widths = [250, 280, 160, 160]
+    padding_x = 10
 
     draw.rounded_rectangle(
         box((x0, y0, x0 + table_w, y0 + header_h)),
@@ -667,17 +720,19 @@ def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> N
     )
     x = x0 + padding_x
     for header, col_w in zip(headers, widths):
-        draw.text(point(x, y0 + 11), header, font=header_font, fill="#c9d1d9")
+        draw.text(point(x, y0 + 10), header, font=header_font, fill="#c9d1d9")
         x += col_w
 
     y = y0 + header_h
     if not rows:
         draw.rectangle(box((x0, y, x0 + table_w, y + row_h)), fill="#161b22")
-        draw.text(
-            point(x0 + padding_x, y + 10),
+        draw_fit(
+            x0 + padding_x,
+            y + 28,
             "Benchmark data is not available yet.",
-            font=row_font,
-            fill="#f0f6fc",
+            row_font,
+            "#f0f6fc",
+            table_w - padding_x * 2,
         )
         y += row_h
     else:
@@ -715,40 +770,62 @@ def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> N
                     fill="#30363d",
                     width=scale,
                 )
-                values = [
-                    row["scenario"],
-                    row["bare"],
-                    row["sccache"],
-                    row["zccache"],
-                    row["vs_sccache"],
-                    row["vs_bare"],
-                ]
-                ratio_values = [
-                    None,
-                    None,
-                    None,
-                    None,
-                    row["zccache_vs_sccache_ratio"],
-                    row["zccache_vs_bare_ratio"],
-                ]
                 x = x0 + padding_x
-                for column_index, (value, col_w) in enumerate(zip(values, widths)):
-                    max_width = (col_w - 18) * scale
-                    text = _truncate_to_width(draw, str(value), row_font, max_width)
-                    color = (
-                        ratio_color(ratio_values[column_index])
-                        if column_index >= 4
-                        else "#c9d1d9"
+                draw_fit(
+                    x,
+                    y + 14,
+                    row["compact_label"],
+                    row_font,
+                    "#8b949e",
+                    widths[0] - 16,
+                )
+                draw_fit(
+                    x,
+                    y + 38,
+                    row["compact_scenario"],
+                    scenario_font,
+                    "#f0f6fc",
+                    widths[0] - 16,
+                )
+
+                x += widths[0]
+                time_lines = [
+                    ("bare", row["bare"], row_font, "#c9d1d9"),
+                    ("sccache", row["sccache"], row_font, "#c9d1d9"),
+                    ("zccache", row["zccache"], row_bold_font, "#f0f6fc"),
+                ]
+                for line_index, (label, value, font, color) in enumerate(time_lines):
+                    draw_fit(
+                        x,
+                        y + 8 + line_index * 21,
+                        f"{label}: {value}",
+                        font,
+                        color,
+                        widths[1] - 18,
                     )
-                    font = row_bold_font if column_index in {3, 4, 5} else row_font
-                    draw.text(point(x, y + 10), text, font=font, fill=color)
-                    x += col_w
+
+                x += widths[1]
+                draw_delta(
+                    x,
+                    y,
+                    row["vs_sccache_percent"],
+                    row["zccache_vs_sccache_ratio"],
+                    widths[2] - 18,
+                )
+                x += widths[2]
+                draw_delta(
+                    x,
+                    y,
+                    row["vs_bare_percent"],
+                    row["zccache_vs_bare_ratio"],
+                    widths[3] - 18,
+                )
                 y += row_h
 
-    draw.rectangle(box((margin, height - 44, width - margin, height - 42)), fill="#30363d")
+    draw.rectangle(box((margin, height - 34, width - margin, height - 32)), fill="#30363d")
     footer = "Artifacts: latest.json, benchmark-c.jpg, benchmark-cpp.jpg, benchmark-rust.jpg"
     draw.text(
-        point(margin, height - 30),
+        point(margin, height - 24),
         _truncate_to_width(draw, footer, small_font, (width - margin * 2) * scale),
         font=small_font,
         fill="#8b949e",
