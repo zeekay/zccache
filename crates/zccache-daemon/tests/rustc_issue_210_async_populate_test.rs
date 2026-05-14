@@ -25,18 +25,36 @@ fn env_lock() -> &'static Mutex<()> {
 struct CacheEnvGuard {
     _lock: MutexGuard<'static, ()>,
     old_cache_dir: Option<String>,
+    old_profile_rust_miss: Option<String>,
+    old_compile_priority: Option<String>,
 }
 
 impl CacheEnvGuard {
     fn new(cache_dir: &Path) -> Self {
+        Self::new_inner(cache_dir, false)
+    }
+
+    fn new_profiled(cache_dir: &Path) -> Self {
+        Self::new_inner(cache_dir, true)
+    }
+
+    fn new_inner(cache_dir: &Path, profiled: bool) -> Self {
         let lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let old_cache_dir = std::env::var(zccache_core::config::CACHE_DIR_ENV).ok();
+        let old_profile_rust_miss = std::env::var("ZCCACHE_PROFILE_RUST_MISS").ok();
+        let old_compile_priority = std::env::var("ZCCACHE_COMPILE_PRIORITY").ok();
         unsafe {
             std::env::set_var(zccache_core::config::CACHE_DIR_ENV, cache_dir);
+            if profiled {
+                std::env::set_var("ZCCACHE_PROFILE_RUST_MISS", "1");
+                std::env::set_var("ZCCACHE_COMPILE_PRIORITY", "high");
+            }
         }
         Self {
             _lock: lock,
             old_cache_dir,
+            old_profile_rust_miss,
+            old_compile_priority,
         }
     }
 }
@@ -47,6 +65,14 @@ impl Drop for CacheEnvGuard {
             match &self.old_cache_dir {
                 Some(value) => std::env::set_var(zccache_core::config::CACHE_DIR_ENV, value),
                 None => std::env::remove_var(zccache_core::config::CACHE_DIR_ENV),
+            }
+            match &self.old_profile_rust_miss {
+                Some(value) => std::env::set_var("ZCCACHE_PROFILE_RUST_MISS", value),
+                None => std::env::remove_var("ZCCACHE_PROFILE_RUST_MISS"),
+            }
+            match &self.old_compile_priority {
+                Some(value) => std::env::set_var("ZCCACHE_COMPILE_PRIORITY", value),
+                None => std::env::remove_var("ZCCACHE_COMPILE_PRIORITY"),
             }
         }
     }
@@ -227,6 +253,45 @@ async fn wait_for_rust_artifacts(client: &mut ClientConn) -> Vec<RustArtifactInf
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     list_rust_artifacts(client).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profiled_rust_build_miss_populates_artifact() {
+    let rustc = match zccache_test_support::find_rustc() {
+        Some(path) => path,
+        None => return,
+    };
+
+    zccache_test_support::test_timeout(async move {
+        let tmp = tempfile::tempdir().unwrap();
+        let _cache_env = CacheEnvGuard::new_profiled(&tmp.path().join("cache"));
+        let src = tmp.path().join("lib.rs");
+        let out_dir = tmp.path().join("deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        write_lib(&src, 232);
+
+        let (endpoint, server_handle, shutdown) = start_daemon().await;
+        let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+        let session_id = start_session(&mut client).await;
+        let args = cargo_build_args(&src, &out_dir, "profile232", "profile232");
+
+        let (exit_code, cached) =
+            compile(&mut client, &session_id, &rustc, &args, tmp.path()).await;
+        assert_eq!(exit_code, 0);
+        assert!(!cached, "profiled build-mode cold compile should miss");
+
+        let artifacts = list_rust_artifacts(&mut client).await;
+        let names = artifact_names(&artifacts);
+        assert!(
+            names
+                .iter()
+                .any(|name| name.ends_with("libprofile232-profile232.rlib")),
+            "profiled build miss should publish the rlib artifact; names={names:?}"
+        );
+
+        stop_daemon(server_handle, shutdown).await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

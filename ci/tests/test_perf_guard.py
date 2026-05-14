@@ -336,3 +336,23 @@ def test_prebuilt_benchmark_binary_commands_are_filtered():
             "--test-threads=1",
         ],
     ]
+
+
+def test_benchmark_env_uses_realtime_priority_and_profiles_rust(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("RUSTC_WRAPPER", "sccache")
+
+    env = perf_guard._benchmark_env(tmp_path, "rust")
+
+    assert env["ZCCACHE_CACHE_DIR"] == str(tmp_path)
+    assert env["ZCCACHE_COMPILE_PRIORITY"] == "high"
+    assert env["ZCCACHE_PROFILE_RUST_MISS"] == "1"
+    assert "RUSTC_WRAPPER" not in env
+
+
+def test_benchmark_env_does_not_enable_rust_profile_for_other_languages(tmp_path):
+    env = perf_guard._benchmark_env(tmp_path, "c++")
+
+    assert env["ZCCACHE_COMPILE_PRIORITY"] == "high"
+    assert "ZCCACHE_PROFILE_RUST_MISS" not in env
