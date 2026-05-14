@@ -1,0 +1,72 @@
+name: Perf Guard
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "action.yml"
+      - "action/**"
+      - "ci/**"
+      - "crates/**"
+      - ".github/workflows/perf-guard.yml"
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "action.yml"
+      - "action/**"
+      - "ci/**"
+      - "crates/**"
+      - ".github/workflows/perf-guard.yml"
+
+concurrency:
+  group: perf-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  perf-guard:
+    name: Rust/C/C++ speed floor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: zackees/setup-soldr@v0
+        with:
+          cache: false
+          build-cache: false
+          target-cache: false
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Install benchmark tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang
+
+      - name: Run perf regression guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m ci.perf_guard \
+            --run-benchmarks \
+            --threshold 1.5 \
+            --attempts 3 \
+            --output-dir perf-guard-output
+
+      - name: Upload perf guard logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-guard-output
+          path: perf-guard-output
+          if-no-files-found: warn

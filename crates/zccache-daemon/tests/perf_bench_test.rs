@@ -1,6 +1,7 @@
 //! Performance benchmark: warm-cache compilation latency.
 //!
-//! Three benchmarks:
+//! Four benchmarks:
+//!   - `perf_c_zccache_vs_bare`: C single-file compilation (inline args)
 //!   - `perf_warm_cache_zccache_vs_sccache`: C++ single-file vs multi-file (inline args)
 //!   - `perf_response_file`: C++ same workload but args passed via large nested response files
 //!   - `perf_rustc_zccache_vs_sccache`: Rust single-file compilation (lib crates)
@@ -145,6 +146,140 @@ fn clean_objects(dir: &Path) {
 
 fn source_names() -> Vec<String> {
     (0..NUM_FILES).map(|i| format!("unit_{i:03}.cpp")).collect()
+}
+
+fn c_source_names() -> Vec<String> {
+    (0..NUM_FILES).map(|i| format!("unit_{i:03}.c")).collect()
+}
+
+fn generate_c_project(dir: &Path) {
+    let incdir = dir.join("include");
+    std::fs::create_dir_all(&incdir).unwrap();
+
+    std::fs::write(
+        incdir.join("common_c.h"),
+        r#"#pragma once
+#include <stdint.h>
+#include <math.h>
+
+static inline uint64_t bench_mix(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+"#,
+    )
+    .unwrap();
+
+    for i in 0..NUM_FILES {
+        let content = format!(
+            r#"#include "common_c.h"
+
+double compute_{i:03}(int n) {{
+    double acc = (double)n * 0.{i:03}1;
+    for (int j = 0; j < 32; ++j) {{
+        acc += sin((double)bench_mix((uint64_t)(n + j + {i})) * 1e-18);
+    }}
+    return acc;
+}}
+"#,
+        );
+        std::fs::write(dir.join(format!("unit_{i:03}.c")), content).unwrap();
+    }
+}
+
+fn nuke_and_regenerate_c(dir: &Path) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path).unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+    generate_c_project(dir);
+}
+
+fn warmup_c_compiler(compiler: &str, dir: &Path) {
+    let src = dir.join("unit_000.c");
+    let obj = dir.join("_warmup.o");
+    let status = std::process::Command::new(compiler)
+        .args(["-c", "-Iinclude", "-O2", "-std=c11"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("C warmup compile failed");
+    assert!(status.success(), "C warmup compile failed");
+    let _ = std::fs::remove_file(&obj);
+}
+
+fn baseline_c_single(compiler: &str, cwd: &Path, sources: &[String]) -> Duration {
+    clean_objects(cwd);
+    let start = Instant::now();
+    for src in sources {
+        let status = std::process::Command::new(compiler)
+            .args([
+                "-c",
+                src,
+                "-o",
+                &src.replace(".c", ".o"),
+                "-Iinclude",
+                "-O2",
+                "-std=c11",
+            ])
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("failed to run C compiler");
+        assert!(status.success(), "C compile failed for {src}");
+    }
+    start.elapsed()
+}
+
+async fn zccache_compile_c_single(
+    client: &mut ClientConn,
+    session_id: &str,
+    compiler: &str,
+    cwd: &str,
+    sources: &[String],
+) -> Duration {
+    clean_objects(Path::new(cwd));
+    let start = Instant::now();
+    for src in sources {
+        client
+            .send(&Request::Compile {
+                session_id: session_id.to_string(),
+                args: vec![
+                    "-c".into(),
+                    src.clone(),
+                    "-o".into(),
+                    src.replace(".c", ".o"),
+                    "-Iinclude".into(),
+                    "-O2".into(),
+                    "-std=c11".into(),
+                ],
+                cwd: cwd.into(),
+                compiler: compiler.to_string().into(),
+                env: None,
+            })
+            .await
+            .unwrap();
+        match client.recv().await.unwrap() {
+            Some(Response::CompileResult { exit_code, .. }) => {
+                assert_eq!(exit_code, 0, "C compile failed for {src}");
+            }
+            other => panic!("expected CompileResult, got: {other:?}"),
+        }
+    }
+    start.elapsed()
 }
 
 // ── zccache benchmarks (in-process daemon, no subprocess overhead) ──────
@@ -581,6 +716,121 @@ fn fmt_ratio(baseline: Duration, test: Duration, bold: bool) -> String {
 }
 
 // ── Main benchmark ──────────────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore] // Run explicitly: soldr cargo test -p zccache-daemon --test perf_bench_test -- perf_c_zccache_vs_bare --nocapture --ignored
+async fn perf_c_zccache_vs_bare() {
+    zccache_test_support::ensure_clang_tool_chain_on_path();
+    let compiler_path = match zccache_test_support::find_on_path("clang") {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: no C compiler found");
+            return;
+        }
+    };
+    let compiler = compiler_path.to_string_lossy().to_string();
+    let sources = c_source_names();
+
+    eprintln!();
+    eprintln!("================================================================");
+    eprintln!("  C COMPILATION BENCHMARK");
+    eprintln!("  {NUM_FILES} .c files | {WARM_TRIALS} warm trials");
+    eprintln!("  Compiler: {compiler}");
+    eprintln!("================================================================");
+    eprintln!();
+
+    let bl_dir = zccache_test_support::temp_cache_dir().unwrap();
+    generate_c_project(bl_dir.path());
+
+    eprintln!("  [1/2] Bare clang");
+    nuke_and_regenerate_c(bl_dir.path());
+    warmup_c_compiler(&compiler, bl_dir.path());
+    let bl_cold = baseline_c_single(&compiler, bl_dir.path(), &sources);
+    eprintln!("        cold:  {}", fmt_dur(bl_cold));
+
+    let bl_warm = baseline_c_single(&compiler, bl_dir.path(), &sources);
+    eprintln!("        warm:  {}", fmt_dur(bl_warm));
+    eprintln!();
+    drop(bl_dir);
+
+    let zc_dir = zccache_test_support::temp_cache_dir().unwrap();
+    generate_c_project(zc_dir.path());
+    let zc_cwd = zc_dir.path().to_string_lossy().into_owned();
+
+    eprintln!("  [2/2] zccache");
+    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
+
+    client
+        .send(&Request::SessionStart {
+            client_pid: std::process::id(),
+            working_dir: zc_cwd.clone().into(),
+            log_file: None,
+            track_stats: true,
+            journal_path: None,
+        })
+        .await
+        .unwrap();
+    let session_id = match client.recv().await.unwrap() {
+        Some(Response::SessionStarted { session_id, .. }) => session_id,
+        other => panic!("expected SessionStarted, got: {other:?}"),
+    };
+
+    nuke_and_regenerate_c(zc_dir.path());
+    warmup_c_compiler(&compiler, zc_dir.path());
+    let zc_cold =
+        zccache_compile_c_single(&mut client, &session_id, &compiler, &zc_cwd, &sources).await;
+    eprintln!("        cold:  {}", fmt_dur(zc_cold));
+
+    let mut zc_warm = Vec::with_capacity(WARM_TRIALS);
+    for _ in 0..WARM_TRIALS {
+        zc_warm.push(
+            zccache_compile_c_single(&mut client, &session_id, &compiler, &zc_cwd, &sources).await,
+        );
+    }
+    print_trials("warm:", &zc_warm);
+
+    client
+        .send(&Request::SessionEnd {
+            session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let _ = client.recv::<Response>().await;
+
+    shutdown.notify_one();
+    server_handle.await.unwrap();
+
+    let dash = "\u{2014}";
+    let zc_warm_med = median(&zc_warm);
+    let vs_bare_cold = fmt_ratio(bl_cold, zc_cold, false);
+    let vs_bare_warm = fmt_ratio(bl_warm, zc_warm_med, true);
+
+    eprintln!();
+    eprintln!("## C Benchmark: {NUM_FILES} .c files, {WARM_TRIALS} warm trials");
+    eprintln!();
+    eprintln!("| Scenario | Bare clang | sccache | zccache | vs sccache | vs bare clang |");
+    eprintln!("|:---------|----------:|--------:|--------:|-----------:|--------------:|");
+    eprintln!(
+        "| Single-file, Cold | {} | {} | {} | {} | {} |",
+        fmt_dur(bl_cold),
+        dash,
+        fmt_dur(zc_cold),
+        dash,
+        vs_bare_cold,
+    );
+    eprintln!(
+        "| Single-file, Warm | {} | {} | **{}** | {} | {} |",
+        fmt_dur(bl_warm),
+        dash,
+        fmt_dur(zc_warm_med),
+        dash,
+        vs_bare_warm,
+    );
+    eprintln!();
+    eprintln!("> **Cold** = first compile (empty cache). **Warm** = median of {WARM_TRIALS} subsequent runs.");
+    eprintln!();
+}
 
 #[tokio::test]
 #[ignore] // Run explicitly: soldr cargo test -p zccache-daemon --test perf_bench_test -- --nocapture --ignored

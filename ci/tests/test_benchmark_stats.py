@@ -2,6 +2,13 @@ from ci import benchmark_stats
 
 
 SAMPLE_LOG = """
+## C Benchmark: 50 .c files, 5 warm trials
+
+| Scenario | Bare clang | sccache | zccache | vs sccache | vs bare clang |
+|:---------|----------:|--------:|--------:|-----------:|--------------:|
+| Single-file, Cold | 3.000s | — | 2.000s | — | 1.5x faster |
+| Single-file, Warm | 3.000s | — | **0.050s** | — | **60x faster** |
+
 ## Benchmark: 50 C++ files, 5 warm trials
 
 | Scenario | Bare Clang | sccache | zccache | vs sccache | vs bare clang |
@@ -28,12 +35,17 @@ SAMPLE_LOG = """
 def test_parse_benchmark_log_extracts_all_tables():
     rows = benchmark_stats.parse_benchmark_log(SAMPLE_LOG)
 
-    assert len(rows) == 6
+    assert len(rows) == 8
     assert {row["benchmark"] for row in rows} == {
+        "c-inline",
         "cpp-inline",
         "cpp-response-file",
         "rust",
     }
+
+    c_warm = [row for row in rows if row["benchmark"] == "c-inline" and row["mode"] == "warm"][0]
+    assert c_warm["language"] == "c"
+    assert c_warm["zccache_vs_bare_ratio"] == 60.0
 
     rust_warm = [row for row in rows if row["scenario"] == "Build, Warm"][0]
     assert rust_warm["language"] == "rust"

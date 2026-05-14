@@ -1,6 +1,7 @@
 """Run performance benchmarks (zccache vs sccache vs bare compiler).
 
-Three benchmarks:
+Four benchmarks:
+  - perf_c_zccache_vs_bare: C inline args
   - perf_warm_cache_zccache_vs_sccache: C++ inline args (single-file + multi-file)
   - perf_response_file: C++ large nested response files (~283 expanded args)
   - perf_rustc_zccache_vs_sccache: Rust compilation (50 .rs lib files)
