@@ -6,8 +6,8 @@ PASSING_LOG = """
 
 | Scenario | Bare clang | sccache | zccache | vs sccache | vs bare clang |
 |:---------|----------:|--------:|--------:|-----------:|--------------:|
-| Single-file, Cold | 3.000s | — | 2.000s | — | 1.5x faster |
-| Single-file, Warm | 3.000s | — | **1.000s** | — | **3.0x faster** |
+| Single-file, Cold | 3.000s | 3.200s | 2.000s | 1.6x faster | 1.5x faster |
+| Single-file, Warm | 3.000s | 2.000s | **1.000s** | **2.0x faster** | **3.0x faster** |
 
 ## Benchmark: 50 C++ files, 5 warm trials
 
@@ -28,6 +28,11 @@ PASSING_LOG = """
 FAILING_RUST_LOG = PASSING_LOG.replace(
     "| Build, Cold | 9.000s | 10.000s | 6.000s | 1.7x faster | 1.5x faster |",
     "| Build, Cold | 9.000s | 10.000s | 7.000s | 1.4x faster | 1.3x faster |",
+)
+
+FAILING_SCCACHE_LOG = PASSING_LOG.replace(
+    "| Single-file, Cold | 6.000s | 7.000s | 4.000s | 1.8x faster | 1.5x faster |",
+    "| Single-file, Cold | 6.000s | 5.000s | 4.000s | 1.2x faster | 1.5x faster |",
 )
 
 
@@ -64,7 +69,20 @@ def test_below_threshold_fails():
 
     assert not report.passed
     failing = [status for status in report.statuses if not status.passed]
-    assert [(status.language, status.scenario) for status in failing] == [("rust", "Build, Cold")]
+    assert [(status.language, status.scenario, status.baseline) for status in failing] == [
+        ("rust", "Build, Cold", "bare"),
+        ("rust", "Build, Cold", "sccache"),
+    ]
+
+
+def test_sccache_threshold_is_enforced_separately_from_bare():
+    report = perf_guard.evaluate_attempts([rows(FAILING_SCCACHE_LOG)], threshold=1.5)
+
+    assert not report.passed
+    failing = [status for status in report.statuses if not status.passed]
+    assert [(status.language, status.scenario, status.baseline) for status in failing] == [
+        ("c++", "Single-file, Cold", "sccache")
+    ]
 
 
 def test_retry_passes_when_later_attempt_clears_threshold():
@@ -102,6 +120,6 @@ def test_all_command_failures_fail_even_when_rows_parse():
 
 def test_report_marks_failed_rows():
     report = perf_guard.evaluate_attempts([rows(FAILING_RUST_LOG)], threshold=1.5)
-    markdown = perf_guard.format_report(report, 1.5)
+    markdown = perf_guard.format_report(report, 1.5, 1.5)
 
-    assert "| FAIL | rust | Rust rustc | Build, Cold | 1.286x | 1 | 1 |" in markdown
+    assert "| FAIL | rust | Rust rustc | Build, Cold | Bare rustc | 1.286x | 1.50x | 1 | 1 |" in markdown

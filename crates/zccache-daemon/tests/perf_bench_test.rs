@@ -244,6 +244,36 @@ fn baseline_c_single(compiler: &str, cwd: &Path, sources: &[String]) -> Duration
     start.elapsed()
 }
 
+fn sccache_compile_c_single(
+    sccache: &Path,
+    compiler: &str,
+    cwd: &Path,
+    sources: &[String],
+) -> Duration {
+    clean_objects(cwd);
+    let start = Instant::now();
+    for src in sources {
+        let status = std::process::Command::new(sccache)
+            .args([
+                compiler,
+                "-c",
+                src,
+                "-o",
+                &src.replace(".c", ".o"),
+                "-Iinclude",
+                "-O2",
+                "-std=c11",
+            ])
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("failed to run sccache for C");
+        assert!(status.success(), "sccache C compile failed for {src}");
+    }
+    start.elapsed()
+}
+
 async fn zccache_compile_c_single(
     client: &mut ClientConn,
     session_id: &str,
@@ -734,7 +764,7 @@ async fn perf_c_zccache_vs_bare() {
     eprintln!();
     eprintln!("================================================================");
     eprintln!("  C COMPILATION BENCHMARK");
-    eprintln!("  {NUM_FILES} .c files | {WARM_TRIALS} warm trials");
+    eprintln!("  {NUM_FILES} .c files | {WARM_TRIALS} warm trials | each tool in its own tempdir");
     eprintln!("  Compiler: {compiler}");
     eprintln!("================================================================");
     eprintln!();
@@ -753,11 +783,70 @@ async fn perf_c_zccache_vs_bare() {
     eprintln!();
     drop(bl_dir);
 
+    let sccache_cold;
+    let sccache_warm;
+    if let Some(sccache_bin) = find_sccache() {
+        let sc_dir = zccache_test_support::temp_cache_dir().unwrap();
+        generate_c_project(sc_dir.path());
+
+        let sc_cache_dir = zccache_test_support::temp_cache_dir().unwrap();
+        let sc_cache_str = sc_cache_dir.path().to_string_lossy().into_owned();
+        std::env::set_var("SCCACHE_DIR", &sc_cache_str);
+
+        eprintln!("  [2/3] sccache ({})", sccache_bin.display());
+        let _ = std::process::Command::new(&sccache_bin)
+            .arg("--stop-server")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if sc_cache_dir.path().exists() {
+            let _ = std::fs::remove_dir_all(sc_cache_dir.path());
+            let _ = std::fs::create_dir_all(sc_cache_dir.path());
+        }
+        let _ = std::process::Command::new(&sccache_bin)
+            .arg("--start-server")
+            .env("SCCACHE_DIR", &sc_cache_str)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        nuke_and_regenerate_c(sc_dir.path());
+        warmup_c_compiler(&compiler, sc_dir.path());
+        let cold = sccache_compile_c_single(&sccache_bin, &compiler, sc_dir.path(), &sources);
+        eprintln!("        cold:  {}", fmt_dur(cold));
+        sccache_cold = Some(cold);
+
+        let mut times = Vec::with_capacity(WARM_TRIALS);
+        for _ in 0..WARM_TRIALS {
+            times.push(sccache_compile_c_single(
+                &sccache_bin,
+                &compiler,
+                sc_dir.path(),
+                &sources,
+            ));
+        }
+        print_trials("warm:", &times);
+        sccache_warm = Some(times);
+
+        let _ = std::process::Command::new(&sccache_bin)
+            .arg("--stop-server")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        std::env::remove_var("SCCACHE_DIR");
+        eprintln!();
+    } else {
+        eprintln!("  [2/3] sccache: not found, skipping");
+        eprintln!();
+        sccache_cold = None;
+        sccache_warm = None;
+    }
+
     let zc_dir = zccache_test_support::temp_cache_dir().unwrap();
     generate_c_project(zc_dir.path());
     let zc_cwd = zc_dir.path().to_string_lossy().into_owned();
 
-    eprintln!("  [2/2] zccache");
+    eprintln!("  [3/3] zccache");
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
 
@@ -801,10 +890,16 @@ async fn perf_c_zccache_vs_bare() {
     shutdown.notify_one();
     server_handle.await.unwrap();
 
-    let dash = "\u{2014}";
     let zc_warm_med = median(&zc_warm);
     let vs_bare_cold = fmt_ratio(bl_cold, zc_cold, false);
     let vs_bare_warm = fmt_ratio(bl_warm, zc_warm_med, true);
+    let dash = "\u{2014}";
+    let sccache_cold_str = sccache_cold.map(fmt_dur);
+    let sccache_warm_str = sccache_warm.as_ref().map(|times| fmt_dur(median(times)));
+    let vs_sccache_cold = sccache_cold.map(|duration| fmt_ratio(duration, zc_cold, false));
+    let vs_sccache_warm = sccache_warm
+        .as_ref()
+        .map(|times| fmt_ratio(median(times), zc_warm_med, true));
 
     eprintln!();
     eprintln!("## C Benchmark: {NUM_FILES} .c files, {WARM_TRIALS} warm trials");
@@ -814,17 +909,17 @@ async fn perf_c_zccache_vs_bare() {
     eprintln!(
         "| Single-file, Cold | {} | {} | {} | {} | {} |",
         fmt_dur(bl_cold),
-        dash,
+        sccache_cold_str.as_deref().unwrap_or(dash),
         fmt_dur(zc_cold),
-        dash,
+        vs_sccache_cold.as_deref().unwrap_or(dash),
         vs_bare_cold,
     );
     eprintln!(
         "| Single-file, Warm | {} | {} | **{}** | {} | {} |",
         fmt_dur(bl_warm),
-        dash,
+        sccache_warm_str.as_deref().unwrap_or(dash),
         fmt_dur(zc_warm_med),
-        dash,
+        vs_sccache_warm.as_deref().unwrap_or(dash),
         vs_bare_warm,
     );
     eprintln!();
