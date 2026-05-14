@@ -68,13 +68,35 @@ class GuardReport:
         )
 
 
-def _benchmark_commands(language: str | None) -> list[list[str]]:
+def _benchmark_binary_command(benchmark_binary: Path, test_name: str | None = None) -> list[str]:
+    command = [str(benchmark_binary)]
+    if test_name is not None:
+        command.append(test_name)
+    command.extend(["--nocapture", "--ignored", "--test-threads=1"])
+    return command
+
+
+def _benchmark_commands(
+    language: str | None,
+    benchmark_binary: Path | None = None,
+) -> list[list[str]]:
+    if benchmark_binary is not None:
+        if language is None:
+            return [_benchmark_binary_command(benchmark_binary)]
+        return [
+            _benchmark_binary_command(benchmark_binary, test_name)
+            for test_name in benchmark_stats.BENCHMARK_TESTS_BY_LANGUAGE[language]
+        ]
     if language is None:
         return [benchmark_stats.BENCHMARK_COMMAND]
     return benchmark_stats.benchmark_commands_for_language(language)
 
 
-def run_benchmarks_once(log_path: Path, language: str | None = None) -> tuple[int, str]:
+def run_benchmarks_once(
+    log_path: Path,
+    language: str | None = None,
+    benchmark_binary: Path | None = None,
+) -> tuple[int, str]:
     cache_dir = Path(tempfile.mkdtemp(prefix="zccache-perf-guard-cache-"))
     env = os.environ.copy()
     env["ZCCACHE_CACHE_DIR"] = str(cache_dir)
@@ -83,7 +105,7 @@ def run_benchmarks_once(log_path: Path, language: str | None = None) -> tuple[in
     try:
         outputs: list[str] = []
         returncode = 0
-        for command in _benchmark_commands(language):
+        for command in _benchmark_commands(language, benchmark_binary):
             result = subprocess.run(
                 command,
                 cwd=REPO_ROOT,
@@ -329,6 +351,7 @@ def _run_attempts(
     sccache_threshold: float,
     languages: tuple[str, ...],
     benchmark_language: str | None,
+    benchmark_binary: Path | None,
 ) -> tuple[list[list[dict[str, Any]]], list[int]]:
     parsed_attempts: list[list[dict[str, Any]]] = []
     command_failures: list[int] = []
@@ -336,7 +359,7 @@ def _run_attempts(
     for attempt in range(1, attempts + 1):
         log_path = output_dir / f"attempt-{attempt}.log"
         print(f"=== Perf guard attempt {attempt}/{attempts} ===")
-        returncode, output = run_benchmarks_once(log_path, benchmark_language)
+        returncode, output = run_benchmarks_once(log_path, benchmark_language, benchmark_binary)
         rows = benchmark_stats.parse_benchmark_log(output)
         parsed_attempts.append(rows)
         write_attempt_json(
@@ -344,7 +367,7 @@ def _run_attempts(
             attempt,
             rows,
             returncode,
-            source="benchmark-run",
+            source="benchmark-binary" if benchmark_binary else "benchmark-run",
             language=benchmark_language,
         )
         if returncode != 0:
@@ -373,6 +396,11 @@ def main() -> int:
     parser.add_argument("--sccache-threshold", type=float, default=DEFAULT_SCCACHE_THRESHOLD)
     parser.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS)
     parser.add_argument(
+        "--benchmark-binary",
+        type=Path,
+        help="Run a prebuilt perf_bench_test binary instead of invoking cargo test.",
+    )
+    parser.add_argument(
         "--language",
         choices=REQUIRED_LANGUAGES,
         help="Run and require only one benchmark language.",
@@ -390,6 +418,10 @@ def main() -> int:
         parser.error("--attempts must be at least 1")
     if bool(args.input_log) == bool(args.run_benchmarks):
         parser.error("use exactly one of --input-log or --run-benchmarks")
+    if args.benchmark_binary and not args.run_benchmarks:
+        parser.error("--benchmark-binary requires --run-benchmarks")
+    if args.benchmark_binary and not args.benchmark_binary.is_file():
+        parser.error(f"--benchmark-binary does not exist: {args.benchmark_binary}")
 
     languages = (args.language,) if args.language else REQUIRED_LANGUAGES
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -412,6 +444,7 @@ def main() -> int:
             args.sccache_threshold,
             languages,
             args.language,
+            args.benchmark_binary,
         )
 
     report = evaluate_attempts(

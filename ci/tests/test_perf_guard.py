@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from ci import benchmark_stats, perf_guard
 
@@ -203,3 +204,24 @@ def test_benchmark_language_commands_are_filtered():
         "perf_response_file",
     ]
     assert [command[-4] for command in rust_commands] == ["perf_rustc_zccache_vs_sccache"]
+
+
+def test_prebuilt_benchmark_binary_commands_are_filtered():
+    commands = perf_guard._benchmark_commands("c++", Path("perf_bench_test"))
+
+    assert commands == [
+        [
+            "perf_bench_test",
+            "perf_warm_cache_zccache_vs_sccache",
+            "--nocapture",
+            "--ignored",
+            "--test-threads=1",
+        ],
+        [
+            "perf_bench_test",
+            "perf_response_file",
+            "--nocapture",
+            "--ignored",
+            "--test-threads=1",
+        ],
+    ]

@@ -21,9 +21,53 @@ permissions:
   contents: read
 
 jobs:
+  build-perf-benchmark:
+    name: Build perf benchmark binary
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: zackees/setup-soldr@v0
+        with:
+          cache: false
+          build-cache: false
+          target-cache: false
+
+      - name: Build perf benchmark binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          soldr --no-cache cargo test -p zccache-daemon --test perf_bench_test --no-run
+          bench_bin="$(
+            find target/debug/deps \
+              -maxdepth 1 \
+              -type f \
+              -name 'perf_bench_test-*' \
+              -perm -111 \
+              | head -n 1
+          )"
+          if [[ -z "$bench_bin" ]]; then
+            echo "perf_bench_test binary was not found" >&2
+            exit 1
+          fi
+          mkdir -p perf-guard-bin
+          cp "$bench_bin" perf-guard-bin/perf_bench_test
+          chmod +x perf-guard-bin/perf_bench_test
+
+      - name: Upload perf benchmark binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-guard-binary
+          path: perf-guard-bin/perf_bench_test
+          if-no-files-found: error
+
   perf-guard:
     name: ${{ matrix.label }} speed floor
     if: github.ref == 'refs/heads/main'
+    needs: build-perf-benchmark
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
@@ -60,6 +104,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang
 
+      - name: Download perf benchmark binary
+        uses: actions/download-artifact@v7
+        with:
+          name: perf-guard-binary
+          path: perf-guard-bin
+
+      - name: Prepare perf benchmark binary
+        shell: bash
+        run: chmod +x perf-guard-bin/perf_bench_test
+
       - name: Run perf regression guard
         shell: bash
         run: |
@@ -70,6 +124,7 @@ jobs:
             --bare-threshold 1.5 \
             --sccache-threshold 1.5 \
             --attempts 3 \
+            --benchmark-binary "$PWD/perf-guard-bin/perf_bench_test" \
             --output-dir perf-guard-output
 
       - name: Upload perf guard artifacts
