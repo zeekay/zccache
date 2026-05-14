@@ -315,6 +315,11 @@ def test_benchmark_language_commands_are_filtered():
         "perf_response_file",
         "perf_cpp_sibling_remap_warm",
     ]
+    em_commands = benchmark_stats.benchmark_commands_for_language("emscripten")
+    assert [command[-4] for command in em_commands] == [
+        "perf_emcc_warm_cache_zccache_vs_sccache",
+        "perf_emcc_sibling_remap_warm",
+    ]
     assert [command[-4] for command in rust_commands] == [
         "perf_rustc_zccache_vs_sccache",
         "perf_rustc_sibling_remap_warm",

@@ -26,6 +26,8 @@ DEFAULT_SCCACHE_THRESHOLD = DEFAULT_WARM_SCCACHE_THRESHOLD
 DEFAULT_THRESHOLD = DEFAULT_WARM_BARE_THRESHOLD
 DEFAULT_ATTEMPTS = 3
 REQUIRED_LANGUAGES = ("c", "c++", "rust")
+OPTIONAL_LANGUAGES = ("emscripten",)
+KNOWN_LANGUAGES = REQUIRED_LANGUAGES + OPTIONAL_LANGUAGES
 REQUIRED_MODES = ("cold", "warm")
 
 
@@ -566,7 +568,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--language",
-        choices=REQUIRED_LANGUAGES,
+        choices=KNOWN_LANGUAGES,
         help="Run and require only one benchmark language.",
     )
     args = parser.parse_args()

@@ -45,6 +45,19 @@ SAMPLE_LOG = """
 | Scenario | Bare rustc | sccache | zccache | vs sccache | vs bare rustc |
 |:---------|----------:|--------:|--------:|-----------:|--------------:|
 | Sibling-workspace, Warm | 7.142s | 8.301s | **0.127s** | **65x faster** | **56x faster** |
+
+## Emscripten Benchmark: 50 .cpp files, 5 warm trials
+
+| Scenario | Bare em++ | sccache | zccache | vs sccache | vs bare em++ |
+|:---------|---------:|--------:|--------:|-----------:|-------------:|
+| Single-file, Cold | 14.301s | 21.118s | 15.420s | 1.4x faster | 1.1x slower |
+| Single-file, Warm | 13.802s | 1.703s | **0.061s** | **28x faster** | **226x faster** |
+
+## Emscripten Sibling-Workspace Remap Benchmark: 50 .cpp files, 5 warm trials
+
+| Scenario | Bare em++ | sccache | zccache | vs sccache | vs bare em++ |
+|:---------|---------:|--------:|--------:|-----------:|-------------:|
+| Sibling-workspace, Warm | 13.654s | 1.712s | **0.063s** | **27x faster** | **217x faster** |
 """
 
 
@@ -74,12 +87,14 @@ def sample_payload():
 def test_parse_benchmark_log_extracts_all_tables():
     rows = benchmark_stats.parse_benchmark_log(SAMPLE_LOG)
 
-    assert len(rows) == 10
+    assert len(rows) == 13
     assert {row["benchmark"] for row in rows} == {
         "c-inline",
         "cpp-inline",
         "cpp-response-file",
         "cpp-sibling-remap",
+        "emscripten",
+        "emscripten-sibling-remap",
         "rust",
         "rust-sibling-remap",
     }
@@ -103,19 +118,32 @@ def test_parse_benchmark_log_extracts_all_tables():
     assert rust_remap["language"] == "rust"
     assert rust_remap["zccache_seconds"] == 0.127
 
+    em_warm = [row for row in rows if row["benchmark"] == "emscripten" and row["mode"] == "warm"][
+        0
+    ]
+    assert em_warm["language"] == "emscripten"
+    assert em_warm["bare_label"] == "Bare em++"
+    assert em_warm["zccache_seconds"] == 0.061
+
+    em_remap = [row for row in rows if row["benchmark"] == "emscripten-sibling-remap"][0]
+    assert em_remap["mode"] == "warm"
+    assert em_remap["language"] == "emscripten"
+    assert em_remap["zccache_seconds"] == 0.063
+
 
 def test_group_results_by_language_returns_expected_buckets():
     rows = benchmark_stats.parse_benchmark_log(SAMPLE_LOG)
 
     groups = benchmark_stats.group_results_by_language(rows)
 
-    assert list(groups) == ["c", "c++", "rust"]
+    assert list(groups) == ["c", "c++", "emscripten", "rust"]
     assert {benchmark_stats.LANGUAGE_LABELS[language] for language in groups} == {
         "C",
         "C++",
+        "Emscripten",
         "Rust",
     }
-    assert [len(groups[language]) for language in groups] == [2, 5, 3]
+    assert [len(groups[language]) for language in groups] == [2, 5, 3, 3]
 
 
 def test_render_html_links_json_stats_and_language_images_only():
@@ -134,7 +162,12 @@ def test_image_rows_cover_c_cpp_and_rust_stats():
     rows = benchmark_stats.parse_benchmark_log(SAMPLE_LOG)
     image_rows = benchmark_stats.build_image_rows(rows)
 
-    assert {row["language"] for row in image_rows} == {"C", "C++", "Rust"}
+    assert {row["language"] for row in image_rows} == {
+        "C",
+        "C++",
+        "Emscripten",
+        "Rust",
+    }
     assert any("C inline args - Single-file, Warm" == row["scenario"] for row in image_rows)
     assert any(
         row["compact_label"] == "inline args"
