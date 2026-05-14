@@ -47,7 +47,7 @@ impl CacheEnvGuard {
             std::env::set_var(zccache_core::config::CACHE_DIR_ENV, cache_dir);
             if profiled {
                 std::env::set_var("ZCCACHE_PROFILE_RUST_MISS", "1");
-                std::env::set_var("ZCCACHE_COMPILE_PRIORITY", "high");
+                std::env::set_var("ZCCACHE_COMPILE_PRIORITY", "auto");
             }
         }
         Self {

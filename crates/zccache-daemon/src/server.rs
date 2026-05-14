@@ -4528,8 +4528,12 @@ async fn handle_compile(
     apply_client_env(&mut cmd, &client_env, &lineage);
     let t_compiler_process = std::time::Instant::now();
     let compiler_priority = CompilePriority::from_client_env(client_env.as_deref());
-    let result =
-        crate::process::tokio_command_output_with_priority(&mut cmd, compiler_priority).await;
+    let compiler_priority_decision = compiler_priority.resolve_for_current_load();
+    let result = crate::process::tokio_command_output_with_priority(
+        &mut cmd,
+        compiler_priority_decision.effective,
+    )
+    .await;
     let compiler_process_ns = t_compiler_process.elapsed().as_nanos() as u64;
 
     let output = match result {
@@ -4993,10 +4997,15 @@ async fn handle_compile(
                 .saturating_add(hash_all_ns)
                 .saturating_add(artifact_store_ns);
             let unaccounted_ns = total_ns.saturating_sub(accounted_ns);
+            let compiler_cpu_usage_percent = compiler_priority_decision
+                .cpu_usage_percent
+                .map(|usage| format!("{usage:.1}"))
+                .unwrap_or_else(|| "n/a".to_string());
             eprintln!(
                 concat!(
                     "zccache_rust_miss_profile ",
-                    "mode={} compiler_priority={} total_ns={} pre_exec_ns={} system_includes_ns={} ",
+                    "mode={} compiler_priority={} compiler_effective_priority={} ",
+                    "compiler_cpu_usage_percent={} total_ns={} pre_exec_ns={} system_includes_ns={} ",
                     "system_watch_ns={} parse_args_ns={} build_context_ns={} ",
                     "hash_source_ns={} hash_headers_ns={} depgraph_check_ns={} ",
                     "pre_exec_other_ns={} break_outputs_ns={} compiler_prep_ns={} compiler_process_ns={} ",
@@ -5013,7 +5022,9 @@ async fn handle_compile(
                     "artifact_store_other_ns={} unaccounted_ns={}"
                 ),
                 rust_profile_mode,
-                compiler_priority.as_str(),
+                compiler_priority_decision.requested.as_str(),
+                compiler_priority_decision.effective.as_str(),
+                compiler_cpu_usage_percent,
                 total_ns,
                 pre_exec_ns,
                 system_includes_ns,
