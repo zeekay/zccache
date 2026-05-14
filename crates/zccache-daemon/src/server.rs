@@ -366,6 +366,12 @@ struct SharedState {
     /// discovery, watch_directories, response file expansion, arg parsing,
     /// context building, and dep_graph registration.
     request_cache: DashMap<ContentHash, RequestCacheEntry>,
+    /// Session-level worktree-root cache resolved once at SessionStart.
+    session_worktree_roots: DashMap<SessionId, SessionWorktreeRoot>,
+    /// Cross-root request-cache validation: (request fingerprint, root) -> last
+    /// verified artifact and journal clock. This lets repeated sibling hits
+    /// validate with journal checks instead of re-hashing every input.
+    request_validation_cache: DashMap<RequestValidationKey, RequestValidationEntry>,
     /// Compiler executable hash cache keyed by compiler path.
     compiler_hash_cache: CompilerHashCache,
     /// Pre-filter for watch_directories: raw (non-canonicalized) paths we've
@@ -401,6 +407,23 @@ struct RequestCacheEntry {
     input_paths: Vec<CachedRequestPath>,
     cross_root_shareable: bool,
     cached_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RequestValidationKey {
+    request_fp: ContentHash,
+    root: NormalizedPath,
+}
+
+struct RequestValidationEntry {
+    artifact_key_hex: String,
+    clock: Clock,
+    cached_at: std::time::Instant,
+}
+
+struct SessionWorktreeRoot {
+    working_dir: NormalizedPath,
+    root: Option<NormalizedPath>,
 }
 
 #[derive(Clone)]
@@ -481,8 +504,37 @@ fn trim_request_cache(cache: &DashMap<ContentHash, RequestCacheEntry>, max_age: 
     trim_request_cache_at(cache, max_age, Instant::now())
 }
 
+fn trim_request_validation_cache(
+    cache: &DashMap<RequestValidationKey, RequestValidationEntry>,
+    max_age: Duration,
+) -> usize {
+    trim_request_validation_cache_at(cache, max_age, Instant::now())
+}
+
 fn trim_request_cache_at(
     cache: &DashMap<ContentHash, RequestCacheEntry>,
+    max_age: Duration,
+    now: Instant,
+) -> usize {
+    let mut removed = 0;
+    cache.retain(|_, entry| {
+        if cache_entry_expired_at(now, entry.cached_at, max_age) {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    if cache.len() > REQUEST_CACHE_MAX_ENTRIES {
+        let remaining = cache.len();
+        cache.clear();
+        removed += remaining;
+    }
+    removed
+}
+
+fn trim_request_validation_cache_at(
+    cache: &DashMap<RequestValidationKey, RequestValidationEntry>,
     max_age: Duration,
     now: Instant,
 ) -> usize {
@@ -591,6 +643,8 @@ impl DaemonServer {
                 watcher_active: AtomicBool::new(false),
                 rsp_cache: DashMap::new(),
                 request_cache: DashMap::new(),
+                session_worktree_roots: DashMap::new(),
+                request_validation_cache: DashMap::new(),
                 compiler_hash_cache: CompilerHashCache::new(),
                 watched_raw_dirs: DashMap::new(),
                 pch_source_map: DashMap::new(),
@@ -737,10 +791,15 @@ impl DaemonServer {
                     tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
                     let req_removed =
                         trim_request_cache(&state.request_cache, EPHEMERAL_CACHE_MAX_AGE);
+                    let req_validation_removed = trim_request_validation_cache(
+                        &state.request_validation_cache,
+                        EPHEMERAL_CACHE_MAX_AGE,
+                    );
                     let rsp_removed = trim_rsp_cache(&state.rsp_cache, EPHEMERAL_CACHE_MAX_AGE);
-                    if req_removed > 0 || rsp_removed > 0 {
+                    if req_removed > 0 || req_validation_removed > 0 || rsp_removed > 0 {
                         tracing::debug!(
                             request_cache_removed = req_removed,
+                            request_validation_cache_removed = req_validation_removed,
                             rsp_cache_removed = rsp_removed,
                             "trimmed ephemeral daemon caches"
                         );
@@ -1231,6 +1290,7 @@ async fn handle_connection(
             Request::SessionEnd { session_id } => (
                 match session_id.parse::<SessionId>() {
                     Ok(sid) => {
+                        state.session_worktree_roots.remove(&sid);
                         if let Some(session) = state.sessions.end(&sid) {
                             // Close the session journal file handle if one was open.
                             if let Some(ref path) = session.journal_path {
@@ -1405,6 +1465,7 @@ async fn handle_clear(state: &SharedState) -> Response {
     state.cache_system.clear();
     state.fast_hit_cache.clear();
     state.request_cache.clear();
+    state.request_validation_cache.clear();
     state.rsp_cache.clear();
     state.watched_raw_dirs.clear();
     state.system_includes.lock().await.clear();
@@ -1475,6 +1536,7 @@ async fn handle_compile_ephemeral(
 
     // 3. End session (best-effort, no response needed)
     if let Ok(sid) = session_id.parse::<SessionId>() {
+        state.session_worktree_roots.remove(&sid);
         state.sessions.end(&sid);
     }
 
@@ -2037,6 +2099,13 @@ async fn handle_session_start(
     };
 
     let session_id = state.sessions.create(session_config);
+    state.session_worktree_roots.insert(
+        session_id,
+        SessionWorktreeRoot {
+            working_dir: working_dir.into(),
+            root: resolve_worktree_root(working_dir, None),
+        },
+    );
 
     // Watch the working directory for file changes.
     watch_directory(state, working_dir).await;
@@ -3087,6 +3156,30 @@ fn find_git_root(cwd: &Path) -> Option<NormalizedPath> {
     None
 }
 
+fn compile_worktree_root(
+    state: &SharedState,
+    sid: &SessionId,
+    cwd: &Path,
+    client_env: Option<&[(String, String)]>,
+) -> Option<NormalizedPath> {
+    if client_env_value(client_env, WORKTREE_ROOT_ENV).is_some() {
+        return resolve_worktree_root(cwd, client_env);
+    }
+
+    let cwd: NormalizedPath = cwd.into();
+    if let Some(cached) = state.session_worktree_roots.get(sid) {
+        if let Some(root) = cached.root.as_ref() {
+            if cwd.starts_with(root.as_path()) {
+                return Some(root.clone());
+            }
+        } else if cwd.starts_with(cached.working_dir.as_path()) {
+            return None;
+        }
+    }
+
+    resolve_worktree_root(&cwd, client_env)
+}
+
 fn normalize_path_for_request_key(path: &Path, key_root: Option<&Path>) -> String {
     if let Some(root) = key_root {
         if let Ok(relative) = path.strip_prefix(root) {
@@ -3827,19 +3920,73 @@ fn request_cache_entry_matches_root(
     entry.cross_root_shareable && entry.root.is_some() && key_root.is_some()
 }
 
+fn request_validation_key(request_fp: ContentHash, root: &NormalizedPath) -> RequestValidationKey {
+    RequestValidationKey {
+        request_fp,
+        root: root.clone(),
+    }
+}
+
+fn request_cache_resolved_inputs(
+    entry: &RequestCacheEntry,
+    root: &NormalizedPath,
+) -> Option<Vec<NormalizedPath>> {
+    if !entry.cross_root_shareable {
+        return None;
+    }
+    let mut paths = Vec::with_capacity(entry.input_paths.len());
+    for cached_path in &entry.input_paths {
+        if !cached_path.is_root_relative() {
+            return None;
+        }
+        paths.push(cached_path.resolve(Some(root)));
+    }
+    Some(paths)
+}
+
+fn request_cache_inputs_fresh_since(
+    journal: &zccache_fscache::ChangeJournal,
+    paths: &[NormalizedPath],
+    since: Clock,
+) -> bool {
+    paths.iter().all(|path| !journal.changed_since(path, since))
+}
+
 fn request_cache_artifact_matches(
     state: &SharedState,
     entry: &RequestCacheEntry,
+    request_fp: ContentHash,
     key_root: Option<&NormalizedPath>,
     expected_artifact_key_hex: &str,
+    now: Instant,
     clock: Clock,
 ) -> bool {
     let Some(root) = key_root else {
         return false;
     };
-    let mut file_hashes = Vec::with_capacity(entry.input_paths.len());
-    for cached_path in &entry.input_paths {
-        let path = cached_path.resolve(Some(root));
+
+    let Some(paths) = request_cache_resolved_inputs(entry, root) else {
+        return false;
+    };
+    let validation_key = request_validation_key(request_fp, root);
+    if let Some(validation) = state.request_validation_cache.get(&validation_key) {
+        if validation.artifact_key_hex == expected_artifact_key_hex
+            && cache_entry_fresh_at(now, validation.cached_at, EPHEMERAL_CACHE_MAX_AGE)
+            && request_cache_inputs_fresh_since(
+                state.cache_system.journal(),
+                &paths,
+                validation.clock,
+            )
+        {
+            return true;
+        }
+    }
+
+    state.cache_system.register_tracked(&paths);
+    let validation_clock = state.cache_system.current_clock();
+
+    let mut file_hashes = Vec::with_capacity(paths.len());
+    for path in paths {
         let Ok(hash) = hash_file(&state.cache_system, &path, clock) else {
             return false;
         };
@@ -3851,7 +3998,18 @@ fn request_cache_artifact_matches(
         &mut file_hashes,
         Some(root.as_path()),
     );
-    artifact_key.hash().to_hex() == expected_artifact_key_hex
+    let matches = artifact_key.hash().to_hex() == expected_artifact_key_hex;
+    if matches {
+        state.request_validation_cache.insert(
+            validation_key,
+            RequestValidationEntry {
+                artifact_key_hex: expected_artifact_key_hex.to_string(),
+                clock: validation_clock,
+                cached_at: std::time::Instant::now(),
+            },
+        );
+    }
+    matches
 }
 
 fn strict_paths_mode_from_client_env(
@@ -3912,7 +4070,7 @@ async fn handle_compile(
         return compile_failure_stderr(err.diagnostic(&compiler, &expanded_args));
     }
 
-    let worktree_root = resolve_worktree_root(cwd, client_env.as_deref());
+    let worktree_root = compile_worktree_root(state, &sid, cwd, client_env.as_deref());
     let effective_args = effective_compile_args(
         &expanded_args,
         compiler_path,
@@ -3933,6 +4091,7 @@ async fn handle_compile(
     // discovery, watch_directories, response file expansion, arg parsing,
     // context building, and dep_graph registration.
     if state.watcher_active.load(Ordering::Acquire) {
+        let t_request_cache_lookup = std::time::Instant::now();
         let request_fp = request_fingerprint(
             compiler_path,
             &effective_args,
@@ -3941,6 +4100,7 @@ async fn handle_compile(
             client_env.as_deref(),
         );
         if let Some(req_entry) = state.request_cache.get(&request_fp) {
+            let request_cache_lookup_ns = t_request_cache_lookup.elapsed().as_nanos() as u64;
             if request_cache_entry_matches_root(&req_entry, request_cache_key_root.as_ref()) {
                 if let Some(fh_entry) = state.fast_hit_cache.get(&req_entry.context_key) {
                     let artifact_key_hex = &fh_entry.artifact_key_hex;
@@ -3951,6 +4111,7 @@ async fn handle_compile(
                         .output_path
                         .resolve(request_cache_key_root.as_deref());
                     let same_root = req_entry.root.as_ref() == request_cache_key_root.as_ref();
+                    let t_cross_root_validate = std::time::Instant::now();
                     let inputs_match = if same_root {
                         context_files_fresh(
                             state,
@@ -3962,10 +4123,17 @@ async fn handle_compile(
                         request_cache_artifact_matches(
                             state,
                             &req_entry,
+                            request_fp,
                             request_cache_key_root.as_ref(),
                             artifact_key_hex,
+                            compile_start,
                             snap_clock,
                         )
+                    };
+                    let cross_root_validate_ns = if same_root {
+                        0
+                    } else {
+                        t_cross_root_validate.elapsed().as_nanos() as u64
                     };
                     if cache_entry_fresh_at(compile_start, fh_entry.cached_at, FAST_HIT_MAX_AGE)
                         && cache_entry_fresh_at(
@@ -3975,6 +4143,7 @@ async fn handle_compile(
                         )
                         && inputs_match
                     {
+                        let t_artifact_lookup = std::time::Instant::now();
                         if let Some(mut cached_ref) = state.artifacts.get_mut(artifact_key_hex) {
                             cached_ref.last_used = std::time::Instant::now();
                             let loaded = ensure_payloads(
@@ -3984,6 +4153,8 @@ async fn handle_compile(
                             )
                             .is_some();
                             if loaded {
+                                let artifact_lookup_ns =
+                                    t_artifact_lookup.elapsed().as_nanos() as u64;
                                 let payloads = Arc::clone(cached_ref.payloads.as_ref().unwrap());
                                 let names = Arc::clone(&cached_ref.meta.output_names);
                                 let exit_code = cached_ref.meta.exit_code;
@@ -3994,6 +4165,7 @@ async fn handle_compile(
                                 drop(cached_ref);
 
                                 // Write output
+                                let t_write_output = std::time::Instant::now();
                                 let mut write_ok = true;
                                 let secondary_dir =
                                     output_path.parent().unwrap_or(cwd).to_path_buf();
@@ -4013,6 +4185,9 @@ async fn handle_compile(
                                     }
                                 }
                                 if write_ok {
+                                    let write_output_ns =
+                                        t_write_output.elapsed().as_nanos() as u64;
+                                    let t_bookkeeping = std::time::Instant::now();
                                     state.stats.record_compilation();
                                     let latency_ns = compile_start.elapsed().as_nanos() as u64;
                                     state.stats.record_hit(latency_ns, artifact_bytes);
@@ -4034,6 +4209,21 @@ async fn handle_compile(
                                             output_path.display()
                                         ),
                                     );
+                                    let bookkeeping_ns = t_bookkeeping.elapsed().as_nanos() as u64;
+                                    let total_ns = compile_start.elapsed().as_nanos() as u64;
+                                    state.profiler.record_hit(&HitPhases {
+                                        parse_args_ns: 0,
+                                        build_context_ns: 0,
+                                        hash_source_ns: 0,
+                                        hash_headers_ns: 0,
+                                        depgraph_check_ns: 0,
+                                        request_cache_lookup_ns,
+                                        cross_root_validate_ns,
+                                        artifact_lookup_ns,
+                                        write_output_ns,
+                                        bookkeeping_ns,
+                                        total_ns,
+                                    });
 
                                     return Response::CompileResult {
                                         exit_code,
@@ -4335,6 +4525,8 @@ async fn handle_compile(
                                 hash_source_ns: 0,
                                 hash_headers_ns: 0,
                                 depgraph_check_ns: 0,
+                                request_cache_lookup_ns: 0,
+                                cross_root_validate_ns: 0,
                                 artifact_lookup_ns,
                                 write_output_ns,
                                 bookkeeping_ns,
@@ -4574,6 +4766,9 @@ async fn handle_compile(
                         let bookkeeping_ns = t7.elapsed().as_nanos() as u64;
 
                         // Populate fast-hit cache for future requests
+                        let input_paths =
+                            request_cache_input_paths(state, &context_key, &source_path, &ctx);
+                        state.cache_system.register_tracked(&input_paths);
                         let current_clock = state.cache_system.current_clock();
                         state.fast_hit_cache.insert(
                             context_key,
@@ -4591,8 +4786,6 @@ async fn handle_compile(
                             request_cache_key_root.as_deref(),
                             client_env.as_deref(),
                         );
-                        let input_paths =
-                            request_cache_input_paths(state, &context_key, &source_path, &ctx);
                         state.request_cache.insert(
                             rfp,
                             request_cache_entry(
@@ -4612,6 +4805,8 @@ async fn handle_compile(
                             hash_source_ns,
                             hash_headers_ns,
                             depgraph_check_ns,
+                            request_cache_lookup_ns: 0,
+                            cross_root_validate_ns: 0,
                             artifact_lookup_ns,
                             write_output_ns,
                             bookkeeping_ns,
@@ -5474,6 +5669,8 @@ fn check_unit_cache(
                             hash_source_ns: 0,
                             hash_headers_ns: 0,
                             depgraph_check_ns: 0,
+                            request_cache_lookup_ns: 0,
+                            cross_root_validate_ns: 0,
                             artifact_lookup_ns: 0,
                             write_output_ns: 0,
                             bookkeeping_ns: 0,
@@ -5577,6 +5774,9 @@ fn check_unit_cache(
                 state.stats.record_hit(0, artifact_bytes);
 
                 // Populate fast-hit cache for future requests
+                let tracked_paths =
+                    request_cache_input_paths(state, &context_key, &source_path, &ctx);
+                state.cache_system.register_tracked(&tracked_paths);
                 let current_clock = state.cache_system.current_clock();
                 state.fast_hit_cache.insert(
                     context_key,
@@ -5594,6 +5794,8 @@ fn check_unit_cache(
                     hash_source_ns: (t_hash_source - t_register).as_nanos() as u64,
                     hash_headers_ns: (t_hash_headers - t_hash_source).as_nanos() as u64,
                     depgraph_check_ns: (t_depgraph - t_hash_headers).as_nanos() as u64,
+                    request_cache_lookup_ns: 0,
+                    cross_root_validate_ns: 0,
                     artifact_lookup_ns: (t_lookup - t_depgraph).as_nanos() as u64,
                     write_output_ns: 0,
                     bookkeeping_ns: 0,
@@ -6294,6 +6496,21 @@ mod tests {
         );
     }
 
+    fn test_request_validation_key(index: usize, root: &Path) -> RequestValidationKey {
+        RequestValidationKey {
+            request_fp: test_content_hash(index),
+            root: NormalizedPath::new(root),
+        }
+    }
+
+    fn test_request_validation_entry(cached_at: std::time::Instant) -> RequestValidationEntry {
+        RequestValidationEntry {
+            artifact_key_hex: "artifact".to_string(),
+            clock: Clock::ZERO,
+            cached_at,
+        }
+    }
+
     #[test]
     fn compiler_hash_cache_reuses_hash_for_unchanged_compiler() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6450,6 +6667,88 @@ mod tests {
 
         assert_eq!(removed, REQUEST_CACHE_MAX_ENTRIES + 1);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn trim_request_validation_cache_removes_old_entries() {
+        let cache = DashMap::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let max_age = std::time::Duration::from_millis(10);
+        let old_at = std::time::Instant::now();
+        let now = old_at.checked_add(max_age * 2).unwrap();
+        cache.insert(
+            test_request_validation_key(1, &tmp.path().join("old-root")),
+            test_request_validation_entry(old_at),
+        );
+        cache.insert(
+            test_request_validation_key(2, &tmp.path().join("fresh-root")),
+            test_request_validation_entry(now),
+        );
+
+        let removed = trim_request_validation_cache_at(&cache, max_age, now);
+
+        assert_eq!(removed, 1);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&test_request_validation_key(
+            2,
+            &tmp.path().join("fresh-root")
+        )));
+    }
+
+    #[test]
+    fn request_cache_resolved_inputs_requires_cross_root_shareable_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("workspace-a");
+        let root_b = tmp.path().join("workspace-b");
+        let source_a: NormalizedPath = root_a.join("src/main.cc").into();
+        let header_a: NormalizedPath = root_a.join("include/common.h").into();
+        let output_a: NormalizedPath = root_a.join("build/main.o").into();
+        let entry = request_cache_entry(
+            test_context_key("src/main.cc"),
+            &source_a,
+            &output_a,
+            vec![source_a.clone(), header_a],
+            Some(&NormalizedPath::new(&root_a)),
+        );
+
+        let resolved =
+            request_cache_resolved_inputs(&entry, &NormalizedPath::new(&root_b)).unwrap();
+
+        assert_eq!(
+            resolved,
+            vec![
+                NormalizedPath::new(root_b.join("src/main.cc")),
+                NormalizedPath::new(root_b.join("include/common.h")),
+            ]
+        );
+    }
+
+    #[test]
+    fn request_cache_inputs_fresh_since_uses_journal_tracking() {
+        let journal = zccache_fscache::ChangeJournal::new();
+        let path: NormalizedPath = "/tmp/request-cache-input.cc".into();
+        let clock = journal.current_clock();
+
+        assert!(!request_cache_inputs_fresh_since(
+            &journal,
+            std::slice::from_ref(&path),
+            clock
+        ));
+
+        journal.register(path.clone());
+        let validation_clock = journal.current_clock();
+        assert!(request_cache_inputs_fresh_since(
+            &journal,
+            std::slice::from_ref(&path),
+            validation_clock
+        ));
+
+        journal.advance(vec![path.clone()]);
+        assert!(!request_cache_inputs_fresh_since(
+            &journal,
+            std::slice::from_ref(&path),
+            validation_clock
+        ));
     }
 
     #[test]

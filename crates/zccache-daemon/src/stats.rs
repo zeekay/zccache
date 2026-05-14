@@ -211,6 +211,10 @@ pub struct PhaseProfiler {
     pub hash_headers_ns: AtomicU64,
     /// Check depgraph for cache verdict.
     pub depgraph_check_ns: AtomicU64,
+    /// Request-level cache lookup.
+    pub request_cache_lookup_ns: AtomicU64,
+    /// Cross-root request-cache validation.
+    pub cross_root_validate_ns: AtomicU64,
     /// Artifact lookup (in-memory HashMap).
     pub artifact_lookup_ns: AtomicU64,
     /// Write cached outputs to disk.
@@ -244,6 +248,8 @@ impl PhaseProfiler {
             hash_source_ns: AtomicU64::new(0),
             hash_headers_ns: AtomicU64::new(0),
             depgraph_check_ns: AtomicU64::new(0),
+            request_cache_lookup_ns: AtomicU64::new(0),
+            cross_root_validate_ns: AtomicU64::new(0),
             artifact_lookup_ns: AtomicU64::new(0),
             write_output_ns: AtomicU64::new(0),
             bookkeeping_ns: AtomicU64::new(0),
@@ -270,6 +276,10 @@ impl PhaseProfiler {
             .fetch_add(phases.hash_headers_ns, Ordering::Relaxed);
         self.depgraph_check_ns
             .fetch_add(phases.depgraph_check_ns, Ordering::Relaxed);
+        self.request_cache_lookup_ns
+            .fetch_add(phases.request_cache_lookup_ns, Ordering::Relaxed);
+        self.cross_root_validate_ns
+            .fetch_add(phases.cross_root_validate_ns, Ordering::Relaxed);
         self.artifact_lookup_ns
             .fetch_add(phases.artifact_lookup_ns, Ordering::Relaxed);
         self.write_output_ns
@@ -303,6 +313,8 @@ impl PhaseProfiler {
         self.hash_source_ns.store(0, Ordering::Relaxed);
         self.hash_headers_ns.store(0, Ordering::Relaxed);
         self.depgraph_check_ns.store(0, Ordering::Relaxed);
+        self.request_cache_lookup_ns.store(0, Ordering::Relaxed);
+        self.cross_root_validate_ns.store(0, Ordering::Relaxed);
         self.artifact_lookup_ns.store(0, Ordering::Relaxed);
         self.write_output_ns.store(0, Ordering::Relaxed);
         self.bookkeeping_ns.store(0, Ordering::Relaxed);
@@ -328,6 +340,8 @@ impl PhaseProfiler {
             avg_hash_source_ns: self.hash_source_ns.load(Ordering::Relaxed) / n,
             avg_hash_headers_ns: self.hash_headers_ns.load(Ordering::Relaxed) / n,
             avg_depgraph_check_ns: self.depgraph_check_ns.load(Ordering::Relaxed) / n,
+            avg_request_cache_lookup_ns: self.request_cache_lookup_ns.load(Ordering::Relaxed) / n,
+            avg_cross_root_validate_ns: self.cross_root_validate_ns.load(Ordering::Relaxed) / n,
             avg_artifact_lookup_ns: self.artifact_lookup_ns.load(Ordering::Relaxed) / n,
             avg_write_output_ns: self.write_output_ns.load(Ordering::Relaxed) / n,
             avg_bookkeeping_ns: self.bookkeeping_ns.load(Ordering::Relaxed) / n,
@@ -354,6 +368,8 @@ pub struct HitPhases {
     pub hash_source_ns: u64,
     pub hash_headers_ns: u64,
     pub depgraph_check_ns: u64,
+    pub request_cache_lookup_ns: u64,
+    pub cross_root_validate_ns: u64,
     pub artifact_lookup_ns: u64,
     pub write_output_ns: u64,
     pub bookkeeping_ns: u64,
@@ -379,6 +395,8 @@ pub struct ProfileSnapshot {
     pub avg_hash_source_ns: u64,
     pub avg_hash_headers_ns: u64,
     pub avg_depgraph_check_ns: u64,
+    pub avg_request_cache_lookup_ns: u64,
+    pub avg_cross_root_validate_ns: u64,
     pub avg_artifact_lookup_ns: u64,
     pub avg_write_output_ns: u64,
     pub avg_bookkeeping_ns: u64,
@@ -521,6 +539,8 @@ mod tests {
             hash_source_ns: 300,
             hash_headers_ns: 400,
             depgraph_check_ns: 500,
+            request_cache_lookup_ns: 0,
+            cross_root_validate_ns: 0,
             artifact_lookup_ns: 600,
             write_output_ns: 700,
             bookkeeping_ns: 800,
