@@ -482,6 +482,28 @@ def _font(size: int, bold: bool = False) -> Any:
     return ImageFont.load_default()
 
 
+def _truncate(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)].rstrip() + "..."
+
+
+def build_image_rows(results: list[dict[str, Any]]) -> list[dict[str, str]]:
+    labels = {"c": "C", "c++": "C++", "rust": "Rust"}
+    return [
+        {
+            "language": labels.get(str(row["language"]), str(row["language"])),
+            "scenario": f"{row['benchmark_label']} - {row['scenario']}",
+            "bare": _format_seconds(row["bare_seconds"]),
+            "sccache": _format_seconds(row["sccache_seconds"]),
+            "zccache": _format_seconds(row["zccache_seconds"]),
+            "vs_sccache": _format_ratio(row["zccache_vs_sccache_ratio"]),
+            "vs_bare": _format_ratio(row["zccache_vs_bare_ratio"]),
+        }
+        for row in results
+    ]
+
+
 def render_jpg(payload: dict[str, Any], path: Path) -> None:
     try:
         from PIL import Image, ImageDraw
@@ -491,55 +513,70 @@ def render_jpg(payload: dict[str, Any], path: Path) -> None:
             "or `python -m pip install Pillow`."
         ) from exc
 
-    width, height = 1200, 630
+    rows = build_image_rows(payload["results"])
+    width = 1600
+    row_h = 44
+    table_y = 174
+    header_h = 44
+    footer_h = 90
+    height = max(760, table_y + header_h + row_h * max(1, len(rows)) + footer_h)
     image = Image.new("RGB", (width, height), "#f7f8f8")
     draw = ImageDraw.Draw(image)
-    title_font = _font(42, bold=True)
+    title_font = _font(44, bold=True)
     subtitle_font = _font(22)
-    header_font = _font(20, bold=True)
+    header_font = _font(19, bold=True)
     row_font = _font(18)
-    small_font = _font(15)
+    row_bold_font = _font(18, bold=True)
+    small_font = _font(16)
 
-    draw.rectangle((0, 0, width, 96), fill="#202426")
-    draw.text((42, 26), "zccache benchmark stats", font=title_font, fill="#ffffff")
+    draw.rectangle((0, 0, width, 108), fill="#202426")
+    draw.text((42, 28), "zccache benchmark stats", font=title_font, fill="#ffffff")
     metadata = payload["metadata"]
     sha = (metadata.get("git_sha") or "n/a")[:12]
     draw.text(
-        (42, 106),
+        (42, 120),
         f"Generated {metadata['generated_at']} | {metadata.get('git_ref') or 'n/a'} | {sha}",
         font=subtitle_font,
         fill="#38464b",
     )
 
-    warm_rows = [row for row in payload["results"] if row["mode"] == "warm"]
-    display_rows = warm_rows[:6]
-    x0, y0 = 42, 166
+    x0, y0 = 42, table_y
     table_w = width - 84
-    row_h = 54
-    headers = ["Scenario", "Bare", "sccache", "zccache", "vs sccache"]
-    widths = [430, 145, 145, 145, 220]
+    headers = ["Lang", "Scenario", "Bare", "sccache", "zccache", "vs sccache", "vs bare"]
+    widths = [96, 520, 145, 145, 145, 190, 190]
 
-    draw.rounded_rectangle((x0, y0, x0 + table_w, y0 + 42), radius=8, fill="#e9eef0")
-    x = x0 + 16
+    draw.rounded_rectangle((x0, y0, x0 + table_w, y0 + header_h), radius=8, fill="#dfe7ea")
+    x = x0 + 14
     for header, col_w in zip(headers, widths):
-        draw.text((x, y0 + 11), header, font=header_font, fill="#202426")
+        draw.text((x, y0 + 12), header, font=header_font, fill="#202426")
         x += col_w
 
-    y = y0 + 42
-    for index, row in enumerate(display_rows):
+    y = y0 + header_h
+    if not rows:
+        draw.rectangle((x0, y, x0 + table_w, y + row_h), fill="#ffffff")
+        draw.text(
+            (x0 + 14, y + 12),
+            "Benchmark data is not available yet.",
+            font=row_font,
+            fill="#202426",
+        )
+    for index, row in enumerate(rows):
         fill = "#ffffff" if index % 2 == 0 else "#f1f4f5"
         draw.rectangle((x0, y, x0 + table_w, y + row_h), fill=fill)
         values = [
-            f"{row['benchmark_label']} - {row['scenario']}",
-            _format_seconds(row["bare_seconds"]),
-            _format_seconds(row["sccache_seconds"]),
-            _format_seconds(row["zccache_seconds"]),
-            _format_ratio(row["zccache_vs_sccache_ratio"]),
+            row["language"],
+            _truncate(row["scenario"], 58),
+            row["bare"],
+            row["sccache"],
+            row["zccache"],
+            row["vs_sccache"],
+            row["vs_bare"],
         ]
-        x = x0 + 16
-        for value, col_w in zip(values, widths):
-            color = "#0f6b44" if value == values[3] else "#202426"
-            draw.text((x, y + 15), value[:44], font=row_font, fill=color)
+        x = x0 + 14
+        for column_index, (value, col_w) in enumerate(zip(values, widths)):
+            color = "#0f6b44" if column_index == 4 else "#202426"
+            font = row_bold_font if column_index in {0, 4} else row_font
+            draw.text((x, y + 12), value, font=font, fill=color)
             x += col_w
         y += row_h
 
@@ -551,8 +588,8 @@ def render_jpg(payload: dict[str, Any], path: Path) -> None:
         )
     else:
         line = "Benchmark data is not available yet."
-    draw.rounded_rectangle((42, height - 92, width - 42, height - 34), radius=8, fill="#202426")
-    draw.text((62, height - 75), line[:118], font=small_font, fill="#ffffff")
+    draw.rounded_rectangle((42, height - 72, width - 42, height - 24), radius=8, fill="#202426")
+    draw.text((62, height - 57), _truncate(line, 150), font=small_font, fill="#ffffff")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     image.save(path, format="JPEG", quality=90, optimize=True)

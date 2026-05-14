@@ -58,46 +58,10 @@ zccache --version
 
 [![Latest zccache benchmark stats](https://raw.githubusercontent.com/zackees/zccache/benchmark-stats/benchmark.jpg)](https://zackees.github.io/zccache/)
 
-Latest rendered report: [zackees.github.io/zccache](https://zackees.github.io/zccache/)
-
-50 files per benchmark, median of 5 trials. Run it yourself: `./perf`
-
-### Cache Hit (warm cache)
-
-| Benchmark | Bare Compiler | sccache | zccache | vs sccache | vs bare |
-|:----------|-------------:|--------:|--------:|-----------:|--------:|
-| **C++ single-file** | 11.705s | 1.576s | **0.050s** | **32x** | **236x** |
-| **C++ multi-file** | 11.553s | 11.530s | **0.017s** | **695x** | **696x** |
-| **C++ response-file (single)** | 12.540s | 1.558s | **0.047s** | **33x** | **267x** |
-| **C++ response-file (multi)** | 12.049s | 12.434s | **0.019s** | **669x** | **648x** |
-| **Rust build** | 6.592s | 8.604s | **0.045s** | **193x** | **148x** |
-| **Rust check** | 3.716s | 5.922s | **0.049s** | **121x** | **76x** |
-
-### Cache Miss (cold compile)
-
-| Benchmark | Bare Compiler | sccache | zccache | vs sccache | vs bare |
-|:----------|-------------:|--------:|--------:|-----------:|--------:|
-| C++ single-file | 12.641s | 20.632s | 13.430s | 1.5x | 0.9x |
-| C++ multi-file | 11.358s | 11.759s | 12.867s | 0.9x | 0.9x |
-| C++ response-file (single) | 12.063s | 20.607s | 14.087s | 1.5x | 0.9x |
-| C++ response-file (multi) | 13.030s | 25.303s | 13.975s | 1.8x | 0.9x |
-| Rust build | 7.119s | 10.023s | 8.507s | 1.2x | 0.8x |
-| Rust check | 4.289s | 7.056s | 5.060s | 1.4x | 0.8x |
-
-<details>
-<summary>Benchmark details</summary>
-
-- **Single-file** = 50 sequential `clang++ -c unit.cpp` invocations
-- **Multi-file** = one `clang++ -c *.cpp` invocation (sccache cannot cache these — its "warm" time is a full recompile)
-- **Response-file** = args via nested `.rsp` files: 200 `-D` defines + 50 `-I` paths + 30 warning flags (~283 expanded args)
-- **Rust build** = `--emit=dep-info,metadata,link` (cargo build)
-- **Rust check** = `--emit=dep-info,metadata` (cargo check)
-- **Cold** = first compile (empty cache). **Warm** = median of 5 subsequent runs.
-- sccache gets cache hits but each hit still costs ~170ms subprocess overhead. zccache serves hits in ~1ms via in-process IPC.
-
-</details>
-
----
+The benchmark image is generated from the latest scheduled run and replaces
+hand-maintained text stats. Full results and machine-readable JSON are published
+at [zackees.github.io/zccache](https://zackees.github.io/zccache/). Run the same
+suite locally with `./perf`.
 
 ### Why is zccache so much faster on warm hits?
 
