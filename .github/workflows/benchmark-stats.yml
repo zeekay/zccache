@@ -42,7 +42,7 @@ jobs:
         shell: bash
         env:
           ZCCACHE_BENCHMARK_PAGES_URL: https://zackees.github.io/zccache/
-          ZCCACHE_BENCHMARK_IMAGE_URL: https://raw.githubusercontent.com/zackees/zccache/benchmark-stats/benchmark.jpg
+          ZCCACHE_BENCHMARK_RAW_BASE_URL: https://raw.githubusercontent.com/zackees/zccache/benchmark-stats
         run: |
           set -euo pipefail
           python3 -m ci.benchmark_stats --run-benchmarks --output-dir benchmark-stats --log-path benchmark-output/benchmark.log
