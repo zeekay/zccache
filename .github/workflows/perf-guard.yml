@@ -12,15 +12,6 @@ on:
       - "ci/**"
       - "crates/**"
       - ".github/workflows/perf-guard.yml"
-  pull_request:
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "action.yml"
-      - "action/**"
-      - "ci/**"
-      - "crates/**"
-      - ".github/workflows/perf-guard.yml"
 
 concurrency:
   group: perf-guard-${{ github.ref }}
@@ -31,9 +22,23 @@ permissions:
 
 jobs:
   perf-guard:
-    name: Rust/C/C++ speed floor
+    name: ${{ matrix.label }} speed floor
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: c
+            label: C
+            artifact: c
+          - language: c++
+            label: C++
+            artifact: cpp
+          - language: rust
+            label: Rust
+            artifact: rust
 
     steps:
       - uses: actions/checkout@v6
@@ -61,6 +66,7 @@ jobs:
           set -euo pipefail
           python3 -m ci.perf_guard \
             --run-benchmarks \
+            --language "${{ matrix.language }}" \
             --bare-threshold 1.5 \
             --sccache-threshold 1.5 \
             --attempts 3 \
@@ -70,6 +76,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: perf-guard-output
+          name: perf-guard-${{ matrix.artifact }}-output
           path: perf-guard-output
           if-no-files-found: warn

@@ -68,39 +68,54 @@ class GuardReport:
         )
 
 
-def run_benchmarks_once(log_path: Path) -> tuple[int, str]:
+def _benchmark_commands(language: str | None) -> list[list[str]]:
+    if language is None:
+        return [benchmark_stats.BENCHMARK_COMMAND]
+    return benchmark_stats.benchmark_commands_for_language(language)
+
+
+def run_benchmarks_once(log_path: Path, language: str | None = None) -> tuple[int, str]:
     cache_dir = Path(tempfile.mkdtemp(prefix="zccache-perf-guard-cache-"))
     env = os.environ.copy()
     env["ZCCACHE_CACHE_DIR"] = str(cache_dir)
     env.pop("RUSTC_WRAPPER", None)
 
     try:
-        result = subprocess.run(
-            benchmark_stats.BENCHMARK_COMMAND,
-            cwd=REPO_ROOT,
-            env=env,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-        )
+        outputs: list[str] = []
+        returncode = 0
+        for command in _benchmark_commands(language):
+            result = subprocess.run(
+                command,
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            outputs.append(result.stdout)
+            if result.returncode != 0 and returncode == 0:
+                returncode = result.returncode
     finally:
         shutil.rmtree(cache_dir, ignore_errors=True)
 
-    output = result.stdout
+    output = "".join(outputs)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(output, encoding="utf-8")
     print(output, end="")
-    return result.returncode, output
+    return returncode, output
 
 
-def _required_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _required_rows(
+    rows: list[dict[str, Any]],
+    languages: tuple[str, ...],
+) -> list[dict[str, Any]]:
     return [
         row
         for row in rows
-        if row.get("language") in REQUIRED_LANGUAGES and row.get("mode") in REQUIRED_MODES
+        if row.get("language") in languages and row.get("mode") in REQUIRED_MODES
     ]
 
 
@@ -111,6 +126,7 @@ def evaluate_attempts(
     bare_threshold: float = DEFAULT_BARE_THRESHOLD,
     sccache_threshold: float = DEFAULT_SCCACHE_THRESHOLD,
     command_failures: list[int] | None = None,
+    languages: tuple[str, ...] = REQUIRED_LANGUAGES,
 ) -> GuardReport:
     if threshold is not None:
         bare_threshold = threshold
@@ -119,7 +135,7 @@ def evaluate_attempts(
     language_modes: set[tuple[str, str]] = set()
 
     for attempt_index, rows in enumerate(attempts, start=1):
-        for row in _required_rows(rows):
+        for row in _required_rows(rows, languages):
             language = str(row["language"])
             mode = str(row["mode"])
             language_modes.add((language, mode))
@@ -156,7 +172,7 @@ def evaluate_attempts(
 
     missing = [
         f"{language} {mode}"
-        for language in REQUIRED_LANGUAGES
+        for language in languages
         for mode in REQUIRED_MODES
         if (language, mode) not in language_modes
     ]
@@ -219,10 +235,12 @@ def format_report_json(
     report: GuardReport,
     bare_threshold: float,
     sccache_threshold: float,
+    languages: tuple[str, ...] = REQUIRED_LANGUAGES,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "passed": report.passed,
+        "languages": list(languages),
         "thresholds": {
             "bare": bare_threshold,
             "sccache": sccache_threshold,
@@ -262,6 +280,7 @@ def write_attempt_json(
     returncode: int | None,
     *,
     source: str,
+    language: str | None = None,
 ) -> None:
     _write_json(
         output_dir / f"attempt-{attempt}.json",
@@ -269,6 +288,7 @@ def write_attempt_json(
             "schema_version": 1,
             "attempt": attempt,
             "source": source,
+            "language": language,
             "returncode": returncode,
             "row_count": len(rows),
             "rows": rows,
@@ -281,10 +301,11 @@ def write_report_json(
     report: GuardReport,
     bare_threshold: float,
     sccache_threshold: float,
+    languages: tuple[str, ...] = REQUIRED_LANGUAGES,
 ) -> None:
     _write_json(
         output_dir / "perf-guard-summary.json",
-        format_report_json(report, bare_threshold, sccache_threshold),
+        format_report_json(report, bare_threshold, sccache_threshold, languages),
     )
 
 
@@ -306,6 +327,8 @@ def _run_attempts(
     attempts: int,
     bare_threshold: float,
     sccache_threshold: float,
+    languages: tuple[str, ...],
+    benchmark_language: str | None,
 ) -> tuple[list[list[dict[str, Any]]], list[int]]:
     parsed_attempts: list[list[dict[str, Any]]] = []
     command_failures: list[int] = []
@@ -313,7 +336,7 @@ def _run_attempts(
     for attempt in range(1, attempts + 1):
         log_path = output_dir / f"attempt-{attempt}.log"
         print(f"=== Perf guard attempt {attempt}/{attempts} ===")
-        returncode, output = run_benchmarks_once(log_path)
+        returncode, output = run_benchmarks_once(log_path, benchmark_language)
         rows = benchmark_stats.parse_benchmark_log(output)
         parsed_attempts.append(rows)
         write_attempt_json(
@@ -322,6 +345,7 @@ def _run_attempts(
             rows,
             returncode,
             source="benchmark-run",
+            language=benchmark_language,
         )
         if returncode != 0:
             command_failures.append(attempt)
@@ -331,6 +355,7 @@ def _run_attempts(
             bare_threshold=bare_threshold,
             sccache_threshold=sccache_threshold,
             command_failures=command_failures,
+            languages=languages,
         )
         if returncode == 0 and interim.passed:
             break
@@ -347,6 +372,11 @@ def main() -> int:
     parser.add_argument("--bare-threshold", type=float, default=DEFAULT_BARE_THRESHOLD)
     parser.add_argument("--sccache-threshold", type=float, default=DEFAULT_SCCACHE_THRESHOLD)
     parser.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS)
+    parser.add_argument(
+        "--language",
+        choices=REQUIRED_LANGUAGES,
+        help="Run and require only one benchmark language.",
+    )
     args = parser.parse_args()
 
     if args.threshold is not None:
@@ -361,6 +391,7 @@ def main() -> int:
     if bool(args.input_log) == bool(args.run_benchmarks):
         parser.error("use exactly one of --input-log or --run-benchmarks")
 
+    languages = (args.language,) if args.language else REQUIRED_LANGUAGES
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.input_log:
         attempts = _load_input_log(args.input_log)
@@ -370,6 +401,7 @@ def main() -> int:
             attempts[0],
             None,
             source="input-log",
+            language=args.language,
         )
         command_failures: list[int] = []
     else:
@@ -378,6 +410,8 @@ def main() -> int:
             args.attempts,
             args.bare_threshold,
             args.sccache_threshold,
+            languages,
+            args.language,
         )
 
     report = evaluate_attempts(
@@ -385,11 +419,18 @@ def main() -> int:
         bare_threshold=args.bare_threshold,
         sccache_threshold=args.sccache_threshold,
         command_failures=command_failures,
+        languages=languages,
     )
     markdown = format_report(report, args.bare_threshold, args.sccache_threshold)
     report_path = args.output_dir / "perf-guard-summary.md"
     report_path.write_text(markdown, encoding="utf-8")
-    write_report_json(args.output_dir, report, args.bare_threshold, args.sccache_threshold)
+    write_report_json(
+        args.output_dir,
+        report,
+        args.bare_threshold,
+        args.sccache_threshold,
+        languages,
+    )
     print(markdown)
     _append_step_summary(markdown)
 

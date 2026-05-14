@@ -31,7 +31,7 @@ DEFAULT_PAGES_URL = "https://zackees.github.io/zccache/"
 DEFAULT_RAW_IMAGE_URL = (
     "https://raw.githubusercontent.com/zackees/zccache/benchmark-stats/benchmark.jpg"
 )
-BENCHMARK_COMMAND = [
+BENCHMARK_BASE_COMMAND = [
     "soldr",
     "--no-cache",
     "cargo",
@@ -40,6 +40,14 @@ BENCHMARK_COMMAND = [
     "zccache-daemon",
     "--test",
     "perf_bench_test",
+]
+BENCHMARK_TESTS_BY_LANGUAGE = {
+    "c": ("perf_c_zccache_vs_bare",),
+    "c++": ("perf_warm_cache_zccache_vs_sccache", "perf_response_file"),
+    "rust": ("perf_rustc_zccache_vs_sccache",),
+}
+BENCHMARK_COMMAND = [
+    *BENCHMARK_BASE_COMMAND,
     "--",
     "--nocapture",
     "--ignored",
@@ -73,6 +81,27 @@ TABLES = {
         "bare_label": "Bare rustc",
     },
 }
+
+
+def benchmark_command_for_test(test_name: str) -> list[str]:
+    return [
+        *BENCHMARK_BASE_COMMAND,
+        "--",
+        test_name,
+        "--nocapture",
+        "--ignored",
+        "--test-threads=1",
+    ]
+
+
+def benchmark_commands_for_language(language: str) -> list[list[str]]:
+    try:
+        test_names = BENCHMARK_TESTS_BY_LANGUAGE[language]
+    except KeyError as exc:
+        supported = ", ".join(sorted(BENCHMARK_TESTS_BY_LANGUAGE))
+        message = f"unsupported benchmark language {language!r}; expected {supported}"
+        raise ValueError(message) from exc
+    return [benchmark_command_for_test(test_name) for test_name in test_names]
 
 
 def _utc_now() -> str:
