@@ -422,10 +422,25 @@ A few things worth knowing:
 - One daemon, one cache. All worktrees share the same zccache daemon and
   artifact store by default — do not set `ZCCACHE_CACHE_DIR` per worktree, or
   you defeat the sharing.
-- Auto-detection finds the worktree root via `.git` (file or directory), so
-  `git worktree`-linked checkouts and plain clones both work. Use
-  `ZCCACHE_WORKTREE_ROOT="$PWD"` only when detection is unreliable (non-Git
-  checkouts or unusual layouts).
+- Auto-detection requires a Git checkout. The daemon walks ancestors of the
+  compile cwd looking for `.git` (file or directory), so plain `git clone`
+  and `git worktree add` checkouts both work, but raw source trees
+  (tarball extracts, archive payloads, custom build layouts with no `.git`)
+  do not. For those, set `ZCCACHE_WORKTREE_ROOT="$PWD"` (or any absolute
+  path) to the logical project root you want cache keys normalized against.
+  Without either a detected Git root or an explicit override,
+  `ZCCACHE_PATH_REMAP=auto` is a no-op and the session log reports
+  `git_root_unavailable`.
+- User-supplied remap flags take precedence. If your build already passes
+  `-ffile-prefix-map=<root>=...` (C/C++/Emscripten) or
+  `--remap-path-prefix=<root>=...` (Rust) where `<root>` is the auto-detected
+  worktree root, zccache uses your flag as-is and does not inject a
+  duplicate. The check is per-flag and per-path: only `-ffile-prefix-map` /
+  `--remap-path-prefix` matching the worktree root suppress auto-injection;
+  related flags like `-fdebug-prefix-map`, `-fmacro-prefix-map`,
+  `-fcoverage-prefix-map`, and `-fprofile-prefix-map` do not. If cwd differs
+  from the detected root and you have not supplied a matching
+  `-ffile-prefix-map=<cwd>=.`, zccache may still inject one for that path.
 - Same-content guarantee. Cross-worktree hits validate content hashes for
   every input. If two worktrees have diverged on a file, the second compile
   misses and recompiles — the cache cannot be poisoned across siblings (the
