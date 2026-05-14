@@ -17,8 +17,8 @@ def soldr_executable() -> str:
     soldr = shutil.which("soldr")
     if soldr is None:
         print(
-            "error: `soldr` not found on PATH. Run `uv sync` (or ./install) "
-            "to install the dev dependencies.",
+            "error: `soldr` not found on PATH. Install the global soldr tool "
+            "before running Rust development commands.",
             file=sys.stderr,
         )
         raise SystemExit(1)

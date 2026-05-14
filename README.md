@@ -287,6 +287,23 @@ Checked flags include `-I`, `-isystem`, `-iquote`, `-idirafter`, `-include`,
 `-include-pch`, `-imacros`, `-F`, `-iframework`, `-imsvc`, and MSVC `/I`.
 Response-file arguments are checked after expansion by the daemon.
 
+### Compiler child priority
+
+Compiler and linker subprocesses run with `ZCCACHE_COMPILE_PRIORITY=low` by
+default so interactive work stays responsive while cache misses compile in the
+background. Set the variable on the build command or in the daemon environment
+to override it:
+
+| Value | Behavior |
+|-------|----------|
+| `low` | Default. Lower compiler priority (`nice +10` on Unix/macOS, `BELOW_NORMAL_PRIORITY_CLASS` on Windows). |
+| `normal` | Preserve the inherited process priority for maximum throughput. |
+| `idle` | More conservative background mode (`nice +19` on Unix/macOS, `IDLE_PRIORITY_CLASS` on Windows). |
+| `high` | Higher-priority mode for real-time benchmarking (`nice -5` on Unix/macOS where permitted, `HIGH_PRIORITY_CLASS` on Windows). |
+
+Unsupported priority changes fail soft with a daemon log message and do not
+break compilation. Invalid values warn and fall back to `low`.
+
 <details>
 <summary>Bash integration</summary>
 

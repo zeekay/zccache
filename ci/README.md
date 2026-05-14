@@ -24,7 +24,7 @@ Python scripts for development tooling. Rust commands go through `soldr <tool>` 
 
 ## Hooks (`ci/hooks/`)
 
-Claude Code hooks that enforce project conventions:
+Claude Code and Codex hooks that enforce project conventions:
 
 - **tool_guard.py** - PreToolUse: blocks bare `cargo`/`rustc`, legacy root trampolines, and `uv run cargo`/`uv run rustc` (must use `soldr`) and bare `python`/`pip` (must use `uv`)
 - **lint.py** - PostToolUse: auto-formats + runs clippy on edited `.rs` files

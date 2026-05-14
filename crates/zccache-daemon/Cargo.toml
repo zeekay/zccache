@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true }
+libc = "0.2"
 
 [[bin]]
 name = "zccache-daemon"

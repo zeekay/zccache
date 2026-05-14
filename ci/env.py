@@ -18,7 +18,10 @@ def clean_env() -> dict[str, str]:
 def rustc_host() -> str | None:
     soldr = shutil.which("soldr")
     if soldr is None:
-        raise FileNotFoundError("Cannot find soldr. Run `uv sync` or ./install.")
+        raise FileNotFoundError(
+            "Cannot find soldr on PATH. Install the global soldr tool before "
+            "running Rust development commands."
+        )
 
     result = subprocess.run(
         [soldr, "--no-cache", "rustc", "-vV"],
