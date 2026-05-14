@@ -1,3 +1,5 @@
+import pytest
+
 from ci import benchmark_stats
 
 
@@ -76,3 +78,45 @@ def test_render_html_links_json_stats():
     assert 'href="latest.json"' in html
     assert 'src="benchmark.jpg"' in html
     assert "Rust rustc" in html
+
+
+def test_image_rows_cover_c_cpp_and_rust_stats():
+    rows = benchmark_stats.parse_benchmark_log(SAMPLE_LOG)
+    image_rows = benchmark_stats.build_image_rows(rows)
+
+    assert {row["language"] for row in image_rows} == {"C", "C++", "Rust"}
+    assert any("C inline args - Single-file, Warm" == row["scenario"] for row in image_rows)
+    assert any(
+        "C++ response files - Single-file RSP, Cold" == row["scenario"]
+        for row in image_rows
+    )
+    assert any("Rust rustc - Build, Warm" == row["scenario"] for row in image_rows)
+
+
+def test_write_outputs_creates_timestamped_benchmark_image(tmp_path):
+    pytest.importorskip("PIL")
+    rows = benchmark_stats.parse_benchmark_log(SAMPLE_LOG)
+    payload = benchmark_stats.build_payload(
+        rows,
+        {
+            "generated_at": "2026-05-13T00:00:00+00:00",
+            "repository": "zackees/zccache",
+            "git_sha": "abcdef1234567890",
+            "git_ref": "main",
+            "run_url": "https://example.invalid/run",
+            "runner": {"platform": "test", "os": "test", "arch": "x64", "cpu_count": 1},
+            "versions": {"soldr": None, "rustc": None, "clang": None, "sccache": None},
+            "benchmark_command": "soldr --no-cache cargo test ...",
+            "pages_url": "https://zackees.github.io/zccache/",
+            "raw_image_url": (
+                "https://raw.githubusercontent.com/zackees/zccache/"
+                "benchmark-stats/benchmark.jpg"
+            ),
+        },
+    )
+
+    benchmark_stats.write_outputs(payload, tmp_path)
+
+    assert (tmp_path / "latest.json").is_file()
+    assert (tmp_path / "index.html").is_file()
+    assert (tmp_path / "benchmark.jpg").stat().st_size > 0
