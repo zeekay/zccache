@@ -777,4 +777,13 @@ mod tests {
         );
         assert_eq!(parsed.remap_path_prefixes, vec!["/home/user=/anon"]);
     }
+
+    #[test]
+    fn remap_path_prefix_equals_form_parsed() {
+        let parsed = parse_rustc_args(
+            &args(&["--remap-path-prefix=/home/user=/anon", "src/lib.rs"]),
+            &cwd(),
+        );
+        assert_eq!(parsed.remap_path_prefixes, vec!["/home/user=/anon"]);
+    }
 }
