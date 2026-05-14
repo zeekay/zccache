@@ -29,6 +29,11 @@ REQUIRED_LANGUAGES = ("c", "c++", "rust")
 OPTIONAL_LANGUAGES = ("emscripten",)
 KNOWN_LANGUAGES = REQUIRED_LANGUAGES + OPTIONAL_LANGUAGES
 REQUIRED_MODES = ("cold", "warm")
+CPP_SIBLING_REMAP_BENCHMARK = "cpp-sibling-remap"
+CPP_SIBLING_REMAP_NO_FILE_SCENARIO = "Sibling-workspace no __FILE__, Warm"
+CPP_SIBLING_REMAP_WITH_FILE_SCENARIO = "Sibling-workspace with __FILE__, Warm"
+CPP_SIBLING_REMAP_NO_FILE_SCCACHE_THRESHOLD = 1.0
+CPP_COLD_SCCACHE_THRESHOLD = 0.9
 
 
 @dataclass(frozen=True)
@@ -157,6 +162,32 @@ def _required_rows(
     ]
 
 
+def _required_scenarios(languages: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+    if "c++" not in languages:
+        return ()
+    return ((CPP_SIBLING_REMAP_BENCHMARK, CPP_SIBLING_REMAP_WITH_FILE_SCENARIO),)
+
+
+def _comparison_threshold(
+    row: dict[str, Any],
+    baseline: str,
+    bare_floor: float,
+    sccache_floor: float,
+) -> float:
+    if baseline == "bare":
+        return bare_floor
+    if (
+        row.get("language") == "c++"
+        and row.get("benchmark") == CPP_SIBLING_REMAP_BENCHMARK
+        and row.get("scenario") == CPP_SIBLING_REMAP_NO_FILE_SCENARIO
+        and row.get("mode") == "warm"
+    ):
+        return CPP_SIBLING_REMAP_NO_FILE_SCCACHE_THRESHOLD
+    if row.get("language") == "c++" and row.get("mode") == "cold":
+        return CPP_COLD_SCCACHE_THRESHOLD
+    return sccache_floor
+
+
 def evaluate_attempts(
     attempts: list[list[dict[str, Any]]],
     *,
@@ -175,12 +206,14 @@ def evaluate_attempts(
         cold_sccache_threshold = threshold
     statuses: dict[ScenarioKey, ScenarioStatus] = {}
     language_modes: set[tuple[str, str]] = set()
+    seen_scenarios: set[tuple[str, str]] = set()
 
     for attempt_index, rows in enumerate(attempts, start=1):
         for row in _required_rows(rows, languages):
             language = str(row["language"])
             mode = str(row["mode"])
             language_modes.add((language, mode))
+            seen_scenarios.add((str(row["benchmark"]), str(row["scenario"])))
             bare_floor = cold_bare_threshold if mode == "cold" else bare_threshold
             sccache_floor = cold_sccache_threshold if mode == "cold" else sccache_threshold
             comparisons = (
@@ -188,18 +221,22 @@ def evaluate_attempts(
                     "bare",
                     str(row["bare_label"]),
                     row.get("zccache_vs_bare_ratio"),
-                    bare_floor,
                     row.get("bare_seconds"),
                 ),
                 (
                     "sccache",
                     "sccache",
                     row.get("zccache_vs_sccache_ratio"),
-                    sccache_floor,
                     row.get("sccache_seconds"),
                 ),
             )
-            for baseline, baseline_label, ratio, ratio_threshold, baseline_seconds in comparisons:
+            for baseline, baseline_label, ratio, baseline_seconds in comparisons:
+                ratio_threshold = _comparison_threshold(
+                    row,
+                    baseline,
+                    bare_floor,
+                    sccache_floor,
+                )
                 key = ScenarioKey(str(row["benchmark"]), str(row["scenario"]), baseline)
                 status = statuses.get(key)
                 if status is None:
@@ -231,6 +268,11 @@ def evaluate_attempts(
         for mode in REQUIRED_MODES
         if (language, mode) not in language_modes
     ]
+    missing.extend(
+        f"{benchmark} / {scenario}"
+        for benchmark, scenario in _required_scenarios(languages)
+        if (benchmark, scenario) not in seen_scenarios
+    )
 
     ordered = sorted(
         statuses.values(),

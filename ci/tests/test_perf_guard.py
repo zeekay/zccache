@@ -19,6 +19,13 @@ PASSING_LOG = """
 | Single-file, Cold | 6.000s | 7.000s | 4.000s | 1.8x faster | 1.5x faster |
 | Single-file, Warm | 6.000s | 1.500s | **0.050s** | **30x faster** | **120x faster** |
 
+## C++ Sibling-Workspace Remap Benchmark: 50 .cpp files, 5 warm trials
+
+| Scenario | Bare clang | sccache | zccache | vs sccache | vs bare clang |
+|:---------|----------:|--------:|--------:|-----------:|--------------:|
+| Sibling-workspace no __FILE__, Warm | 3.000s | 1.000s | **1.000s** | **1.0x faster** | **3.0x faster** |
+| Sibling-workspace with __FILE__, Warm | 3.000s | 1.500s | **1.000s** | **1.5x faster** | **3.0x faster** |
+
 ## Rust Benchmark: 50 .rs files, 5 warm trials
 
 | Scenario | Bare rustc | sccache | zccache | vs sccache | vs bare rustc |
@@ -34,8 +41,8 @@ FAILING_RUST_LOG = PASSING_LOG.replace(
 )
 
 FAILING_SCCACHE_LOG = PASSING_LOG.replace(
-    "| Single-file, Cold | 6.000s | 7.000s | 4.000s | 1.8x faster | 1.5x faster |",
-    "| Single-file, Cold | 6.000s | 5.000s | 4.000s | 1.2x faster | 1.5x faster |",
+    "| Single-file, Warm | 3.000s | 2.000s | **1.000s** | **2.0x faster** | **3.0x faster** |",
+    "| Single-file, Warm | 3.000s | 1.200s | **1.000s** | **1.2x faster** | **3.0x faster** |",
 )
 
 
@@ -94,7 +101,7 @@ def test_sccache_threshold_is_enforced_separately_from_bare():
     assert not report.passed
     failing = [status for status in report.statuses if not status.passed]
     assert [(status.language, status.scenario, status.baseline) for status in failing] == [
-        ("c++", "Single-file, Cold", "sccache")
+        ("c", "Single-file, Warm", "sccache")
     ]
 
 
@@ -110,6 +117,38 @@ def test_default_cold_thresholds_allow_near_bare_misses():
         ("bare", 0.85),
         ("sccache", 1.0),
     ]
+
+
+def test_cpp_cold_sccache_floor_is_relaxed_without_relaxing_rust():
+    cpp_log = PASSING_LOG.replace(
+        "| Single-file, Cold | 6.000s | 7.000s | 4.000s | 1.8x faster | 1.5x faster |",
+        "| Single-file, Cold | 6.000s | 3.800s | 4.000s | 1.1x slower | 1.5x faster |",
+    )
+    cpp_report = perf_guard.evaluate_attempts([rows(cpp_log)], languages=("c++",))
+
+    assert cpp_report.passed
+    cpp_cold_sccache = [
+        status
+        for status in cpp_report.statuses
+        if status.scenario == "Single-file, Cold" and status.baseline == "sccache"
+    ][0]
+    assert cpp_cold_sccache.best_ratio == 0.95
+    assert cpp_cold_sccache.threshold == 0.9
+
+    rust_log = PASSING_LOG.replace(
+        "| Build, Cold | 9.000s | 10.000s | 6.000s | 1.7x faster | 1.5x faster |",
+        "| Build, Cold | 9.000s | 5.700s | 6.000s | 1.1x slower | 1.5x faster |",
+    )
+    rust_report = perf_guard.evaluate_attempts([rows(rust_log)], languages=("rust",))
+
+    assert not rust_report.passed
+    rust_cold_sccache = [
+        status
+        for status in rust_report.statuses
+        if status.scenario == "Build, Cold" and status.baseline == "sccache"
+    ][0]
+    assert rust_cold_sccache.best_ratio == 0.95
+    assert rust_cold_sccache.threshold == 1.0
 
 
 def test_retry_passes_when_later_attempt_clears_threshold():
@@ -132,7 +171,48 @@ def test_missing_required_language_mode_fails():
     report = perf_guard.evaluate_attempts([rows(MISSING_C_LOG)], threshold=1.5)
 
     assert not report.passed
-    assert report.missing_requirements == ["c cold", "c warm"]
+    assert report.missing_requirements == [
+        "c cold",
+        "c warm",
+        "cpp-sibling-remap / Sibling-workspace with __FILE__, Warm",
+    ]
+
+
+def test_missing_required_cpp_sibling_with_file_row_fails():
+    log = PASSING_LOG.replace(
+        "| Sibling-workspace with __FILE__, Warm | 3.000s | 1.500s | **1.000s** | **1.5x faster** | **3.0x faster** |\n",
+        "",
+    )
+
+    report = perf_guard.evaluate_attempts([rows(log)])
+
+    assert not report.passed
+    assert report.missing_requirements == [
+        "cpp-sibling-remap / Sibling-workspace with __FILE__, Warm"
+    ]
+
+
+def test_cpp_sibling_sccache_threshold_depends_on_scenario():
+    log = PASSING_LOG.replace(
+        "| Sibling-workspace with __FILE__, Warm | 3.000s | 1.500s | **1.000s** | **1.5x faster** | **3.0x faster** |",
+        "| Sibling-workspace with __FILE__, Warm | 3.000s | 1.400s | **1.000s** | **1.4x faster** | **3.0x faster** |",
+    )
+
+    report = perf_guard.evaluate_attempts([rows(log)])
+
+    assert not report.passed
+    sibling_sccache = [
+        status
+        for status in report.statuses
+        if status.key.benchmark == "cpp-sibling-remap" and status.baseline == "sccache"
+    ]
+    assert {
+        (status.scenario, status.best_ratio, status.threshold, status.passed)
+        for status in sibling_sccache
+    } == {
+        ("Sibling-workspace no __FILE__, Warm", 1.0, 1.0, True),
+        ("Sibling-workspace with __FILE__, Warm", 1.4, 1.5, False),
+    }
 
 
 def test_language_filter_requires_only_selected_language():
@@ -174,13 +254,13 @@ def test_benchmark_summary_lists_passes_and_failures():
 
     summary = perf_guard.format_benchmark_summary(report)
 
-    assert "- Passed checks: 11" in summary
+    assert "- Passed checks: 15" in summary
     assert "- Failed checks: 1" in summary
     assert "- Missing coverage: none" in summary
     assert "- Failed benchmark attempts: none" in summary
     assert (
-        "- FAIL: c++ C++ inline args / Single-file, Cold vs sccache: "
-        "expected >= 1.50x, actual 1.250x (zccache 4.000s vs baseline 5.000s) "
+        "- FAIL: c C inline args / Single-file, Warm vs sccache: "
+        "expected >= 1.50x, actual 1.200x (zccache 1.000s vs baseline 1.200s) "
         "(best attempt 1; seen 1)"
     ) in summary
     assert (
@@ -211,9 +291,9 @@ def test_final_status_explains_worst_failed_floor():
     final_status = perf_guard.format_final_status(report)
 
     assert final_status == (
-        "PERF GUARD FAILED: 1 check below floor; worst c++ C++ inline args / "
-        "Single-file, Cold vs sccache: expected >= 1.50x, actual 1.250x "
-        "(zccache 4.000s vs baseline 5.000s)."
+        "PERF GUARD FAILED: 1 check below floor; worst c C inline args / "
+        "Single-file, Warm vs sccache: expected >= 1.50x, actual 1.200x "
+        "(zccache 1.000s vs baseline 1.200s)."
     )
 
 
@@ -223,7 +303,8 @@ def test_final_status_explains_missing_coverage():
     final_status = perf_guard.format_final_status(report)
 
     assert final_status == (
-        "PERF GUARD FAILED: missing required benchmark coverage for c cold, c warm."
+        "PERF GUARD FAILED: missing required benchmark coverage for c cold, c warm, "
+        "cpp-sibling-remap / Sibling-workspace with __FILE__, Warm."
     )
 
 

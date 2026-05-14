@@ -85,6 +85,14 @@ const RSP_NUM_INCLUDES: usize = 50;
 
 /// Generate NUM_FILES lightweight C++ source files with a shared header.
 fn generate_project(dir: &Path) {
+    generate_cpp_project(dir, false);
+}
+
+fn generate_project_with_file_tags(dir: &Path) {
+    generate_cpp_project(dir, true);
+}
+
+fn generate_cpp_project(dir: &Path, with_file_tags: bool) {
     let incdir = dir.join("include");
     std::fs::create_dir_all(&incdir).unwrap();
 
@@ -103,10 +111,19 @@ namespace bench {
     .unwrap();
 
     for i in 0..NUM_FILES {
+        let file_tag = if with_file_tags {
+            format!(
+                r#"  static const char *file_tag_{i:03}(void) {{ return __FILE__; }}
+"#
+            )
+        } else {
+            String::new()
+        };
         let content = format!(
             r#"#include "common.h"
 #include <cmath>
 namespace unit_{i:03} {{
+{file_tag}
   double compute(int n) {{ return std::sin(n * 0.{i:03}1); }}
   std::vector<double> build(int n) {{
     std::vector<double> v(n);
@@ -165,6 +182,21 @@ fn clean_objects(dir: &Path) {
         let path = entry.unwrap().path();
         if path.extension().and_then(|e| e.to_str()) == Some("o") {
             let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+fn clear_dir_contents(dir: &Path) {
+    if !dir.exists() {
+        std::fs::create_dir_all(dir).unwrap();
+        return;
+    }
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path).unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
         }
     }
 }
@@ -2238,31 +2270,32 @@ async fn end_zccache_session(client: &mut ClientConn, session_id: String) {
     let _ = client.recv::<Response>().await;
 }
 
-/// C++ sibling-workspace remap benchmark. Warm-only. Compares zccache (with
-/// ZCCACHE_PATH_REMAP=auto, primed from sibling workspace A) against bare clang
-/// and sccache (each warm in workspace B).
-#[tokio::test]
-#[ignore] // Run explicitly: soldr cargo test -p zccache-daemon --test perf_bench_test -- perf_cpp_sibling_remap_warm --nocapture --ignored
-async fn perf_cpp_sibling_remap_warm() {
-    let compiler_path = match zccache_test_support::find_clang() {
-        Some(p) => p,
-        None => {
-            eprintln!("SKIP: no C++ compiler found");
-            return;
-        }
-    };
-    let compiler = compiler_path.to_string_lossy().to_string();
-    let sources = source_names();
+fn absolute_cpp_source_names(dir: &Path) -> Vec<String> {
+    (0..NUM_FILES)
+        .map(|i| {
+            dir.join(format!("unit_{i:03}.cpp"))
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
 
-    eprintln!();
-    eprintln!("================================================================");
-    eprintln!("  C++ SIBLING-WORKSPACE REMAP BENCHMARK (warm-only)");
-    eprintln!("  {NUM_FILES} .cpp files | {WARM_TRIALS} warm trials | ZCCACHE_PATH_REMAP=auto");
-    eprintln!("  Compiler: {compiler}");
-    eprintln!("================================================================");
+struct CppSiblingRemapResult {
+    scenario: &'static str,
+    bare_warm: Duration,
+    sccache_warm: Option<Vec<Duration>>,
+    zccache_warm: Vec<Duration>,
+}
+
+async fn measure_cpp_sibling_remap_mode(
+    scenario: &'static str,
+    compiler: &str,
+    with_file_tags: bool,
+    use_absolute_sources: bool,
+) -> CppSiblingRemapResult {
+    eprintln!("  Mode: {scenario}");
     eprintln!();
 
-    // Use one parent tempdir so sibling roots are filesystem-adjacent.
     let parent = zccache_test_support::temp_cache_dir().unwrap();
     let workspace_a = parent.path().join("workspace-a");
     let workspace_b = parent.path().join("workspace-b");
@@ -2270,46 +2303,66 @@ async fn perf_cpp_sibling_remap_warm() {
     std::fs::create_dir_all(&workspace_b).unwrap();
     make_git_workspace(&workspace_a);
     make_git_workspace(&workspace_b);
-    generate_project(&workspace_a);
-    generate_project(&workspace_b);
+    if with_file_tags {
+        generate_project_with_file_tags(&workspace_a);
+        generate_project_with_file_tags(&workspace_b);
+    } else {
+        generate_project(&workspace_a);
+        generate_project(&workspace_b);
+    }
 
-    // ── Bare clang warm in workspace B ─────────────────────────────────
+    let sources_a = if use_absolute_sources {
+        absolute_cpp_source_names(&workspace_a)
+    } else {
+        source_names()
+    };
+    let sources_b = if use_absolute_sources {
+        absolute_cpp_source_names(&workspace_b)
+    } else {
+        source_names()
+    };
+
     eprintln!("  [1/3] Bare clang (workspace B, warm)");
-    warmup_compiler(&compiler, &workspace_b);
-    let _ = baseline_single(&compiler, &workspace_b, &sources); // discard cold
+    warmup_compiler(compiler, &workspace_b);
+    let _ = baseline_single(compiler, &workspace_b, &sources_b);
     let mut bl_warm = Vec::with_capacity(WARM_TRIALS);
     for _ in 0..WARM_TRIALS {
-        bl_warm.push(baseline_single(&compiler, &workspace_b, &sources));
+        bl_warm.push(baseline_single(compiler, &workspace_b, &sources_b));
     }
     print_trials_per("warm:", &bl_warm, Some(NUM_FILES));
     eprintln!();
 
-    // ── sccache warm in workspace B ────────────────────────────────────
     let sccache_warm = if let Some(sccache_bin) = find_sccache() {
         let sc_cache_dir = zccache_test_support::temp_cache_dir().unwrap();
         let sc_cache_str = sc_cache_dir.path().to_string_lossy().into_owned();
         std::env::set_var("SCCACHE_DIR", &sc_cache_str);
-        eprintln!("  [2/3] sccache (workspace B, warm)");
-        let _ = std::process::Command::new(&sccache_bin)
-            .arg("--stop-server")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let _ = std::process::Command::new(&sccache_bin)
-            .arg("--start-server")
-            .env("SCCACHE_DIR", &sc_cache_str)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        warmup_compiler(&compiler, &workspace_b);
-        let _ = sccache_compile_single(&sccache_bin, &compiler, &workspace_b, &sources); // discard cold
+        eprintln!("  [2/3] sccache (prime: workspace A, warm: workspace B)");
         let mut warm = Vec::with_capacity(WARM_TRIALS);
-        for _ in 0..WARM_TRIALS {
+        for trial in 0..WARM_TRIALS {
+            if with_file_tags || trial == 0 {
+                let _ = std::process::Command::new(&sccache_bin)
+                    .arg("--stop-server")
+                    .env("SCCACHE_DIR", &sc_cache_str)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                if with_file_tags {
+                    clear_dir_contents(sc_cache_dir.path());
+                }
+                let _ = std::process::Command::new(&sccache_bin)
+                    .arg("--start-server")
+                    .env("SCCACHE_DIR", &sc_cache_str)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                warmup_compiler(compiler, &workspace_a);
+                let _ = sccache_compile_single(&sccache_bin, compiler, &workspace_a, &sources_a);
+            }
             warm.push(sccache_compile_single(
                 &sccache_bin,
-                &compiler,
+                compiler,
                 &workspace_b,
-                &sources,
+                &sources_b,
             ));
         }
         print_trials_per("warm:", &warm, Some(NUM_FILES));
@@ -2326,7 +2379,6 @@ async fn perf_cpp_sibling_remap_warm() {
         None
     };
 
-    // ── zccache primed from workspace A, warm in workspace B ───────────
     eprintln!("  [3/3] zccache (prime: workspace A, warm: workspace B, remap=auto)");
     let (endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
@@ -2335,40 +2387,28 @@ async fn perf_cpp_sibling_remap_warm() {
     let workspace_b_str = workspace_b.to_string_lossy().into_owned();
     let session_a = start_zccache_session(&mut client, &workspace_a_str).await;
 
-    // Prime: compile in workspace A (cold miss + populates remap-keyed cache).
-    warmup_compiler(&compiler, &workspace_a);
+    warmup_compiler(compiler, &workspace_a);
     let _ = zccache_compile_cpp_single_with_env(
         &mut client,
         &session_a,
-        &compiler,
+        compiler,
         &workspace_a_str,
-        &sources,
+        &sources_a,
         path_remap_auto_env(),
     )
     .await;
     end_zccache_session(&mut client, session_a).await;
 
     let session_b = start_zccache_session(&mut client, &workspace_b_str).await;
-    // First compile in B should already hit the sibling cache entry from A.
-    let _ = zccache_compile_cpp_single_with_env(
-        &mut client,
-        &session_b,
-        &compiler,
-        &workspace_b_str,
-        &sources,
-        path_remap_auto_env(),
-    )
-    .await;
-
     let mut zc_warm = Vec::with_capacity(WARM_TRIALS);
     for _ in 0..WARM_TRIALS {
         zc_warm.push(
             zccache_compile_cpp_single_with_env(
                 &mut client,
                 &session_b,
-                &compiler,
+                compiler,
                 &workspace_b_str,
-                &sources,
+                &sources_b,
                 path_remap_auto_env(),
             )
             .await,
@@ -2379,17 +2419,56 @@ async fn perf_cpp_sibling_remap_warm() {
     end_zccache_session(&mut client, session_b).await;
     shutdown.notify_one();
     server_handle.await.unwrap();
+    eprintln!();
 
-    // ── Report ─────────────────────────────────────────────────────────
+    CppSiblingRemapResult {
+        scenario,
+        bare_warm: median(&bl_warm),
+        sccache_warm,
+        zccache_warm: zc_warm,
+    }
+}
+
+/// C++ sibling-workspace remap benchmark. Warm-only. Compares zccache (with
+/// ZCCACHE_PATH_REMAP=auto, primed from sibling workspace A) against bare clang
+/// and sccache (also primed from workspace A, then measured in workspace B).
+#[tokio::test]
+#[ignore] // Run explicitly: soldr cargo test -p zccache-daemon --test perf_bench_test -- perf_cpp_sibling_remap_warm --nocapture --ignored
+async fn perf_cpp_sibling_remap_warm() {
+    let compiler_path = match zccache_test_support::find_clang() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: no C++ compiler found");
+            return;
+        }
+    };
+    let compiler = compiler_path.to_string_lossy().to_string();
+
+    eprintln!();
+    eprintln!("================================================================");
+    eprintln!("  C++ SIBLING-WORKSPACE REMAP BENCHMARK (warm-only)");
+    eprintln!("  {NUM_FILES} .cpp files | {WARM_TRIALS} warm trials | ZCCACHE_PATH_REMAP=auto");
+    eprintln!("  Compiler: {compiler}");
+    eprintln!("================================================================");
+    eprintln!();
+
+    let no_file = measure_cpp_sibling_remap_mode(
+        "Sibling-workspace no __FILE__, Warm",
+        &compiler,
+        false,
+        false,
+    )
+    .await;
+    let with_file = measure_cpp_sibling_remap_mode(
+        "Sibling-workspace with __FILE__, Warm",
+        &compiler,
+        true,
+        true,
+    )
+    .await;
+    let results = [no_file, with_file];
+
     let dash = "\u{2014}";
-    let bl_warm_med = median(&bl_warm);
-    let zc_warm_med = median(&zc_warm);
-    let sccache_warm_str = sccache_warm.as_ref().map(|t| fmt_dur(median(t)));
-    let vs_sccache = sccache_warm
-        .as_ref()
-        .map(|t| fmt_ratio(median(t), zc_warm_med, true));
-    let vs_bare = fmt_ratio(bl_warm_med, zc_warm_med, true);
-
     eprintln!();
     eprintln!(
         "## C++ Sibling-Workspace Remap Benchmark: {NUM_FILES} .cpp files, {WARM_TRIALS} warm trials"
@@ -2397,17 +2476,27 @@ async fn perf_cpp_sibling_remap_warm() {
     eprintln!();
     eprintln!("| Scenario | Bare clang | sccache | zccache | vs sccache | vs bare clang |");
     eprintln!("|:---------|----------:|--------:|--------:|-----------:|--------------:|");
-    eprintln!(
-        "| Sibling-workspace, Warm | {} | {} | **{}** | {} | {} |",
-        fmt_dur(bl_warm_med),
-        sccache_warm_str.as_deref().unwrap_or(dash),
-        fmt_dur(zc_warm_med),
-        vs_sccache.as_deref().unwrap_or(dash),
-        vs_bare,
-    );
+    for result in &results {
+        let zc_warm_med = median(&result.zccache_warm);
+        let sccache_warm_str = result.sccache_warm.as_ref().map(|t| fmt_dur(median(t)));
+        let vs_sccache = result
+            .sccache_warm
+            .as_ref()
+            .map(|t| fmt_ratio(median(t), zc_warm_med, true));
+        let vs_bare = fmt_ratio(result.bare_warm, zc_warm_med, true);
+        eprintln!(
+            "| {} | {} | {} | **{}** | {} | {} |",
+            result.scenario,
+            fmt_dur(result.bare_warm),
+            sccache_warm_str.as_deref().unwrap_or(dash),
+            fmt_dur(zc_warm_med),
+            vs_sccache.as_deref().unwrap_or(dash),
+            vs_bare,
+        );
+    }
     eprintln!();
     eprintln!(
-        "> Sibling-workspace = two adjacent git roots; zccache primed from workspace A, warm trials measured in workspace B with `ZCCACHE_PATH_REMAP=auto`. Bare/sccache run their normal same-workspace warm trials in workspace B."
+        "> Sibling-workspace = two adjacent git roots; sccache and zccache are primed from workspace A, then warm trials are measured in workspace B. The `with __FILE__` row compiles absolute source paths so each sibling root is embedded in preprocessed output."
     );
     eprintln!();
 }

@@ -38,7 +38,8 @@ SAMPLE_LOG = """
 
 | Scenario | Bare clang | sccache | zccache | vs sccache | vs bare clang |
 |:---------|----------:|--------:|--------:|-----------:|--------------:|
-| Sibling-workspace, Warm | 11.812s | 1.602s | **0.052s** | **31x faster** | **227x faster** |
+| Sibling-workspace no __FILE__, Warm | 11.812s | 1.602s | **1.602s** | **1.0x faster** | **7.4x faster** |
+| Sibling-workspace with __FILE__, Warm | 11.812s | 1.602s | **0.052s** | **31x faster** | **227x faster** |
 
 ## Rust Sibling-Workspace Remap Benchmark: 50 .rs files, 5 warm trials
 
@@ -87,7 +88,7 @@ def sample_payload():
 def test_parse_benchmark_log_extracts_all_tables():
     rows = benchmark_stats.parse_benchmark_log(SAMPLE_LOG)
 
-    assert len(rows) == 13
+    assert len(rows) == 14
     assert {row["benchmark"] for row in rows} == {
         "c-inline",
         "cpp-inline",
@@ -108,10 +109,14 @@ def test_parse_benchmark_log_extracts_all_tables():
     assert rust_warm["zccache_seconds"] == 0.123
     assert rust_warm["zccache_vs_sccache_ratio"] == 66.959
 
-    cpp_remap = [row for row in rows if row["benchmark"] == "cpp-sibling-remap"][0]
-    assert cpp_remap["mode"] == "warm"
-    assert cpp_remap["language"] == "c++"
-    assert cpp_remap["zccache_seconds"] == 0.052
+    cpp_remaps = [row for row in rows if row["benchmark"] == "cpp-sibling-remap"]
+    assert [row["scenario"] for row in cpp_remaps] == [
+        "Sibling-workspace no __FILE__, Warm",
+        "Sibling-workspace with __FILE__, Warm",
+    ]
+    assert all(row["mode"] == "warm" for row in cpp_remaps)
+    assert all(row["language"] == "c++" for row in cpp_remaps)
+    assert [row["zccache_vs_sccache_ratio"] for row in cpp_remaps] == [1.0, 30.808]
 
     rust_remap = [row for row in rows if row["benchmark"] == "rust-sibling-remap"][0]
     assert rust_remap["mode"] == "warm"
@@ -143,7 +148,7 @@ def test_group_results_by_language_returns_expected_buckets():
         "Emscripten",
         "Rust",
     }
-    assert [len(groups[language]) for language in groups] == [2, 5, 3, 3]
+    assert [len(groups[language]) for language in groups] == [2, 6, 3, 3]
 
 
 def test_render_html_links_json_stats_and_language_images_only():
