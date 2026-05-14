@@ -366,9 +366,40 @@ worktree shares the same logical cache.
 
    ```bash
    export ZCCACHE_PATH_REMAP=auto
-   export RUSTC_WRAPPER=zccache              # Rust projects
-   # For C/C++, point your build to zccache (e.g. CMAKE_C_COMPILER_LAUNCHER=zccache).
    ```
+
+   Then wire zccache into the build the same way you would for a single
+   checkout. For Rust:
+
+   ```bash
+   export RUSTC_WRAPPER=zccache
+   ```
+
+   For C/C++, use the launcher pattern your build system already supports
+   (Make and Ninja pick `CC`/`CXX` up automatically):
+
+   ```bash
+   # Make / Ninja / plain shell
+   export CC="zccache clang"
+   export CXX="zccache clang++"
+   ```
+
+   ```cmake
+   # CMake — set once, applies to every target
+   set(CMAKE_C_COMPILER_LAUNCHER zccache)
+   set(CMAKE_CXX_COMPILER_LAUNCHER zccache)
+   ```
+
+   For Emscripten, swap in `emcc` / `em++`:
+
+   ```bash
+   export CC="zccache emcc"
+   export CXX="zccache em++"
+   ```
+
+   The `ZCCACHE_PATH_REMAP=auto` export is what unlocks cross-worktree
+   sharing for whichever language the agent compiles; the wrapper choice is
+   just the normal single-checkout setup.
 
 3. Launch sub-agents in their own worktrees in parallel. The first agent to
    compile a unit populates the cache; the others get worktree-equivalent
