@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
@@ -332,7 +332,7 @@ impl RustPlanSummary {
             plan.schema_version,
             plan.cache_schema_version,
             cache_key,
-            Some(archive_path.into()),
+            Some(archive_path),
             plan.journal_log_path.clone(),
         )
     }
@@ -603,8 +603,8 @@ pub fn rust_plan_identity_hash(plan: &RustArtifactPlanV1) -> String {
 
 /// Bundle directory for a plan cache key.
 #[must_use]
-pub fn rust_plan_bundle_dir(cache_dir: &Path, cache_key: &str) -> PathBuf {
-    cache_dir.join("rust-plan").join(cache_key)
+pub fn rust_plan_bundle_dir(cache_dir: &Path, cache_key: &str) -> NormalizedPath {
+    NormalizedPath::new(cache_dir.join("rust-plan").join(cache_key))
 }
 
 /// Execute local bundle save for a validated plan.
@@ -623,7 +623,7 @@ pub fn save_rust_plan_local(
         plan.schema_version,
         plan.cache_schema_version,
         cache_key.clone(),
-        Some(bundle_dir.clone().into()),
+        Some(bundle_dir.clone()),
         plan.journal_log_path.clone(),
     );
 
@@ -772,7 +772,7 @@ pub fn restore_rust_plan_local(
         plan.schema_version,
         plan.cache_schema_version,
         cache_key.clone(),
-        Some(bundle_dir.clone().into()),
+        Some(bundle_dir.clone()),
         plan.journal_log_path.clone(),
     );
 
@@ -904,14 +904,14 @@ fn validate_manifest(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SelectedArtifact {
-    source_path: PathBuf,
+    source_path: NormalizedPath,
     relative_path: String,
     class: RustArtifactClass,
 }
 
 fn select_artifacts(
     plan: &RustArtifactPlanV1,
-    candidates: Vec<PathBuf>,
+    candidates: Vec<NormalizedPath>,
     summary: &mut RustPlanSummary,
 ) -> Vec<SelectedArtifact> {
     let allowed = plan.effective_allowed_classes();
@@ -1009,7 +1009,7 @@ fn is_likely_proc_macro_dylib(rel: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn collect_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), RustPlanError> {
+fn collect_files(root: &Path, files: &mut Vec<NormalizedPath>) -> Result<(), RustPlanError> {
     if !root.exists() {
         return Ok(());
     }
@@ -1021,10 +1021,10 @@ fn collect_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), RustPlanEr
     entries.sort_by_key(|entry| entry.file_name());
 
     for entry in entries {
-        let path = entry.path();
+        let path = NormalizedPath::new(entry.path());
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            collect_files(&path, files)?;
+            collect_files(path.as_path(), files)?;
         } else if file_type.is_file() {
             files.push(path);
         }
@@ -1032,7 +1032,7 @@ fn collect_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), RustPlanEr
     Ok(())
 }
 
-fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, RustPlanError> {
+fn safe_join(root: &Path, relative: &str) -> Result<NormalizedPath, RustPlanError> {
     let rel = Path::new(relative);
     if rel.as_os_str().is_empty() {
         return Err(RustPlanError::UnsafeRelativePath(relative.to_string()));
@@ -1045,7 +1045,7 @@ fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, RustPlanError> {
             }
         }
     }
-    Ok(root.join(rel))
+    Ok(NormalizedPath::new(root.join(rel)))
 }
 
 fn default_thin_classes() -> BTreeSet<RustArtifactClass> {

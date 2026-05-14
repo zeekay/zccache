@@ -10,16 +10,19 @@
 //! a higher version than this binary supports is a hard error
 //! ([`KvError::Corrupt`]) rather than silent garbage.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use zccache_core::NormalizedPath;
 
 /// Windows long-path (`\\?\`) helpers. On non-Windows platforms every entry
 /// point is a no-op pass-through.
 mod long_path {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+
+    use zccache_core::NormalizedPath;
 
     /// Normalize `dir` so that paths joined off it can exceed `MAX_PATH`
     /// without tripping the legacy Win32 path APIs used by transitive crates
@@ -31,20 +34,20 @@ mod long_path {
     ///
     /// The dir must already exist; callers in this crate `create_dir_all`
     /// first.
-    pub(super) fn ensure_long_path(dir: &Path) -> std::io::Result<PathBuf> {
+    pub(super) fn ensure_long_path(dir: &Path) -> std::io::Result<NormalizedPath> {
         #[cfg(windows)]
         {
             // `fs::canonicalize` on Windows returns the verbatim form
             // (`\\?\C:\...` or `\\?\UNC\...`), which is exactly what we need.
             // If the path already starts with `\\?\` we keep it as-is.
             if starts_with_verbatim(dir) {
-                return Ok(dir.to_path_buf());
+                return Ok(NormalizedPath::new(dir));
             }
-            std::fs::canonicalize(dir)
+            std::fs::canonicalize(dir).map(NormalizedPath::new)
         }
         #[cfg(not(windows))]
         {
-            Ok(dir.to_path_buf())
+            Ok(NormalizedPath::new(dir))
         }
     }
 
@@ -236,30 +239,30 @@ fn composite(ns: &str, key: &Key) -> String {
 
 /// Namespaced key/value store backed by redb plus optional spilled side files.
 ///
-/// Cheap to clone (`Arc<Database>` + `Arc<PathBuf>`); intended to be passed
+/// Cheap to clone (`Arc<Database>` + `Arc<NormalizedPath>`); intended to be passed
 /// across threads. All writes are committed before the call returns
 /// (single-fsync per `put`/`remove`/`clear_namespace`).
 #[derive(Clone)]
 pub struct KvStore {
     db: Arc<Database>,
-    cache_dir: Arc<PathBuf>,
+    cache_dir: Arc<NormalizedPath>,
 }
 
 impl KvStore {
     /// Open under the canonical zccache root (`default_cache_dir()`).
     pub fn open_default() -> KvResult<Self> {
-        let dir = zccache_core::config::default_cache_dir().to_path_buf();
+        let dir = zccache_core::config::default_cache_dir();
         Self::open(dir)
     }
 
     /// Open at an explicit dir. Creates the dir + redb file if missing.
     pub fn open<P: AsRef<Path>>(dir: P) -> KvResult<Self> {
-        let mut dir = dir.as_ref().to_path_buf();
+        let mut dir = NormalizedPath::new(dir.as_ref());
         std::fs::create_dir_all(&dir)?;
         // On Windows, normalize to a `\\?\`-prefixed (verbatim) form so that
         // every spill path joined off `cache_dir` exceeds `MAX_PATH` safely.
         // No-op on Unix.
-        dir = long_path::ensure_long_path(&dir)?;
+        dir = long_path::ensure_long_path(dir.as_path())?;
         let db_path = dir.join("index.redb");
         let db = Database::create(&db_path).map_err(|e| KvError::Redb(e.to_string()))?;
         let store = Self {
@@ -274,12 +277,12 @@ impl KvStore {
     /// [`ArtifactStore`](crate::ArtifactStore)). Both stores see each other's
     /// commits; spill files live under `cache_dir/kv/...`.
     pub fn from_database<P: AsRef<Path>>(db: Arc<Database>, cache_dir: P) -> KvResult<Self> {
-        let mut cache_dir = cache_dir.as_ref().to_path_buf();
+        let mut cache_dir = NormalizedPath::new(cache_dir.as_ref());
         std::fs::create_dir_all(&cache_dir)?;
         // Match the verbatim normalization done by [`KvStore::open`] so callers
         // who route long paths through `from_database` get the same long-path
         // safety on Windows.
-        cache_dir = long_path::ensure_long_path(&cache_dir)?;
+        cache_dir = long_path::ensure_long_path(cache_dir.as_path())?;
         let store = Self {
             db,
             cache_dir: Arc::new(cache_dir),
@@ -297,7 +300,7 @@ impl KvStore {
         Ok(())
     }
 
-    fn spill_path(&self, namespace: &str, key: &Key) -> PathBuf {
+    fn spill_path(&self, namespace: &str, key: &Key) -> NormalizedPath {
         self.cache_dir
             .join("kv")
             .join(namespace)
