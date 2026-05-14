@@ -69,3 +69,92 @@ def test_write_zip_preserves_full_version_and_target(tmp_path: Path) -> None:
 
     with zipfile.ZipFile(archive) as zf:
         assert "zccache-v1.3.10-x86_64-pc-windows-msvc/zccache.exe" in zf.namelist()
+
+
+def test_stage_debug_tree_packages_dwp_files(tmp_path: Path) -> None:
+    debug_input_dir = tmp_path / "staging-debug"
+    output_dir = tmp_path / "output"
+    debug_input_dir.mkdir()
+    output_dir.mkdir()
+
+    for name in package_release.INCLUDE:
+        (debug_input_dir / f"{name}.dwp").write_bytes(b"dwp\n")
+
+    result = package_release.stage_debug_tree(
+        version="1.3.10",
+        target="x86_64-unknown-linux-gnu",
+        debug_input_dir=debug_input_dir,
+        output_dir=output_dir,
+    )
+    assert result is not None
+    debug_stage_dir, debug_archive_base = result
+    archive = package_release.write_tarball(debug_stage_dir, debug_archive_base)
+
+    assert archive.name == "zccache-v1.3.10-x86_64-unknown-linux-gnu-debug.tar.gz"
+    with tarfile.open(archive, "r:gz") as tf:
+        members = {member.name for member in tf.getmembers()}
+        for name in package_release.INCLUDE:
+            assert (
+                f"zccache-v1.3.10-x86_64-unknown-linux-gnu-debug/{name}.dwp" in members
+            )
+
+
+def test_stage_debug_tree_handles_dsym_directories(tmp_path: Path) -> None:
+    debug_input_dir = tmp_path / "staging-debug"
+    output_dir = tmp_path / "output"
+    debug_input_dir.mkdir()
+    output_dir.mkdir()
+
+    dsym = debug_input_dir / "zccache.dSYM"
+    (dsym / "Contents/Resources/DWARF").mkdir(parents=True)
+    (dsym / "Contents/Resources/DWARF/zccache").write_bytes(b"dwarf\n")
+
+    result = package_release.stage_debug_tree(
+        version="1.3.10",
+        target="x86_64-apple-darwin",
+        debug_input_dir=debug_input_dir,
+        output_dir=output_dir,
+    )
+    assert result is not None
+    debug_stage_dir, debug_archive_base = result
+    archive = package_release.write_tarball(debug_stage_dir, debug_archive_base)
+
+    with tarfile.open(archive, "r:gz") as tf:
+        members = {member.name for member in tf.getmembers()}
+        assert (
+            "zccache-v1.3.10-x86_64-apple-darwin-debug/zccache.dSYM/"
+            "Contents/Resources/DWARF/zccache" in members
+        )
+
+
+def test_stage_debug_tree_skips_empty_input(tmp_path: Path) -> None:
+    debug_input_dir = tmp_path / "staging-debug"
+    output_dir = tmp_path / "output"
+    debug_input_dir.mkdir()
+    output_dir.mkdir()
+
+    assert (
+        package_release.stage_debug_tree(
+            version="1.3.10",
+            target="x86_64-unknown-linux-gnu",
+            debug_input_dir=debug_input_dir,
+            output_dir=output_dir,
+        )
+        is None
+    )
+
+
+def test_stage_debug_tree_skips_missing_input(tmp_path: Path) -> None:
+    missing = tmp_path / "nope"
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    assert (
+        package_release.stage_debug_tree(
+            version="1.3.10",
+            target="x86_64-unknown-linux-gnu",
+            debug_input_dir=missing,
+            output_dir=output_dir,
+        )
+        is None
+    )
