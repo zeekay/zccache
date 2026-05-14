@@ -102,9 +102,7 @@ def run_benchmarks_once(
     benchmark_binary: Path | None = None,
 ) -> tuple[int, str]:
     cache_dir = Path(tempfile.mkdtemp(prefix="zccache-perf-guard-cache-"))
-    env = os.environ.copy()
-    env["ZCCACHE_CACHE_DIR"] = str(cache_dir)
-    env.pop("RUSTC_WRAPPER", None)
+    env = _benchmark_env(cache_dir, language)
 
     try:
         outputs: list[str] = []
@@ -132,6 +130,16 @@ def run_benchmarks_once(
     log_path.write_text(output, encoding="utf-8")
     print(output, end="")
     return returncode, output
+
+
+def _benchmark_env(cache_dir: Path, language: str | None) -> dict[str, str]:
+    env = os.environ.copy()
+    env["ZCCACHE_CACHE_DIR"] = str(cache_dir)
+    env["ZCCACHE_COMPILE_PRIORITY"] = "high"
+    if language == "rust":
+        env["ZCCACHE_PROFILE_RUST_MISS"] = "1"
+    env.pop("RUSTC_WRAPPER", None)
+    return env
 
 
 def _required_rows(

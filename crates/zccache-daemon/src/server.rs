@@ -2533,17 +2533,38 @@ fn persist_artifact_output(cache_path: &Path, payload: &[u8]) -> std::io::Result
     result
 }
 
-fn persist_artifact_file(cache_path: &Path, source_path: &Path) -> std::io::Result<()> {
+#[derive(Clone, Copy, Debug, Default)]
+struct PersistArtifactFileStats {
+    hardlink_count: u64,
+    copy_count: u64,
+    copy_bytes: u64,
+}
+
+fn persist_artifact_file(
+    cache_path: &Path,
+    source_path: &Path,
+) -> std::io::Result<PersistArtifactFileStats> {
     if let Some(parent) = cache_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     let tmp_path = artifact_persist_tmp_path(cache_path);
     let result = (|| match std::fs::hard_link(source_path, &tmp_path) {
-        Ok(()) => replace_artifact_cache_file(&tmp_path, cache_path),
+        Ok(()) => {
+            replace_artifact_cache_file(&tmp_path, cache_path)?;
+            Ok(PersistArtifactFileStats {
+                hardlink_count: 1,
+                ..PersistArtifactFileStats::default()
+            })
+        }
         Err(_) => {
-            std::fs::copy(source_path, &tmp_path)?;
-            replace_artifact_cache_file(&tmp_path, cache_path)
+            let copy_bytes = std::fs::copy(source_path, &tmp_path)?;
+            replace_artifact_cache_file(&tmp_path, cache_path)?;
+            Ok(PersistArtifactFileStats {
+                copy_count: 1,
+                copy_bytes,
+                ..PersistArtifactFileStats::default()
+            })
         }
     })();
     if result.is_err() {
@@ -4047,6 +4068,7 @@ async fn handle_compile(
     } else {
         vec![output_path.clone()]
     };
+    let t_break_outputs = std::time::Instant::now();
     for path in &output_paths {
         if let Err(e) = break_output_hardlink_before_compile(path) {
             return Response::Error {
@@ -4057,6 +4079,7 @@ async fn handle_compile(
             };
         }
     }
+    let break_outputs_ns = t_break_outputs.elapsed().as_nanos() as u64;
 
     let mut cmd = tokio::process::Command::new(&compiler);
     if let Some(ref rsp) = _rsp_guard {
@@ -4310,6 +4333,15 @@ async fn handle_compile(
         let mut artifact_build_ns = 0;
         let mut persist_enqueue_ns = 0;
         let mut artifact_insert_stats_ns = 0;
+        let mut artifact_meta_build_ns = 0;
+        let mut rust_snapshot_ns = 0;
+        let mut rust_snapshot_hardlink_count = 0;
+        let mut rust_snapshot_copy_count = 0;
+        let mut rust_snapshot_copy_bytes = 0;
+        let mut rust_snapshot_error_count = 0;
+        let mut artifact_index_build_ns = 0;
+        let mut artifact_index_persist_ns = 0;
+        let mut artifact_memory_insert_ns = 0;
         if let Some(artifact_key) = artifact_key_result {
             let artifact_key_hex = artifact_key.hash().to_hex();
             let ctx_hex = &context_key.hash().to_hex()[..8];
@@ -4336,6 +4368,7 @@ async fn handle_compile(
             // Build artifact — multi-output for Rustc, single output for C/C++.
             let t_artifact_build = std::time::Instant::now();
             if let Some(ref all_outputs) = rustc_all_outputs {
+                let t_artifact_meta_build = std::time::Instant::now();
                 let artifact_bytes: u64 = all_outputs.iter().map(|o| o.size).sum();
                 let output_names: Vec<String> =
                     all_outputs.iter().map(|o| o.name.clone()).collect();
@@ -4343,23 +4376,35 @@ async fn handle_compile(
                 let payload_paths: Vec<NormalizedPath> = (0..all_outputs.len())
                     .map(|i| state.artifact_dir.join(format!("{artifact_key_hex}_{i}")))
                     .collect();
+                artifact_meta_build_ns = t_artifact_meta_build.elapsed().as_nanos() as u64;
 
                 let mut snapshot_ok = true;
+                let t_rust_snapshot = std::time::Instant::now();
                 for (output, cache_path) in all_outputs.iter().zip(payload_paths.iter()) {
-                    if let Err(e) = persist_artifact_file(cache_path, &output.path) {
-                        snapshot_ok = false;
-                        tracing::warn!(
-                            source = %output.path.display(),
-                            cache = %cache_path.display(),
-                            "failed to snapshot rustc output: {e}"
-                        );
-                        break;
+                    match persist_artifact_file(cache_path, &output.path) {
+                        Ok(stats) => {
+                            rust_snapshot_hardlink_count += stats.hardlink_count;
+                            rust_snapshot_copy_count += stats.copy_count;
+                            rust_snapshot_copy_bytes += stats.copy_bytes;
+                        }
+                        Err(e) => {
+                            rust_snapshot_error_count += 1;
+                            snapshot_ok = false;
+                            tracing::warn!(
+                                source = %output.path.display(),
+                                cache = %cache_path.display(),
+                                "failed to snapshot rustc output: {e}"
+                            );
+                            break;
+                        }
                     }
                 }
+                rust_snapshot_ns = t_rust_snapshot.elapsed().as_nanos() as u64;
                 artifact_build_ns = t_artifact_build.elapsed().as_nanos() as u64;
 
                 let t_artifact_insert_stats = std::time::Instant::now();
                 if snapshot_ok {
+                    let t_artifact_index_build = std::time::Instant::now();
                     let meta = ArtifactIndex::new(
                         output_names,
                         output_sizes,
@@ -4367,14 +4412,21 @@ async fn handle_compile(
                         Arc::clone(&stderr),
                         exit_code,
                     );
+                    artifact_index_build_ns = t_artifact_index_build.elapsed().as_nanos() as u64;
+                    let t_artifact_index_persist = std::time::Instant::now();
                     if let Err(e) = state.artifact_store.insert(&artifact_key_hex, &meta) {
                         tracing::warn!(
                             key = %artifact_key_hex,
                             "failed to persist artifact index: {e}"
                         );
                     }
+                    artifact_index_persist_ns =
+                        t_artifact_index_persist.elapsed().as_nanos() as u64;
+                    let t_artifact_memory_insert = std::time::Instant::now();
                     let cached = CachedArtifact::from_file_payloads(meta, payload_paths);
                     state.artifacts.insert(artifact_key_hex, cached);
+                    artifact_memory_insert_ns =
+                        t_artifact_memory_insert.elapsed().as_nanos() as u64;
                 }
 
                 let latency_ns = compile_start.elapsed().as_nanos() as u64;
@@ -4509,18 +4561,24 @@ async fn handle_compile(
             eprintln!(
                 concat!(
                     "zccache_rust_miss_profile ",
-                    "mode={} total_ns={} pre_exec_ns={} system_includes_ns={} ",
+                    "mode={} compiler_priority={} total_ns={} pre_exec_ns={} system_includes_ns={} ",
                     "system_watch_ns={} parse_args_ns={} build_context_ns={} ",
                     "hash_source_ns={} hash_headers_ns={} depgraph_check_ns={} ",
-                    "pre_exec_other_ns={} compiler_prep_ns={} compiler_process_ns={} ",
+                    "pre_exec_other_ns={} break_outputs_ns={} compiler_prep_ns={} compiler_process_ns={} ",
                     "post_exec_ns={} apply_changes_ns={} collect_outputs_ns={} ",
                     "outputs={} output_bytes={} include_scan_ns={} ",
                     "register_tracked_ns={} dep_dirs_ns={} hash_all_ns={} ",
                     "artifact_store_ns={} depgraph_update_ns={} artifact_build_ns={} ",
+                    "artifact_meta_build_ns={} rust_snapshot_ns={} ",
+                    "rust_snapshot_hardlink_count={} rust_snapshot_copy_count={} ",
+                    "rust_snapshot_copy_bytes={} rust_snapshot_error_count={} ",
                     "persist_enqueue_ns={} artifact_insert_stats_ns={} ",
+                    "artifact_index_build_ns={} artifact_index_persist_ns={} ",
+                    "artifact_memory_insert_ns={} ",
                     "artifact_store_other_ns={} unaccounted_ns={}"
                 ),
                 rust_profile_mode,
+                compiler_priority.as_str(),
                 total_ns,
                 pre_exec_ns,
                 system_includes_ns,
@@ -4531,6 +4589,7 @@ async fn handle_compile(
                 hash_headers_ns,
                 depgraph_check_ns,
                 pre_exec_other_ns,
+                break_outputs_ns,
                 compiler_prep_ns,
                 compiler_process_ns,
                 post_exec_ns,
@@ -4545,8 +4604,17 @@ async fn handle_compile(
                 artifact_store_ns,
                 depgraph_update_ns,
                 artifact_build_ns,
+                artifact_meta_build_ns,
+                rust_snapshot_ns,
+                rust_snapshot_hardlink_count,
+                rust_snapshot_copy_count,
+                rust_snapshot_copy_bytes,
+                rust_snapshot_error_count,
                 persist_enqueue_ns,
                 artifact_insert_stats_ns,
+                artifact_index_build_ns,
+                artifact_index_persist_ns,
+                artifact_memory_insert_ns,
                 artifact_store_other_ns,
                 unaccounted_ns,
             );
@@ -6872,6 +6940,26 @@ exit /b 0
             !same_file(&out, &cache),
             "cache path replacement should break the hardlink relationship"
         );
+    }
+
+    #[test]
+    fn persist_artifact_file_reports_hardlink_snapshot_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("libunit.rlib");
+        let cache = dir.path().join("artifact-key_0");
+        let content = b"compiled rust artifact";
+        std::fs::write(&source, content).unwrap();
+
+        let stats = persist_artifact_file(&cache, &source).unwrap();
+
+        assert_eq!(std::fs::read(&cache).unwrap(), content);
+        assert!(
+            same_file(&source, &cache),
+            "same-directory snapshots should use a hardlink"
+        );
+        assert_eq!(stats.hardlink_count, 1);
+        assert_eq!(stats.copy_count, 0);
+        assert_eq!(stats.copy_bytes, 0);
     }
 
     /// Regression test for issue #197: a cache hit hardlinks the target

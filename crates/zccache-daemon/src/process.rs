@@ -49,6 +49,15 @@ impl CompilePriority {
         }
     }
 
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Low => "low",
+            Self::Idle => "idle",
+            Self::High => "high",
+        }
+    }
+
     fn parse_or_warn(value: &str) -> Self {
         match Self::parse(value) {
             Ok(priority) => priority,
@@ -340,6 +349,14 @@ mod tests {
             CompilePriority::High
         );
         assert!(CompilePriority::parse("fast").is_err());
+    }
+
+    #[test]
+    fn formats_compile_priority_for_profiles() {
+        assert_eq!(CompilePriority::Normal.as_str(), "normal");
+        assert_eq!(CompilePriority::Low.as_str(), "low");
+        assert_eq!(CompilePriority::Idle.as_str(), "idle");
+        assert_eq!(CompilePriority::High.as_str(), "high");
     }
 
     #[test]
