@@ -72,6 +72,67 @@ struct RspCacheEntry {
 }
 
 #[derive(Clone)]
+struct CompilerHashEntry {
+    mtime: std::time::SystemTime,
+    size: u64,
+    hash: ContentHash,
+}
+
+#[derive(Default)]
+struct CompilerHashCache {
+    entries: DashMap<NormalizedPath, CompilerHashEntry>,
+}
+
+impl CompilerHashCache {
+    fn new() -> Self {
+        Self {
+            entries: DashMap::new(),
+        }
+    }
+
+    fn clear(&self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn get_or_hash(&self, path: &Path) -> Option<ContentHash> {
+        self.get_or_hash_with(path, |path| zccache_hash::hash_file(path).ok())
+    }
+
+    fn get_or_hash_with<F>(&self, path: &Path, hasher: F) -> Option<ContentHash>
+    where
+        F: FnOnce(&Path) -> Option<ContentHash>,
+    {
+        let metadata = std::fs::metadata(path).ok()?;
+        let mtime = metadata.modified().ok()?;
+        let size = metadata.len();
+        let key = NormalizedPath::new(path);
+
+        if let Some(entry) = self.entries.get(&key) {
+            if entry.mtime == mtime && entry.size == size {
+                return Some(entry.hash);
+            }
+        }
+
+        let hash = hasher(path)?;
+        let post_metadata = std::fs::metadata(path).ok()?;
+        let post_mtime = post_metadata.modified().ok()?;
+        let post_size = post_metadata.len();
+        if post_mtime != mtime || post_size != size {
+            return Some(hash);
+        }
+
+        self.entries
+            .insert(key, CompilerHashEntry { mtime, size, hash });
+        Some(hash)
+    }
+}
+
+#[derive(Clone)]
 /// Cached compilation artifact with lazy payload loading.
 ///
 /// Metadata (output names, sizes, stdout, stderr, exit code) is always in
@@ -267,6 +328,8 @@ struct SharedState {
     /// discovery, watch_directories, response file expansion, arg parsing,
     /// context building, and dep_graph registration.
     request_cache: DashMap<ContentHash, RequestCacheEntry>,
+    /// Compiler executable hash cache keyed by compiler path.
+    compiler_hash_cache: CompilerHashCache,
     /// Pre-filter for watch_directories: raw (non-canonicalized) paths we've
     /// already processed. Avoids expensive canonicalize() syscalls (~1-5ms each
     /// on Windows) for directories that are already being watched.
@@ -457,6 +520,7 @@ impl DaemonServer {
                 watcher_active: AtomicBool::new(false),
                 rsp_cache: DashMap::new(),
                 request_cache: DashMap::new(),
+                compiler_hash_cache: CompilerHashCache::new(),
                 watched_raw_dirs: DashMap::new(),
                 pch_source_map: DashMap::new(),
                 journal: CompileJournal::new(zccache_core::config::log_dir()),
@@ -1271,6 +1335,7 @@ async fn handle_clear(state: &SharedState) -> Response {
     state.fast_hit_cache.clear();
     state.request_cache.clear();
     state.rsp_cache.clear();
+    state.compiler_hash_cache.clear();
     state.watched_raw_dirs.clear();
     state.system_includes.lock().await.clear();
     state.watched_dirs.lock().await.clear();
@@ -2023,9 +2088,10 @@ fn build_compile_context(
     cwd: &Path,
     system_includes: &[NormalizedPath],
     client_env: &[(String, String)],
+    compiler_hash_cache: &CompilerHashCache,
 ) -> BuildContextResult {
     if compilation.family == zccache_compiler::CompilerFamily::Rustc {
-        return build_rustc_compile_context(compilation, cwd, client_env);
+        return build_rustc_compile_context(compilation, cwd, client_env, compiler_hash_cache);
     }
 
     // Dispatch to the correct parser based on compiler family.
@@ -2063,12 +2129,13 @@ fn build_rustc_compile_context(
     compilation: &zccache_compiler::CacheableCompilation,
     cwd: &Path,
     client_env: &[(String, String)],
+    compiler_hash_cache: &CompilerHashCache,
 ) -> BuildContextResult {
     let rustc_args = zccache_depgraph::parse_rustc_args(&compilation.original_args, cwd);
 
     // Hash the rustc binary for compiler version identity.
     // Different rustc versions produce different output for the same source.
-    let compiler_hash = zccache_hash::hash_file(&compilation.compiler).ok();
+    let compiler_hash = compiler_hash_cache.get_or_hash(&compilation.compiler);
 
     let rustc_ctx = zccache_depgraph::RustcCompileContext::from_parsed_args(
         &rustc_args,
@@ -3052,7 +3119,13 @@ async fn handle_compile(
     // ── Phase: build context + register ──────────────────────────────
     let t1 = std::time::Instant::now();
     let env_slice = client_env.as_deref().unwrap_or(&[]);
-    let build_result = build_compile_context(&compilation, &cwd_path, &system_includes, env_slice);
+    let build_result = build_compile_context(
+        &compilation,
+        &cwd_path,
+        &system_includes,
+        env_slice,
+        &state.compiler_hash_cache,
+    );
     let (ctx, dep_flags, rustc_args_opt, context_key) = match build_result {
         BuildContextResult::Cc { ctx, dep_flags } => {
             let key = state
@@ -4017,7 +4090,13 @@ fn check_unit_cache(
             },
         )
     } else {
-        match build_compile_context(compilation, cwd_path, system_includes, &[]) {
+        match build_compile_context(
+            compilation,
+            cwd_path,
+            system_includes,
+            &[],
+            &state.compiler_hash_cache,
+        ) {
             BuildContextResult::Cc { ctx, dep_flags } => (ctx, dep_flags),
             BuildContextResult::Rustc { compat_ctx, .. } => (compat_ctx, UserDepFlags::default()),
         }
@@ -4791,6 +4870,109 @@ mod tests {
         let mut bytes = [0; 32];
         bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
         ContentHash::from_bytes(bytes)
+    }
+
+    #[test]
+    fn compiler_hash_cache_reuses_hash_for_unchanged_compiler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let compiler = tmp.path().join("rustc.exe");
+        std::fs::write(&compiler, b"fake rustc").unwrap();
+
+        let cache = CompilerHashCache::new();
+        let hash_calls = AtomicUsize::new(0);
+        let first = cache.get_or_hash_with(&compiler, |_| {
+            hash_calls.fetch_add(1, Ordering::Relaxed);
+            Some(ContentHash::from_bytes([7; 32]))
+        });
+        let second = cache.get_or_hash_with(&compiler, |_| {
+            hash_calls.fetch_add(1, Ordering::Relaxed);
+            Some(ContentHash::from_bytes([9; 32]))
+        });
+
+        assert_eq!(first, Some(ContentHash::from_bytes([7; 32])));
+        assert_eq!(second, first);
+        assert_eq!(hash_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn compiler_hash_cache_rehashes_when_compiler_metadata_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let compiler = tmp.path().join("rustc.exe");
+        std::fs::write(&compiler, b"fake rustc").unwrap();
+        filetime::set_file_mtime(
+            &compiler,
+            filetime::FileTime::from_unix_time(1_000_000_000, 0),
+        )
+        .unwrap();
+
+        let cache = CompilerHashCache::new();
+        let hash_calls = AtomicUsize::new(0);
+        let first = cache.get_or_hash_with(&compiler, |_| {
+            hash_calls.fetch_add(1, Ordering::Relaxed);
+            Some(ContentHash::from_bytes([1; 32]))
+        });
+
+        std::fs::write(&compiler, b"fake rustc changed").unwrap();
+        filetime::set_file_mtime(
+            &compiler,
+            filetime::FileTime::from_unix_time(1_000_000_010, 0),
+        )
+        .unwrap();
+
+        let second = cache.get_or_hash_with(&compiler, |_| {
+            hash_calls.fetch_add(1, Ordering::Relaxed);
+            Some(ContentHash::from_bytes([2; 32]))
+        });
+
+        assert_eq!(first, Some(ContentHash::from_bytes([1; 32])));
+        assert_eq!(second, Some(ContentHash::from_bytes([2; 32])));
+        assert_eq!(hash_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn rustc_context_build_reuses_compiler_hash_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let compiler = tmp.path().join("rustc.exe");
+        let source = tmp.path().join("lib.rs");
+        let output = tmp.path().join("libunit.rmeta");
+        std::fs::write(&compiler, b"fake rustc").unwrap();
+        std::fs::write(&source, b"pub fn unit() {}").unwrap();
+
+        let args: Vec<String> = vec![
+            "--crate-name".into(),
+            "unit".into(),
+            "--edition".into(),
+            "2021".into(),
+            "--emit=dep-info,metadata".into(),
+            source.to_string_lossy().into_owned(),
+            "-o".into(),
+            output.to_string_lossy().into_owned(),
+        ];
+        let compilation = zccache_compiler::CacheableCompilation {
+            compiler: compiler.clone().into(),
+            family: zccache_compiler::CompilerFamily::Rustc,
+            source_file: source.clone().into(),
+            output_file: output.into(),
+            original_args: std::sync::Arc::from(args),
+            unknown_flags: Vec::new(),
+        };
+        let cache = CompilerHashCache::new();
+        let expected_hash = zccache_hash::hash_file(&compiler).ok();
+
+        let first = build_rustc_compile_context(&compilation, tmp.path(), &[], &cache);
+        let second = build_rustc_compile_context(&compilation, tmp.path(), &[], &cache);
+
+        let first_hash = match first {
+            BuildContextResult::Rustc { rustc_ctx, .. } => rustc_ctx.compiler_hash,
+            BuildContextResult::Cc { .. } => panic!("expected rustc context"),
+        };
+        let second_hash = match second {
+            BuildContextResult::Rustc { rustc_ctx, .. } => rustc_ctx.compiler_hash,
+            BuildContextResult::Cc { .. } => panic!("expected rustc context"),
+        };
+        assert_eq!(first_hash, expected_hash);
+        assert_eq!(second_hash, expected_hash);
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
