@@ -1,11 +1,11 @@
 """Generate durable zccache benchmark stats artifacts.
 
 The benchmark runner reuses `perf_bench_test` and turns its markdown tables into
-three generated files suitable for publishing from an orphan branch:
+generated files suitable for publishing from an orphan branch:
 
 - `index.html` for humans
 - `latest.json` for machines
-- `benchmark.jpg` for README embedding
+- `benchmark-c.jpg`, `benchmark-cpp.jpg`, and `benchmark-rust.jpg` for README embedding
 """
 
 from __future__ import annotations
@@ -28,9 +28,20 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "benchmark-stats"
 DEFAULT_PAGES_URL = "https://zackees.github.io/zccache/"
-DEFAULT_RAW_IMAGE_URL = (
-    "https://raw.githubusercontent.com/zackees/zccache/benchmark-stats/benchmark.jpg"
-)
+DEFAULT_RAW_IMAGE_BASE_URL = "https://raw.githubusercontent.com/zackees/zccache/benchmark-stats"
+BENCHMARK_STATS_BRANCH_URL = "https://github.com/zackees/zccache/tree/benchmark-stats"
+LANGUAGES = ("c", "c++", "rust")
+LANGUAGE_LABELS = {"c": "C", "c++": "C++", "rust": "Rust"}
+LANGUAGE_IMAGE_FILES = {
+    "c": "benchmark-c.jpg",
+    "c++": "benchmark-cpp.jpg",
+    "rust": "benchmark-rust.jpg",
+}
+RATIO_COLORS = {
+    "faster": "#3fb950",
+    "slower": "#f85149",
+    "neutral": "#8b949e",
+}
 BENCHMARK_BASE_COMMAND = [
     "soldr",
     "--no-cache",
@@ -151,6 +162,9 @@ def _git_ref() -> str | None:
 def collect_metadata() -> dict[str, Any]:
     run_id = os.environ.get("GITHUB_RUN_ID")
     repository = os.environ.get("GITHUB_REPOSITORY", "zackees/zccache")
+    raw_image_base_url = os.environ.get(
+        "ZCCACHE_BENCHMARK_RAW_BASE_URL", DEFAULT_RAW_IMAGE_BASE_URL
+    ).rstrip("/")
     run_url = None
     if run_id:
         run_url = f"https://github.com/{repository}/actions/runs/{run_id}"
@@ -175,7 +189,11 @@ def collect_metadata() -> dict[str, Any]:
         },
         "benchmark_command": " ".join(BENCHMARK_COMMAND),
         "pages_url": os.environ.get("ZCCACHE_BENCHMARK_PAGES_URL", DEFAULT_PAGES_URL),
-        "raw_image_url": os.environ.get("ZCCACHE_BENCHMARK_IMAGE_URL", DEFAULT_RAW_IMAGE_URL),
+        "raw_image_base_url": raw_image_base_url,
+        "raw_image_urls": {
+            language: f"{raw_image_base_url}/{image_file}"
+            for language, image_file in LANGUAGE_IMAGE_FILES.items()
+        },
     }
 
 
@@ -289,6 +307,18 @@ def _format_ratio(value: float | None) -> str:
     return f"{1 / value:.1f}x slower"
 
 
+def ratio_tone(value: float | None) -> str:
+    if value is None or value == 1:
+        return "neutral"
+    if value > 1:
+        return "faster"
+    return "slower"
+
+
+def ratio_color(value: float | None) -> str:
+    return RATIO_COLORS[ratio_tone(value)]
+
+
 def build_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     warm = [row for row in results if row["mode"] == "warm"]
     cold = [row for row in results if row["mode"] == "cold"]
@@ -327,6 +357,13 @@ def _grouped_results(results: list[dict[str, Any]]) -> dict[str, list[dict[str, 
     return groups
 
 
+def group_results_by_language(results: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    return {
+        language: [row for row in results if row["language"] == language]
+        for language in LANGUAGES
+    }
+
+
 def render_html(payload: dict[str, Any]) -> str:
     metadata = payload["metadata"]
     rows_html: list[str] = []
@@ -355,6 +392,21 @@ def render_html(payload: dict[str, Any]) -> str:
     if metadata.get("run_url"):
         run_link = f" | <a href=\"{escape(metadata['run_url'])}\">workflow run</a>"
 
+    image_links = "\n".join(
+        f'<li><a href="{escape(image_file)}">{escape(image_file)}</a></li>'
+        for image_file in LANGUAGE_IMAGE_FILES.values()
+    )
+    image_figures = "\n".join(
+        "<figure>"
+        f'<a href="{escape(image_file)}">'
+        f'<img src="{escape(image_file)}" '
+        f'alt="Latest zccache {escape(LANGUAGE_LABELS[language])} benchmark stats" />'
+        "</a>"
+        f"<figcaption>{escape(LANGUAGE_LABELS[language])}</figcaption>"
+        "</figure>"
+        for language, image_file in LANGUAGE_IMAGE_FILES.items()
+    )
+
     return f"""<!doctype html>
 <html lang="en">
   <head>
@@ -366,8 +418,8 @@ def render_html(payload: dict[str, Any]) -> str:
         margin: 0;
         padding: 32px 20px 44px;
         font-family: Arial, sans-serif;
-        color: #202426;
-        background: #f7f8f8;
+        color: #f0f6fc;
+        background: #0d1117;
       }}
       main {{
         max-width: 1080px;
@@ -385,12 +437,29 @@ def render_html(payload: dict[str, Any]) -> str:
         line-height: 1.5;
       }}
       .meta {{
-        color: #556166;
+        color: #8b949e;
       }}
       .note {{
         padding: 12px 14px;
-        background: #eef2f3;
-        border: 1px solid #d9e0e3;
+        background: #161b22;
+        border: 1px solid #30363d;
+      }}
+      a {{
+        color: #58a6ff;
+      }}
+      .images {{
+        display: grid;
+        gap: 16px;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        margin: 20px 0;
+      }}
+      figure {{
+        margin: 0;
+      }}
+      figcaption {{
+        color: #8b949e;
+        font-size: 13px;
+        margin-top: 6px;
       }}
       .table-wrap {{
         overflow-x: auto;
@@ -400,23 +469,23 @@ def render_html(payload: dict[str, Any]) -> str:
         min-width: 820px;
         border-collapse: collapse;
         margin-top: 18px;
-        background: white;
+        background: #161b22;
       }}
       th, td {{
-        border: 1px solid #d9e0e3;
+        border: 1px solid #30363d;
         padding: 10px 12px;
         text-align: left;
         font-size: 14px;
       }}
       thead th, tr.group th {{
-        background: #e9eef0;
+        background: #21262d;
       }}
       .strong {{
         font-weight: 700;
       }}
       img {{
         max-width: 100%;
-        border: 1px solid #d9e0e3;
+        border: 1px solid #30363d;
       }}
     </style>
   </head>
@@ -430,9 +499,14 @@ def render_html(payload: dict[str, Any]) -> str:
       </p>
       <p class="note">
         Raw machine-readable data: <a href="latest.json">latest.json</a>.
-        README image: <a href="benchmark.jpg">benchmark.jpg</a>.
+        Per-language README images:
       </p>
-      <p><img src="benchmark.jpg" alt="Latest zccache benchmark summary" /></p>
+      <ul>
+        {image_links}
+      </ul>
+      <div class="images">
+        {image_figures}
+      </div>
       <div class="table-wrap">
         <table>
           <thead>
@@ -482,116 +556,207 @@ def _font(size: int, bold: bool = False) -> Any:
     return ImageFont.load_default()
 
 
-def _truncate(value: str, limit: int) -> str:
-    if len(value) <= limit:
+def _text_width(draw: Any, value: str, font: Any) -> int:
+    bbox = draw.textbbox((0, 0), value, font=font)
+    return bbox[2] - bbox[0]
+
+
+def _truncate_to_width(draw: Any, value: str, font: Any, max_width: int) -> str:
+    if _text_width(draw, value, font) <= max_width:
         return value
-    return value[: max(0, limit - 3)].rstrip() + "..."
+    ellipsis = "..."
+    if _text_width(draw, ellipsis, font) > max_width:
+        return ""
+    while value and _text_width(draw, value.rstrip() + ellipsis, font) > max_width:
+        value = value[:-1]
+    return value.rstrip() + ellipsis
 
 
-def build_image_rows(results: list[dict[str, Any]]) -> list[dict[str, str]]:
-    labels = {"c": "C", "c++": "C++", "rust": "Rust"}
+def build_image_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
-            "language": labels.get(str(row["language"]), str(row["language"])),
+            "language": LANGUAGE_LABELS.get(str(row["language"]), str(row["language"])),
             "scenario": f"{row['benchmark_label']} - {row['scenario']}",
+            "mode": row["mode"],
             "bare": _format_seconds(row["bare_seconds"]),
             "sccache": _format_seconds(row["sccache_seconds"]),
             "zccache": _format_seconds(row["zccache_seconds"]),
             "vs_sccache": _format_ratio(row["zccache_vs_sccache_ratio"]),
             "vs_bare": _format_ratio(row["zccache_vs_bare_ratio"]),
+            "zccache_vs_sccache_ratio": row["zccache_vs_sccache_ratio"],
+            "zccache_vs_bare_ratio": row["zccache_vs_bare_ratio"],
         }
         for row in results
     ]
 
 
-def render_jpg(payload: dict[str, Any], path: Path) -> None:
+def _section_rows(rows: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
+    return [row for row in rows if row["mode"] == mode]
+
+
+def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> None:
     try:
         from PIL import Image, ImageDraw
     except ImportError as exc:
         raise SystemExit(
-            "Pillow is required to write benchmark.jpg. Install it with `uv run --with pillow` "
-            "or `python -m pip install Pillow`."
+            "Pillow is required to write benchmark JPGs. Install it with "
+            "`uv run --with pillow` or `python -m pip install Pillow`."
         ) from exc
 
-    rows = build_image_rows(payload["results"])
-    width = 1600
-    row_h = 44
-    table_y = 174
-    header_h = 44
-    footer_h = 90
-    height = max(760, table_y + header_h + row_h * max(1, len(rows)) + footer_h)
-    image = Image.new("RGB", (width, height), "#f7f8f8")
+    rows = build_image_rows(group_results_by_language(payload["results"])[language])
+    title = f"zccache {LANGUAGE_LABELS[language]} benchmarks"
+    width = 1240
+    margin = 32
+    row_h = 36
+    section_h = 30
+    header_h = 38
+    table_y = 134
+    footer_h = 58
+    section_count = 2
+    rendered_row_count = max(1, len(rows))
+    height = max(
+        420,
+        table_y + header_h + section_h * section_count + row_h * rendered_row_count + footer_h,
+    )
+    scale = 2
+    image = Image.new("RGB", (width * scale, height * scale), "#0d1117")
     draw = ImageDraw.Draw(image)
-    title_font = _font(44, bold=True)
-    subtitle_font = _font(22)
-    header_font = _font(19, bold=True)
-    row_font = _font(18)
-    row_bold_font = _font(18, bold=True)
-    small_font = _font(16)
+    title_font = _font(30 * scale, bold=True)
+    subtitle_font = _font(13 * scale)
+    header_font = _font(13 * scale, bold=True)
+    section_font = _font(14 * scale, bold=True)
+    row_font = _font(13 * scale)
+    row_bold_font = _font(13 * scale, bold=True)
+    small_font = _font(12 * scale)
 
-    draw.rectangle((0, 0, width, 108), fill="#202426")
-    draw.text((42, 28), "zccache benchmark stats", font=title_font, fill="#ffffff")
+    def box(values: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        return tuple(value * scale for value in values)
+
+    def point(x: int, y: int) -> tuple[int, int]:
+        return x * scale, y * scale
+
+    draw.rectangle(box((0, 0, width, height)), fill="#0d1117")
+    draw.rectangle(box((0, 0, width, 106)), fill="#161b22")
+    draw.text(point(margin, 24), title, font=title_font, fill="#f0f6fc")
     metadata = payload["metadata"]
     sha = (metadata.get("git_sha") or "n/a")[:12]
+    runner = metadata.get("runner", {}).get("platform") or "n/a"
+    metadata_line = (
+        f"Generated {metadata['generated_at']} | ref {metadata.get('git_ref') or 'n/a'} | "
+        f"sha {sha} | runner {runner}"
+    )
     draw.text(
-        (42, 120),
-        f"Generated {metadata['generated_at']} | {metadata.get('git_ref') or 'n/a'} | {sha}",
+        point(margin, 72),
+        _truncate_to_width(draw, metadata_line, subtitle_font, (width - margin * 2) * scale),
         font=subtitle_font,
-        fill="#38464b",
+        fill="#8b949e",
     )
 
-    x0, y0 = 42, table_y
-    table_w = width - 84
-    headers = ["Lang", "Scenario", "Bare", "sccache", "zccache", "vs sccache", "vs bare"]
-    widths = [96, 520, 145, 145, 145, 190, 190]
+    x0, y0 = margin, table_y
+    table_w = width - margin * 2
+    headers = ["Scenario", "Bare", "sccache", "zccache", "vs sccache", "vs bare"]
+    widths = [470, 120, 120, 120, 150, 150]
+    padding_x = 14
 
-    draw.rounded_rectangle((x0, y0, x0 + table_w, y0 + header_h), radius=8, fill="#dfe7ea")
-    x = x0 + 14
+    draw.rounded_rectangle(
+        box((x0, y0, x0 + table_w, y0 + header_h)),
+        radius=8 * scale,
+        fill="#21262d",
+        outline="#30363d",
+        width=scale,
+    )
+    x = x0 + padding_x
     for header, col_w in zip(headers, widths):
-        draw.text((x, y0 + 12), header, font=header_font, fill="#202426")
+        draw.text(point(x, y0 + 11), header, font=header_font, fill="#c9d1d9")
         x += col_w
 
     y = y0 + header_h
     if not rows:
-        draw.rectangle((x0, y, x0 + table_w, y + row_h), fill="#ffffff")
+        draw.rectangle(box((x0, y, x0 + table_w, y + row_h)), fill="#161b22")
         draw.text(
-            (x0 + 14, y + 12),
+            point(x0 + padding_x, y + 10),
             "Benchmark data is not available yet.",
             font=row_font,
-            fill="#202426",
+            fill="#f0f6fc",
         )
-    for index, row in enumerate(rows):
-        fill = "#ffffff" if index % 2 == 0 else "#f1f4f5"
-        draw.rectangle((x0, y, x0 + table_w, y + row_h), fill=fill)
-        values = [
-            row["language"],
-            _truncate(row["scenario"], 58),
-            row["bare"],
-            row["sccache"],
-            row["zccache"],
-            row["vs_sccache"],
-            row["vs_bare"],
-        ]
-        x = x0 + 14
-        for column_index, (value, col_w) in enumerate(zip(values, widths)):
-            color = "#0f6b44" if column_index == 4 else "#202426"
-            font = row_bold_font if column_index in {0, 4} else row_font
-            draw.text((x, y + 12), value, font=font, fill=color)
-            x += col_w
         y += row_h
-
-    best = payload["summary"].get("best_warm_vs_sccache")
-    if best:
-        line = (
-            f"Best warm result: {best['benchmark_label']} {best['scenario']} "
-            f"at {_format_ratio(best['zccache_vs_sccache_ratio'])} than sccache."
-        )
     else:
-        line = "Benchmark data is not available yet."
-    draw.rounded_rectangle((42, height - 72, width - 42, height - 24), radius=8, fill="#202426")
-    draw.text((62, height - 57), _truncate(line, 150), font=small_font, fill="#ffffff")
+        section_styles = {
+            "cold": {
+                "title": "Cold",
+                "section": "#10233a",
+                "row": "#0f1b2d",
+                "row_alt": "#11243a",
+                "accent": "#79c0ff",
+            },
+            "warm": {
+                "title": "Warm",
+                "section": "#2f2110",
+                "row": "#241a0f",
+                "row_alt": "#2b1f12",
+                "accent": "#ffa657",
+            },
+        }
+        for mode in ("cold", "warm"):
+            style = section_styles[mode]
+            draw.rectangle(box((x0, y, x0 + table_w, y + section_h)), fill=style["section"])
+            draw.text(
+                point(x0 + padding_x, y + 7),
+                style["title"],
+                font=section_font,
+                fill=style["accent"],
+            )
+            y += section_h
+            for index, row in enumerate(_section_rows(rows, mode)):
+                fill = style["row"] if index % 2 == 0 else style["row_alt"]
+                draw.rectangle(box((x0, y, x0 + table_w, y + row_h)), fill=fill)
+                draw.line(
+                    box((x0, y + row_h, x0 + table_w, y + row_h)),
+                    fill="#30363d",
+                    width=scale,
+                )
+                values = [
+                    row["scenario"],
+                    row["bare"],
+                    row["sccache"],
+                    row["zccache"],
+                    row["vs_sccache"],
+                    row["vs_bare"],
+                ]
+                ratio_values = [
+                    None,
+                    None,
+                    None,
+                    None,
+                    row["zccache_vs_sccache_ratio"],
+                    row["zccache_vs_bare_ratio"],
+                ]
+                x = x0 + padding_x
+                for column_index, (value, col_w) in enumerate(zip(values, widths)):
+                    max_width = (col_w - 18) * scale
+                    text = _truncate_to_width(draw, str(value), row_font, max_width)
+                    color = (
+                        ratio_color(ratio_values[column_index])
+                        if column_index >= 4
+                        else "#c9d1d9"
+                    )
+                    font = row_bold_font if column_index in {3, 4, 5} else row_font
+                    draw.text(point(x, y + 10), text, font=font, fill=color)
+                    x += col_w
+                y += row_h
+
+    draw.rectangle(box((margin, height - 44, width - margin, height - 42)), fill="#30363d")
+    footer = "Artifacts: latest.json, benchmark-c.jpg, benchmark-cpp.jpg, benchmark-rust.jpg"
+    draw.text(
+        point(margin, height - 30),
+        _truncate_to_width(draw, footer, small_font, (width - margin * 2) * scale),
+        font=small_font,
+        fill="#8b949e",
+    )
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
+    image = image.resize((width, height), resampling)
     image.save(path, format="JPEG", quality=90, optimize=True)
 
 
@@ -600,13 +765,22 @@ def write_outputs(payload: dict[str, Any], output_dir: Path) -> None:
     (output_dir / "latest.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     (output_dir / "index.html").write_text(render_html(payload), encoding="utf-8")
     (output_dir / ".nojekyll").write_text("", encoding="utf-8")
-    render_jpg(payload, output_dir / "benchmark.jpg")
+    allowed_images = set(LANGUAGE_IMAGE_FILES.values())
+    for image_path in output_dir.glob("benchmark*.jpg"):
+        if image_path.name not in allowed_images:
+            image_path.unlink()
+    for language, image_file in LANGUAGE_IMAGE_FILES.items():
+        render_language_jpg(payload, language, output_dir / image_file)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--input-log", type=Path, help="Parse an existing perf log instead of running benchmarks.")
+    parser.add_argument(
+        "--input-log",
+        type=Path,
+        help="Parse an existing perf log instead of running benchmarks.",
+    )
     parser.add_argument(
         "--run-benchmarks",
         action="store_true",

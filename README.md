@@ -56,12 +56,18 @@ zccache --version
 
 ## Performance
 
-[![Latest zccache benchmark stats](https://raw.githubusercontent.com/zackees/zccache/benchmark-stats/benchmark.jpg)](https://zackees.github.io/zccache/)
+[![Latest zccache C benchmark stats](https://raw.githubusercontent.com/zackees/zccache/benchmark-stats/benchmark-c.jpg)](https://github.com/zackees/zccache/tree/benchmark-stats)
 
-The benchmark image is generated from the latest scheduled run and replaces
-hand-maintained text stats. Full results and machine-readable JSON are published
-at [zackees.github.io/zccache](https://zackees.github.io/zccache/). Run the same
-suite locally with `./perf`.
+[![Latest zccache C++ benchmark stats](https://raw.githubusercontent.com/zackees/zccache/benchmark-stats/benchmark-cpp.jpg)](https://github.com/zackees/zccache/tree/benchmark-stats)
+
+[![Latest zccache Rust benchmark stats](https://raw.githubusercontent.com/zackees/zccache/benchmark-stats/benchmark-rust.jpg)](https://github.com/zackees/zccache/tree/benchmark-stats)
+
+The benchmark images are generated from the latest scheduled run and replace
+hand-maintained text stats. Full results, rendered HTML, and machine-readable
+JSON are published in the
+[benchmark-stats branch](https://github.com/zackees/zccache/tree/benchmark-stats)
+and at [zackees.github.io/zccache](https://zackees.github.io/zccache/). Run the
+same suite locally with `./perf`.
 
 ### Why is zccache so much faster on warm hits?
 
