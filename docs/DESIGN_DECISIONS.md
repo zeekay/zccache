@@ -600,7 +600,7 @@ v1 is deliberately minimal. The goal is a correct, useful tool for the most comm
 **Consequences:**
 - Disk usage is slightly higher (~1x metadata overhead per artifact).
 - `zccache clear` must delete `.meta` files alongside output files (already handled).
-- Dep graph is NOT persisted — cold compiles still re-discover include dependencies. Only the artifact data survives restarts.
+- Dep graph IS persisted across daemon restarts (issue #262, `<cache_dir>/depgraph/depgraph.bin`). The daemon flushes on graceful shutdown and every 5 minutes while running; the next start loads the snapshot, rejects any version mismatch (`DEPGRAPH_VERSION`), and falls back to an empty graph on any other error. `DaemonStatus.dep_graph_persisted` exposes this state to `zccache status`.
 
 ---
 

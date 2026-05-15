@@ -601,6 +601,7 @@ mod tests {
                 cache_dir: NormalizedPath::from(""),
                 dep_graph_version: 0,
                 dep_graph_disk_size: 0,
+                dep_graph_persisted: false,
             }),
             Response::LookupResult(LR::Miss),
             Response::StoreResult(SR::Stored),

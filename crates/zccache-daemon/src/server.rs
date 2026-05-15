@@ -396,6 +396,14 @@ struct SharedState {
     artifacts_loaded: AtomicBool,
     /// Fingerprint manager: tracks per-watch dirty state for `zccache fp` commands.
     fingerprint: FingerprintManager,
+    /// Whether the in-memory dep graph is backed by a persisted snapshot.
+    ///
+    /// Set to `true` when the graph is loaded from disk on startup (via
+    /// `set_dep_graph`) or when a periodic/shutdown save completes
+    /// successfully. Surfaced in `DaemonStatus.dep_graph_persisted` so the
+    /// CLI can distinguish "persisted graph" from "first-run, not yet flushed"
+    /// without inferring it from the on-disk file size.
+    dep_graph_persisted: AtomicBool,
 }
 
 /// Pre-computed compile request data for the request-level fast path.
@@ -654,6 +662,7 @@ impl DaemonServer {
                 artifact_store,
                 artifacts_loaded: AtomicBool::new(false),
                 fingerprint: FingerprintManager::new(),
+                dep_graph_persisted: AtomicBool::new(false),
             }),
         })
     }
@@ -667,10 +676,12 @@ impl DaemonServer {
     /// Replace the dependency graph with a pre-loaded one.
     ///
     /// Must be called before `run()` (while this is the only Arc holder).
+    /// Marks the graph as persisted because it was restored from disk.
     pub fn set_dep_graph(&mut self, graph: zccache_depgraph::DepGraph) {
         let state =
             Arc::get_mut(&mut self.state).expect("set_dep_graph must be called before run()");
         state.dep_graph = graph;
+        state.dep_graph_persisted.store(true, Ordering::Release);
     }
 
     /// Get a snapshot of the phase profiler (for benchmarks).
@@ -879,7 +890,10 @@ impl DaemonServer {
                         std::fs::create_dir_all(parent).ok();
                     }
                     match zccache_depgraph::save_to_file(&state.dep_graph, &path) {
-                        Ok(()) => tracing::debug!("periodic depgraph save"),
+                        Ok(()) => {
+                            state.dep_graph_persisted.store(true, Ordering::Release);
+                            tracing::debug!("periodic depgraph save");
+                        }
                         Err(e) => tracing::warn!("periodic depgraph save failed: {e}"),
                     }
                 }
@@ -917,10 +931,15 @@ impl DaemonServer {
                         std::fs::create_dir_all(parent).ok();
                     }
                     match zccache_depgraph::save_to_file(&self.state.dep_graph, &path) {
-                        Ok(()) => tracing::info!(
-                            elapsed_ms = start.elapsed().as_millis() as u64,
-                            "depgraph saved"
-                        ),
+                        Ok(()) => {
+                            self.state
+                                .dep_graph_persisted
+                                .store(true, Ordering::Release);
+                            tracing::info!(
+                                elapsed_ms = start.elapsed().as_millis() as u64,
+                                "depgraph saved"
+                            );
+                        }
                         Err(e) => tracing::warn!("depgraph save failed: {e}"),
                     }
 
@@ -1169,6 +1188,7 @@ async fn handle_connection(
                             .metadata()
                             .map(|m| m.len())
                             .unwrap_or(0),
+                        dep_graph_persisted: state.dep_graph_persisted.load(Ordering::Acquire),
                     }),
                     None,
                 )
