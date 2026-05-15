@@ -276,15 +276,25 @@ pub fn log_dir() -> NormalizedPath {
     log_dir_from_cache_dir(&default_cache_dir())
 }
 
-fn artifacts_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+/// Returns the artifact directory under an explicit cache root.
+///
+/// Use this when the caller already has a cache dir (e.g. a test passing a
+/// per-test temp dir) and wants to avoid the global env-var lookup in
+/// [`default_cache_dir`].
+#[must_use]
+pub fn artifacts_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
     cache_dir.join("artifacts")
 }
 
-fn tmp_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+/// Returns the tmp directory under an explicit cache root.
+#[must_use]
+pub fn tmp_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
     cache_dir.join("tmp")
 }
 
-fn depfile_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+/// Returns the depfile directory under an explicit cache root.
+#[must_use]
+pub fn depfile_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
     tmp_dir_from_cache_dir(cache_dir).join("depfiles")
 }
 
@@ -292,7 +302,9 @@ fn depgraph_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
     cache_dir.join("depgraph")
 }
 
-fn index_path_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+/// Returns the redb artifact index path under an explicit cache root.
+#[must_use]
+pub fn index_path_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
     cache_dir.join("index.redb")
 }
 
@@ -300,7 +312,9 @@ fn crash_dump_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
     cache_dir.join("crashes")
 }
 
-fn log_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+/// Returns the log directory under an explicit cache root.
+#[must_use]
+pub fn log_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
     cache_dir.join("logs")
 }
 

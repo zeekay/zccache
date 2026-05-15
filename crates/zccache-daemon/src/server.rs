@@ -602,13 +602,29 @@ static SERVER_INSTANCE: AtomicU64 = AtomicU64::new(0);
 static ARTIFACT_PERSIST_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl DaemonServer {
-    /// Create a new daemon server bound to the given endpoint.
+    /// Create a new daemon server bound to the given endpoint, using the
+    /// configured cache directory (resolved via [`zccache_core::config::default_cache_dir`]).
+    ///
+    /// Production callers should use this. Tests that need to isolate their
+    /// cache directory must use [`Self::bind_with_cache_dir`] instead — this
+    /// reads `ZCCACHE_CACHE_DIR` from a process-global env, which races when
+    /// multiple tests run in parallel.
     pub fn bind(endpoint: &str) -> Result<Self, zccache_ipc::IpcError> {
+        Self::bind_with_cache_dir(endpoint, &zccache_core::config::default_cache_dir())
+    }
+
+    /// Create a new daemon server bound to the given endpoint, rooted at an
+    /// explicit cache directory. Bypasses the `ZCCACHE_CACHE_DIR` env var so
+    /// parallel tests can each operate in isolation.
+    pub fn bind_with_cache_dir(
+        endpoint: &str,
+        cache_dir: &zccache_core::NormalizedPath,
+    ) -> Result<Self, zccache_ipc::IpcError> {
         let listener = IpcListener::bind(endpoint)?;
         let shutdown = Arc::new(Notify::new());
         let now = now_secs();
         let instance = SERVER_INSTANCE.fetch_add(1, Ordering::Relaxed);
-        let artifact_dir = zccache_core::config::artifacts_dir();
+        let artifact_dir = zccache_core::config::artifacts_dir_from_cache_dir(cache_dir);
         std::fs::create_dir_all(&artifact_dir).ok();
 
         // Artifact loading is deferred to a background task in run() so the
@@ -616,7 +632,7 @@ impl DaemonServer {
         let artifacts: DashMap<String, CachedArtifact> = DashMap::new();
 
         // Open redb artifact index for fast startup + persistence.
-        let index_path = zccache_core::config::index_path();
+        let index_path = zccache_core::config::index_path_from_cache_dir(cache_dir);
         let artifact_store = ArtifactStore::open(&index_path).map_err(|e| {
             zccache_ipc::IpcError::Io(std::io::Error::other(format!(
                 "failed to open artifact index at {}: {e}",
@@ -642,7 +658,7 @@ impl DaemonServer {
                 profiler: PhaseProfiler::new(),
                 artifact_dir,
                 depfile_tmpdir: {
-                    let dir = zccache_core::config::depfile_dir()
+                    let dir = zccache_core::config::depfile_dir_from_cache_dir(cache_dir)
                         .join(format!("{}-{instance}", std::process::id()));
                     std::fs::create_dir_all(&dir).ok();
                     dir
@@ -656,7 +672,9 @@ impl DaemonServer {
                 compiler_hash_cache: CompilerHashCache::new(),
                 watched_raw_dirs: DashMap::new(),
                 pch_source_map: DashMap::new(),
-                journal: CompileJournal::new(zccache_core::config::log_dir()),
+                journal: CompileJournal::new(zccache_core::config::log_dir_from_cache_dir(
+                    cache_dir,
+                )),
                 in_flight_bytes: AtomicUsize::new(0),
                 persist_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
                 artifact_store,

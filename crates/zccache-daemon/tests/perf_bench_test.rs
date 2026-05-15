@@ -24,41 +24,28 @@ type ClientConn = zccache_ipc::IpcClientConnection;
 const NUM_FILES: usize = 50;
 const WARM_TRIALS: usize = 5;
 
-struct EnvVarGuard {
-    name: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl EnvVarGuard {
-    fn set_path(name: &'static str, value: &Path) -> Self {
-        let previous = std::env::var_os(name);
-        std::env::set_var(name, value);
-        Self { name, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        if let Some(previous) = self.previous.take() {
-            std::env::set_var(self.name, previous);
-        } else {
-            std::env::remove_var(self.name);
-        }
-    }
-}
-
+/// Boot a daemon rooted at a fresh per-test cache directory.
+///
+/// The returned `tempfile::TempDir` must be held by the caller — when it is
+/// dropped, the cache root (including the redb index) is deleted. Bind order
+/// in the returned tuple is intentional: the `TempDir` is declared first so
+/// Rust's reverse-order drop guarantees the daemon (`server_handle`) shuts
+/// down before the cache root disappears.
 async fn start_daemon() -> (
+    tempfile::TempDir,
     String,
     tokio::task::JoinHandle<()>,
     std::sync::Arc<tokio::sync::Notify>,
 ) {
+    let cache_dir = zccache_test_support::temp_cache_dir().unwrap();
     let endpoint = zccache_ipc::unique_test_endpoint();
-    let mut server = DaemonServer::bind(&endpoint).unwrap();
+    let normalized = zccache_core::NormalizedPath::new(cache_dir.path());
+    let mut server = DaemonServer::bind_with_cache_dir(&endpoint, &normalized).unwrap();
     let shutdown = server.shutdown_handle();
     let handle = tokio::spawn(async move {
         server.run(0).await.unwrap();
     });
-    (endpoint, handle, shutdown)
+    (cache_dir, endpoint, handle, shutdown)
 }
 
 fn find_sccache() -> Option<NormalizedPath> {
@@ -1171,7 +1158,7 @@ async fn measure_ephemeral_link_scenario(
     let _ = run_tool_timed(tool, args, zccache_dir, "zccache linker warmup");
     clean_link_outputs(zccache_dir, outputs);
 
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let (_zccache_cache_dir, endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
     clear_zccache(&mut client).await;
 
@@ -1568,7 +1555,7 @@ async fn perf_c_zccache_vs_bare() {
     let zc_cwd = zc_dir.path().to_string_lossy().into_owned();
 
     eprintln!("  [3/3] zccache");
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let (_zccache_cache_dir, endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
 
     client
@@ -1806,7 +1793,7 @@ async fn perf_warm_cache_zccache_vs_sccache() {
 
     eprintln!("  [3/3] zccache (in-process daemon)");
 
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let (_zccache_cache_dir, endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
 
     // Start session
@@ -2133,7 +2120,7 @@ async fn perf_response_file() {
 
     eprintln!("  [3/3] zccache (in-process daemon)");
 
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let (_zccache_cache_dir, endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
 
     client
@@ -2619,7 +2606,7 @@ async fn perf_rustc_zccache_vs_sccache() {
     generate_rust_project(zd.path());
     let zc = zd.path().to_string_lossy().into_owned();
     eprintln!("  [3/3] zccache");
-    let (ep, sh, sd) = start_daemon().await;
+    let (_zccache_cache_dir, ep, sh, sd) = start_daemon().await;
     let mut cl = zccache_ipc::connect(&ep).await.unwrap();
     cl.send(&Request::SessionStart {
         client_pid: std::process::id(),
@@ -3030,12 +3017,7 @@ async fn measure_cpp_sibling_remap_mode(
     };
 
     eprintln!("  [3/3] zccache (prime: workspace A, warm: workspace B, remap=auto)");
-    let zccache_cache_dir = zccache_test_support::temp_cache_dir().unwrap();
-    let _zccache_cache_guard = EnvVarGuard::set_path(
-        zccache_core::config::CACHE_DIR_ENV,
-        zccache_cache_dir.path(),
-    );
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let (_zccache_cache_dir, endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
 
     let workspace_a_str = workspace_a.to_string_lossy().into_owned();
@@ -3248,7 +3230,7 @@ async fn perf_rustc_sibling_remap_warm() {
 
     // ── zccache primed from workspace A, warm in workspace B ───────────
     eprintln!("  [3/3] zccache (prime: workspace A, warm: workspace B, remap=auto)");
-    let (ep, sh, sd) = start_daemon().await;
+    let (_zccache_cache_dir, ep, sh, sd) = start_daemon().await;
     let mut cl = zccache_ipc::connect(&ep).await.unwrap();
     let workspace_a_str = workspace_a.to_string_lossy().into_owned();
     let workspace_b_str = workspace_b.to_string_lossy().into_owned();
@@ -3511,7 +3493,7 @@ async fn perf_emcc_warm_cache_zccache_vs_sccache() {
     let zc_cwd = zc_dir.path().to_string_lossy().into_owned();
 
     eprintln!("  [3/3] zccache em++");
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let (_zccache_cache_dir, endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
     let session_id = start_zccache_session(&mut client, &zc_cwd).await;
 
@@ -3693,7 +3675,7 @@ async fn perf_emcc_sibling_remap_warm() {
 
     // ── zccache primed from workspace A, warm in workspace B ──────────
     eprintln!("  [3/3] zccache em++ (prime: workspace A, warm: workspace B, remap=auto)");
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let (_zccache_cache_dir, endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
 
     let workspace_a_str = workspace_a.to_string_lossy().into_owned();
@@ -4154,7 +4136,7 @@ async fn perf_rust_workspace_link() {
         &output,
         "zccache Rust linker warmup",
     );
-    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let (_zccache_cache_dir, endpoint, server_handle, shutdown) = start_daemon().await;
     let mut client = zccache_ipc::connect(&endpoint).await.unwrap();
     clear_zccache(&mut client).await;
     let zccache_cwd = zccache_dir.path().to_string_lossy().into_owned();
