@@ -164,17 +164,23 @@ namespace unit_{i:03} {{
 fn warmup_compiler(compiler: &str, dir: &Path) {
     let src = dir.join("unit_000.cpp");
     let obj = dir.join("_warmup.o");
-    let status = std::process::Command::new(compiler)
+    let output = std::process::Command::new(compiler)
         .args(["-c", "-Iinclude", "-O2", "-std=c++17"])
         .arg(&src)
         .arg("-o")
         .arg(&obj)
         .current_dir(dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("warmup compile failed");
-    assert!(status.success(), "warmup compile failed");
+        .output()
+        .expect("warmup compile failed to spawn");
+    assert!(
+        output.status.success(),
+        "C++ warmup compile failed: status={:?}\ncompiler={compiler}\ndir={dir:?}\nsrc exists={}\ninclude exists={}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        src.exists(),
+        dir.join("include").is_dir(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     let _ = std::fs::remove_file(&obj);
 }
 
@@ -260,9 +266,12 @@ static inline size_t bench_strlen(const char *s) {
     return s ? strlen(s) : 0;
 }
 
+/* Uses only standard C11 <time.h> APIs (no POSIX clock_gettime),
+ * so compilation under -std=c11 without feature-test macros works
+ * on Ubuntu's glibc. */
 static inline double bench_now(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+    struct timespec ts = {0, 0};
+    if (timespec_get(&ts, TIME_UTC) == 0) {
         return 0.0;
     }
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
@@ -303,17 +312,23 @@ fn nuke_and_regenerate_c(dir: &Path) {
 fn warmup_c_compiler(compiler: &str, dir: &Path) {
     let src = dir.join("unit_000.c");
     let obj = dir.join("_warmup.o");
-    let status = std::process::Command::new(compiler)
+    let output = std::process::Command::new(compiler)
         .args(["-c", "-Iinclude", "-O2", "-std=c11"])
         .arg(&src)
         .arg("-o")
         .arg(&obj)
         .current_dir(dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("C warmup compile failed");
-    assert!(status.success(), "C warmup compile failed");
+        .output()
+        .expect("C warmup compile failed to spawn");
+    assert!(
+        output.status.success(),
+        "C warmup compile failed: status={:?}\ncompiler={compiler}\ndir={dir:?}\nsrc exists={}\ninclude exists={}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        src.exists(),
+        dir.join("include").is_dir(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     let _ = std::fs::remove_file(&obj);
 }
 
@@ -2345,7 +2360,7 @@ fn clean_rlibs(dir: &Path) {
 fn warmup_rustc(rc: &str, dir: &Path) {
     let src = dir.join("unit_000.rs");
     let deps = dir.join("deps");
-    let s = std::process::Command::new(rc)
+    let output = std::process::Command::new(rc)
         .args([
             "--edition",
             "2021",
@@ -2363,11 +2378,16 @@ fn warmup_rustc(rc: &str, dir: &Path) {
         .arg("--out-dir")
         .arg(&deps)
         .current_dir(dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("rustc warmup failed");
-    assert!(s.success());
+        .output()
+        .expect("rustc warmup failed to spawn");
+    assert!(
+        output.status.success(),
+        "rustc warmup failed: status={:?}\nrustc={rc}\ndir={dir:?}\nsrc exists={}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        src.exists(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     clean_rlibs(dir);
 }
 
@@ -4186,4 +4206,37 @@ async fn perf_rust_workspace_link() {
         "Bare rustc",
         &[result],
     );
+}
+
+/// Regression test for the C benchmark's generated source compiling cleanly
+/// under `-std=c11`.
+///
+/// Background: commit 359811c added `<time.h>` plus a `bench_now()` helper to
+/// the C benchmark's `common_c.h`. The helper called `clock_gettime`, which is
+/// a POSIX (not C11) symbol — under strict `-std=c11`, glibc's `<time.h>` does
+/// not declare it, so every C benchmark broke with "C warmup compile failed"
+/// the first time perf-guard ran on main after the change.
+///
+/// This test rebuilds the same one-file warmup the benchmark uses and asserts
+/// it compiles. It runs only when clang is on PATH (e.g., the perf-guard CI
+/// jobs and any dev environment with clang installed); without clang it logs
+/// a skip and returns. That guarantees CI lanes that don't have clang aren't
+/// forced to install it just to run this guard.
+#[test]
+fn generated_c_project_compiles_under_std_c11() {
+    zccache_test_support::ensure_clang_tool_chain_on_path();
+    let Some(compiler_path) = zccache_test_support::find_on_path("clang") else {
+        eprintln!("SKIP: no `clang` on PATH; skipping strict-C11 compile guard");
+        return;
+    };
+    let compiler = compiler_path.to_string_lossy().to_string();
+
+    let dir = zccache_test_support::temp_cache_dir().unwrap();
+    generate_c_project(dir.path());
+
+    // Exact compile flags used by `warmup_c_compiler`. If this fails, the
+    // benchmark's warmup will also fail — and unlike the benchmark, this
+    // test runs without the `#[ignore]` gate so it catches the regression
+    // on every CI lane that has clang.
+    warmup_c_compiler(&compiler, dir.path());
 }
