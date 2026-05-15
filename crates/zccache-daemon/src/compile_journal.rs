@@ -308,7 +308,27 @@ pub fn extract_outcome(response: &Response) -> Option<(&'static str, i32)> {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// Poll `path` until it contains at least `expected` lines, or up to ~5 s.
+    /// The journal writer is a background thread that flushes asynchronously,
+    /// so a fixed sleep races on slow runners (notably Windows CI). Polling
+    /// keeps the fast path fast while staying deterministic.
+    fn wait_for_lines(path: &std::path::Path, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let count = fs::read_to_string(path)
+                .map(|s| s.lines().count())
+                .unwrap_or(0);
+            if count >= expected {
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
 
     #[test]
     fn test_journal_entry_serialization() {
@@ -858,7 +878,7 @@ mod tests {
             journal.log(&entry, Some(&session_path));
         }
 
-        std::thread::sleep(Duration::from_millis(300));
+        wait_for_lines(&session_path, 5);
 
         let content = fs::read_to_string(&session_path).unwrap();
         assert_eq!(content.lines().count(), 5, "session should have 5 entries");
@@ -892,7 +912,8 @@ mod tests {
             journal.log(&entry, Some(path));
         }
 
-        std::thread::sleep(Duration::from_millis(300));
+        wait_for_lines(&path_a, 3);
+        wait_for_lines(&path_b, 3);
 
         let content_a = fs::read_to_string(&path_a).unwrap();
         let content_b = fs::read_to_string(&path_b).unwrap();
@@ -953,7 +974,7 @@ mod tests {
         let entry2 = JournalEntry::new(ctx2, "hit", 0, 200);
         journal.log(&entry2, Some(&session_path));
 
-        std::thread::sleep(Duration::from_millis(300));
+        wait_for_lines(&session_path, 2);
 
         let content = fs::read_to_string(&session_path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
