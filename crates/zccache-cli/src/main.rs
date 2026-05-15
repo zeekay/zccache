@@ -1123,10 +1123,14 @@ async fn cmd_status(endpoint: &str, json: bool) -> ExitCode {
             {
                 let disk_info = if s.dep_graph_disk_size > 0 {
                     format!(
-                        "v{}, {} on disk",
+                        "v{}, persisted, {} on disk",
                         s.dep_graph_version,
                         format_bytes(s.dep_graph_disk_size)
                     )
+                } else if s.dep_graph_persisted {
+                    // Save has flushed at least once, but the file metadata
+                    // call lost a race (e.g. rename window) — still persisted.
+                    format!("v{}, persisted", s.dep_graph_version)
                 } else {
                     format!("v{}, not persisted", s.dep_graph_version)
                 };

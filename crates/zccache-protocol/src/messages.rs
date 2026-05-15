@@ -270,6 +270,12 @@ pub struct DaemonStatus {
     pub dep_graph_version: u32,
     /// Size of the depgraph snapshot file on disk (0 = not persisted).
     pub dep_graph_disk_size: u64,
+    /// Whether the in-memory dep graph is backed by a persisted snapshot.
+    ///
+    /// `true` if the graph was loaded from disk on startup OR has been
+    /// successfully written to disk since startup (periodic save or shutdown).
+    /// `false` on a fresh daemon that has not yet flushed its first snapshot.
+    pub dep_graph_persisted: bool,
 }
 
 /// Result of a cache lookup.
@@ -423,6 +429,7 @@ mod tests {
             cache_dir: "/home/user/.zccache".into(),
             dep_graph_version: 1,
             dep_graph_disk_size: 2_500_000,
+            dep_graph_persisted: true,
         };
         roundtrip(&status);
     }
@@ -659,14 +666,15 @@ mod tests {
             cache_dir: "".into(),
             dep_graph_version: 0,
             dep_graph_disk_size: 0,
+            dep_graph_persisted: false,
         };
         roundtrip(&with_version);
     }
 
     // Compile-time check: PROTOCOL_VERSION must be positive.
     const _: () = assert!(crate::PROTOCOL_VERSION > 0);
-    // Compile-time check: PROTOCOL_VERSION == 6 after ListRustArtifacts addition.
-    const _FINGERPRINT_VERSION: () = assert!(crate::PROTOCOL_VERSION == 6);
+    // Compile-time check: PROTOCOL_VERSION == 7 after dep_graph_persisted addition.
+    const _FINGERPRINT_VERSION: () = assert!(crate::PROTOCOL_VERSION == 7);
 
     #[test]
     fn fingerprint_check_roundtrip() {

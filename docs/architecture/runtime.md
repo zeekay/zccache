@@ -115,6 +115,17 @@ The in-memory metadata cache is **not persisted**. After a daemon restart, the c
 
 This is a deliberate design choice. Persisting the metadata cache would add complexity (serialization, staleness on restart) for marginal benefit — the cache warms up within one full build.
 
+### Dep Graph Recovery
+
+The dep graph **is** persisted across daemon restarts (issue #262). At graceful shutdown, and again every 5 minutes while running, the daemon flushes the current `DepGraph` to `<cache_dir>/depgraph/depgraph.bin` using a rkyv zero-copy snapshot. The on-disk format carries a magic header (`ZCDG`) plus a `DEPGRAPH_VERSION` (currently 4) so old snapshots written by an incompatible build are rejected rather than misread.
+
+On startup, the daemon attempts to load the snapshot:
+
+- **Success:** the in-memory graph is populated from the file and `DaemonStatus.dep_graph_persisted` reports `true`. CI runs that restore `<cache_dir>` from a cache store skip the cold-seed compile entirely.
+- **Missing file / `VersionMismatch` / corrupt bytes:** a warning is logged and the daemon starts with an empty graph (the pre-fix behavior).
+
+The `dep_graph_persisted` flag is also flipped to `true` when a periodic or shutdown save completes successfully, so a daemon that started cold but has since flushed reports itself as persisted. `zccache status` surfaces this as either `vN, persisted, X.YZ MB on disk` or `vN, not persisted`.
+
 ### Artifact Store Recovery
 
 **Orphaned temp directories:** On startup, `{cache_root}/tmp/` is deleted recursively. This removes any incomplete artifact writes from a previous crash.

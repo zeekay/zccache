@@ -74,6 +74,8 @@ pub struct NativeDaemonStatus {
     dep_graph_version: u32,
     #[pyo3(get)]
     dep_graph_disk_size: u64,
+    #[pyo3(get)]
+    dep_graph_persisted: bool,
 }
 
 impl From<zccache_protocol::DaemonStatus> for NativeDaemonStatus {
@@ -101,6 +103,7 @@ impl From<zccache_protocol::DaemonStatus> for NativeDaemonStatus {
             cache_dir: value.cache_dir.display().to_string(),
             dep_graph_version: value.dep_graph_version,
             dep_graph_disk_size: value.dep_graph_disk_size,
+            dep_graph_persisted: value.dep_graph_persisted,
         }
     }
 }
