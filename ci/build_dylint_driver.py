@@ -27,8 +27,12 @@ def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
 
 
 def rustc_host() -> str:
+    # Invoke rustc through `rustup run` so the call works even when PATH
+    # is fronted by shims (e.g. soldr) that do not understand the
+    # `+<toolchain>` directive that only the rustup `cargo`/`rustc`
+    # wrappers parse.
     output = subprocess.check_output(
-        ["rustc", f"+{TOOLCHAIN_CHANNEL}", "-vV"],
+        ["rustup", "run", TOOLCHAIN_CHANNEL, "rustc", "-vV"],
         text=True,
     )
     for line in output.splitlines():
@@ -122,7 +126,17 @@ def main() -> int:
             rpath = f"-C link-args=-Wl,-rpath,{toolchain_root / 'lib'}"
             env["RUSTFLAGS"] = f"{env.get('RUSTFLAGS', '')} {rpath}".strip()
 
-        run(["cargo", f"+{TOOLCHAIN_CHANNEL}", "build"], cwd=package, env=env)
+        # Use `rustup run` instead of `cargo +<toolchain>` because the
+        # cargo on PATH may be a shim (e.g. soldr's) that does not parse
+        # the `+<toolchain>` directive — that directive is only honored
+        # by the rustup-managed cargo wrapper. `rustup run` selects the
+        # toolchain explicitly and works regardless of which `cargo`
+        # comes first on PATH.
+        run(
+            ["rustup", "run", TOOLCHAIN_CHANNEL, "cargo", "build"],
+            cwd=package,
+            env=env,
+        )
 
         exe_suffix = ".exe" if os.name == "nt" else ""
         built_driver = package / "target" / "debug" / f"dylint_driver-{full_toolchain}{exe_suffix}"
