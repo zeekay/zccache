@@ -21,7 +21,7 @@ jobs:
         with:
           version: "0.7.18"
           toolchain: 1.94.1
-          cache: true
+          cache: false
           cache-key-suffix: check-${{ inputs.os }}
       - name: Check
         shell: bash
@@ -42,7 +42,7 @@ jobs:
         with:
           version: "0.7.18"
           toolchain: 1.94.1
-          cache: true
+          cache: false
           cache-key-suffix: test-${{ inputs.os }}
       # Platform Test runs unit tests in libraries and binaries only — it
       # intentionally does NOT compile the integration test binaries under
