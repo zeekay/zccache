@@ -512,37 +512,57 @@ fn apply_cli_spawn_lineage(cmd: &mut std::process::Command) {
     }
 }
 
+const ENV_ORIGINATOR: &str = "RUNNING_PROCESS_ORIGINATOR";
+const ENV_LINEAGE: &str = "ZCCACHE_LINEAGE";
+const ENV_PARENT_PID: &str = "ZCCACHE_PARENT_PID";
+const ENV_CLIENT_PID: &str = "ZCCACHE_CLIENT_PID";
+
 /// Compute the lineage env-var pairs the CLI sets on the daemon it
 /// spawns. Returns the same overrides `apply_cli_spawn_lineage` writes
 /// onto a `Command`, in a form usable by the Windows raw-spawn path
 /// (which needs to build its own merged environment block).
+///
+/// Thin wrapper over [`build_cli_spawn_lineage_env`] that captures the
+/// current process's PID and reads the outer lineage env vars. The
+/// pure-input variant is what tests target so they don't have to mutate
+/// process-global env state (which would race across parallel tests).
 fn cli_spawn_lineage_env() -> Vec<(String, String)> {
-    const ENV_ORIGINATOR: &str = "RUNNING_PROCESS_ORIGINATOR";
-    const ENV_LINEAGE: &str = "ZCCACHE_LINEAGE";
-    const ENV_PARENT_PID: &str = "ZCCACHE_PARENT_PID";
-    const ENV_CLIENT_PID: &str = "ZCCACHE_CLIENT_PID";
+    build_cli_spawn_lineage_env(
+        std::process::id(),
+        std::env::var(ENV_ORIGINATOR).ok().as_deref(),
+        std::env::var(ENV_LINEAGE).ok().as_deref(),
+    )
+}
 
-    let cli_pid = std::process::id();
+/// Pure-input variant of [`cli_spawn_lineage_env`]. Same logic, no env
+/// reads, no `std::process::id` call. All three inputs are taken as
+/// parameters so unit tests can exercise the branching without setting
+/// global env vars.
+fn build_cli_spawn_lineage_env(
+    cli_pid: u32,
+    outer_originator: Option<&str>,
+    outer_lineage: Option<&str>,
+) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::with_capacity(4);
 
     // Preserve any outer originator (e.g. the build tool was already wrapped
     // by running-process). Otherwise, claim the originator slot ourselves.
-    if std::env::var(ENV_ORIGINATOR).is_err() {
+    if outer_originator.is_none() {
         out.push((ENV_ORIGINATOR.to_string(), format!("zccache-cli:{cli_pid}")));
     }
 
     // Extend or initialize the chain with our PID.
-    let chain = match std::env::var(ENV_LINEAGE) {
-        Ok(existing)
+    let chain = match outer_lineage {
+        Some(existing)
             if existing
                 .rsplit_once('>')
-                .map_or(existing.as_str(), |(_, last)| last)
+                .map_or(existing, |(_, last)| last)
                 != cli_pid.to_string() =>
         {
             format!("{existing}>{cli_pid}")
         }
-        Ok(existing) => existing,
-        Err(_) => cli_pid.to_string(),
+        Some(existing) => existing.to_string(),
+        None => cli_pid.to_string(),
     };
     out.push((ENV_LINEAGE.to_string(), chain));
     out.push((ENV_PARENT_PID.to_string(), cli_pid.to_string()));
@@ -648,11 +668,11 @@ pub fn spawn_daemon(bin: &Path, endpoint: &str) -> Result<(), String> {
     // root-cause analysis.
     #[cfg(windows)]
     {
-        return spawn_daemon_windows::spawn_daemon_sanitized(
+        spawn_daemon_windows::spawn_daemon_sanitized(
             spawn_bin,
             &["--foreground", "--endpoint", endpoint],
             &cli_spawn_lineage_env(),
-        );
+        )
     }
 
     #[cfg(not(windows))]
@@ -1273,6 +1293,133 @@ mod tests {
         assert!(
             matches!(result, Ok(None)),
             "vanished daemon must produce Ok(None) (success no-op), got {result:?}"
+        );
+    }
+
+    // ── spawn_daemon: lineage env composition ───────────────────────────
+    //
+    // These tests target `build_cli_spawn_lineage_env`, the pure-input
+    // helper underneath `cli_spawn_lineage_env`. The wrapper reads
+    // process-global env vars; the helper takes them as parameters so
+    // parallel tests don't race over `RUNNING_PROCESS_ORIGINATOR` /
+    // `ZCCACHE_LINEAGE`.
+
+    /// Fresh chain: no outer originator, no outer lineage. The CLI claims
+    /// the originator slot and seeds the chain with just its own PID.
+    /// Every field uses the same PID.
+    #[test]
+    fn build_lineage_env_claims_originator_when_unset() {
+        let out = build_cli_spawn_lineage_env(4242, None, None);
+        let map: std::collections::HashMap<String, String> = out.into_iter().collect();
+        assert_eq!(
+            map.get(ENV_ORIGINATOR).map(String::as_str),
+            Some("zccache-cli:4242"),
+            "originator must be claimed when not already set"
+        );
+        assert_eq!(map.get(ENV_LINEAGE).map(String::as_str), Some("4242"));
+        assert_eq!(map.get(ENV_PARENT_PID).map(String::as_str), Some("4242"));
+        assert_eq!(map.get(ENV_CLIENT_PID).map(String::as_str), Some("4242"));
+    }
+
+    /// Outer originator preserved: if the wrapping tool already set
+    /// `RUNNING_PROCESS_ORIGINATOR`, we must NOT overwrite it. The
+    /// originator pair must be absent from the override list — otherwise
+    /// running-process's orphan-discovery loses the original ancestor.
+    #[test]
+    fn build_lineage_env_preserves_outer_originator() {
+        let out = build_cli_spawn_lineage_env(4242, Some("soldr:9999"), None);
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            !keys.contains(&ENV_ORIGINATOR),
+            "ORIGINATOR must not be re-claimed when an outer tool set it; \
+             got override keys: {keys:?}"
+        );
+        // The chain still extends with our PID even when originator is preserved.
+        let map: std::collections::HashMap<String, String> = out.into_iter().collect();
+        assert_eq!(map.get(ENV_LINEAGE).map(String::as_str), Some("4242"));
+    }
+
+    /// Outer lineage chain extension: the existing chain is appended to,
+    /// not replaced. PARENT_PID/CLIENT_PID still reflect our own PID.
+    #[test]
+    fn build_lineage_env_extends_existing_chain() {
+        let out = build_cli_spawn_lineage_env(4242, None, Some("100>200>300"));
+        let map: std::collections::HashMap<String, String> = out.into_iter().collect();
+        assert_eq!(
+            map.get(ENV_LINEAGE).map(String::as_str),
+            Some("100>200>300>4242"),
+            "chain must be extended by appending our PID"
+        );
+        assert_eq!(map.get(ENV_PARENT_PID).map(String::as_str), Some("4242"));
+        assert_eq!(map.get(ENV_CLIENT_PID).map(String::as_str), Some("4242"));
+    }
+
+    /// Idempotency: if the tail of the chain already matches our PID
+    /// (because the CLI is re-entering itself in some recursive scenario),
+    /// don't double-append. Without this guard, repeated CLI invocations
+    /// would build pathological chains like "100>200>200>200>200".
+    #[test]
+    fn build_lineage_env_idempotent_when_chain_tail_is_our_pid() {
+        let out = build_cli_spawn_lineage_env(4242, None, Some("100>4242"));
+        let map: std::collections::HashMap<String, String> = out.into_iter().collect();
+        assert_eq!(
+            map.get(ENV_LINEAGE).map(String::as_str),
+            Some("100>4242"),
+            "chain tail equals our PID; must not be re-appended"
+        );
+    }
+
+    /// Single-element chain idempotency: matches the case where we are
+    /// the only entry in the chain. Same property as the multi-element
+    /// case above, exercised separately because the parse uses
+    /// `rsplit_once('>').map_or(existing, ...)` and the fallback branch
+    /// has different semantics.
+    #[test]
+    fn build_lineage_env_idempotent_when_chain_is_just_our_pid() {
+        let out = build_cli_spawn_lineage_env(4242, None, Some("4242"));
+        let map: std::collections::HashMap<String, String> = out.into_iter().collect();
+        assert_eq!(map.get(ENV_LINEAGE).map(String::as_str), Some("4242"));
+    }
+
+    /// Result has all four overrides whenever we claim the originator.
+    /// Guards against a refactor that accidentally drops one of the
+    /// chain-membership keys (the daemon's lineage propagation reads
+    /// PARENT_PID and CLIENT_PID separately from the chain string).
+    #[test]
+    fn build_lineage_env_produces_all_four_overrides_when_unset() {
+        let out = build_cli_spawn_lineage_env(4242, None, None);
+        assert_eq!(out.len(), 4, "expected ORIGINATOR + LINEAGE + PARENT + CLIENT");
+        let keys: std::collections::HashSet<&str> =
+            out.iter().map(|(k, _)| k.as_str()).collect();
+        for expected in &[ENV_ORIGINATOR, ENV_LINEAGE, ENV_PARENT_PID, ENV_CLIENT_PID] {
+            assert!(keys.contains(expected), "missing override: {expected}");
+        }
+    }
+
+    // ── spawn_daemon: end-to-end error path ────────────────────────────
+
+    /// `spawn_daemon` must surface a clean `Err` (not a panic, not silent
+    /// success) when handed a binary path that does not exist. Both the
+    /// Windows path (sanitized CreateProcessW failing) and the Unix path
+    /// (`Command::spawn` returning ENOENT) reach this branch via different
+    /// internals; the public-API behavior must be the same.
+    ///
+    /// Note: this exercises `prepare_daemon_exe` + `gc_runtime_binaries`
+    /// on the way through. Those touch the user's real runtime-binaries
+    /// directory but are no-ops or best-effort for orphan files, so the
+    /// test has no production-state impact beyond what a regular CLI run
+    /// would already do.
+    #[test]
+    fn spawn_daemon_returns_err_for_missing_binary() {
+        let bogus = if cfg!(windows) {
+            Path::new("C:\\zccache-spawn-daemon-test-does-not-exist\\nope.exe")
+        } else {
+            Path::new("/nonexistent/zccache-spawn-daemon-test/nope")
+        };
+        let result = spawn_daemon(bogus, "test-endpoint-that-is-never-connected-to");
+        assert!(
+            result.is_err(),
+            "spawn_daemon must error when the binary does not exist, got {result:?}"
         );
     }
 }

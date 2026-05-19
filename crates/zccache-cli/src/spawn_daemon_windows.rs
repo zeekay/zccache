@@ -49,9 +49,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-    UpdateProcThreadAttribute, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
-    EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    UpdateProcThreadAttribute, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+    CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, EXTENDED_STARTUPINFO_PRESENT,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 /// Spawn a child process with a sanitized handle table.
@@ -164,6 +164,19 @@ pub fn spawn_daemon_sanitized(
         // 6) CreateProcessW. bInheritHandles must be TRUE for the listed
         //    handles to be duplicated; the attribute list restricts what
         //    *else* the child sees (i.e., nothing).
+        //
+        // Flag rationale:
+        //   EXTENDED_STARTUPINFO_PRESENT - we're passing STARTUPINFOEXW
+        //   DETACHED_PROCESS             - child has no console at all; survives parent exit
+        //   CREATE_NO_WINDOW             - no transient console window flash during launch
+        //   CREATE_NEW_PROCESS_GROUP     - isolates the daemon from CTRL_C_EVENT / CTRL_BREAK_EVENT
+        //                                  sent to the spawning console (defense in depth on top
+        //                                  of DETACHED_PROCESS, in case anything later attaches
+        //                                  a console via AttachConsole)
+        //   CREATE_UNICODE_ENVIRONMENT   - our env_block is UTF-16
+        //
+        // bInheritHandles=TRUE is required for the *listed* handles to cross;
+        // the attribute list restricts what else does (i.e., nothing).
         let mut pi: PROCESS_INFORMATION = zeroed();
         let ok = CreateProcessW(
             null(),
@@ -174,6 +187,7 @@ pub fn spawn_daemon_sanitized(
             EXTENDED_STARTUPINFO_PRESENT
                 | DETACHED_PROCESS
                 | CREATE_NO_WINDOW
+                | CREATE_NEW_PROCESS_GROUP
                 | CREATE_UNICODE_ENVIRONMENT,
             env_block.as_ptr() as _,
             null(),
@@ -269,7 +283,7 @@ fn build_env_block(overrides: &[(String, String)]) -> Vec<u16> {
         map.insert(k.to_uppercase(), (k.clone(), v.clone()));
     }
     let mut block: Vec<u16> = Vec::new();
-    for (_, (k, v)) in &map {
+    for (k, v) in map.values() {
         let entry = format!("{k}={v}");
         block.extend(OsStr::new(&entry).encode_wide());
         block.push(0);
@@ -283,10 +297,30 @@ fn build_env_block(overrides: &[(String, String)]) -> Vec<u16> {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::thread;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::System::Pipes::CreatePipe;
+
+    /// Poll for `path` to exist, returning true once it appears or false
+    /// after `deadline`. Sleeps 25 ms between probes — fast enough to keep
+    /// short-running child tests under ~100 ms in the happy case while
+    /// still allowing a generous wall-clock budget for slow CI hosts.
+    fn wait_for_file(path: &Path, deadline: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            if path.exists() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        path.exists()
+    }
+
+    fn cmd_exe() -> std::ffi::OsString {
+        std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into())
+    }
 
     /// Regression test for issue #289: a child spawned via
     /// `spawn_daemon_sanitized` must NOT inherit the parent's orphaned
@@ -319,9 +353,8 @@ mod tests {
         //    `cmd /C ping -n 6 127.0.0.1 > NUL` because `cmd` ships with
         //    every Windows host and the ping reliably keeps the process
         //    alive for ~5 seconds.
-        let cmd_exe = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
         let res = spawn_daemon_sanitized(
-            Path::new(&cmd_exe),
+            Path::new(&cmd_exe()),
             &["/C", "ping", "-n", "6", "127.0.0.1", ">", "NUL"],
             &[],
         );
@@ -356,5 +389,130 @@ mod tests {
              (regression of #289)"
         );
         // file (and its inner read_h) drops here.
+    }
+
+    /// Happy path: spawn cmd.exe with a benign `copy NUL <tempfile>` and
+    /// observe the side-effect file. Proves that
+    ///   - the function returns `Ok(())` for a real binary,
+    ///   - the child's command line is parsed correctly by cmd.exe,
+    ///   - a specific positional arg (the tempfile path) reaches the child verbatim,
+    ///   - the spawn is detached well enough that the child runs to completion
+    ///     without the parent waiting on a handle.
+    #[test]
+    fn sanitized_spawn_runs_child_and_passes_args() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("ran.flag");
+        let marker_str = marker.to_string_lossy().to_string();
+        let res = spawn_daemon_sanitized(
+            Path::new(&cmd_exe()),
+            &["/C", "copy", "NUL", marker_str.as_str()],
+            &[],
+        );
+        assert!(res.is_ok(), "spawn failed: {:?}", res);
+        assert!(
+            wait_for_file(&marker, Duration::from_secs(5)),
+            "child never created marker file {marker_str} - either spawn was \
+             silently broken or args were mangled"
+        );
+    }
+
+    /// Env overrides: the child must see env vars supplied via the
+    /// `env_overrides` parameter. We use `cmd /C if defined <KEY> ...` to
+    /// observe presence without relying on stdio (which is NUL-piped).
+    /// Variant: a key that we did NOT supply must NOT be visible (smoke
+    /// check that we are not silently leaking the test process's env in
+    /// a way that would mask a real failure).
+    #[test]
+    fn sanitized_spawn_applies_env_overrides() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("env-was-set.flag");
+        let marker_str = marker.to_string_lossy().to_string();
+
+        // Unique key so concurrent / repeated test runs don't collide.
+        let key = format!("ZCCACHE_SPAWN_TEST_KEY_{}", std::process::id());
+
+        // `cmd /C if defined KEY copy NUL "<marker>"` writes the file iff
+        // the env var is set. cmd's `if defined` is the cleanest "did the
+        // child see this env var?" probe that avoids stdout entirely.
+        let res = spawn_daemon_sanitized(
+            Path::new(&cmd_exe()),
+            &[
+                "/C",
+                "if",
+                "defined",
+                key.as_str(),
+                "copy",
+                "NUL",
+                marker_str.as_str(),
+            ],
+            &[(key.clone(), "1".to_string())],
+        );
+        assert!(res.is_ok(), "spawn failed: {:?}", res);
+        assert!(
+            wait_for_file(&marker, Duration::from_secs(5)),
+            "child did not see env override {key}=1; marker {marker_str} \
+             was never created"
+        );
+    }
+
+    /// Negative control: when `env_overrides` does NOT contain the key,
+    /// the child must NOT observe it. Without this control, the previous
+    /// test could pass even if `env_overrides` were silently ignored and
+    /// the var were leaking from the test process's environment via the
+    /// inherited block.
+    #[test]
+    fn sanitized_spawn_does_not_invent_env_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("env-was-set.flag");
+        let marker_str = marker.to_string_lossy().to_string();
+
+        // Use a key we explicitly do not set anywhere. The chance of it
+        // already existing in the test process's env is effectively zero,
+        // but we still make it process-unique.
+        let key = format!("ZCCACHE_SPAWN_TEST_UNSET_{}", std::process::id());
+
+        let res = spawn_daemon_sanitized(
+            Path::new(&cmd_exe()),
+            &[
+                "/C",
+                "if",
+                "defined",
+                key.as_str(),
+                "copy",
+                "NUL",
+                marker_str.as_str(),
+            ],
+            &[], // No overrides.
+        );
+        assert!(res.is_ok(), "spawn failed: {:?}", res);
+
+        // Give cmd time to run to completion. 1 s is more than enough on
+        // any host that can launch cmd.exe at all.
+        thread::sleep(Duration::from_secs(1));
+        assert!(
+            !marker.exists(),
+            "child saw env key {key} we never set - env block construction \
+             is leaking unrelated keys into the child"
+        );
+    }
+
+    /// Error path: an obviously-bogus binary path must surface a clean
+    /// `Err(String)` from `CreateProcessW`, not a panic or silent success.
+    /// Guards against the helper returning Ok for a no-op spawn.
+    #[test]
+    fn sanitized_spawn_fails_for_missing_binary() {
+        // A path that definitely doesn't exist. The drive letter form
+        // avoids any current-directory resolution side-effects.
+        let bogus = Path::new("C:\\zccache-this-path-does-not-exist\\nope.exe");
+        let res = spawn_daemon_sanitized(bogus, &[], &[]);
+        assert!(
+            res.is_err(),
+            "spawn of missing binary unexpectedly succeeded"
+        );
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("CreateProcessW failed"),
+            "error message should identify the failing call, got: {msg}"
+        );
     }
 }
