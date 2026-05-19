@@ -3330,6 +3330,7 @@ version = "1.6.0"
 dependencies = [
  "blake3",
  "clap",
+ "criterion",
  "flate2",
  "fs2",
  "jwalk",
@@ -3620,11 +3621,13 @@ dependencies = [
 name = "zccache-watcher"
 version = "1.6.0"
 dependencies = [
+ "criterion",
  "globset",
  "jwalk",
  "notify",
  "pyo3",
  "pyo3-build-config",
+ "rayon",
  "tempfile",
  "thiserror",
  "tokio",
