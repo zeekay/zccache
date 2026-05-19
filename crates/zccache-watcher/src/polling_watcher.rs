@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -486,6 +486,8 @@ fn has_glob_meta(pattern: &str) -> bool {
 }
 
 fn scan_snapshot(config: &ScanConfig) -> HashMap<NormalizedPath, FileState> {
+    use rayon::prelude::*;
+
     let mut result = HashMap::new();
 
     for base in &config.include_folders {
@@ -519,17 +521,35 @@ fn scan_snapshot(config: &ScanConfig) -> HashMap<NormalizedPath, FileState> {
                 });
             });
 
-        for entry in walker.into_iter().flatten() {
-            if !entry.file_type.is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let rel = rel_string(&config.root, &path);
-            if config.exclude_globs.is_match(&rel) || !config.include_globs.is_match(&rel) {
-                continue;
-            }
-            if let Ok(metadata) = path.metadata() {
-                result.insert(
+        // Step 1: collect the candidate file paths from the (already-parallel)
+        // jwalk traversal. Applying the include/exclude globs here is cheap
+        // (string match) and avoids an extra `metadata()` syscall for files
+        // we'd just drop.
+        let candidates: Vec<PathBuf> = walker
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                if !entry.file_type.is_file() {
+                    return None;
+                }
+                let path = entry.path();
+                let rel = rel_string(&config.root, &path);
+                if config.exclude_globs.is_match(&rel) || !config.include_globs.is_match(&rel) {
+                    return None;
+                }
+                Some(path)
+            })
+            .collect();
+
+        // Step 2: fetch metadata in parallel. Each `metadata()` is an
+        // independent syscall — on Windows this is the dominant cost
+        // (Defender intercepts every stat). Skip files whose metadata
+        // can't be read (deleted between walk and stat).
+        let pairs: Vec<(NormalizedPath, FileState)> = candidates
+            .par_iter()
+            .filter_map(|path| {
+                let metadata = path.metadata().ok()?;
+                Some((
                     NormalizedPath::new(path),
                     FileState {
                         mtime_ns: metadata
@@ -539,9 +559,11 @@ fn scan_snapshot(config: &ScanConfig) -> HashMap<NormalizedPath, FileState> {
                             .map_or(0, |duration| duration.as_nanos()),
                         size: metadata.len(),
                     },
-                );
-            }
-        }
+                ))
+            })
+            .collect();
+
+        result.extend(pairs);
     }
 
     result

@@ -2108,69 +2108,93 @@ fn warm_target(
         .set_accessed(now)
         .set_modified(now);
 
-    let mut restored = 0u64;
-    let mut skipped = 0u64;
-    let mut errors = 0u64;
-
+    // Flatten the artifact → output-name nesting into a single Vec of
+    // (src, dst, name) so we can parallelize the per-file work below.
+    // Each entry is independent: a hardlink + touch of one cache file
+    // into one output path. CI cache restores can be 1k–5k entries, and
+    // the per-file syscalls (remove_file + hard_link + open + set_times)
+    // dominate; rayon takes us from ~100 µs/file serial to N_cores-way
+    // parallel on warm OS cache.
+    let total_outputs: usize = artifacts
+        .iter()
+        .map(|(_, idx)| idx.output_names.len())
+        .sum();
+    let mut work: Vec<(std::path::PathBuf, std::path::PathBuf, String)> =
+        Vec::with_capacity(total_outputs);
     for (key_hex, idx) in &artifacts {
         for (i, name) in idx.output_names.iter().enumerate() {
-            let src = artifact_dir.join(format!("{key_hex}_{i}"));
-            let dst = deps_dir.join(name.as_str());
-
-            // Skip if artifact doesn't match any crate in the lockfile
-            if let Some(ref allowed) = allowed_crates {
-                if !artifact_matches_lockfile(name, allowed) {
-                    skipped += 1;
-                    continue;
-                }
-            }
-
-            // Skip if source payload does not exist on disk.
-            if !src.exists() {
-                skipped += 1;
-                continue;
-            }
-
-            // Remove existing file at destination (hardlink will fail if it exists).
-            if dst.exists() {
-                if let Err(e) = std::fs::remove_file(&dst) {
-                    eprintln!(
-                        "zccache warm: failed to remove existing {}: {e}",
-                        dst.display()
-                    );
-                    errors += 1;
-                    continue;
-                }
-            }
-
-            // Try hardlink first, fall back to copy.
-            let linked = std::fs::hard_link(&src, &dst).is_ok();
-            if !linked {
-                if let Err(e) = std::fs::copy(&src, &dst) {
-                    eprintln!(
-                        "zccache warm: failed to copy {} -> {}: {e}",
-                        src.display(),
-                        dst.display()
-                    );
-                    errors += 1;
-                    continue;
-                }
-            }
-
-            // Touch the just-hardlinked dst to bump the underlying inode's
-            // mtime, which propagates to the artifact-cache file via the
-            // shared-inode hardlink. See the comment on `file_times` above
-            // — this is the LRU recency signal for eviction, not a
-            // cargo-freshness hack.
-            if let Ok(f) = std::fs::File::open(&dst) {
-                let _ = f.set_times(file_times);
-            }
-
-            restored += 1;
+            work.push((
+                artifact_dir.join(format!("{key_hex}_{i}")),
+                deps_dir.join(name.as_str()),
+                name.clone(),
+            ));
         }
     }
 
-    Ok((restored, skipped, errors))
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let restored = AtomicU64::new(0);
+    let skipped = AtomicU64::new(0);
+    let errors = AtomicU64::new(0);
+
+    work.par_iter().for_each(|(src, dst, name)| {
+        // Skip if artifact doesn't match any crate in the lockfile.
+        if let Some(ref allowed) = allowed_crates {
+            if !artifact_matches_lockfile(name, allowed) {
+                skipped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        // Skip if source payload does not exist on disk.
+        if !src.exists() {
+            skipped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // Remove existing file at destination (hardlink will fail if it exists).
+        if dst.exists() {
+            if let Err(e) = std::fs::remove_file(dst) {
+                eprintln!(
+                    "zccache warm: failed to remove existing {}: {e}",
+                    dst.display()
+                );
+                errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        // Try hardlink first, fall back to copy.
+        let linked = std::fs::hard_link(src, dst).is_ok();
+        if !linked {
+            if let Err(e) = std::fs::copy(src, dst) {
+                eprintln!(
+                    "zccache warm: failed to copy {} -> {}: {e}",
+                    src.display(),
+                    dst.display()
+                );
+                errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        // Touch the just-hardlinked dst to bump the underlying inode's
+        // mtime, which propagates to the artifact-cache file via the
+        // shared-inode hardlink. See the comment on `file_times` above
+        // — this is the LRU recency signal for eviction, not a
+        // cargo-freshness hack.
+        if let Ok(f) = std::fs::File::open(dst) {
+            let _ = f.set_times(file_times);
+        }
+
+        restored.fetch_add(1, Ordering::Relaxed);
+    });
+
+    Ok((
+        restored.into_inner(),
+        skipped.into_inner(),
+        errors.into_inner(),
+    ))
 }
 
 async fn cmd_session_start(
