@@ -4,7 +4,6 @@
 //! and string literals. Does not evaluate preprocessor conditionals â€”
 //! all `#include` directives are returned unconditionally.
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use crate::search_paths::IncludeSearchPaths;
@@ -156,75 +155,119 @@ pub fn resolve_include(
 /// Recursively scan a source file for all transitive includes.
 ///
 /// Builds the full include list by scanning the source file, resolving
-/// each `#include`, then scanning each resolved header, and so on.
-/// Uses a visited set to handle circular includes.
+/// each `#include`, then scanning each resolved header, and so on, using
+/// a parallel BFS over per-level frontiers. Headers within a frontier are
+/// read and parsed in parallel via rayon; new resolutions feed the next
+/// frontier. A `DashSet` deduplicates so each header is scanned exactly
+/// once across the DAG, even with circular or diamond includes.
+///
+/// `resolved` returns in BFS-level order (was DFS-post-order before
+/// parallelization). Callers in `graph.rs` only iterate the list to hash
+/// all files; no order invariant is broken.
 pub fn scan_recursive(source: &Path, search: &IncludeSearchPaths) -> ScanResult {
-    let mut resolved = Vec::new();
-    let mut unresolved = Vec::new();
-    let mut has_computed = false;
-    let mut visited = HashSet::new();
+    use dashmap::DashSet;
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
-    // Mark the source itself as visited so we don't re-scan it.
+    let visited: DashSet<NormalizedPath> = DashSet::new();
+    let resolved: Mutex<Vec<NormalizedPath>> = Mutex::new(Vec::new());
+    let unresolved: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let has_computed = AtomicBool::new(false);
+
+    // Mark the source itself as visited so we don't re-scan it via a
+    // self-include chain.
     if let Some(abs) = try_normalize(source) {
         visited.insert(abs);
     }
 
-    scan_recursive_inner(
-        source,
-        search,
-        &mut resolved,
-        &mut unresolved,
-        &mut has_computed,
-        &mut visited,
-    );
+    let mut frontier: Vec<NormalizedPath> = vec![NormalizedPath::from(source)];
+    while !frontier.is_empty() {
+        let next: Vec<NormalizedPath> = frontier
+            .par_iter()
+            .flat_map_iter(|file| {
+                scan_one_level(
+                    file.as_path(),
+                    search,
+                    &visited,
+                    &resolved,
+                    &unresolved,
+                    &has_computed,
+                )
+            })
+            .collect();
+        frontier = next;
+    }
 
     ScanResult {
-        resolved,
-        unresolved,
-        has_computed,
+        resolved: resolved.into_inner().expect("resolved mutex poisoned"),
+        unresolved: unresolved.into_inner().expect("unresolved mutex poisoned"),
+        has_computed: has_computed.load(Ordering::Relaxed),
     }
 }
 
-fn scan_recursive_inner(
+/// Scan one file: read it, parse `#include`s, resolve each, and return the
+/// list of newly-discovered resolved paths for the next frontier level.
+///
+/// All four shared collections take exactly one lock per scanned file: the
+/// per-file results are buffered locally and pushed in a single batch at
+/// the end. This keeps Mutex contention proportional to (file count) and
+/// not to (include count).
+fn scan_one_level(
     file: &Path,
     search: &IncludeSearchPaths,
-    resolved: &mut Vec<NormalizedPath>,
-    unresolved: &mut Vec<String>,
-    has_computed: &mut bool,
-    visited: &mut HashSet<NormalizedPath>,
-) {
+    visited: &dashmap::DashSet<NormalizedPath>,
+    resolved: &std::sync::Mutex<Vec<NormalizedPath>>,
+    unresolved: &std::sync::Mutex<Vec<String>>,
+    has_computed: &std::sync::atomic::AtomicBool,
+) -> Vec<NormalizedPath> {
     let directives = match scan_includes(file) {
         Ok(d) => d,
-        Err(_) => return,
+        Err(_) => return Vec::new(),
     };
 
     let file_dir = file.parent().unwrap_or(Path::new("."));
 
+    let mut new_for_next: Vec<NormalizedPath> = Vec::new();
+    let mut local_resolved: Vec<NormalizedPath> = Vec::new();
+    let mut local_unresolved: Vec<String> = Vec::new();
+    let mut saw_computed = false;
+
     for directive in &directives {
         match &directive.kind {
             IncludeKind::Computed(_) => {
-                *has_computed = true;
+                saw_computed = true;
             }
             _ => {
                 if let Some(abs_path) = resolve_include(directive, search, file_dir) {
                     if visited.insert(abs_path.clone()) {
-                        resolved.push(abs_path.clone());
-                        // Recurse into the resolved header.
-                        scan_recursive_inner(
-                            &abs_path,
-                            search,
-                            resolved,
-                            unresolved,
-                            has_computed,
-                            visited,
-                        );
+                        local_resolved.push(abs_path.clone());
+                        new_for_next.push(abs_path);
                     }
                 } else {
-                    unresolved.push(directive.path.clone());
+                    local_unresolved.push(directive.path.clone());
                 }
             }
         }
     }
+
+    if !local_resolved.is_empty() {
+        resolved
+            .lock()
+            .expect("resolved mutex poisoned")
+            .extend(local_resolved);
+    }
+    if !local_unresolved.is_empty() {
+        unresolved
+            .lock()
+            .expect("unresolved mutex poisoned")
+            .extend(local_unresolved);
+    }
+    if saw_computed {
+        has_computed.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    new_for_next
 }
 
 // â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

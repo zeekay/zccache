@@ -3516,6 +3516,7 @@ version = "1.6.0"
 dependencies = [
  "bincode",
  "clap",
+ "criterion",
  "dashmap",
  "filetime",
  "libc",
@@ -3549,6 +3550,7 @@ name = "zccache-depgraph"
 version = "1.6.0"
 dependencies = [
  "blake3",
+ "criterion",
  "dashmap",
  "rayon",
  "rkyv",
