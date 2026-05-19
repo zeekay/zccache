@@ -6,6 +6,9 @@ use zccache_core::NormalizedPath;
 #[cfg(feature = "python")]
 mod python;
 
+#[cfg(windows)]
+mod spawn_daemon_windows;
+
 pub mod symbols;
 
 pub use zccache_download_client::{
@@ -502,18 +505,30 @@ fn which_on_path(name: &str) -> Option<NormalizedPath> {
 /// initialized with the CLI's PID, and the originator marker (used by
 /// running-process for crash-resilient orphan discovery) is set to
 /// `zccache-cli:<pid>` unless an outer tool has already claimed it.
+#[cfg(not(windows))]
 fn apply_cli_spawn_lineage(cmd: &mut std::process::Command) {
+    for (k, v) in cli_spawn_lineage_env() {
+        cmd.env(k, v);
+    }
+}
+
+/// Compute the lineage env-var pairs the CLI sets on the daemon it
+/// spawns. Returns the same overrides `apply_cli_spawn_lineage` writes
+/// onto a `Command`, in a form usable by the Windows raw-spawn path
+/// (which needs to build its own merged environment block).
+fn cli_spawn_lineage_env() -> Vec<(String, String)> {
     const ENV_ORIGINATOR: &str = "RUNNING_PROCESS_ORIGINATOR";
     const ENV_LINEAGE: &str = "ZCCACHE_LINEAGE";
     const ENV_PARENT_PID: &str = "ZCCACHE_PARENT_PID";
     const ENV_CLIENT_PID: &str = "ZCCACHE_CLIENT_PID";
 
     let cli_pid = std::process::id();
+    let mut out: Vec<(String, String)> = Vec::with_capacity(4);
 
     // Preserve any outer originator (e.g. the build tool was already wrapped
     // by running-process). Otherwise, claim the originator slot ourselves.
     if std::env::var(ENV_ORIGINATOR).is_err() {
-        cmd.env(ENV_ORIGINATOR, format!("zccache-cli:{cli_pid}"));
+        out.push((ENV_ORIGINATOR.to_string(), format!("zccache-cli:{cli_pid}")));
     }
 
     // Extend or initialize the chain with our PID.
@@ -529,9 +544,10 @@ fn apply_cli_spawn_lineage(cmd: &mut std::process::Command) {
         Ok(existing) => existing,
         Err(_) => cli_pid.to_string(),
     };
-    cmd.env(ENV_LINEAGE, chain);
-    cmd.env(ENV_PARENT_PID, cli_pid.to_string());
-    cmd.env(ENV_CLIENT_PID, cli_pid.to_string());
+    out.push((ENV_LINEAGE.to_string(), chain));
+    out.push((ENV_PARENT_PID.to_string(), cli_pid.to_string()));
+    out.push((ENV_CLIENT_PID.to_string(), cli_pid.to_string()));
+    out
 }
 
 /// Subdir of the zccache global cache directory where the CLI stores
@@ -605,7 +621,7 @@ pub fn gc_runtime_binaries_in(dir: &Path) {
     }
 }
 
-fn spawn_daemon(bin: &Path, endpoint: &str) -> Result<(), String> {
+pub fn spawn_daemon(bin: &Path, endpoint: &str) -> Result<(), String> {
     // GC before the new spawn so the dir doesn't grow unbounded across
     // crash-loop scenarios. Live daemons are skipped (locked files).
     gc_runtime_binaries();
@@ -622,62 +638,34 @@ fn spawn_daemon(bin: &Path, endpoint: &str) -> Result<(), String> {
         Err(_) => bin,
     };
 
-    let mut cmd = std::process::Command::new(spawn_bin);
-    cmd.args(["--foreground", "--endpoint", endpoint]);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-
-    apply_cli_spawn_lineage(&mut cmd);
-
+    // On Windows we cannot use std::process::Command::spawn for the
+    // daemon: it calls CreateProcessW with bInheritHandles = TRUE and
+    // the kernel duplicates every inheritable handle in our table —
+    // including orphaned pipe handles inherited from a grandparent
+    // (e.g. Python's `subprocess.Popen(stdout=PIPE)`). The daemon would
+    // then hold that pipe open and the grandparent's read would never
+    // EOF. See `spawn_daemon_windows` and issue #289 for the full
+    // root-cause analysis.
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        disable_handle_inheritance();
+        return spawn_daemon_windows::spawn_daemon_sanitized(
+            spawn_bin,
+            &["--foreground", "--endpoint", endpoint],
+            &cli_spawn_lineage_env(),
+        );
     }
 
-    cmd.spawn()
-        .map_err(|e| format!("failed to spawn daemon: {e}"))?;
-
-    #[cfg(windows)]
-    restore_handle_inheritance();
-
-    Ok(())
-}
-
-#[cfg(windows)]
-fn disable_handle_inheritance() {
-    use std::os::windows::io::AsRawHandle;
-
-    extern "system" {
-        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
-    }
-    const HANDLE_FLAG_INHERIT: u32 = 1;
-
-    unsafe {
-        let stdout = std::io::stdout().as_raw_handle();
-        let stderr = std::io::stderr().as_raw_handle();
-        let _ = SetHandleInformation(stdout.cast(), HANDLE_FLAG_INHERIT, 0);
-        let _ = SetHandleInformation(stderr.cast(), HANDLE_FLAG_INHERIT, 0);
-    }
-}
-
-#[cfg(windows)]
-fn restore_handle_inheritance() {
-    use std::os::windows::io::AsRawHandle;
-
-    extern "system" {
-        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
-    }
-    const HANDLE_FLAG_INHERIT: u32 = 1;
-
-    unsafe {
-        let stdout = std::io::stdout().as_raw_handle();
-        let stderr = std::io::stderr().as_raw_handle();
-        let _ = SetHandleInformation(stdout.cast(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-        let _ = SetHandleInformation(stderr.cast(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    #[cfg(not(windows))]
+    {
+        let mut cmd = std::process::Command::new(spawn_bin);
+        cmd.args(["--foreground", "--endpoint", endpoint]);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        apply_cli_spawn_lineage(&mut cmd);
+        cmd.spawn()
+            .map_err(|e| format!("failed to spawn daemon: {e}"))?;
+        Ok(())
     }
 }
 
