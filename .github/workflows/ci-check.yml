@@ -68,15 +68,15 @@ jobs:
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-          exit $status
 
-      # Stop the zccache daemon spawned during testing. Without this, the
-      # orphan daemon can hold open file handles in $TARGET that block the
-      # runner's post-job cleanup (and on Windows specifically prevented
-      # upload-artifact from packaging the target directory — see #299).
-      # `|| true` so a missing or already-stopped daemon never fails the
-      # job. `if: always()` so it runs after test failures too.
-      - name: Stop zccache daemon
-        if: always()
-        shell: bash
-        run: zccache stop 2>/dev/null || true
+          # Stop the zccache daemon before the step exits. Without this,
+          # the orphan daemon can hold open file handles in target/ that
+          # block the runner's post-job cleanup — on Windows this
+          # specifically prevented upload-artifact from packaging the
+          # target directory (see #299). Inline (not a separate step) so
+          # the daemon is stopped within the same shell context as the
+          # test run, before the step terminates. `|| true` so a missing
+          # or already-stopped daemon never masks the test exit code.
+          zccache stop 2>/dev/null || true
+
+          exit $status
