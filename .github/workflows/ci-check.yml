@@ -23,7 +23,6 @@ jobs:
           toolchain: 1.94.1
           cache: true
           cache-key-suffix: check-${{ inputs.os }}
-          enable: false
       - name: Check
         shell: bash
         run: |
@@ -45,7 +44,6 @@ jobs:
           toolchain: 1.94.1
           cache: true
           cache-key-suffix: test-${{ inputs.os }}
-          enable: false
       # Platform Test runs unit tests in libraries and binaries only — it
       # intentionally does NOT compile the integration test binaries under
       # `crates/*/tests/`. Most of those binaries' tests are #[ignore]'d, but
