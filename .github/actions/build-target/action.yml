@@ -328,3 +328,36 @@ runs:
         # fail the job. The bounded poll inside `zccache stop` is the real
         # safeguard.
         zccache stop || true
+
+        # Defense-in-depth force-kill for orphan zccache-daemon processes.
+        #
+        # setup-soldr ships a managed zccache binary built from an older
+        # zccache release (pre-#291). That older daemon's spawn path went
+        # through std::process::Command which inherits the parent's
+        # inheritable handles — including a Python pipe write-end leaked
+        # down the soldr -> cargo -> rustc chain. Result: the
+        # setup-soldr-spawned daemon can survive a graceful `zccache stop`
+        # (the new daemon respawns on a connection attempt, or a child
+        # process is holding the IPC handle), and on Windows it then
+        # randomly locks files in the build's staging dir long enough to
+        # break `actions/upload-artifact@v7` with a silent failure (only
+        # "Root directory input is valid!" then nothing — see release-auto
+        # run 26094070914 / job 76727133236).
+        #
+        # The taskkill/pkill below force-kills any straggler so the
+        # composite ends with zero zccache-daemon processes, removing the
+        # upload-artifact flake source. Both commands tolerate "process
+        # not found" (the common case once `zccache stop` worked).
+        #
+        # Tracking removal: zccache#299. Once setup-soldr bumps its
+        # managed zccache to >= 1.7.0 (which has the
+        # PROC_THREAD_ATTRIBUTE_HANDLE_LIST fix from #291), this block
+        # becomes redundant and should be deleted.
+        case "$RUNNER_OS" in
+          Windows)
+            taskkill //F //IM zccache-daemon.exe //T 2>/dev/null || true
+            ;;
+          Linux|macOS)
+            pkill -KILL -x zccache-daemon 2>/dev/null || true
+            ;;
+        esac
