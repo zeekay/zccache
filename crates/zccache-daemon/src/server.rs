@@ -1973,26 +1973,22 @@ async fn handle_link_ephemeral(
             } else {
                 cwd_path.join(&parsed_tool.output_file).into()
             };
-            let mut write_ok = true;
-            for (i, payload) in payloads.iter().enumerate() {
-                let target = if payloads.len() == 1 {
-                    output_path.clone()
-                } else {
-                    output_path
-                        .parent()
-                        .unwrap_or(cwd_path)
-                        .join(&names[i])
-                        .into()
-                };
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                let cache_file = state.artifact_dir.join(format!("{key_hex}_{i}"));
-                if write_cached_payload(&target, &cache_file, payload).is_err() {
-                    write_ok = false;
-                    break;
-                }
-            }
+            let targets: Vec<(NormalizedPath, NormalizedPath)> = (0..payloads.len())
+                .map(|i| {
+                    let target: NormalizedPath = if payloads.len() == 1 {
+                        output_path.clone()
+                    } else {
+                        output_path
+                            .parent()
+                            .unwrap_or(cwd_path)
+                            .join(&names[i])
+                            .into()
+                    };
+                    let cache_file = state.artifact_dir.join(format!("{key_hex}_{i}"));
+                    (target, cache_file)
+                })
+                .collect();
+            let write_ok = write_payloads_par(&targets, &payloads);
             if write_ok {
                 return Response::LinkResult {
                     exit_code,
@@ -2057,68 +2053,95 @@ async fn handle_link_ephemeral(
         ..
     } = result
     {
-        if let Ok(data) = std::fs::read(&output_path) {
-            let mut outputs = vec![ArtifactOutput {
-                name: parsed_tool
-                    .output_file
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned(),
-                data: Arc::new(data),
-            }];
+        // Enumerate (name, path) for primary + declared secondaries +
+        // detected side-effects in cache-index order so that `outputs[i]`
+        // maps to `{key}_i` on disk after the parallel reads below. Missing
+        // secondaries and read errors are dropped (preserves the prior
+        // serial behavior). Side-effect detection uses the full set of
+        // declared output names so it doesn't double-capture them.
+        let primary_name_os = parsed_tool
+            .output_file
+            .file_name()
+            .unwrap_or_default()
+            .to_os_string();
+        let already_captured: std::collections::HashSet<std::ffi::OsString> =
+            std::iter::once(primary_name_os.clone())
+                .chain(
+                    parsed_tool
+                        .secondary_outputs
+                        .iter()
+                        .filter_map(|s| s.file_name().map(|n| n.to_os_string())),
+                )
+                .collect();
+        let side_effects = crate::side_effect::detect_side_effects(
+            &dir_snapshot,
+            output_dir,
+            &primary_name_os,
+            &already_captured,
+        )
+        .unwrap_or_default();
 
-            // Collect secondary outputs (e.g., MSVC import lib + .exp)
-            for secondary in &parsed_tool.secondary_outputs {
-                let sec_path = if secondary.is_absolute() {
-                    secondary.clone()
-                } else {
-                    cwd_path.join(secondary).into()
-                };
-                if let Ok(sec_data) = std::fs::read(&sec_path) {
-                    outputs.push(ArtifactOutput {
-                        name: secondary
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned(),
-                        data: Arc::new(sec_data),
-                    });
-                }
-                // Missing secondary outputs are silently skipped —
-                // e.g., .exp may not always be generated.
-            }
-
-            // Detect side-effect files deployed by compiler wrapper post-link hooks
-            // (e.g., ASan runtime DLLs copied next to the output binary).
-            let primary_name = parsed_tool
-                .output_file
+        let mut read_targets: Vec<(String, std::path::PathBuf)> =
+            Vec::with_capacity(1 + parsed_tool.secondary_outputs.len() + side_effects.len());
+        read_targets.push((
+            primary_name_os.to_string_lossy().into_owned(),
+            std::path::PathBuf::from(output_path.as_path()),
+        ));
+        for secondary in &parsed_tool.secondary_outputs {
+            let sec_path = if secondary.is_absolute() {
+                secondary.to_path_buf()
+            } else {
+                cwd_path.join(secondary)
+            };
+            let name = secondary
                 .file_name()
                 .unwrap_or_default()
-                .to_os_string();
-            let already_captured: std::collections::HashSet<std::ffi::OsString> = outputs
+                .to_string_lossy()
+                .into_owned();
+            read_targets.push((name, sec_path));
+        }
+        for se in &side_effects {
+            read_targets.push((
+                se.file_name.to_string_lossy().into_owned(),
+                std::path::PathBuf::from(se.path.as_path()),
+            ));
+        }
+
+        // Read all output files; preserve order. Falls back to a serial
+        // loop when there's only the primary output — rayon dispatch cost
+        // (~150 µs) is comparable to one fs::read for small outputs.
+        let reads: Vec<Option<ArtifactOutput>> = if read_targets.len() <= 1 {
+            read_targets
                 .iter()
-                .map(|o| std::ffi::OsString::from(&o.name))
-                .collect();
-            if let Ok(side_effects) = crate::side_effect::detect_side_effects(
-                &dir_snapshot,
-                output_dir,
-                &primary_name,
-                &already_captured,
-            ) {
-                for se in &side_effects {
-                    if let Ok(data) = std::fs::read(&se.path) {
-                        tracing::debug!(
-                            file = %se.file_name.to_string_lossy(),
-                            size = data.len(),
-                            "caching side-effect file"
-                        );
-                        outputs.push(ArtifactOutput {
-                            name: se.file_name.to_string_lossy().into_owned(),
-                            data: Arc::new(data),
-                        });
-                    }
-                }
+                .map(|(name, path)| {
+                    std::fs::read(path).ok().map(|data| ArtifactOutput {
+                        name: name.clone(),
+                        data: Arc::new(data),
+                    })
+                })
+                .collect()
+        } else {
+            use rayon::prelude::*;
+            read_targets
+                .par_iter()
+                .map(|(name, path)| {
+                    std::fs::read(path).ok().map(|data| ArtifactOutput {
+                        name: name.clone(),
+                        data: Arc::new(data),
+                    })
+                })
+                .collect()
+        };
+
+        // Primary read gates the cache populate. If it fails, the link
+        // succeeded but the output file is no longer readable — skip
+        // caching, same as the prior serial behavior.
+        if reads.first().and_then(|r| r.as_ref()).is_some() {
+            let outputs: Vec<ArtifactOutput> = reads.into_iter().flatten().collect();
+            // Log side-effect captures (preserves prior tracing).
+            let side_effect_start = 1 + parsed_tool.secondary_outputs.len();
+            for o in outputs.iter().skip(side_effect_start) {
+                tracing::debug!(file = %o.name, size = o.data.len(), "caching side-effect file");
             }
 
             let artifact = ArtifactData {
@@ -3123,6 +3146,46 @@ fn write_cached_payload(
         CachedPayload::Bytes(data) => write_cached_output(out_path, cache_file, data),
         CachedPayload::File(path) => write_cached_file(out_path, path),
     }
+}
+
+/// Write a batch of cached payloads to their target paths in parallel.
+///
+/// `targets[i]` is the `(out_path, cache_file)` pair for `payloads[i]`. The
+/// parent of each `out_path` is created if it does not exist (matches the
+/// per-site behavior of the link-hit path). Returns `true` iff every write
+/// succeeded; `false` on first failure (callers either fall through to a
+/// fallback path or ignore the result, mirroring the prior serial loops).
+///
+/// Threshold: rayon is only used when `targets.len() >= 4`. For N ≤ 3 the
+/// per-iteration thread-pool dispatch cost (~300 µs) is comparable to the
+/// hardlink syscalls themselves, so a serial loop is faster. The
+/// `benches/write_payloads.rs` micro-benchmark sets this cut-off
+/// empirically on the Windows / NTFS host.
+const PAR_WRITE_THRESHOLD: usize = 4;
+
+fn write_payloads_par<P, Q>(targets: &[(P, Q)], payloads: &[CachedPayload]) -> bool
+where
+    P: AsRef<Path> + Sync,
+    Q: AsRef<Path> + Sync,
+{
+    debug_assert_eq!(targets.len(), payloads.len());
+    let write_one = |out: &Path, cache: &Path, payload: &CachedPayload| -> bool {
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        write_cached_payload(out, cache, payload).is_ok()
+    };
+    if targets.len() < PAR_WRITE_THRESHOLD {
+        return targets
+            .iter()
+            .zip(payloads.iter())
+            .all(|((out, cache), payload)| write_one(out.as_ref(), cache.as_ref(), payload));
+    }
+    use rayon::prelude::*;
+    targets
+        .par_iter()
+        .zip(payloads.par_iter())
+        .all(|((out, cache), payload)| write_one(out.as_ref(), cache.as_ref(), payload))
 }
 
 fn break_output_hardlink_before_compile(path: &Path) -> std::io::Result<()> {
@@ -4530,24 +4593,23 @@ async fn handle_compile(
 
                                 // Write output
                                 let t_write_output = std::time::Instant::now();
-                                let mut write_ok = true;
                                 let secondary_dir =
                                     output_path.parent().unwrap_or(cwd).to_path_buf();
-                                for (i, payload) in payloads.iter().enumerate() {
-                                    let out_path = if i == 0 {
-                                        output_path.clone()
-                                    } else {
-                                        secondary_dir.join(&names[i]).into()
-                                    };
-                                    let cache_file =
-                                        state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                                    if write_cached_payload(&out_path, &cache_file, payload)
-                                        .is_err()
-                                    {
-                                        write_ok = false;
-                                        break;
-                                    }
-                                }
+                                let targets: Vec<(NormalizedPath, NormalizedPath)> = (0..payloads
+                                    .len())
+                                    .map(|i| {
+                                        let out: NormalizedPath = if i == 0 {
+                                            output_path.clone()
+                                        } else {
+                                            secondary_dir.join(&names[i]).into()
+                                        };
+                                        let cache_file = state
+                                            .artifact_dir
+                                            .join(format!("{artifact_key_hex}_{i}"));
+                                        (out, cache_file)
+                                    })
+                                    .collect();
+                                let write_ok = write_payloads_par(&targets, &payloads);
                                 if write_ok {
                                     let write_output_ns =
                                         t_write_output.elapsed().as_nanos() as u64;
@@ -4808,25 +4870,24 @@ async fn handle_compile(
                         // Drop the DashMap reference before doing more work
                         drop(cached_ref);
 
-                        let mut write_ok = true;
                         let secondary_dir = if is_rustc {
                             output_path.parent().unwrap_or(&cwd_path).to_path_buf()
                         } else {
                             cwd_path.clone().to_path_buf()
                         };
-                        for (i, payload) in payloads.iter().enumerate() {
-                            let out_path = if i == 0 {
-                                output_path.clone()
-                            } else {
-                                secondary_dir.join(&names[i]).into()
-                            };
-                            let cache_file =
-                                state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                            if write_cached_payload(&out_path, &cache_file, payload).is_err() {
-                                write_ok = false;
-                                break;
-                            }
-                        }
+                        let targets: Vec<(NormalizedPath, NormalizedPath)> = (0..payloads.len())
+                            .map(|i| {
+                                let out: NormalizedPath = if i == 0 {
+                                    output_path.clone()
+                                } else {
+                                    secondary_dir.join(&names[i]).into()
+                                };
+                                let cache_file =
+                                    state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                                (out, cache_file)
+                            })
+                            .collect();
+                        let write_ok = write_payloads_par(&targets, &payloads);
                         if !write_ok {
                             // Fall through to slow path on write failure
                         } else {
@@ -5077,24 +5138,24 @@ async fn handle_compile(
                     let artifact_bytes: u64 = cached_ref.meta.total_size;
                     drop(cached_ref);
 
-                    let mut write_ok = true;
                     let secondary_dir = if is_rustc {
                         output_path.parent().unwrap_or(&cwd_path).to_path_buf()
                     } else {
                         cwd_path.clone().to_path_buf()
                     };
-                    for (i, payload) in payloads.iter().enumerate() {
-                        let out_path = if i == 0 {
-                            output_path.clone()
-                        } else {
-                            secondary_dir.join(&names[i]).into()
-                        };
-                        let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                        if write_cached_payload(&out_path, &cache_file, payload).is_err() {
-                            write_ok = false;
-                            break;
-                        }
-                    }
+                    let targets: Vec<(NormalizedPath, NormalizedPath)> = (0..payloads.len())
+                        .map(|i| {
+                            let out: NormalizedPath = if i == 0 {
+                                output_path.clone()
+                            } else {
+                                secondary_dir.join(&names[i]).into()
+                            };
+                            let cache_file =
+                                state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                            (out, cache_file)
+                        })
+                        .collect();
+                    let write_ok = write_payloads_par(&targets, &payloads);
                     if !write_ok {
                         // Fall through to compile on write failure
                     } else {
@@ -6008,16 +6069,19 @@ fn check_unit_cache(
                         let stderr = cached_ref.stderr.clone();
                         drop(cached_ref);
 
-                        for (i, payload) in payloads.iter().enumerate() {
-                            let out_path = if i == 0 {
-                                output_path.clone()
-                            } else {
-                                cwd_path.join(&names[i]).into()
-                            };
-                            let cache_file =
-                                state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                            let _ = write_cached_payload(&out_path, &cache_file, payload);
-                        }
+                        let targets: Vec<(NormalizedPath, NormalizedPath)> = (0..payloads.len())
+                            .map(|i| {
+                                let out: NormalizedPath = if i == 0 {
+                                    output_path.clone()
+                                } else {
+                                    cwd_path.join(&names[i]).into()
+                                };
+                                let cache_file =
+                                    state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                                (out, cache_file)
+                            })
+                            .collect();
+                        let _ = write_payloads_par(&targets, &payloads);
 
                         state.stats.record_hit(0, artifact_bytes);
                         state.profiler.record_hit(&HitPhases {
@@ -6118,15 +6182,18 @@ fn check_unit_cache(
                 let stderr = cached_ref.stderr.clone();
                 drop(cached_ref);
 
-                for (i, payload) in payloads.iter().enumerate() {
-                    let out_path = if i == 0 {
-                        output_path.clone()
-                    } else {
-                        cwd_path.join(&names[i]).into()
-                    };
-                    let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
-                    let _ = write_cached_payload(&out_path, &cache_file, payload);
-                }
+                let targets: Vec<(NormalizedPath, NormalizedPath)> = (0..payloads.len())
+                    .map(|i| {
+                        let out: NormalizedPath = if i == 0 {
+                            output_path.clone()
+                        } else {
+                            cwd_path.join(&names[i]).into()
+                        };
+                        let cache_file = state.artifact_dir.join(format!("{artifact_key_hex}_{i}"));
+                        (out, cache_file)
+                    })
+                    .collect();
+                let _ = write_payloads_par(&targets, &payloads);
 
                 state.stats.record_hit(0, artifact_bytes);
 

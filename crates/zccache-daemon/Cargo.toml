@@ -53,3 +53,12 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 [dev-dependencies]
 tempfile = { workspace = true }
 zccache-test-support = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "write_payloads"
+harness = false
+
+[[bench]]
+name = "read_outputs"
+harness = false
