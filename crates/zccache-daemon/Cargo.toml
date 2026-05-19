@@ -62,3 +62,7 @@ harness = false
 [[bench]]
 name = "read_outputs"
 harness = false
+
+[[bench]]
+name = "persist_payloads"
+harness = false

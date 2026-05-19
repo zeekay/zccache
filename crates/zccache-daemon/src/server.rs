@@ -3008,14 +3008,30 @@ fn persist_artifact_payloads(
 ) -> std::io::Result<()> {
     if pack_mode_enabled() {
         let pack = build_pack(payloads);
-        persist_artifact_output(&pack_path_for(artifact_dir, key_hex), &pack)
-    } else {
+        return persist_artifact_output(&pack_path_for(artifact_dir, key_hex), &pack);
+    }
+    // Run inline for small N — rayon dispatch cost is comparable to the
+    // syscalls themselves below the threshold (same break-even as
+    // `write_payloads_par`). Empirically tuned in
+    // `crates/zccache-daemon/benches/persist_payloads.rs`.
+    if payloads.len() < PAR_WRITE_THRESHOLD {
         for (i, payload) in payloads.iter().enumerate() {
             let cache_path = artifact_dir.join(format!("{key_hex}_{i}"));
             persist_artifact_output(&cache_path, payload)?;
         }
-        Ok(())
+        return Ok(());
     }
+    use rayon::prelude::*;
+    // `reduce` preserves the prior "return first error" semantics:
+    // `a.and(b)` returns the first `Err` it sees and otherwise `Ok(())`.
+    payloads
+        .par_iter()
+        .enumerate()
+        .map(|(i, payload)| {
+            let cache_path = artifact_dir.join(format!("{key_hex}_{i}"));
+            persist_artifact_output(&cache_path, payload)
+        })
+        .reduce(|| Ok(()), |a, b| a.and(b))
 }
 
 #[derive(Clone, Copy, Debug, Default)]
