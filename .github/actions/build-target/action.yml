@@ -124,6 +124,13 @@ runs:
         soldr cargo build --release --target ${{ inputs.target }} -p zccache-daemon
         soldr cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint
 
+        # Stop the zccache daemon inline before this step exits. Without
+        # this, the daemon can hold file handles in target/ that break
+        # downstream staging / packaging — on Windows specifically this
+        # blocks actions/upload-artifact (#299). Matches the pattern used
+        # in ci-check.yml's Test step.
+        zccache stop 2>/dev/null || true
+
     # Windows DLL load smoke gate (see zccache#269). If the just-built
     # `zccache.exe` cannot complete loader init on this host, `--version`
     # exits non-zero before any Rust code runs and the release stops here
@@ -163,6 +170,10 @@ runs:
         soldr cargo build --release --target ${{ inputs.target }} -p zccache-cli --features python --lib
         soldr cargo build --release --target ${{ inputs.target }} -p zccache-watcher --features python --lib
         soldr cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint --features python --lib
+
+        # Stop the zccache daemon inline before this step exits — same
+        # rationale as the prior "Build release binaries" step.
+        zccache stop 2>/dev/null || true
 
     - name: Stage artifacts
       shell: bash
