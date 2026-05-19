@@ -17,17 +17,17 @@ jobs:
     runs-on: ${{ inputs.os }}
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@v0
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          version: "0.7.18"
           toolchain: 1.94.1
-          cache: false
-          cache-key-suffix: check-${{ inputs.os }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check-${{ inputs.os }}
       - name: Check
         shell: bash
         run: |
           start=$SECONDS
-          soldr cargo check --workspace
+          cargo check --workspace
           status=$?
           dur=$((SECONDS - start))
           echo "- **${{ inputs.os }} / Check**: ${dur}s" >> "$GITHUB_STEP_SUMMARY"
@@ -38,12 +38,12 @@ jobs:
     runs-on: ${{ inputs.os }}
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@v0
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          version: "0.7.18"
           toolchain: 1.94.1
-          cache: false
-          cache-key-suffix: test-${{ inputs.os }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ inputs.os }}
       # Platform Test runs unit tests in libraries and binaries only — it
       # intentionally does NOT compile the integration test binaries under
       # `crates/*/tests/`. Most of those binaries' tests are #[ignore]'d, but
@@ -55,7 +55,7 @@ jobs:
         run: |
           set +e
           start=$SECONDS
-          soldr cargo test --workspace --lib --bins --no-fail-fast 2>&1 | tee test-output.txt
+          cargo test --workspace --lib --bins --no-fail-fast 2>&1 | tee test-output.txt
           status=${PIPESTATUS[0]}
           dur=$((SECONDS - start))
           echo "- **${{ inputs.os }} / Test**: ${dur}s" >> "$GITHUB_STEP_SUMMARY"
@@ -68,15 +68,5 @@ jobs:
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-
-          # Stop the zccache daemon before the step exits. Without this,
-          # the orphan daemon can hold open file handles in target/ that
-          # block the runner's post-job cleanup — on Windows this
-          # specifically prevented upload-artifact from packaging the
-          # target directory (see #299). Inline (not a separate step) so
-          # the daemon is stopped within the same shell context as the
-          # test run, before the step terminates. `|| true` so a missing
-          # or already-stopped daemon never masks the test exit code.
-          zccache stop 2>/dev/null || true
 
           exit $status

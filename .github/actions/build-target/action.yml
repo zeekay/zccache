@@ -10,7 +10,7 @@ inputs:
     required: false
     default: ""
   cache_key:
-    description: Cache key suffix for setup-soldr caches.
+    description: Cache key suffix passed to Swatinem/rust-cache as shared-key.
     required: true
   include_python:
     description: Build and stage Python extension artifacts.
@@ -56,17 +56,16 @@ runs:
       with:
         python-version: ${{ inputs.python_version }}
 
-    - name: Setup Soldr
-      uses: zackees/setup-soldr@v0
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
       with:
-        version: "0.7.18"
         toolchain: 1.94.1
-        cache: true
-        cache-key-suffix: ${{ inputs.cache_key }}
+        targets: ${{ inputs.target }}
 
-    - name: Ensure target stdlib is installed
-      shell: bash
-      run: rustup target add ${{ inputs.target }}
+    - name: Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.cache_key }}
 
     - name: Install musl tools
       if: inputs.target == 'x86_64-unknown-linux-musl'
@@ -120,16 +119,9 @@ runs:
         if [[ "${{ inputs.target }}" == *pc-windows-msvc ]]; then
           export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
         fi
-        soldr cargo build --release --target ${{ inputs.target }} -p zccache-cli
-        soldr cargo build --release --target ${{ inputs.target }} -p zccache-daemon
-        soldr cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint
-
-        # Stop the zccache daemon inline before this step exits. Without
-        # this, the daemon can hold file handles in target/ that break
-        # downstream staging / packaging — on Windows specifically this
-        # blocks actions/upload-artifact (#299). Matches the pattern used
-        # in ci-check.yml's Test step.
-        zccache stop 2>/dev/null || true
+        cargo build --release --target ${{ inputs.target }} -p zccache-cli
+        cargo build --release --target ${{ inputs.target }} -p zccache-daemon
+        cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint
 
     # Windows DLL load smoke gate (see zccache#269). If the just-built
     # `zccache.exe` cannot complete loader init on this host, `--version`
@@ -160,20 +152,16 @@ runs:
       env:
         PYO3_PYTHON: python
       run: |
-        HOST_TARGET=$(soldr --no-cache rustc -vV | awk '/^host: / { print $2 }')
+        HOST_TARGET=$(rustc -vV | awk '/^host: / { print $2 }')
         if [ "$HOST_TARGET" != "${{ inputs.target }}" ]; then
           export PYO3_CROSS=1
           export PYO3_CROSS_PYTHON_VERSION="${{ inputs.python_version }}"
           export PYO3_CROSS_PYTHON_IMPLEMENTATION=CPython
         fi
 
-        soldr cargo build --release --target ${{ inputs.target }} -p zccache-cli --features python --lib
-        soldr cargo build --release --target ${{ inputs.target }} -p zccache-watcher --features python --lib
-        soldr cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint --features python --lib
-
-        # Stop the zccache daemon inline before this step exits — same
-        # rationale as the prior "Build release binaries" step.
-        zccache stop 2>/dev/null || true
+        cargo build --release --target ${{ inputs.target }} -p zccache-cli --features python --lib
+        cargo build --release --target ${{ inputs.target }} -p zccache-watcher --features python --lib
+        cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint --features python --lib
 
     - name: Stage artifacts
       shell: bash
@@ -325,50 +313,3 @@ runs:
           --debug-input-dir staging-debug \
           --output-dir standalone
 
-    # The setup-soldr post-step that runs after this composite finishes will
-    # tar `$SOLDR_CACHE_DIR/cache/zccache/` for the actions/cache save. On
-    # Windows that tar fails with EBUSY on `index.redb` if the zccache daemon
-    # is still alive holding the redb exclusive lock. `zccache stop` now waits
-    # until the IPC endpoint is gone and the redb file is openable. See #182
-    # and run https://github.com/zackees/zccache/actions/runs/25765121262/job/75675819635.
-    - name: Shutdown zccache daemon before cache save
-      if: always()
-      shell: bash
-      run: |
-        # `|| true` so a never-started daemon (e.g. cold cache hit) doesn't
-        # fail the job. The bounded poll inside `zccache stop` is the real
-        # safeguard.
-        zccache stop || true
-
-        # Defense-in-depth force-kill for orphan zccache-daemon processes.
-        #
-        # setup-soldr ships a managed zccache binary built from an older
-        # zccache release (pre-#291). That older daemon's spawn path went
-        # through std::process::Command which inherits the parent's
-        # inheritable handles — including a Python pipe write-end leaked
-        # down the soldr -> cargo -> rustc chain. Result: the
-        # setup-soldr-spawned daemon can survive a graceful `zccache stop`
-        # (the new daemon respawns on a connection attempt, or a child
-        # process is holding the IPC handle), and on Windows it then
-        # randomly locks files in the build's staging dir long enough to
-        # break `actions/upload-artifact@v7` with a silent failure (only
-        # "Root directory input is valid!" then nothing — see release-auto
-        # run 26094070914 / job 76727133236).
-        #
-        # The taskkill/pkill below force-kills any straggler so the
-        # composite ends with zero zccache-daemon processes, removing the
-        # upload-artifact flake source. Both commands tolerate "process
-        # not found" (the common case once `zccache stop` worked).
-        #
-        # Tracking removal: zccache#299. Once setup-soldr bumps its
-        # managed zccache to >= 1.7.0 (which has the
-        # PROC_THREAD_ATTRIBUTE_HANDLE_LIST fix from #291), this block
-        # becomes redundant and should be deleted.
-        case "$RUNNER_OS" in
-          Windows)
-            taskkill //F //IM zccache-daemon.exe //T 2>/dev/null || true
-            ;;
-          Linux|macOS)
-            pkill -KILL -x zccache-daemon 2>/dev/null || true
-            ;;
-        esac
