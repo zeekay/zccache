@@ -17,20 +17,12 @@ jobs:
     runs-on: ${{ inputs.os }}
     steps:
       - uses: actions/checkout@v6
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
-      - name: Setup zccache
-        uses: ./
+      - uses: Swatinem/rust-cache@v2
         with:
           shared-key: check-${{ inputs.os }}
-          cache-target: "true"
-          # Opt into restore-key fallback so commits whose deps are unchanged
-          # reuse the previous run's target snapshot instead of cold-building.
-          # action.yml's primary key includes ${{ github.sha }}, so without
-          # this every commit cold-builds. See #190.
-          target-restore-fallback: "true"
       - name: Check
         shell: bash
         run: |
@@ -40,24 +32,18 @@ jobs:
           dur=$((SECONDS - start))
           echo "- **${{ inputs.os }} / Check**: ${dur}s" >> "$GITHUB_STEP_SUMMARY"
           exit $status
-      - if: always()
-        uses: ./action/cleanup
 
   test:
     name: Test
     runs-on: ${{ inputs.os }}
     steps:
       - uses: actions/checkout@v6
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
-      - name: Setup zccache
-        uses: ./
+      - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ inputs.os }}
-          cache-target: "true"
-          target-restore-fallback: "true"
       # Platform Test runs unit tests in libraries and binaries only — it
       # intentionally does NOT compile the integration test binaries under
       # `crates/*/tests/`. Most of those binaries' tests are #[ignore]'d, but
@@ -82,6 +68,5 @@ jobs:
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+
           exit $status
-      - if: always()
-        uses: ./action/cleanup
