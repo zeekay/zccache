@@ -2081,9 +2081,8 @@ async fn handle_link_ephemeral(
         )
         .unwrap_or_default();
 
-        let mut read_targets: Vec<(String, std::path::PathBuf)> = Vec::with_capacity(
-            1 + parsed_tool.secondary_outputs.len() + side_effects.len(),
-        );
+        let mut read_targets: Vec<(String, std::path::PathBuf)> =
+            Vec::with_capacity(1 + parsed_tool.secondary_outputs.len() + side_effects.len());
         read_targets.push((
             primary_name_os.to_string_lossy().into_owned(),
             std::path::PathBuf::from(output_path.as_path()),
@@ -4596,7 +4595,8 @@ async fn handle_compile(
                                 let t_write_output = std::time::Instant::now();
                                 let secondary_dir =
                                     output_path.parent().unwrap_or(cwd).to_path_buf();
-                                let targets: Vec<(NormalizedPath, NormalizedPath)> = (0..payloads.len())
+                                let targets: Vec<(NormalizedPath, NormalizedPath)> = (0..payloads
+                                    .len())
                                     .map(|i| {
                                         let out: NormalizedPath = if i == 0 {
                                             output_path.clone()

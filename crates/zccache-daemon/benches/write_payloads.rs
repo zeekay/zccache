@@ -44,9 +44,7 @@ impl Fixture {
                 p
             })
             .collect();
-        let out_paths: Vec<PathBuf> = (0..n)
-            .map(|i| out_dir.join(format!("out_{i}")))
-            .collect();
+        let out_paths: Vec<PathBuf> = (0..n).map(|i| out_dir.join(format!("out_{i}"))).collect();
         Self {
             _tmp: tmp,
             cache_files,
