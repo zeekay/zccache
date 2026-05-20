@@ -158,18 +158,60 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Tests in this module mutate the process-global `ZCCACHE_CACHE_DIR`
+    /// env var to redirect `default_cache_dir()` at a per-test tempdir.
+    /// Cargo test runs tests in parallel by default, so without a lock,
+    /// test A overwrites test B's env value mid-write and events land in
+    /// the wrong tempdir — the exact race that flaked Windows CI on PR
+    /// #311. The lock serializes the env-var-swap critical section
+    /// (acquire → set env → run test body → restore env on Drop) so two
+    /// tests in this module never observe each other's `ZCCACHE_CACHE_DIR`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that owns the env-var lock for the duration of a test
+    /// and restores the prior `ZCCACHE_CACHE_DIR` value when dropped.
+    /// Mirrors the pattern at `crates/zccache-ipc/src/lib.rs:301`.
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set_cache_dir(value: &std::path::Path) -> Self {
+            // If a previous test panicked while holding the lock, the
+            // Mutex is poisoned. We still want to acquire it — the env
+            // restore-on-drop is idempotent and prior poisoning doesn't
+            // affect the value we're about to set. `into_inner()` strips
+            // the poison wrapper.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os("ZCCACHE_CACHE_DIR");
+            std::env::set_var("ZCCACHE_CACHE_DIR", value);
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("ZCCACHE_CACHE_DIR", value),
+                None => std::env::remove_var("ZCCACHE_CACHE_DIR"),
+            }
+        }
+    }
 
     /// Two events at separate call sites land as two JSONL lines in the
     /// correct order, each with the standard envelope keys and the
     /// caller-supplied extras.
     #[test]
     fn write_event_appends_jsonl_with_envelope_and_extras() {
-        // The function uses the global default_cache_dir, which respects
-        // the ZCCACHE_CACHE_DIR env var. Point it at a tempdir for this
-        // test so we don't pollute the user's real lifecycle log.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var_os("ZCCACHE_CACHE_DIR");
-        std::env::set_var("ZCCACHE_CACHE_DIR", tmp.path());
+        let _env = EnvGuard::set_cache_dir(tmp.path());
 
         write_event(
             EVENT_SPAWN,
@@ -195,12 +237,6 @@ mod tests {
         assert_eq!(second["event"], "died-idle");
         assert_eq!(second["idle_secs"], 3600);
         assert_eq!(second["uptime_secs"], 7200);
-
-        // Restore env so other tests aren't affected.
-        match prev {
-            Some(v) => std::env::set_var("ZCCACHE_CACHE_DIR", v),
-            None => std::env::remove_var("ZCCACHE_CACHE_DIR"),
-        }
     }
 
     /// `archive_path` derives the `.1` neighbor reliably for the
@@ -222,8 +258,7 @@ mod tests {
     #[test]
     fn write_event_rotates_when_live_log_exceeds_max() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var_os("ZCCACHE_CACHE_DIR");
-        std::env::set_var("ZCCACHE_CACHE_DIR", tmp.path());
+        let _env = EnvGuard::set_cache_dir(tmp.path());
 
         let log_path = tmp.path().join("logs").join("daemon-lifecycle.log");
         let archive = tmp.path().join("logs").join("daemon-lifecycle.log.1");
@@ -283,11 +318,6 @@ mod tests {
             archive_first_bytes.starts_with(b"xxx"),
             "archive holds the most-recent padding from before this rotation"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("ZCCACHE_CACHE_DIR", v),
-            None => std::env::remove_var("ZCCACHE_CACHE_DIR"),
-        }
     }
 
     /// Rotation is a no-op when the live log is under the threshold.
@@ -297,8 +327,7 @@ mod tests {
     #[test]
     fn write_event_does_not_rotate_when_under_max() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var_os("ZCCACHE_CACHE_DIR");
-        std::env::set_var("ZCCACHE_CACHE_DIR", tmp.path());
+        let _env = EnvGuard::set_cache_dir(tmp.path());
 
         let log_path = tmp.path().join("logs").join("daemon-lifecycle.log");
         let archive = tmp.path().join("logs").join("daemon-lifecycle.log.1");
@@ -310,10 +339,5 @@ mod tests {
         assert!(!archive.exists(), "no archive on a tiny log");
         let contents = std::fs::read_to_string(&log_path).unwrap();
         assert_eq!(contents.lines().count(), 2);
-
-        match prev {
-            Some(v) => std::env::set_var("ZCCACHE_CACHE_DIR", v),
-            None => std::env::remove_var("ZCCACHE_CACHE_DIR"),
-        }
     }
 }
