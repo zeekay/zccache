@@ -40,8 +40,22 @@ struct Args {
     #[arg(long)]
     endpoint: Option<String>,
 
-    /// Idle timeout in seconds (0 = no timeout). Default: 3600.
-    #[arg(long, default_value = "3600")]
+    /// Idle timeout in seconds (0 = no timeout).
+    ///
+    /// Default comes from `zccache_core::config::DEFAULT_IDLE_TIMEOUT_SECS`
+    /// (60 minutes), kept as the single source of truth so [`Config::default`]
+    /// and this flag never drift apart.
+    ///
+    /// Reads `ZCCACHE_IDLE_TIMEOUT_SECS` from the environment when the
+    /// flag is not given. Setting the env var on `zccache-cli` propagates
+    /// to the daemon via `spawn_daemon`'s inherited environment, so a
+    /// caller can ask for a shorter idle window without touching the
+    /// command line. `0` disables the timeout (daemon runs forever).
+    #[arg(
+        long,
+        default_value_t = zccache_core::config::DEFAULT_IDLE_TIMEOUT_SECS,
+        env = "ZCCACHE_IDLE_TIMEOUT_SECS"
+    )]
     idle_timeout: u64,
 
     /// Disable loading/saving the dependency graph from/to disk.
@@ -135,6 +149,19 @@ fn run_server(args: Args) {
     zccache_daemon::crash::check_previous_crashes();
 
     tracing::info!(%endpoint, idle_timeout, "zccache-daemon starting");
+
+    // Persist a "spawn" lifecycle event to disk. tracing logs go to
+    // stderr which is detached to NUL, so this file-based sink is the
+    // only way an operator (or CI) can correlate daemon lifetime with
+    // surrounding events after the fact.
+    zccache_daemon::lifecycle::write_event(
+        zccache_daemon::lifecycle::EVENT_SPAWN,
+        serde_json::json!({
+            "endpoint": &endpoint,
+            "idle_timeout": idle_timeout,
+            "version": env!("CARGO_PKG_VERSION"),
+        }),
+    );
 
     // Write lock file so CLI can detect us
     let pid = std::process::id();
