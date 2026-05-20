@@ -164,6 +164,10 @@ fn run_server(args: Args) {
     let idle_timeout = args.idle_timeout;
 
     zccache_daemon::crash::install_panic_hook();
+    // The returned handle MUST be kept alive — drop unregisters the
+    // OS-level signal/exception handlers. Bind it for the whole
+    // `run_server` lifetime by storing it in this stack frame.
+    let _minidump_guard = zccache_daemon::crash::install_minidump_handler();
     zccache_daemon::crash::check_previous_crashes();
 
     tracing::info!(%endpoint, idle_timeout, "zccache-daemon starting");
