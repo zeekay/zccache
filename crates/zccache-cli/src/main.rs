@@ -1095,13 +1095,13 @@ async fn cmd_stop(endpoint: &str) -> ExitCode {
     };
 
     if let Err(e) = conn.send(&zccache_protocol::Request::Shutdown).await {
-        eprintln!("zccache: failed to send to daemon: {e}");
+        eprintln!("zccache[err][S]: failed to send to daemon: {e}");
         return ExitCode::FAILURE;
     }
     let recv_result = match conn.recv().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("zccache: broken connection to daemon: {e}");
+            eprintln!("zccache[err][R]: broken connection to daemon: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1118,11 +1118,11 @@ async fn cmd_stop(endpoint: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         None => {
-            eprintln!("zccache: lost connection to daemon (no response received)");
+            eprintln!("zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`");
             ExitCode::FAILURE
         }
         Some(other) => {
-            eprintln!("zccache: unexpected response from daemon: {other:?}");
+            eprintln!("zccache[err][U]: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -1299,7 +1299,7 @@ async fn cmd_status(endpoint: &str, json: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         None => {
-            let message = "zccache: lost connection to daemon (no response received)";
+            let message = "zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`";
             if json {
                 print_status_error_json(endpoint, message);
             } else {
@@ -1774,13 +1774,13 @@ async fn cmd_clear(endpoint: &str) -> ExitCode {
     };
 
     if let Err(e) = conn.send(&zccache_protocol::Request::Clear).await {
-        eprintln!("zccache: failed to send to daemon: {e}");
+        eprintln!("zccache[err][S]: failed to send to daemon: {e}");
         return ExitCode::FAILURE;
     }
     let recv_result = match conn.recv().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("zccache: broken connection to daemon: {e}");
+            eprintln!("zccache[err][R]: broken connection to daemon: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1804,11 +1804,11 @@ async fn cmd_clear(endpoint: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         None => {
-            eprintln!("zccache: lost connection to daemon (no response received)");
+            eprintln!("zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`");
             ExitCode::FAILURE
         }
         Some(other) => {
-            eprintln!("zccache: unexpected response from daemon: {other:?}");
+            eprintln!("zccache[err][U]: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -2211,14 +2211,14 @@ async fn cmd_session_start(
     journal: Option<NormalizedPath>,
 ) -> ExitCode {
     if let Err(e) = ensure_daemon(endpoint).await {
-        eprintln!("cannot start daemon at {endpoint}: {e}");
+        eprintln!("zccache[err][D]: cannot start daemon at {endpoint}: {e}");
         return ExitCode::FAILURE;
     }
 
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("cannot connect to daemon at {endpoint}: {e}");
+            eprintln!("zccache[err][C]: cannot connect to daemon at {endpoint}: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -2233,14 +2233,14 @@ async fn cmd_session_start(
         })
         .await
     {
-        eprintln!("zccache: failed to send to daemon: {e}");
+        eprintln!("zccache[err][S]: failed to send to daemon: {e}");
         return ExitCode::FAILURE;
     }
 
     let recv_result = match conn.recv().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("zccache: broken connection to daemon: {e}");
+            eprintln!("zccache[err][R]: broken connection to daemon: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -2275,11 +2275,11 @@ async fn cmd_session_start(
             ExitCode::FAILURE
         }
         None => {
-            eprintln!("zccache: lost connection to daemon (no response received)");
+            eprintln!("zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`");
             ExitCode::FAILURE
         }
         Some(other) => {
-            eprintln!("zccache: unexpected response from daemon: {other:?}");
+            eprintln!("zccache[err][U]: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -2385,7 +2385,7 @@ async fn cmd_session_stats(endpoint: &str, session_id: String, json: bool) -> Ex
             ExitCode::FAILURE
         }
         None => {
-            let message = "zccache: lost connection to daemon (no response received)";
+            let message = "zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`";
             if json {
                 print_session_stats_error_json(&session_id, message);
             } else {
@@ -3391,7 +3391,7 @@ async fn query_session_stats(
         Some(zccache_protocol::Response::SessionStatsResult { stats }) => Ok(stats),
         Some(zccache_protocol::Response::Error { message }) => Err(message),
         Some(other) => Err(format!("unexpected daemon response: {other:?}")),
-        None => Err("lost connection to daemon (no response received)".to_string()),
+        None => Err("lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`".to_string()),
     }
 }
 
@@ -4075,10 +4075,11 @@ async fn cmd_compile(
     compiler: NormalizedPath,
     client_env: Vec<(String, String)>,
 ) -> ExitCode {
+    let stdin_bytes = slurp_stdin_if_piped();
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("cannot connect to daemon at {endpoint}: {e}");
+            eprintln!("zccache[err][C]: cannot connect to daemon at {endpoint}: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4090,17 +4091,18 @@ async fn cmd_compile(
             cwd,
             compiler,
             env: Some(client_env),
+            stdin: stdin_bytes,
         })
         .await
     {
-        eprintln!("zccache: failed to send to daemon: {e}");
+        eprintln!("zccache[err][S]: failed to send to daemon: {e}");
         return ExitCode::FAILURE;
     }
 
     let recv_result = match conn.recv().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("zccache: broken connection to daemon: {e}");
+            eprintln!("zccache[err][R]: broken connection to daemon: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4118,15 +4120,15 @@ async fn cmd_compile(
             exit_code_from_i32(exit_code)
         }
         Some(zccache_protocol::Response::Error { message }) => {
-            eprintln!("zccache error: {message}");
+            eprintln!("zccache[err][E]: daemon error: {message}");
             ExitCode::FAILURE
         }
         None => {
-            eprintln!("zccache: lost connection to daemon (no response received)");
+            eprintln!("zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`");
             ExitCode::FAILURE
         }
         Some(other) => {
-            eprintln!("zccache: unexpected response from daemon: {other:?}");
+            eprintln!("zccache[err][U]: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -4143,17 +4145,18 @@ async fn cmd_compile_ephemeral(
 ) -> ExitCode {
     // Ensure daemon is running and version-compatible.
     if let Err(e) = ensure_daemon(endpoint).await {
-        eprintln!("cannot start daemon at {endpoint}: {e}");
+        eprintln!("zccache[err][D]: cannot start daemon at {endpoint}: {e}");
         return ExitCode::FAILURE;
     }
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("cannot connect to daemon at {endpoint}: {e}");
+            eprintln!("zccache[err][C]: cannot connect to daemon at {endpoint}: {e}");
             return ExitCode::FAILURE;
         }
     };
 
+    let stdin_bytes = slurp_stdin_if_piped();
     if let Err(e) = conn
         .send(&zccache_protocol::Request::CompileEphemeral {
             client_pid: std::process::id(),
@@ -4162,17 +4165,18 @@ async fn cmd_compile_ephemeral(
             args,
             cwd,
             env: Some(client_env),
+            stdin: stdin_bytes,
         })
         .await
     {
-        eprintln!("zccache: failed to send to daemon: {e}");
+        eprintln!("zccache[err][S]: failed to send to daemon: {e}");
         return ExitCode::FAILURE;
     }
 
     let recv_result = match conn.recv().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("zccache: broken connection to daemon: {e}");
+            eprintln!("zccache[err][R]: broken connection to daemon: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4189,15 +4193,15 @@ async fn cmd_compile_ephemeral(
             exit_code_from_i32(exit_code)
         }
         Some(zccache_protocol::Response::Error { message }) => {
-            eprintln!("zccache error: {message}");
+            eprintln!("zccache[err][E]: daemon error: {message}");
             ExitCode::FAILURE
         }
         None => {
-            eprintln!("zccache: lost connection to daemon (no response received)");
+            eprintln!("zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`");
             ExitCode::FAILURE
         }
         Some(other) => {
-            eprintln!("zccache: unexpected response from daemon: {other:?}");
+            eprintln!("zccache[err][U]: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -4212,13 +4216,13 @@ async fn cmd_link_ephemeral(
     client_env: Vec<(String, String)>,
 ) -> ExitCode {
     if let Err(e) = ensure_daemon(endpoint).await {
-        eprintln!("cannot start daemon at {endpoint}: {e}");
+        eprintln!("zccache[err][D]: cannot start daemon at {endpoint}: {e}");
         return ExitCode::FAILURE;
     }
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("cannot connect to daemon at {endpoint}: {e}");
+            eprintln!("zccache[err][C]: cannot connect to daemon at {endpoint}: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4233,14 +4237,14 @@ async fn cmd_link_ephemeral(
         })
         .await
     {
-        eprintln!("zccache: failed to send to daemon: {e}");
+        eprintln!("zccache[err][S]: failed to send to daemon: {e}");
         return ExitCode::FAILURE;
     }
 
     let recv_result = match conn.recv().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("zccache: broken connection to daemon: {e}");
+            eprintln!("zccache[err][R]: broken connection to daemon: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4261,15 +4265,15 @@ async fn cmd_link_ephemeral(
             exit_code_from_i32(exit_code)
         }
         Some(zccache_protocol::Response::Error { message }) => {
-            eprintln!("zccache error: {message}");
+            eprintln!("zccache[err][E]: daemon error: {message}");
             ExitCode::FAILURE
         }
         None => {
-            eprintln!("zccache: lost connection to daemon (no response received)");
+            eprintln!("zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`");
             ExitCode::FAILURE
         }
         Some(other) => {
-            eprintln!("zccache: unexpected response from daemon: {other:?}");
+            eprintln!("zccache[err][U]: unexpected response from daemon: {other:?}");
             ExitCode::FAILURE
         }
     }
@@ -4534,6 +4538,37 @@ fn resolve_endpoint(explicit: Option<&str>) -> String {
         return ep;
     }
     zccache_ipc::default_endpoint()
+}
+
+/// Cap on stdin bytes the wrapper will buffer before forwarding to the
+/// daemon. 16 MiB matches the IPC frame budget — sources bigger than this
+/// don't fit in a single Compile request anyway.
+const MAX_STDIN_BYTES: usize = 16 * 1024 * 1024;
+
+/// Read the wrapper's stdin to EOF when it's not a terminal (i.e. cargo or
+/// some other parent has piped or redirected stdin into us), returning the
+/// raw bytes. Interactive shells (stdin is a TTY) return an empty payload
+/// without blocking on a read.
+///
+/// The cargo RUSTC_WRAPPER scenario normally hands the wrapper an
+/// already-closed stdin (cargo opens `/dev/null` or an immediately-EOF pipe),
+/// so the read returns `Ok(0)` and the cost is one syscall. The bytes flow
+/// over IPC to the daemon, which forwards them to the compiler child so
+/// invocations like `rustc -` (read source from stdin) still work.
+fn slurp_stdin_if_piped() -> Vec<u8> {
+    use std::io::IsTerminal;
+    use std::io::Read;
+
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    let _ = stdin
+        .by_ref()
+        .take(MAX_STDIN_BYTES as u64)
+        .read_to_end(&mut buf);
+    buf
 }
 
 fn run_async(future: impl std::future::Future<Output = ExitCode>) -> ExitCode {
