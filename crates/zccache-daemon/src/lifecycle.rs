@@ -186,7 +186,9 @@ mod tests {
             // restore-on-drop is idempotent and prior poisoning doesn't
             // affect the value we're about to set. `into_inner()` strips
             // the poison wrapper.
-            let lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let previous = std::env::var_os("ZCCACHE_CACHE_DIR");
             std::env::set_var("ZCCACHE_CACHE_DIR", value);
             Self {
