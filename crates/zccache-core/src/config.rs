@@ -467,6 +467,17 @@ pub fn index_path_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
     cache_dir.join("index.bin")
 }
 
+/// Returns the on-disk path for the persisted `MetadataCache` snapshot.
+///
+/// Bincode blob written by `MetadataCache::save_to_disk` on flush + shutdown,
+/// read by `MetadataCache::load_from_disk` on daemon startup. Sibling of
+/// [`index_path_from_cache_dir`] so that whatever bundles the cache dir (e.g.
+/// `soldr save`/`soldr load`) picks both files up automatically.
+#[must_use]
+pub fn metadata_path_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+    cache_dir.join("metadata.bin")
+}
+
 fn crash_dump_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
     cache_dir.join("crashes")
 }
@@ -535,6 +546,10 @@ mod tests {
             override_dir.join("index.bin")
         );
         assert_eq!(
+            metadata_path_from_cache_dir(&cache_dir),
+            override_dir.join("metadata.bin")
+        );
+        assert_eq!(
             crash_dump_dir_from_cache_dir(&cache_dir),
             override_dir.join("crashes")
         );
@@ -547,6 +562,30 @@ mod tests {
     #[test]
     fn cache_dir_override_ignores_empty_env_value() {
         assert!(cache_dir_from_env_value(Some(OsString::new())).is_none());
+    }
+
+    /// `metadata.bin` MUST live in the same directory as `index.bin` so that
+    /// whatever mechanism bundles the cache directory (notably `soldr save`
+    /// / `soldr load` for the `cold-tar-untar-warm` perf-cluster scenario)
+    /// picks both files up automatically. If a future refactor moves either
+    /// file without moving the other, the warm-side daemon spawned after
+    /// `soldr load` would restart with an empty `MetadataCache` even though
+    /// the artifact index was restored — silently undoing the perf win this
+    /// pair was designed to deliver.
+    #[test]
+    fn metadata_path_is_sibling_of_index_path() {
+        let (_temp, cache_dir) = temp_cache_dir();
+        let index = index_path_from_cache_dir(&cache_dir);
+        let metadata = metadata_path_from_cache_dir(&cache_dir);
+        assert_eq!(
+            index.parent(),
+            metadata.parent(),
+            "metadata.bin must live in the same directory as index.bin so soldr save/load bundles both",
+        );
+        assert!(
+            metadata.starts_with(&cache_dir),
+            "metadata.bin must be a descendant of cache_dir",
+        );
     }
 
     #[test]

@@ -3755,6 +3755,7 @@ dependencies = [
 name = "zccache-fscache"
 version = "1.8.1"
 dependencies = [
+ "bincode",
  "dashmap",
  "rayon",
  "serde",

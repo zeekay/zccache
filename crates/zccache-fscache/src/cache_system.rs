@@ -42,6 +42,23 @@ impl CacheSystem {
         }
     }
 
+    /// Create a new cache system with a pre-populated [`MetadataCache`].
+    ///
+    /// The journal is fresh (`Clock::ZERO`) because [`Clock`] is a
+    /// process-local monotonic counter and cannot be persisted across
+    /// daemon restarts. Use this on startup after restoring the metadata
+    /// snapshot from disk; subsequent `lookup_since` calls with the
+    /// freshly-restored entries still take the stat-verify safety-net
+    /// path in `MetadataCache::get_cached_hash_if_stat_valid`, so a
+    /// stale snapshot remains correctness-safe.
+    #[must_use]
+    pub fn with_metadata(metadata: MetadataCache) -> Self {
+        Self {
+            metadata,
+            journal: ChangeJournal::new(),
+        }
+    }
+
     /// Returns the current clock value.
     #[must_use]
     pub fn current_clock(&self) -> Clock {
