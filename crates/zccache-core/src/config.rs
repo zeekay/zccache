@@ -564,6 +564,30 @@ mod tests {
         assert!(cache_dir_from_env_value(Some(OsString::new())).is_none());
     }
 
+    /// `metadata.bin` MUST live in the same directory as `index.bin` so that
+    /// whatever mechanism bundles the cache directory (notably `soldr save`
+    /// / `soldr load` for the `cold-tar-untar-warm` perf-cluster scenario)
+    /// picks both files up automatically. If a future refactor moves either
+    /// file without moving the other, the warm-side daemon spawned after
+    /// `soldr load` would restart with an empty `MetadataCache` even though
+    /// the artifact index was restored — silently undoing the perf win this
+    /// pair was designed to deliver.
+    #[test]
+    fn metadata_path_is_sibling_of_index_path() {
+        let (_temp, cache_dir) = temp_cache_dir();
+        let index = index_path_from_cache_dir(&cache_dir);
+        let metadata = metadata_path_from_cache_dir(&cache_dir);
+        assert_eq!(
+            index.parent(),
+            metadata.parent(),
+            "metadata.bin must live in the same directory as index.bin so soldr save/load bundles both",
+        );
+        assert!(
+            metadata.starts_with(&cache_dir),
+            "metadata.bin must be a descendant of cache_dir",
+        );
+    }
+
     #[test]
     fn relative_cache_dir_override_is_made_absolute() {
         let override_dir = cache_dir_from_env_value(Some(OsString::from("target/../zc"))).unwrap();
