@@ -1,4 +1,4 @@
-name: zccache Perf Cluster (Rust)
+name: Perf Cluster Rust
 
 # See PERF.md for branch-naming convention and per-branch scope table.
 # Mirrors soldr's perf-cluster.yml; the diff is:
@@ -31,10 +31,15 @@ on:
           - mac-arm
           - win
       fixtures:
+        # sqlite-link is intentionally NOT the default: it adds ~3-5
+        # minutes of cargo build per cell (cc-rs + bundled libsqlite3)
+        # and the medium fixture is the primary signal today. Pick
+        # `all` or `sqlite-link` explicitly when you specifically want
+        # the C-bundled crate exercised.
         description: Fixture subset
         type: choice
         required: true
-        default: all
+        default: medium
         options:
           - all
           - medium
@@ -114,17 +119,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          PLAT="all"; FIX="all"; SCEN="all"; SOURCE="default"
+          # Defaults are intentionally narrow. `FIX="medium"` keeps
+          # the per-push cycle short (sqlite-link adds 3-5 min/cell).
+          # Branches that want the full sweep ask for it explicitly via
+          # `perf/all-all-all` or the `perf/all` alias.
+          PLAT="all"; FIX="medium"; SCEN="all"; SOURCE="default"
 
           if [[ "${EVENT}" == "workflow_dispatch" ]]; then
             PLAT="${IN_PLAT:-linux}"
-            FIX="${IN_FIX:-all}"
+            FIX="${IN_FIX:-medium}"
             SCEN="${IN_SCEN:-all}"
             SOURCE="dispatch"
           else
             case "${REF_NAME}" in
-              main|perf/all)
-                SOURCE="alias:${REF_NAME}"
+              main)
+                # Main pushes default to medium-only so a routine
+                # merge doesn't pay for the sqlite-link build. Use
+                # `perf/all` to opt into the full sweep when you
+                # actually want sqlite-link measured.
+                SOURCE="alias:main"
+                ;;
+              perf/all)
+                # The explicit "give me everything" alias.
+                FIX="all"
+                SOURCE="alias:perf/all"
                 ;;
               perf/*)
                 triple="${REF_NAME#perf/}"
@@ -153,7 +171,7 @@ jobs:
                   *)        bad=1 ;;
                 esac
                 if [[ -n "${rest}" || "${bad}" == "1" ]]; then
-                  echo "::notice::Branch '${REF_NAME}' does not match perf/<plat>-<fix>-<scen>; running full sweep. See PERF.md."
+                  echo "::notice::Branch '${REF_NAME}' does not match perf/<plat>-<fix>-<scen>; falling back to defaults (medium fixture, all scenarios). See PERF.md."
                   SOURCE="unknown-perf:${REF_NAME}"
                 else
                   PLAT="${plat}"; FIX="${fix}"; SCEN="${scen}"
@@ -162,7 +180,9 @@ jobs:
                 ;;
               *)
                 # evaluate/** and anything else covered by the push
-                # filter that isn't main/perf — run full.
+                # filter that isn't main/perf — use defaults (medium
+                # fixture, all scenarios). Push to `perf/all` if you
+                # want sqlite-link included.
                 SOURCE="non-perf:${REF_NAME}"
                 ;;
             esac

@@ -28,7 +28,7 @@ The workflow fires on:
 2. **`push`** to `main`, `perf/**`, or `evaluate/**`. The branch name is parsed into an effective `(platforms, fixtures, scenarios)` scope (see below). The dispatch inputs are not consulted.
 3. **Manual `gh workflow run` CLI** — same as the dispatch button.
 
-The full matrix is always loaded; cells that fall outside the resolved scope skip themselves at the gate step. `main` always runs the full sweep.
+The full matrix is always loaded; cells that fall outside the resolved scope skip themselves at the gate step. **`main` defaults to the `medium` fixture only** to keep per-push cycle time short; push to `perf/all` (or `perf/all-sqlite-*`) when you want `sqlite-link` measured too — its bundled `libsqlite3` adds ~3-5 min of `cc-rs` build per cell.
 
 ## Branch-name convention
 
@@ -52,13 +52,13 @@ Short tokens keep the branch name unambiguous (the real names contain hyphens th
 
 ### Full scope table
 
-48 hierarchical patterns plus two full-sweep aliases. Anything not in this table (e.g., a developer iteration branch like `perf/cluster-hierarchical-skip`) falls back to a full sweep and emits a `::notice::` so the run is still useful.
+48 hierarchical patterns plus two opt-in-full aliases. Anything not in this table (e.g., a developer iteration branch like `perf/cluster-hierarchical-skip`) falls back to the **default scope (`medium` fixture, all scenarios)** and emits a `::notice::` so the run is still useful. Use `perf/all` if you want the full fixture sweep included.
 
 #### Aliases — full ride
 
 | Branch | Scope |
 |---|---|
-| `main` | every platform × fixture × scenario |
+| `main` | every platform × `medium` fixture × every scenario (use `perf/all` for full sweep) |
 | `perf/all` | same as `perf/all-all-all` |
 
 #### Platform = `all` (12)
@@ -136,8 +136,8 @@ Short tokens keep the branch name unambiguous (the real names contain hyphens th
 - **Iterating on cache hit-rate fixes that only affect sqlite builds** → `perf/linux-sqlite-cold` (fastest signal: one cell, the hard gate scenario).
 - **Tuning archive fidelity** → `perf/all-all-cold` (sweep cold-tar-untar-warm across everything; fixture variation matters).
 - **Worktree path-remap change** → `perf/linux-all-worktree` (every fixture on linux, worktree scenario only).
-- **Just experimenting / unsure** → `perf/all` or `main` — full sweep; the workflow handles the volume.
-- **Personal feature branch like `perf/wip/foo`** → falls through to full sweep with an `::notice::`. Fine for one-off runs; rename to a canonical pattern when you know what axis you're working on.
+- **Just experimenting / unsure** → `perf/all` for the full sweep, or push to `main` for the default scope (medium fixture, all scenarios) — fastest cycle that still covers all three scenarios.
+- **Personal feature branch like `perf/wip/foo`** → falls through to the default scope (medium, all scenarios) with a `::notice::`. Fine for one-off runs; rename to a canonical pattern when you know what axis you're working on.
 
 ## Gate semantics
 
