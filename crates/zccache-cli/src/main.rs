@@ -333,6 +333,20 @@ enum Commands {
         #[command(subcommand)]
         action: SymbolsCommands,
     },
+    /// Print the resolved cache root directory and exit.
+    ///
+    /// Reads `ZCCACHE_CACHE_DIR` (or falls back to the platform default) and
+    /// prints the absolute path. Wrappers like [soldr](https://github.com/zackees/soldr)
+    /// use this to verify at runtime that their cache-redirect env var was
+    /// honored by whichever `zccache` binary is on PATH. See issue #275.
+    #[command(name = "cache-root")]
+    CacheRoot {
+        /// Emit `{"cache_root": "<abs>", "source": "<src>"}` instead of the
+        /// plain path. `source` is one of `env:ZCCACHE_CACHE_DIR`,
+        /// `colocate:cross_volume`, `default:platform_dirs`.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -660,6 +674,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "snapshot-fp-record",
     "snapshot-fp-validate",
     "symbols",
+    "cache-root",
     "help",
     "--help",
     "-h",
@@ -967,7 +982,26 @@ fn main() -> ExitCode {
             } => cmd_symbols_install(version, target, prefix, force),
             SymbolsCommands::Symbolicate { dumps } => cmd_symbols_symbolicate(dumps),
         },
+        Commands::CacheRoot { json } => cmd_cache_root(json),
     }
+}
+
+/// Print the resolved cache root and how it was determined. Issue #275:
+/// soldr (and any other wrapper) calls this to confirm at runtime that the
+/// zccache binary on PATH honored `ZCCACHE_CACHE_DIR` before trusting the
+/// Defender-exclusion contract.
+fn cmd_cache_root(json: bool) -> ExitCode {
+    let (root, source) = zccache_core::config::resolve_cache_root();
+    if json {
+        let payload = serde_json::json!({
+            "cache_root": root.as_path(),
+            "source": source.as_str(),
+        });
+        println!("{}", serde_json::to_string(&payload).unwrap_or_default());
+    } else {
+        println!("{}", root.display());
+    }
+    ExitCode::SUCCESS
 }
 
 fn cmd_symbols_symbolicate(dumps: Vec<PathBuf>) -> ExitCode {

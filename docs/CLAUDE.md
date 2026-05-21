@@ -20,6 +20,7 @@ Architecture docs are split by subsystem. Read only what's relevant to your curr
 | Perf measurement workflows | [/PERF.md](../PERF.md) — `perf-rust-cluster.yml`, scenarios, gate semantics |
 | Platform-specific issues | [portability.md](architecture/portability.md) |
 | Compile journal record shape | [journal-schema.md](journal-schema.md) |
+| `ZCCACHE_CACHE_DIR` contract + `zccache cache-root` | [runtime.md § Cache root invariants](architecture/runtime.md#cache-root-invariants) |
 
 ## Where to document new features
 

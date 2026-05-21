@@ -142,3 +142,81 @@ The `dep_graph_persisted` flag is also flipped to `true` when a periodic or shut
 **Index-artifact divergence:** If the daemon crashed after writing the artifact directory but before inserting the redb entry, the artifact exists on disk but is not in the index. This is a harmless orphan; it wastes disk space but does not cause incorrect behavior. A periodic (or on-demand) maintenance task can scan the artifact directories and reconcile with the index:
 - Artifact on disk but not in index: add to index.
 - Entry in index but no artifact on disk: remove from index.
+
+---
+
+## Cache root invariants
+
+The "cache root" is the directory resolved by
+[`zccache_core::config::resolve_cache_root`][resolve]. Wrappers (notably
+[soldr](https://github.com/zackees/soldr)) excludable this single directory
+from Windows Defender / on-access scanners and trust that **no zccache
+persistent write escapes it**. Issue #275 closes that contract.
+
+[resolve]: ../../crates/zccache-core/src/config.rs
+
+### Resolution rules
+
+| Source | When it fires | `cache-root --json` value |
+|---|---|---|
+| `ZCCACHE_CACHE_DIR` | Env var set and non-empty | `env:ZCCACHE_CACHE_DIR` |
+| Same-volume colocation | `ZCCACHE_COLOCATE` is truthy *and* CWD is on a different volume from `$HOME` (issue #296) | `colocate:cross_volume` |
+| Default | Otherwise | `default:platform_dirs` (`~/.zccache`) |
+
+`zccache cache-root` (default) prints the resolved absolute path; `--json`
+adds the `source` field so wrappers can verify at runtime that their
+redirect was honored.
+
+### Persistent writes — exhaustive table
+
+Every persistent write the daemon and CLI perform lands under the resolved
+cache root via one of the helpers in `zccache_core::config`:
+
+| Subpath | Owner | Resolver |
+|---|---|---|
+| `artifacts/` | daemon — content-addressed artifact store + sibling tmp files for atomic rename | `artifacts_dir_from_cache_dir` |
+| `tmp/` | daemon — recursively wiped on startup (orphaned in-progress writes) | `tmp_dir_from_cache_dir` |
+| `tmp/depfiles/<pid>-<instance>/` | daemon — compiler-injected depfiles and Windows response files (`*.rsp`) | `depfile_dir_from_cache_dir` |
+| `depgraph/depgraph.bin` | daemon — rkyv snapshot of the dep graph | `depgraph_file_path` |
+| `logs/daemon.log[.<ts>]` | daemon — rolling event log | `log_dir_from_cache_dir` |
+| `logs/daemon-lifecycle.log[.1]` | daemon + CLI — JSONL lifecycle events (spawn / shutdown / version mismatch) | `lifecycle::log_file_path` |
+| `logs/compile_journal.jsonl` + per-session `*.jsonl` | daemon — compile decisions | derives from `log_dir_from_cache_dir` |
+| `crashes/crash-*.{txt,dmp}` + `.reported` | daemon — panic & signal dumps | `crash_dump_dir_from_cache_dir` |
+| `symbols/<version>-<triple>/` + `.symref` sidecars next to dumps | CLI — `zccache symbols install` + `symbolicate` | `symbols_cache_dir_from_cache_dir` |
+| `index.bin` (+ sibling tmp) | daemon — bincode artifact index, atomic-rename writes | `index_path_from_cache_dir` |
+| `ino/<key>.ino.cpp` | CLI — Arduino preprocessor cache | `default_cache_dir().join("ino")` |
+| `kv/<namespace>/<hex>.bin` | CLI — namespaced key/value store | derives from `default_cache_dir` |
+| `daemon.lock` | CLI + daemon — PID lock | `lock_file_path` |
+| `daemon.sock` (Unix, only when env override is set) | daemon — IPC socket co-located with the cache root | `default_endpoint` |
+
+The cache-root-rooted invariant for the well-known subpaths is asserted in
+the unit test `cache_root_invariant_all_subpaths_rooted` in
+`crates/zccache-core/src/config.rs`.
+
+### Legitimate exceptions (documented and stable)
+
+A small set of writes is intentionally *outside* the cache root. soldr
+excludes these separately if Defender scanning ever becomes an issue:
+
+- **IPC socket (Unix, no env override):** `$XDG_RUNTIME_DIR/zccache/sock`
+  or `/tmp/zccache-$USER/sock`. The socket inode lives in `tmpfs` on Linux
+  so it is not a real on-disk write. When `ZCCACHE_CACHE_DIR` is set, the
+  socket moves into `<cache>/daemon.sock` automatically — see
+  `zccache_ipc::endpoint_for_cache_dir`.
+- **Named pipe (Windows):** `\\.\pipe\zccache-<username>` (default) or
+  `\\.\pipe\zccache-<stable-id>` (when `ZCCACHE_CACHE_DIR` is set). Named
+  pipes have no filesystem footprint — nothing for Defender to scan.
+- **OS-managed working directory (`std::env::set_current_dir(temp_dir())`):**
+  the daemon's `trampoline::release_cwd()` chdirs the process to `$TMPDIR`
+  *only* to release the inherited CWD handle. No file is written there.
+- **`.claude/`, `target/`, scratch tempdirs in dev-mode tests:** test code
+  paths and dev tooling. Production runtime never writes here. The
+  `ban_unrooted_tempdir` dylint blocks new ad-hoc `tempfile::tempdir()`
+  call sites in production code; legacy call sites are listed explicitly
+  in `dylints/ban_unrooted_tempdir/src/allowlist.txt`.
+
+Any new persistent write must either pick a helper from the table above or
+get its own row plus a one-line justification here. The dylint catches
+unrooted `$TMPDIR` writes at compile time, but it cannot catch writes that
+hardcode an absolute path outside the cache root — those have to be caught
+in review against this section.

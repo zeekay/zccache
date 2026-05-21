@@ -1963,7 +1963,15 @@ async fn handle_link_ephemeral(
                         "link non-cacheable, passing through"
                     );
                     state.stats.record_link_non_cacheable();
-                    return run_tool_passthrough(tool, args, cwd, env, &lineage).await;
+                    return run_tool_passthrough(
+                        tool,
+                        args,
+                        cwd,
+                        env,
+                        &lineage,
+                        state.depfile_tmpdir.as_path(),
+                    )
+                    .await;
                 }
             }
         }
@@ -1987,7 +1995,15 @@ async fn handle_link_ephemeral(
         Some(h) => h,
         None => {
             tracing::warn!("cannot hash tool {}", tool.display());
-            return run_tool_passthrough(tool, args, cwd, env, &lineage).await;
+            return run_tool_passthrough(
+                tool,
+                args,
+                cwd,
+                env,
+                &lineage,
+                state.depfile_tmpdir.as_path(),
+            )
+            .await;
         }
     };
 
@@ -2032,7 +2048,15 @@ async fn handle_link_ephemeral(
                     "cannot hash input file {}: skipping cache",
                     input_path.display()
                 );
-                return run_tool_passthrough(tool, args, cwd, env, &lineage).await;
+                return run_tool_passthrough(
+                    tool,
+                    args,
+                    cwd,
+                    env,
+                    &lineage,
+                    state.depfile_tmpdir.as_path(),
+                )
+                .await;
             }
         };
         key_builder = key_builder.input(input_hash);
@@ -2089,7 +2113,15 @@ async fn handle_link_ephemeral(
                 };
             }
             // Fall through to passthrough if write failed
-            return run_tool_passthrough(tool, args, cwd, env, &lineage).await;
+            return run_tool_passthrough(
+                tool,
+                args,
+                cwd,
+                env,
+                &lineage,
+                state.depfile_tmpdir.as_path(),
+            )
+            .await;
         }
         // Payloads missing — treat as cache miss, fall through
     }
@@ -2123,7 +2155,15 @@ async fn handle_link_ephemeral(
     // Clone env for the hook (we need to re-use it; passthrough consumes env).
     let env_for_hook = env.clone();
 
-    let result = run_tool_passthrough(tool, args, cwd, env, &lineage).await;
+    let result = run_tool_passthrough(
+        tool,
+        args,
+        cwd,
+        env,
+        &lineage,
+        state.depfile_tmpdir.as_path(),
+    )
+    .await;
 
     // 6b. Invoke optional post-link deploy command on successful link.
     // This handles the case where the compiler driver does NOT auto-deploy
@@ -2323,16 +2363,21 @@ fn hash_file_via_cache(state: &SharedState, path: &Path) -> Option<ContentHash> 
 }
 
 /// Run a tool directly (passthrough) and return a LinkResult response.
+///
+/// `tmp_dir` is where the synthesized Windows response file lands when the
+/// command line exceeds the OS limit. Production callers pass the daemon's
+/// `state.depfile_tmpdir` (under the cache root) so the contents are
+/// covered by the wrapper's Defender exclusion — see issue #275.
 async fn run_tool_passthrough(
     tool: &Path,
     args: &[String],
     cwd: &Path,
     env: Option<Vec<(String, String)>>,
     lineage: &crate::lineage::Lineage,
+    tmp_dir: &Path,
 ) -> Response {
-    let tmp_dir = std::env::temp_dir();
     let _rsp_guard =
-        match zccache_compiler::response_file::write_response_file_if_needed(args, &tmp_dir) {
+        match zccache_compiler::response_file::write_response_file_if_needed(args, tmp_dir) {
             Ok(guard) => guard,
             Err(e) => {
                 return Response::Error {
@@ -4900,6 +4945,7 @@ async fn handle_compile(
                 &sid,
                 &client_env,
                 &stdin,
+                state.depfile_tmpdir.as_path(),
             )
             .await;
         }
@@ -5169,6 +5215,7 @@ async fn handle_compile(
                     &sid,
                     &client_env,
                     &stdin,
+                    state.depfile_tmpdir.as_path(),
                 )
                 .await;
             }
@@ -7010,6 +7057,11 @@ async fn handle_compile_multi(
 }
 
 /// Run the compiler directly without caching.
+///
+/// `tmp_dir` is where the synthesized Windows response file lands when the
+/// command line exceeds the OS limit. Production callers pass the daemon's
+/// `state.depfile_tmpdir` (under the cache root) so the contents are
+/// covered by the wrapper's Defender exclusion — see issue #275.
 #[allow(clippy::too_many_arguments)] // Mirrors handle_compile's surface — refactor parked.
 async fn run_compiler_direct(
     compiler: &NormalizedPath,
@@ -7019,10 +7071,10 @@ async fn run_compiler_direct(
     sid: &SessionId,
     client_env: &Option<Vec<(String, String)>>,
     stdin_bytes: &[u8],
+    tmp_dir: &Path,
 ) -> Response {
-    let tmp_dir = std::env::temp_dir();
     let _rsp_guard =
-        match zccache_compiler::response_file::write_response_file_if_needed(args, &tmp_dir) {
+        match zccache_compiler::response_file::write_response_file_if_needed(args, tmp_dir) {
             Ok(guard) => guard,
             Err(e) => {
                 return Response::Error {
