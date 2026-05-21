@@ -23,6 +23,7 @@ This document is the index for zccache's architecture specification. Each subsys
 - **File change detection** → [metadata-cache.md](architecture/metadata-cache.md)
 - **Disk cache & eviction** → [artifact-store.md](architecture/artifact-store.md)
 - **Thread safety & crash safety** → [runtime.md](architecture/runtime.md)
+- **Where zccache writes on disk (`ZCCACHE_CACHE_DIR` contract)** → [runtime.md § Cache root invariants](architecture/runtime.md#cache-root-invariants)
 - **Windows/macOS/Linux differences** → [portability.md](architecture/portability.md)
 - **Compile journal fields & `miss_reason` enum** → [journal-schema.md](journal-schema.md)
 

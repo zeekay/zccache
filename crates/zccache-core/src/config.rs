@@ -74,16 +74,66 @@ pub fn default_cache_dir() -> NormalizedPath {
 }
 
 fn default_cache_dir_from_env_value(value: Option<OsString>) -> NormalizedPath {
+    resolve_cache_root_from_env_value(value).0
+}
+
+/// How [`resolve_cache_root`] determined the active cache root path.
+///
+/// Exposed via `zccache cache-root --json` (issue #275) so wrappers like
+/// [soldr](https://github.com/zackees/soldr) can confirm at runtime that
+/// `ZCCACHE_CACHE_DIR` actually took effect. Older zccache binaries on PATH
+/// that ignore the env var would surface here as `Default` instead of `Env`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheRootSource {
+    /// `ZCCACHE_CACHE_DIR` was set and non-empty.
+    Env,
+    /// Same-volume colocation kicked in (`ZCCACHE_COLOCATE`) because the
+    /// CWD lives on a different volume from `$HOME`. See issue #296.
+    Colocated,
+    /// Plain default: `~/.zccache` (or `.zccache` next to the binary if
+    /// `$HOME`/`$USERPROFILE` cannot be resolved).
+    Default,
+}
+
+impl CacheRootSource {
+    /// Stable wire string, matched by soldr's runtime verification. Format:
+    /// `env:ZCCACHE_CACHE_DIR`, `colocate:cross_volume`, `default:platform_dirs`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Env => "env:ZCCACHE_CACHE_DIR",
+            Self::Colocated => "colocate:cross_volume",
+            Self::Default => "default:platform_dirs",
+        }
+    }
+}
+
+impl std::fmt::Display for CacheRootSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Returns the cache root + the rule that resolved it.
+///
+/// Equivalent to [`default_cache_dir`] but also reports which branch fired.
+/// Used by `zccache cache-root --json` (issue #275).
+#[must_use]
+pub fn resolve_cache_root() -> (NormalizedPath, CacheRootSource) {
+    resolve_cache_root_from_env_value(std::env::var_os(CACHE_DIR_ENV))
+}
+
+fn resolve_cache_root_from_env_value(value: Option<OsString>) -> (NormalizedPath, CacheRootSource) {
     if let Some(p) = cache_dir_from_env_value(value) {
-        return p;
+        return (p, CacheRootSource::Env);
     }
     let home = dirs_fallback();
     if colocate_enabled() {
         if let Some(p) = colocated_cache_dir(&home) {
-            return p;
+            return (p, CacheRootSource::Colocated);
         }
     }
-    home.join(".zccache")
+    (home.join(".zccache"), CacheRootSource::Default)
 }
 
 /// True when `ZCCACHE_COLOCATE` is set to a non-empty, non-"0" value.
@@ -522,6 +572,72 @@ mod tests {
     fn default_cache_dir_ends_with_zccache() {
         let dir = default_cache_dir_from_env_value(None);
         assert!(dir.ends_with(".zccache"));
+    }
+
+    #[test]
+    fn resolve_cache_root_env_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let want = root.path().join("zc");
+        let (dir, src) = resolve_cache_root_from_env_value(Some(want.clone().into_os_string()));
+        assert_eq!(dir, want);
+        assert_eq!(src, CacheRootSource::Env);
+        assert_eq!(src.as_str(), "env:ZCCACHE_CACHE_DIR");
+    }
+
+    #[test]
+    fn resolve_cache_root_default_branch_when_env_unset() {
+        std::env::remove_var(COLOCATE_ENV);
+        let (dir, src) = resolve_cache_root_from_env_value(None);
+        assert!(dir.ends_with(".zccache"));
+        assert_eq!(src, CacheRootSource::Default);
+        assert_eq!(src.as_str(), "default:platform_dirs");
+    }
+
+    #[test]
+    fn resolve_cache_root_default_branch_when_env_empty() {
+        std::env::remove_var(COLOCATE_ENV);
+        let (_dir, src) = resolve_cache_root_from_env_value(Some(OsString::new()));
+        assert_eq!(src, CacheRootSource::Default);
+    }
+
+    #[test]
+    fn cache_root_source_display_matches_as_str() {
+        assert_eq!(CacheRootSource::Env.to_string(), "env:ZCCACHE_CACHE_DIR");
+        assert_eq!(
+            CacheRootSource::Colocated.to_string(),
+            "colocate:cross_volume"
+        );
+        assert_eq!(
+            CacheRootSource::Default.to_string(),
+            "default:platform_dirs"
+        );
+    }
+
+    /// Every well-known subpath that the daemon/CLI persistently writes to
+    /// MUST live under the resolved cache root. This is the soldr/Defender
+    /// exclusion contract from issue #275: one directory the wrapper can
+    /// exclude and trust that no zccache write escapes it.
+    #[test]
+    fn cache_root_invariant_all_subpaths_rooted() {
+        let (_temp, cache) = temp_cache_dir();
+        let subs: [(NormalizedPath, &str); 8] = [
+            (artifacts_dir_from_cache_dir(&cache), "artifacts/"),
+            (tmp_dir_from_cache_dir(&cache), "tmp/"),
+            (depfile_dir_from_cache_dir(&cache), "tmp/depfiles/"),
+            (depgraph_dir_from_cache_dir(&cache), "depgraph/"),
+            (log_dir_from_cache_dir(&cache), "logs/"),
+            (crash_dump_dir_from_cache_dir(&cache), "crashes/"),
+            (symbols_cache_dir_from_cache_dir(&cache), "symbols/"),
+            (index_path_from_cache_dir(&cache), "index.bin"),
+        ];
+        for (p, label) in &subs {
+            assert!(
+                p.starts_with(&cache),
+                "{label} ({}) must be under cache root ({})",
+                p.display(),
+                cache.display()
+            );
+        }
     }
 
     #[test]
