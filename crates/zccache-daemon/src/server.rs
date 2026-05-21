@@ -608,6 +608,54 @@ struct SharedState {
     dep_graph_persisted: AtomicBool,
 }
 
+/// Look up an artifact by key, falling through to the on-disk
+/// [`ArtifactStore`] when the in-memory [`SharedState::artifacts`] DashMap
+/// has not yet been hydrated.
+///
+/// # Why the fallthrough is required
+///
+/// Daemon startup spawns a background task that copies every entry from
+/// `state.artifact_store` (loaded synchronously by `ArtifactStore::open`)
+/// into `state.artifacts`. The daemon begins accepting IPC requests
+/// immediately, before that background task finishes. Without this
+/// helper, the warm-after-restore window (`soldr load` → first compile)
+/// reports MISS on every lookup until the DashMap catches up — measured
+/// at 0/115 hits on the medium fixture's `cold-tar-untar-warm`
+/// scenario (perf-cluster run 26255457227).
+///
+/// The DashMap is a cache *of* the on-disk store; the on-disk store is
+/// the source of truth for artifact existence. Lookups now:
+/// 1. Hit the in-memory DashMap (fast path; populated by stores +
+///    background load).
+/// 2. On miss, consult the in-memory hashmap that backs
+///    [`ArtifactStore::open`] (also fast — already hydrated from
+///    `index.bin` at daemon bind time).
+/// 3. On disk-store hit, hydrate the DashMap so subsequent lookups
+///    skip the fallback entirely.
+///
+/// # Why two `get_mut` calls
+///
+/// DashMap forbids holding a shard lock (`get_mut` returns a guard
+/// holding it) across an `insert` on the same map — that would
+/// deadlock. We release the first guard's `None` arm, do the
+/// disk-store lookup + insert, then take a fresh `get_mut` to hand
+/// back. The `insert` + re-`get_mut` is on the cold path (DashMap
+/// miss + disk-store hit), so the extra hash is dwarfed by the
+/// hardlink/write work that follows.
+fn lookup_artifact_with_disk_fallback<'a>(
+    state: &'a SharedState,
+    key_hex: &str,
+) -> Option<dashmap::mapref::one::RefMut<'a, String, CachedArtifact>> {
+    if let Some(entry) = state.artifacts.get_mut(key_hex) {
+        return Some(entry);
+    }
+    let meta = state.artifact_store.get(key_hex)?;
+    state
+        .artifacts
+        .insert(key_hex.to_string(), CachedArtifact::from_index(meta));
+    state.artifacts.get_mut(key_hex)
+}
+
 /// Pre-computed compile request data for the request-level fast path.
 struct RequestCacheEntry {
     context_key: ContextKey,
@@ -946,6 +994,41 @@ impl DaemonServer {
     #[must_use]
     pub fn profile_snapshot(&self) -> crate::stats::ProfileSnapshot {
         self.state.profiler.snapshot()
+    }
+
+    /// Test-only seam: exercise the DashMap → on-disk-`ArtifactStore`
+    /// fallback used by every artifact-lookup site.
+    ///
+    /// Returns `true` if the key is found either in the in-memory
+    /// `artifacts` DashMap or in the on-disk artifact store (in which
+    /// case the DashMap is hydrated as a side-effect). Lets perf tests
+    /// assert that warm-after-restore lookups hit the on-disk store
+    /// without spinning up an IPC server + real compile.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_lookup_artifact(&self, key_hex: &str) -> bool {
+        lookup_artifact_with_disk_fallback(&self.state, key_hex).is_some()
+    }
+
+    /// Test-only seam: report whether the background artifact-load
+    /// task has finished hydrating `state.artifacts`. Used by
+    /// `perf_artifact_fallback_test.rs` to assert that the fallback
+    /// path is the one being exercised (not the post-load fast path).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_artifacts_loaded(&self) -> bool {
+        self.state.artifacts_loaded.load(Ordering::Acquire)
+    }
+
+    /// Test-only seam: report the number of entries currently in the
+    /// in-memory `state.artifacts` DashMap. Lets the perf test assert
+    /// that a fresh bind (before `run()`) starts with an empty
+    /// DashMap, proving that any subsequent hit comes from the
+    /// on-disk fallback path.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_artifacts_len(&self) -> usize {
+        self.state.artifacts.len()
     }
 
     /// Run the server, accepting connections until shutdown is signaled.
@@ -2123,7 +2206,7 @@ async fn handle_link_ephemeral(
     let key_hex = cache_key.to_hex();
 
     // 5. Cache lookup
-    if let Some(mut entry) = state.artifacts.get_mut(&key_hex) {
+    if let Some(mut entry) = lookup_artifact_with_disk_fallback(state, &key_hex) {
         entry.last_used = std::time::Instant::now();
         // Load payloads from disk if not already loaded.
         let loaded = ensure_payloads(&mut entry, &state.artifact_dir, &key_hex).is_some();
@@ -4813,7 +4896,9 @@ async fn handle_compile(
                         && inputs_match
                     {
                         let t_artifact_lookup = std::time::Instant::now();
-                        if let Some(mut cached_ref) = state.artifacts.get_mut(artifact_key_hex) {
+                        if let Some(mut cached_ref) =
+                            lookup_artifact_with_disk_fallback(state, artifact_key_hex)
+                        {
                             cached_ref.last_used = std::time::Instant::now();
                             let loaded = ensure_payloads(
                                 &mut cached_ref,
@@ -5101,7 +5186,9 @@ async fn handle_compile(
                 let t5 = std::time::Instant::now();
                 // Write directly from DashMap reference — avoids cloning the
                 // entire CachedArtifact (including all .o data, ~50-200KB).
-                if let Some(mut cached_ref) = state.artifacts.get_mut(artifact_key_hex) {
+                if let Some(mut cached_ref) =
+                    lookup_artifact_with_disk_fallback(state, artifact_key_hex)
+                {
                     cached_ref.last_used = std::time::Instant::now();
                     let artifact_lookup_ns = t5.elapsed().as_nanos() as u64;
                     let t6 = std::time::Instant::now();
@@ -5370,7 +5457,9 @@ async fn handle_compile(
             // ── Phase: artifact lookup + write ─────────────────────────
             let t5 = std::time::Instant::now();
             let artifact_key_hex = artifact_key.hash().to_hex();
-            if let Some(mut cached_ref) = state.artifacts.get_mut(&artifact_key_hex) {
+            if let Some(mut cached_ref) =
+                lookup_artifact_with_disk_fallback(state, &artifact_key_hex)
+            {
                 cached_ref.last_used = std::time::Instant::now();
                 let artifact_lookup_ns = t5.elapsed().as_nanos() as u64;
 
@@ -6318,7 +6407,9 @@ fn check_unit_cache(
                 // cloning all .o data (~50-200KB per file) into PendingWrite.
                 // Each check_unit_cache runs in its own spawn_blocking task,
                 // so writes are already parallel across units.
-                if let Some(mut cached_ref) = state.artifacts.get_mut(artifact_key_hex) {
+                if let Some(mut cached_ref) =
+                    lookup_artifact_with_disk_fallback(state, artifact_key_hex)
+                {
                     cached_ref.last_used = std::time::Instant::now();
                     let loaded =
                         ensure_payloads(&mut cached_ref, &state.artifact_dir, artifact_key_hex)
@@ -6431,7 +6522,7 @@ fn check_unit_cache(
     | zccache_depgraph::CacheVerdict::SourceChanged { artifact_key } = verdict
     {
         let artifact_key_hex = artifact_key.hash().to_hex();
-        if let Some(mut cached_ref) = state.artifacts.get_mut(&artifact_key_hex) {
+        if let Some(mut cached_ref) = lookup_artifact_with_disk_fallback(state, &artifact_key_hex) {
             cached_ref.last_used = std::time::Instant::now();
             let t_lookup = t0.elapsed();
             let loaded =
