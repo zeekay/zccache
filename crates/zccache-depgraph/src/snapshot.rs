@@ -323,6 +323,105 @@ pub fn save_to_file(graph: &DepGraph, path: &Path) -> Result<(), SnapshotError> 
     Ok(())
 }
 
+/// Outcome of attempting to load the persisted depgraph from a cache directory.
+///
+/// Returned by [`classify_load`] so the daemon can both seed its in-memory
+/// graph and surface the load result to operators (stderr + `last-session.log`).
+/// The variants mirror the failure modes the daemon must handle distinctly:
+///
+/// - `Loaded` — file present, magic + version + payload all valid; the graph
+///   is ready to serve hits from the very first lookup.
+/// - `Missing` — no `depgraph.bin` in the cache dir. Genuine cold start.
+/// - `VersionMismatch` — file present but the embedded version tag does not
+///   match this build. The on-disk format changed since the prior session.
+/// - `Corrupt` — magic mismatch, truncated, or payload validation failed.
+/// - `IoError` — any other I/O failure reading the file.
+#[derive(Debug)]
+pub enum DepGraphLoadOutcome {
+    Loaded {
+        graph: DepGraph,
+    },
+    Missing,
+    VersionMismatch {
+        file_version: u32,
+        expected_version: u32,
+    },
+    Corrupt {
+        message: String,
+    },
+    IoError {
+        message: String,
+    },
+}
+
+impl DepGraphLoadOutcome {
+    /// Returns the loaded graph if this outcome is `Loaded`, else `None`.
+    #[must_use]
+    pub fn into_graph(self) -> Option<DepGraph> {
+        match self {
+            Self::Loaded { graph } => Some(graph),
+            _ => None,
+        }
+    }
+
+    /// Returns a human-readable warning message for non-`Loaded`, non-`Missing`
+    /// outcomes. Used by the daemon to emit a clear notice on stderr AND in the
+    /// per-session log so operators can see exactly why the warm-load failed
+    /// and the session fell back to cold behavior.
+    #[must_use]
+    pub fn warning(&self, path: &Path) -> Option<String> {
+        match self {
+            Self::Loaded { .. } | Self::Missing => None,
+            Self::VersionMismatch {
+                file_version,
+                expected_version,
+            } => Some(format!(
+                "warning: persisted depgraph at {} has version {file_version}, expected {expected_version}; treating session as cold",
+                path.display()
+            )),
+            Self::Corrupt { message } => Some(format!(
+                "warning: persisted depgraph at {} is corrupt ({message}); treating session as cold",
+                path.display()
+            )),
+            Self::IoError { message } => Some(format!(
+                "warning: failed to read persisted depgraph at {} ({message}); treating session as cold",
+                path.display()
+            )),
+        }
+    }
+}
+
+/// Classify a load attempt at `path` into a structured outcome.
+///
+/// This is the load-and-classify helper called by the daemon at startup so a
+/// fresh session pointed at a populated cache dir is automatically treated as
+/// warm — no caller-side opt-in required. See issue #320.
+///
+/// On non-`Loaded` outcomes the returned value carries enough information to
+/// generate a stderr/session-log warning via [`DepGraphLoadOutcome::warning`].
+#[must_use]
+pub fn classify_load(path: &Path) -> DepGraphLoadOutcome {
+    match load_from_file(path) {
+        Ok(graph) => DepGraphLoadOutcome::Loaded { graph },
+        Err(SnapshotError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            DepGraphLoadOutcome::Missing
+        }
+        Err(SnapshotError::Io(e)) => DepGraphLoadOutcome::IoError {
+            message: e.to_string(),
+        },
+        Err(SnapshotError::VersionMismatch { file, expected }) => {
+            DepGraphLoadOutcome::VersionMismatch {
+                file_version: file,
+                expected_version: expected,
+            }
+        }
+        Err(SnapshotError::BadMagic) => DepGraphLoadOutcome::Corrupt {
+            message: "bad magic bytes".into(),
+        },
+        Err(SnapshotError::Corrupt(message)) => DepGraphLoadOutcome::Corrupt { message },
+    }
+}
+
 /// Load the dependency graph from disk, validating header and payload.
 pub fn load_from_file(path: &Path) -> Result<DepGraph, SnapshotError> {
     let data = std::fs::read(path)?;
@@ -1879,5 +1978,91 @@ mod tests {
             load_from_file(&path).is_err(),
             "overflow-inducing payload_len must be rejected"
         );
+    }
+
+    // ── classify_load tests (issue #320) ─────────────────────────────────────
+
+    #[test]
+    fn classify_load_missing_returns_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("absent.bin");
+
+        let outcome = classify_load(&path);
+        assert!(matches!(outcome, DepGraphLoadOutcome::Missing));
+        assert!(outcome.warning(&path).is_none(), "Missing must not warn");
+        assert!(outcome.into_graph().is_none());
+    }
+
+    #[test]
+    fn classify_load_valid_returns_loaded() {
+        let dir = TempDir::new().unwrap();
+        let path = test_path(&dir);
+
+        let graph = DepGraph::new();
+        let _ = graph.register(make_ctx("/src/main.cpp"));
+        save_to_file(&graph, &path).unwrap();
+
+        let outcome = classify_load(&path);
+        assert!(matches!(outcome, DepGraphLoadOutcome::Loaded { .. }));
+        assert!(outcome.warning(&path).is_none(), "Loaded must not warn");
+        let loaded = outcome.into_graph().expect("Loaded must yield graph");
+        assert_eq!(loaded.stats().context_count, 1);
+    }
+
+    #[test]
+    fn classify_load_version_mismatch_warns() {
+        let dir = TempDir::new().unwrap();
+        let path = test_path(&dir);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&DEPGRAPH_MAGIC);
+        data.extend_from_slice(&99u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+
+        let outcome = classify_load(&path);
+        match &outcome {
+            DepGraphLoadOutcome::VersionMismatch {
+                file_version: 99,
+                expected_version,
+            } => {
+                assert_eq!(*expected_version, DEPGRAPH_VERSION);
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+        let warning = outcome.warning(&path).expect("must warn");
+        assert!(warning.contains("version 99"));
+        assert!(warning.contains("treating session as cold"));
+    }
+
+    #[test]
+    fn classify_load_bad_magic_is_corrupt() {
+        let dir = TempDir::new().unwrap();
+        let path = test_path(&dir);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        data.extend_from_slice(&DEPGRAPH_VERSION.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+
+        let outcome = classify_load(&path);
+        assert!(matches!(outcome, DepGraphLoadOutcome::Corrupt { .. }));
+        let warning = outcome.warning(&path).expect("must warn");
+        assert!(warning.contains("corrupt"));
+        assert!(warning.contains("treating session as cold"));
+    }
+
+    #[test]
+    fn classify_load_truncated_is_corrupt() {
+        let dir = TempDir::new().unwrap();
+        let path = test_path(&dir);
+
+        // Too small to even hold the header.
+        std::fs::write(&path, [0x5Au8, 0x43, 0x44]).unwrap();
+
+        let outcome = classify_load(&path);
+        assert!(matches!(outcome, DepGraphLoadOutcome::Corrupt { .. }));
+        assert!(outcome.warning(&path).is_some());
     }
 }

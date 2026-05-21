@@ -606,6 +606,14 @@ struct SharedState {
     /// CLI can distinguish "persisted graph" from "first-run, not yet flushed"
     /// without inferring it from the on-disk file size.
     dep_graph_persisted: AtomicBool,
+    /// Optional load-time warning to mirror into every session log.
+    ///
+    /// Populated by `set_depgraph_load_warning` when the daemon's startup load
+    /// of the persisted depgraph fell back to a cold session (version
+    /// mismatch, corrupt header, or unexpected I/O error). The string is
+    /// emitted once per session into the per-session log (`last-session.log`)
+    /// at `SessionStart` time so the cold fallback is never silent. Issue #320.
+    depgraph_load_warning: Mutex<Option<String>>,
 }
 
 /// Look up an artifact by key, falling through to the on-disk
@@ -969,6 +977,7 @@ impl DaemonServer {
                 artifacts_loaded: AtomicBool::new(false),
                 fingerprint: FingerprintManager::new(),
                 dep_graph_persisted: AtomicBool::new(false),
+                depgraph_load_warning: Mutex::new(None),
             }),
         })
     }
@@ -988,6 +997,21 @@ impl DaemonServer {
             Arc::get_mut(&mut self.state).expect("set_dep_graph must be called before run()");
         state.dep_graph = graph;
         state.dep_graph_persisted.store(true, Ordering::Release);
+    }
+
+    /// Record a load-time depgraph warning to mirror into per-session logs.
+    ///
+    /// Called by the daemon's startup path after [`zccache_depgraph::classify_load`]
+    /// returns a non-`Loaded` outcome that warrants surfacing (version
+    /// mismatch, corruption, I/O error). The warning is appended to each
+    /// session's log file at `SessionStart` so a cold fallback caused by a
+    /// stale or corrupt `depgraph.bin` is visible to operators. Issue #320.
+    ///
+    /// Must be called before `run()` (while this is the only `Arc` holder).
+    pub fn set_depgraph_load_warning(&mut self, warning: String) {
+        let state = Arc::get_mut(&mut self.state)
+            .expect("set_depgraph_load_warning must be called before run()");
+        *state.depgraph_load_warning.get_mut() = Some(warning);
     }
 
     /// Get a snapshot of the phase profiler (for benchmarks).
@@ -2649,6 +2673,19 @@ async fn handle_session_start(
             root: resolve_worktree_root(working_dir, None),
         },
     );
+
+    // Mirror any depgraph load-time warning into this session's log so
+    // the cold fallback after a version-mismatch / corrupt depgraph.bin
+    // is visible to operators reading `last-session.log`. Issue #320.
+    {
+        let warning_opt = {
+            let guard = state.depgraph_load_warning.lock().await;
+            guard.clone()
+        };
+        if let Some(warning) = warning_opt {
+            write_session_log(&state.sessions, &session_id, &warning);
+        }
+    }
 
     // Watch the working directory for file changes.
     watch_directory(state, working_dir).await;
