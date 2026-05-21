@@ -22,6 +22,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod defender;
 mod snapshot_fp;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -372,6 +373,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect or modify Windows Defender real-time-scan exclusions for the
+    /// cache root. No-ops cleanly on non-Windows. See `zccache#273`.
+    #[command(name = "defender-exclusions")]
+    DefenderExclusions {
+        #[command(subcommand)]
+        action: DefenderExclusionsCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -409,6 +417,25 @@ enum SymbolsCommands {
         #[arg(required = true)]
         dumps: Vec<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DefenderExclusionsCommands {
+    /// Print whether the resolved cache root (and any sibling `runtime/`)
+    /// is on Defender's exclusion list. Non-destructive — no elevation
+    /// needed. Use `--json` for machine-readable output.
+    Check {
+        /// Emit a JSON document on stdout instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add the cache root (and any sibling `runtime/`) to Defender's
+    /// exclusion list. Requires administrator elevation; exits non-zero
+    /// with instructions when run from a non-elevated shell.
+    Add,
+    /// Remove the cache root (and any sibling `runtime/`) from Defender's
+    /// exclusion list. Requires administrator elevation.
+    Remove,
 }
 
 #[derive(Debug, Subcommand)]
@@ -700,6 +727,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "snapshot-fp-validate",
     "symbols",
     "cache-root",
+    "defender-exclusions",
     "help",
     "--help",
     "-h",
@@ -1035,6 +1063,11 @@ fn main() -> ExitCode {
             SymbolsCommands::Symbolicate { dumps } => cmd_symbols_symbolicate(dumps),
         },
         Commands::CacheRoot { json } => cmd_cache_root(json),
+        Commands::DefenderExclusions { action } => match action {
+            DefenderExclusionsCommands::Check { json } => defender::cmd_check(json),
+            DefenderExclusionsCommands::Add => defender::cmd_add(),
+            DefenderExclusionsCommands::Remove => defender::cmd_remove(),
+        },
     }
 }
 

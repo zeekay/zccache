@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod crash;
+pub mod defender;
 pub mod error;
 pub mod lifecycle;
 pub mod path;
