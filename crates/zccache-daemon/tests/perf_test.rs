@@ -91,6 +91,7 @@ async fn start_session(
             log_file: Some(log_file.to_string().into()),
             track_stats: false,
             journal_path: None,
+            profile: false,
         })
         .await
         .unwrap();

@@ -89,6 +89,23 @@ enum Commands {
         /// Print the analysis as a JSON document on stdout.
         #[arg(long)]
         json: bool,
+        /// Restrict the rollup to a single session id.
+        #[arg(long)]
+        session: Option<String>,
+        /// Restrict the rollup to a single crate by `--crate-name`.
+        #[arg(long = "crate")]
+        crate_name: Option<String>,
+        /// Restrict the rollup to one outcome class: `hit`, `miss`,
+        /// or `non-cacheable` (errors and link records pass through).
+        #[arg(long)]
+        outcome: Option<String>,
+        /// Sort order for the human-readable per-crate table.
+        /// One of `wall-clock` (default), `misses`, `hits`.
+        #[arg(long, default_value = "wall-clock")]
+        sort: String,
+        /// Limit the per-crate table to the top N rows.
+        #[arg(long)]
+        top: Option<usize>,
     },
     /// Clear the artifact cache.
     Clear,
@@ -110,6 +127,14 @@ enum Commands {
         /// Write a per-session JSONL compile journal to this path (must end in .jsonl).
         #[arg(long)]
         journal: Option<String>,
+        /// Issue #256: opt in to the extended journal schema.
+        /// When set, every compile journal line written for this
+        /// session also carries `crate_name`, `crate_type`,
+        /// `output_ext`, and `self_profile_ns` span timings.
+        /// When omitted, behavior is identical to releases before
+        /// the flag existed (no new allocations, no extra fields).
+        #[arg(long)]
+        profile: bool,
     },
     /// End a build session.
     #[command(name = "session-end")]
@@ -755,7 +780,25 @@ fn main() -> ExitCode {
             let endpoint = resolve_endpoint(None);
             run_async(cmd_status(&endpoint, json))
         }
-        Commands::Analyze { journal, json } => cmd_analyze(&journal, json),
+        Commands::Analyze {
+            journal,
+            json,
+            session,
+            crate_name,
+            outcome,
+            sort,
+            top,
+        } => cmd_analyze(
+            &journal,
+            AnalyzeOptions {
+                json,
+                session,
+                crate_name,
+                outcome,
+                sort,
+                top,
+            },
+        ),
         Commands::Clear => {
             let endpoint = resolve_endpoint(None);
             run_async(cmd_clear(&endpoint))
@@ -824,6 +867,7 @@ fn main() -> ExitCode {
             endpoint,
             stats,
             journal,
+            profile,
         } => {
             let endpoint = resolve_endpoint(endpoint.as_deref());
             let cwd = cwd
@@ -843,6 +887,7 @@ fn main() -> ExitCode {
                 log.as_deref(),
                 stats,
                 journal,
+                profile,
             ))
         }
         Commands::SessionEnd {
@@ -1450,12 +1495,60 @@ fn print_status_error_json(endpoint: &str, message: &str) {
     print_json_value(&value);
 }
 
-fn cmd_analyze(journal_path: &str, json: bool) -> ExitCode {
-    let report = match analyze_journal(journal_path) {
+/// Filters and sort/limit knobs for `zccache analyze`. Constructed
+/// from the matching CLI flags (issue #256). All filters are
+/// permissive: when `None`/missing on a journal line the filter
+/// passes (so legacy journals that lack `crate_name` still flow
+/// through when no `--crate` is supplied).
+pub struct AnalyzeOptions {
+    pub json: bool,
+    pub session: Option<String>,
+    pub crate_name: Option<String>,
+    pub outcome: Option<String>,
+    pub sort: String,
+    pub top: Option<usize>,
+}
+
+impl AnalyzeOptions {
+    fn sort_mode(&self) -> AnalyzeSort {
+        match self.sort.as_str() {
+            "misses" => AnalyzeSort::Misses,
+            "hits" => AnalyzeSort::Hits,
+            _ => AnalyzeSort::WallClock,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalyzeSort {
+    WallClock,
+    Misses,
+    Hits,
+}
+
+fn cmd_analyze(journal_path: &str, opts: AnalyzeOptions) -> ExitCode {
+    let report = match analyze_journal_with(journal_path, &opts) {
         Ok(report) => report,
+        Err(AnalyzeError::Read(err)) if matches!(err.kind(), std::io::ErrorKind::NotFound) => {
+            // Missing journal: per issue #256 acceptance criteria the
+            // analyzer exits 0 with a `(no journal)` message so callers
+            // can scaffold the file before the first build runs.
+            if opts.json {
+                print_json_value(&serde_json::json!({
+                    "status": "ok",
+                    "schema_version": 1,
+                    "journal_path": journal_path,
+                    "line_count": 0,
+                    "note": "(no journal)",
+                }));
+            } else {
+                println!("zccache analyze: {journal_path}: (no journal)");
+            }
+            return ExitCode::SUCCESS;
+        }
         Err(e) => {
             let message = format_analyze_error(journal_path, &e);
-            if json {
+            if opts.json {
                 print_json_value(&analyze_error_json(journal_path, &e));
             } else {
                 eprintln!("{message}");
@@ -1464,10 +1557,10 @@ fn cmd_analyze(journal_path: &str, json: bool) -> ExitCode {
         }
     };
 
-    if json {
+    if opts.json {
         print_json_value(&report.to_json(journal_path));
     } else {
-        report.print_human(journal_path);
+        report.print_human_by_crate(journal_path, &opts);
     }
     ExitCode::SUCCESS
 }
@@ -1547,6 +1640,18 @@ struct AnalyzeReport {
     /// Per-crate-name miss counts. Bounded by HashMap during accumulation,
     /// surfaced as a sorted top-N in the report.
     miss_crate_counts: std::collections::HashMap<String, u64>,
+    /// Issue #256: per-crate hit/miss/wall-clock rollup used by the
+    /// default human-readable table. Keyed by crate_name (or
+    /// "<unknown>" when the journal line lacks one).
+    by_crate: std::collections::HashMap<String, CrateBucket>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct CrateBucket {
+    hits: u64,
+    misses: u64,
+    errors: u64,
+    total_ns: u128,
 }
 
 #[derive(Debug, Default)]
@@ -1605,6 +1710,13 @@ impl AnalyzeReport {
         let crate_type = extract_flag_value(&args, "--crate-type");
         let extension_bucket = classify_extension(outcome, &crate_type);
 
+        // Issue #256: roll every compile entry up into a per-crate
+        // bucket so the human-readable table can group by crate.
+        // Falls back to "<unknown>" so journal lines lacking a
+        // crate name still appear in the rollup.
+        let crate_key = crate_name
+            .clone()
+            .unwrap_or_else(|| "<unknown>".to_string());
         match outcome {
             "hit" => {
                 self.compile_count += 1;
@@ -1612,6 +1724,9 @@ impl AnalyzeReport {
                 let bucket = self.by_extension.entry(extension_bucket).or_default();
                 bucket.hits += 1;
                 bucket.total_ns = bucket.total_ns.saturating_add(latency_ns);
+                let cb = self.by_crate.entry(crate_key).or_default();
+                cb.hits += 1;
+                cb.total_ns = cb.total_ns.saturating_add(latency_ns);
             }
             "miss" => {
                 self.compile_count += 1;
@@ -1622,10 +1737,16 @@ impl AnalyzeReport {
                 if let Some(name) = &crate_name {
                     *self.miss_crate_counts.entry(name.clone()).or_default() += 1;
                 }
+                let cb = self.by_crate.entry(crate_key).or_default();
+                cb.misses += 1;
+                cb.total_ns = cb.total_ns.saturating_add(latency_ns);
             }
             "error" => {
                 self.compile_count += 1;
                 self.error_count += 1;
+                let cb = self.by_crate.entry(crate_key).or_default();
+                cb.errors += 1;
+                cb.total_ns = cb.total_ns.saturating_add(latency_ns);
             }
             "link_hit" => {
                 self.link_count += 1;
@@ -1768,9 +1889,32 @@ impl AnalyzeReport {
             "by_tool_calls": by_tool_calls,
             "top_slowest": slowest,
             "top_miss_crates": top_miss_crates,
+            "by_crate": self.by_crate_json(),
         })
     }
 
+    fn by_crate_json(&self) -> serde_json::Value {
+        let mut rows: Vec<(&String, &CrateBucket)> = self.by_crate.iter().collect();
+        rows.sort_by(|a, b| b.1.total_ns.cmp(&a.1.total_ns).then_with(|| a.0.cmp(b.0)));
+        serde_json::Value::Array(
+            rows.into_iter()
+                .map(|(name, b)| {
+                    serde_json::json!({
+                        "crate_name": name,
+                        "hits": b.hits,
+                        "misses": b.misses,
+                        "errors": b.errors,
+                        "total_ms": (b.total_ns / 1_000_000) as u64,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Legacy human printer, kept for reference and reused by
+    /// older tests. The default `cmd_analyze` path uses
+    /// [`Self::print_human_by_crate`] instead.
+    #[allow(dead_code)]
     fn print_human(&self, journal_path: &str) {
         println!("zccache analyze: {journal_path}");
         println!(
@@ -1841,8 +1985,211 @@ impl AnalyzeReport {
             }
         }
     }
+
+    /// Issue #256: default human-readable rollup grouped by crate
+    /// name and sorted by the AnalyzeOptions sort knob. Empty input
+    /// after filtering prints a header line plus an empty-table
+    /// marker so scripts can distinguish "no entries matched" from
+    /// "no journal file" (the latter is short-circuited by cmd_analyze).
+    fn print_human_by_crate(&self, journal_path: &str, opts: &AnalyzeOptions) {
+        println!("zccache analyze: {journal_path}");
+        println!(
+            "  lines: {} parsed; compiles: {} (hits {} / misses {} / errors {}); links: {} (hits {} / misses {})",
+            self.parsed_count,
+            self.compile_count,
+            self.hit_count,
+            self.miss_count,
+            self.error_count,
+            self.link_count,
+            self.link_hit_count,
+            self.link_miss_count,
+        );
+        if let Some(rate) = self.hit_rate() {
+            println!("  hit rate: {:.1}%", rate * 100.0);
+        }
+        println!(
+            "  total wall-clock: {} ms",
+            self.total_latency_ns / 1_000_000
+        );
+
+        let rows = self.crate_rows(opts);
+        if rows.is_empty() {
+            println!("  (no rows after filters)");
+            return;
+        }
+        println!();
+        println!("  by crate (sorted by {}):", opts.sort);
+        println!(
+            "    {col:<32}  hits={h:>6}  misses={m:>6}  errors={e:>4}  ms",
+            col = "crate",
+            h = "h",
+            m = "m",
+            e = "e",
+        );
+        for row in &rows {
+            println!(
+                "    {:<32}  hits={:>6}  misses={:>6}  errors={:>4}  ms={}",
+                row.crate_name,
+                row.hits,
+                row.misses,
+                row.errors,
+                row.total_ns / 1_000_000
+            );
+        }
+    }
+
+    /// Issue #256: build a sorted, optionally-truncated per-crate view
+    /// over `self.by_crate`. Splitting this off the printer keeps the
+    /// sorting logic testable without a stdout fixture.
+    fn crate_rows(&self, opts: &AnalyzeOptions) -> Vec<CrateRow> {
+        let mut rows: Vec<CrateRow> = self
+            .by_crate
+            .iter()
+            .map(|(name, b)| CrateRow {
+                crate_name: name.clone(),
+                hits: b.hits,
+                misses: b.misses,
+                errors: b.errors,
+                total_ns: b.total_ns,
+            })
+            .collect();
+        match opts.sort_mode() {
+            AnalyzeSort::WallClock => rows.sort_by(|a, b| {
+                b.total_ns
+                    .cmp(&a.total_ns)
+                    .then_with(|| a.crate_name.cmp(&b.crate_name))
+            }),
+            AnalyzeSort::Misses => rows.sort_by(|a, b| {
+                b.misses
+                    .cmp(&a.misses)
+                    .then_with(|| a.crate_name.cmp(&b.crate_name))
+            }),
+            AnalyzeSort::Hits => rows.sort_by(|a, b| {
+                b.hits
+                    .cmp(&a.hits)
+                    .then_with(|| a.crate_name.cmp(&b.crate_name))
+            }),
+        }
+        if let Some(n) = opts.top {
+            rows.truncate(n);
+        }
+        rows
+    }
 }
 
+/// One row of the per-crate rollup. Public-within-crate so tests can
+/// pin sort order without going through stdout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrateRow {
+    pub crate_name: String,
+    pub hits: u64,
+    pub misses: u64,
+    pub errors: u64,
+    pub total_ns: u128,
+}
+
+/// Issue #256: streaming analyze with optional filters. Skips
+/// journal lines that fail the `session`/`crate`/`outcome` filter
+/// without counting them in the line tallies. Truncated or malformed
+/// lines emit a single stderr warning per occurrence and are skipped.
+fn analyze_journal_with(
+    journal_path: &str,
+    opts: &AnalyzeOptions,
+) -> Result<AnalyzeReport, AnalyzeError> {
+    let content = std::fs::read_to_string(journal_path).map_err(AnalyzeError::Read)?;
+    let mut report = AnalyzeReport::default();
+    let mut malformed = 0u64;
+    for line in content.lines() {
+        report.line_count += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(value) => {
+                if !is_compile_journal_entry(&value) {
+                    continue;
+                }
+                if !analyze_passes_filters(&value, opts) {
+                    continue;
+                }
+                report.ingest(&value);
+            }
+            Err(_) => {
+                malformed += 1;
+            }
+        }
+    }
+    if malformed > 0 {
+        eprintln!("zccache analyze: skipped {malformed} malformed line(s)");
+    }
+    if report.parsed_count == 0 {
+        // When filters are active, an empty result is a legitimate
+        // zero-row report rather than an input-classification error.
+        let any_filter =
+            opts.session.is_some() || opts.crate_name.is_some() || opts.outcome.is_some();
+        if any_filter {
+            return Ok(report);
+        }
+        return Err(classify_analyze_input_without_entries(
+            content.trim(),
+            report.line_count,
+        ));
+    }
+    Ok(report)
+}
+
+/// Apply the analyze filter flags to a parsed journal value.
+/// Filters are conjunctive; missing values on the line are
+/// treated as non-matches so a `--crate foo` filter never
+/// matches a record without a `crate_name`.
+fn analyze_passes_filters(value: &serde_json::Value, opts: &AnalyzeOptions) -> bool {
+    if let Some(want) = &opts.session {
+        let got = value.get("session_id").and_then(|v| v.as_str());
+        if got != Some(want.as_str()) {
+            return false;
+        }
+    }
+    if let Some(want) = &opts.crate_name {
+        let direct = value
+            .get("crate_name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let derived = direct.or_else(|| {
+            let args: Vec<String> = value
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            extract_flag_value(&args, "--crate-name")
+        });
+        if derived.as_deref() != Some(want.as_str()) {
+            return false;
+        }
+    }
+    if let Some(want) = &opts.outcome {
+        let got = value.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
+        let matches_outcome = match want.as_str() {
+            "hit" => got == "hit" || got == "link_hit",
+            "miss" => got == "miss" || got == "link_miss",
+            "non-cacheable" => got == "error",
+            other => got == other,
+        };
+        if !matches_outcome {
+            return false;
+        }
+    }
+    true
+}
+
+/// Legacy unfiltered analyze entry point. Production callers use
+/// [`analyze_journal_with`]; the tests pinned to this function pre-date
+/// the filter flags and keep the simpler signature.
+#[allow(dead_code)]
 fn analyze_journal(journal_path: &str) -> Result<AnalyzeReport, AnalyzeError> {
     let content = std::fs::read_to_string(journal_path).map_err(AnalyzeError::Read)?;
     let mut report = AnalyzeReport::default();
@@ -2393,6 +2740,7 @@ async fn cmd_session_start(
     log: Option<&Path>,
     track_stats: bool,
     journal: Option<NormalizedPath>,
+    profile: bool,
 ) -> ExitCode {
     if let Err(e) = ensure_daemon(endpoint).await {
         eprintln!("zccache[err][D]: cannot start daemon at {endpoint}: {e}");
@@ -2414,6 +2762,7 @@ async fn cmd_session_start(
             log_file: log.map(NormalizedPath::from),
             track_stats,
             journal_path: journal,
+            profile,
         })
         .await
     {
@@ -4993,6 +5342,76 @@ mod tests {
         ));
     }
 
+    // Issue #256 -- CLI flag parsing for session-start --profile
+    // and the new zccache analyze filter/sort flags.
+
+    #[test]
+    fn session_start_profile_flag_defaults_to_false() {
+        let cli = Cli::try_parse_from(["zccache", "session-start"]).unwrap();
+        match cli.command {
+            Some(Commands::SessionStart { profile, .. }) => assert!(!profile),
+            other => panic!("expected SessionStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_start_profile_flag_parses_when_set() {
+        let cli = Cli::try_parse_from(["zccache", "session-start", "--profile"]).unwrap();
+        match cli.command {
+            Some(Commands::SessionStart { profile, .. }) => assert!(profile),
+            other => panic!("expected SessionStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_parses_session_crate_outcome_sort_top_flags() {
+        let cli = Cli::try_parse_from([
+            "zccache",
+            "analyze",
+            "x.jsonl",
+            "--session",
+            "s1",
+            "--crate",
+            "soldr_cli",
+            "--outcome",
+            "miss",
+            "--sort",
+            "misses",
+            "--top",
+            "5",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Analyze {
+                session,
+                crate_name,
+                outcome,
+                sort,
+                top,
+                ..
+            }) => {
+                assert_eq!(session.as_deref(), Some("s1"));
+                assert_eq!(crate_name.as_deref(), Some("soldr_cli"));
+                assert_eq!(outcome.as_deref(), Some("miss"));
+                assert_eq!(sort, "misses");
+                assert_eq!(top, Some(5));
+            }
+            other => panic!("expected Analyze, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_sort_defaults_to_wall_clock() {
+        let cli = Cli::try_parse_from(["zccache", "analyze", "x.jsonl"]).unwrap();
+        match cli.command {
+            Some(Commands::Analyze { sort, top, .. }) => {
+                assert_eq!(sort, "wall-clock");
+                assert!(top.is_none());
+            }
+            other => panic!("expected Analyze, got {other:?}"),
+        }
+    }
+
     #[test]
     fn session_stats_unavailable_json_has_scrapeable_status() {
         let json = session_stats_unavailable_json("session-123", "stats_not_enabled");
@@ -6035,5 +6454,184 @@ mod tests {
         assert_eq!(report.line_count, 3);
         assert_eq!(report.parsed_count, 1);
         assert_eq!(report.hit_count, 1);
+    }
+
+    // Issue #256 -- AnalyzeOptions filtering, per-crate rollup, sort.
+
+    fn make_journal_line_full(
+        outcome: &str,
+        compiler: &str,
+        crate_name: &str,
+        crate_type: &str,
+        latency_ns: u128,
+        session_id: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "ts": "2026-05-14T18:00:00Z",
+            "outcome": outcome,
+            "compiler": compiler,
+            "args": [
+                "--crate-name", crate_name,
+                "--crate-type", crate_type,
+                "--edition=2021",
+            ],
+            "cwd": "/repo",
+            "exit_code": 0,
+            "session_id": session_id,
+            "latency_ns": latency_ns as u64,
+        })
+    }
+
+    fn write_fixture_journal(
+        entries: &[serde_json::Value],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("fixture.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for e in entries {
+            writeln!(f, "{}", serde_json::to_string(e).unwrap()).unwrap();
+        }
+        drop(f);
+        (tmp, path)
+    }
+
+    fn default_opts() -> AnalyzeOptions {
+        AnalyzeOptions {
+            json: false,
+            session: None,
+            crate_name: None,
+            outcome: None,
+            sort: "wall-clock".into(),
+            top: None,
+        }
+    }
+
+    #[test]
+    fn analyze_by_crate_default_sorts_by_wall_clock_desc() {
+        let entries = vec![
+            make_journal_line_full("hit", "/rustc", "alpha", "lib", 200_000_000, None),
+            make_journal_line_full("miss", "/rustc", "alpha", "lib", 100_000_000, None),
+            make_journal_line_full("hit", "/rustc", "beta", "bin", 500_000_000, None),
+        ];
+        let (_tmp, path) = write_fixture_journal(&entries);
+        let report = analyze_journal_with(path.to_str().unwrap(), &default_opts()).expect("ok");
+        let rows = report.crate_rows(&default_opts());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].crate_name, "beta");
+        assert_eq!(rows[1].crate_name, "alpha");
+        assert_eq!(rows[0].total_ns, 500_000_000);
+        assert_eq!(rows[1].total_ns, 300_000_000);
+    }
+
+    #[test]
+    fn analyze_sort_misses_orders_by_miss_count() {
+        let entries = vec![
+            make_journal_line_full("miss", "/rustc", "a", "lib", 10, None),
+            make_journal_line_full("miss", "/rustc", "a", "lib", 10, None),
+            make_journal_line_full("miss", "/rustc", "b", "lib", 10, None),
+        ];
+        let (_tmp, path) = write_fixture_journal(&entries);
+        let mut opts = default_opts();
+        opts.sort = "misses".into();
+        let report = analyze_journal_with(path.to_str().unwrap(), &opts).expect("ok");
+        let rows = report.crate_rows(&opts);
+        assert_eq!(rows[0].crate_name, "a");
+        assert_eq!(rows[0].misses, 2);
+        assert_eq!(rows[1].crate_name, "b");
+        assert_eq!(rows[1].misses, 1);
+    }
+
+    #[test]
+    fn analyze_top_truncates_rows() {
+        let mut entries = Vec::new();
+        for i in 0..5 {
+            entries.push(make_journal_line_full(
+                "hit",
+                "/rustc",
+                &format!("c{i}"),
+                "lib",
+                100 * (i as u128 + 1),
+                None,
+            ));
+        }
+        let (_tmp, path) = write_fixture_journal(&entries);
+        let mut opts = default_opts();
+        opts.top = Some(2);
+        let report = analyze_journal_with(path.to_str().unwrap(), &opts).expect("ok");
+        let rows = report.crate_rows(&opts);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].crate_name, "c4");
+        assert_eq!(rows[1].crate_name, "c3");
+    }
+
+    #[test]
+    fn analyze_session_filter_excludes_other_sessions() {
+        let entries = vec![
+            make_journal_line_full("hit", "/rustc", "a", "lib", 1, Some("s1")),
+            make_journal_line_full("hit", "/rustc", "b", "lib", 1, Some("s2")),
+        ];
+        let (_tmp, path) = write_fixture_journal(&entries);
+        let mut opts = default_opts();
+        opts.session = Some("s1".into());
+        let report = analyze_journal_with(path.to_str().unwrap(), &opts).expect("ok");
+        let rows = report.crate_rows(&opts);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].crate_name, "a");
+    }
+
+    #[test]
+    fn analyze_crate_filter_matches_by_crate_name_arg() {
+        let entries = vec![
+            make_journal_line_full("hit", "/rustc", "needle", "lib", 1, None),
+            make_journal_line_full("hit", "/rustc", "other", "lib", 1, None),
+        ];
+        let (_tmp, path) = write_fixture_journal(&entries);
+        let mut opts = default_opts();
+        opts.crate_name = Some("needle".into());
+        let report = analyze_journal_with(path.to_str().unwrap(), &opts).expect("ok");
+        assert_eq!(report.hit_count, 1);
+        assert_eq!(report.parsed_count, 1);
+    }
+
+    #[test]
+    fn analyze_outcome_filter_miss_includes_link_miss() {
+        let entries = vec![
+            make_journal_line_full("hit", "/rustc", "a", "lib", 1, None),
+            make_journal_line_full("miss", "/rustc", "a", "lib", 1, None),
+            make_journal_line_full("link_miss", "/lld", "a", "lib", 1, None),
+        ];
+        let (_tmp, path) = write_fixture_journal(&entries);
+        let mut opts = default_opts();
+        opts.outcome = Some("miss".into());
+        let report = analyze_journal_with(path.to_str().unwrap(), &opts).expect("ok");
+        // Both `miss` and `link_miss` flow through; the `hit` is excluded.
+        assert_eq!(report.miss_count, 1);
+        assert_eq!(report.link_miss_count, 1);
+        assert_eq!(report.hit_count, 0);
+    }
+
+    #[test]
+    fn analyze_options_sort_mode_defaults_to_wall_clock() {
+        let opts = default_opts();
+        assert_eq!(opts.sort_mode(), AnalyzeSort::WallClock);
+        let mut opts = default_opts();
+        opts.sort = "nonsense".into();
+        // Unknown sort key falls back to wall-clock.
+        assert_eq!(opts.sort_mode(), AnalyzeSort::WallClock);
+    }
+
+    #[test]
+    fn analyze_filters_returning_empty_are_ok_not_error() {
+        // Issue #256: when filters select zero rows the report is empty
+        // but the run still succeeds. Without filters, the legacy
+        // input-classification error fires instead.
+        let entries = vec![make_journal_line_full("hit", "/rustc", "a", "lib", 1, None)];
+        let (_tmp, path) = write_fixture_journal(&entries);
+        let mut opts = default_opts();
+        opts.crate_name = Some("does-not-exist".into());
+        let report = analyze_journal_with(path.to_str().unwrap(), &opts).expect("filtered ok");
+        assert_eq!(report.parsed_count, 0);
+        assert!(report.crate_rows(&opts).is_empty());
     }
 }

@@ -35,6 +35,7 @@ async fn start_session(client: &mut ClientConn) -> String {
             log_file: None,
             track_stats: false,
             journal_path: None,
+            profile: false,
         })
         .await
         .unwrap();
@@ -54,6 +55,7 @@ async fn start_session_in(client: &mut ClientConn, working_dir: &std::path::Path
             log_file: None,
             track_stats: false,
             journal_path: None,
+            profile: false,
         })
         .await
         .unwrap();

@@ -37,6 +37,12 @@ pub enum Request {
         track_stats: bool,
         /// Path for per-session JSONL compile journal (must end in .jsonl).
         journal_path: Option<NormalizedPath>,
+        /// Issue #256: opt in to the extended journal schema. When true,
+        /// the daemon populates crate_name, crate_type, output_ext, and
+        /// self_profile_ns on every compile journal line for the duration
+        /// of this session. When false, behavior is identical to releases
+        /// before the flag existed (no new allocations, no new fields).
+        profile: bool,
     },
     /// Compile a source file within an existing session.
     Compile {
@@ -502,6 +508,7 @@ mod tests {
             log_file: None,
             track_stats: true,
             journal_path: None,
+            profile: false,
         };
         roundtrip(&req);
 
@@ -511,6 +518,7 @@ mod tests {
             log_file: None,
             track_stats: false,
             journal_path: None,
+            profile: false,
         };
         roundtrip(&req_no_stats);
     }
@@ -523,6 +531,7 @@ mod tests {
             log_file: None,
             track_stats: false,
             journal_path: Some("/tmp/build.jsonl".into()),
+            profile: false,
         };
         roundtrip(&req);
 
@@ -532,6 +541,7 @@ mod tests {
             log_file: None,
             track_stats: false,
             journal_path: None,
+            profile: false,
         };
         roundtrip(&req_no_journal);
     }

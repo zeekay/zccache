@@ -94,6 +94,7 @@ async fn profile_multi_file_warm_path() {
             log_file: None,
             track_stats: true,
             journal_path: None,
+            profile: false,
         })
         .await
         .unwrap();

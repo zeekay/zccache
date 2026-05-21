@@ -1530,6 +1530,7 @@ async fn handle_connection(
                 log_file,
                 track_stats,
                 journal_path,
+                profile,
             } => {
                 state.stats.record_session();
                 (
@@ -1540,6 +1541,7 @@ async fn handle_connection(
                         log_file,
                         track_stats,
                         journal_path,
+                        profile,
                     )
                     .await,
                     None,
@@ -1766,19 +1768,27 @@ async fn handle_connection(
         if let Some(ctx) = journal_ctx {
             if let Some((outcome, exit_code, miss_reason)) = extract_outcome(&response) {
                 let latency_ns = journal_start.elapsed().as_nanos();
-                // Look up session journal path for per-session logging.
-                let session_journal_path = ctx.session_id.as_ref().and_then(|sid| {
-                    sid.parse::<SessionId>().ok().and_then(|parsed| {
-                        state
-                            .sessions
-                            .get(&parsed)
-                            .and_then(|s| s.journal_path.clone())
-                    })
-                });
-                state.journal.log(
-                    &JournalEntry::new(ctx, outcome, exit_code, latency_ns, miss_reason),
-                    session_journal_path.as_deref(),
-                );
+                // Look up session journal path + extended-journal opt-in
+                // in the same query so the session map is touched once.
+                let (session_journal_path, profile_on) = ctx
+                    .session_id
+                    .as_ref()
+                    .and_then(|sid| sid.parse::<SessionId>().ok())
+                    .and_then(|parsed| state.sessions.get(&parsed))
+                    .map(|s| (s.journal_path.clone(), s.profile))
+                    .unwrap_or((None, false));
+                let entry = JournalEntry::new(ctx, outcome, exit_code, latency_ns, miss_reason);
+                // Issue #256: extended-journal fields are populated only
+                // for sessions that opted in via session-start --profile.
+                // Self-profile span timings ride along when the compile
+                // handler captured them (currently None until follow-up
+                // wave wires the compile-handler instrumentation).
+                let entry = if profile_on {
+                    entry.with_profile_fields(None)
+                } else {
+                    entry
+                };
+                state.journal.log(&entry, session_journal_path.as_deref());
             }
         }
 
@@ -1869,7 +1879,7 @@ async fn handle_compile_ephemeral(
     // 1. Start ephemeral session (inline, no IPC roundtrip)
     state.stats.record_session();
     let session_resp =
-        handle_session_start(state, client_pid, working_dir, None, false, None).await;
+        handle_session_start(state, client_pid, working_dir, None, false, None, false).await;
     let session_id = match session_resp {
         Response::SessionStarted { session_id, .. } => session_id,
         Response::Error { message } => return Response::Error { message },
@@ -2468,6 +2478,7 @@ async fn handle_session_start(
     log_file: Option<NormalizedPath>,
     track_stats: bool,
     journal_path: Option<NormalizedPath>,
+    profile: bool,
 ) -> Response {
     let session_config = zccache_depgraph::SessionConfig {
         client_pid,
@@ -2475,6 +2486,7 @@ async fn handle_session_start(
         log_file,
         track_stats,
         journal_path,
+        profile,
     };
 
     let session_id = state.sessions.create(session_config);
@@ -8381,6 +8393,7 @@ exit /b 0
                     log_file: Some(log.to_string_lossy().into_owned().into()),
                     track_stats: false,
                     journal_path: None,
+                    profile: false,
                 })
                 .await
                 .unwrap();
@@ -8657,6 +8670,7 @@ exit /b 0
                     log_file: None,
                     track_stats: false,
                     journal_path: None,
+                    profile: false,
                 })
                 .await
                 .unwrap();
@@ -8748,6 +8762,7 @@ exit /b 0
                     log_file: None,
                     track_stats: false,
                     journal_path: None,
+                    profile: false,
                 })
                 .await
                 .unwrap();
@@ -8816,6 +8831,7 @@ exit /b 0
                     log_file: None,
                     track_stats: true,
                     journal_path: None,
+                    profile: false,
                 })
                 .await
                 .unwrap();

@@ -170,6 +170,7 @@ async fn start_session(client: &mut ClientConn, cwd: &str) -> String {
             log_file: None,
             track_stats: true,
             journal_path: None,
+            profile: false,
         })
         .await
         .unwrap();
@@ -704,6 +705,7 @@ async fn start_session_inline(client: &mut ClientConn, cwd: &str) -> String {
             log_file: None,
             track_stats: true,
             journal_path: None,
+            profile: false,
         })
         .await
         .unwrap();

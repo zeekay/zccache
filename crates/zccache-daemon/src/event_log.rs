@@ -579,6 +579,7 @@ mod tests {
             log_file: Some(session_log.to_path_buf().into()),
             track_stats: false,
             journal_path: None,
+            profile: false,
         });
         let sid_str = sid.to_string();
 
