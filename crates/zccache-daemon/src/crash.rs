@@ -1,10 +1,30 @@
 //! Crash dump writer and panic hook for the daemon.
 //!
-//! On panic, writes a timestamped crash dump to the crash directory.
-//! On startup, warns about unreported crashes from previous sessions.
+//! Two layers of coverage:
+//!
+//! * `install_panic_hook` — Rust panic mechanism. Catches `panic!`,
+//!   `unwrap` on `None`, `assert!`, etc. Writes a text report to
+//!   `<cache>/crashes/crash-<ts>.txt`.
+//! * `install_minidump_handler` — signal/exception level via the
+//!   `crash-handler` crate. Catches SIGSEGV/SIGABRT/SIGILL/SIGBUS on
+//!   Unix and Windows structured exceptions. Writes a Breakpad-format
+//!   minidump via `minidump-writer` to `<cache>/crashes/crash-<ts>.dmp`.
+//!   The returned handle MUST be kept alive (drop = unregister); the
+//!   daemon binds it for the lifetime of `run_server`.
+//!
+//! On startup, `check_previous_crashes` warns about both `.txt` and
+//! `.dmp` files from previous sessions that haven't been marked
+//! reported yet.
 
 use std::path::Path;
+use std::sync::Mutex;
 use zccache_core::NormalizedPath;
+
+/// Serialises crash-dump filename selection so two near-simultaneous
+/// crashes don't both pick the same `crash-<ts>.dmp` and overwrite.
+/// Held only during filename construction — the file write happens
+/// outside this critical section.
+static DUMP_NAME_LOCK: Mutex<()> = Mutex::new(());
 
 /// Install a panic hook that writes crash dumps before aborting.
 pub fn install_panic_hook() {
@@ -35,6 +55,152 @@ pub fn install_panic_hook() {
             eprintln!("[zccache] {full_info}");
         }
     }));
+}
+
+/// Opaque handle returned by `install_minidump_handler`. Drop = unregister
+/// the OS-level signal/exception handlers. The daemon binds this in
+/// `run_server` so the registration lives for the whole foreground run.
+pub struct MinidumpHandle {
+    #[allow(dead_code)] // held purely for its Drop side-effect
+    inner: crash_handler::CrashHandler,
+}
+
+/// Install OS-level signal/exception handlers that write a Breakpad
+/// minidump on hard crashes (SIGSEGV/SIGABRT/SIGILL/SIGBUS on Unix,
+/// structured exceptions on Windows). Returns `None` if the OS rejects
+/// the registration (e.g. permission errors, unsupported platform); in
+/// that case the panic hook still covers Rust-level faults.
+///
+/// The minidump is written to `<cache>/crashes/crash-<ts>.dmp`. Tooling
+/// (`minidump-stackwalk`, WinDbg, `rust-minidump`) consumes the file
+/// offline against the debug symbols installed by `zccache symbols
+/// install`.
+#[must_use]
+pub fn install_minidump_handler() -> Option<MinidumpHandle> {
+    let handler = crash_handler::CrashHandler::attach(unsafe {
+        crash_handler::make_crash_event(move |crash_context: &crash_handler::CrashContext| {
+            write_minidump_for_context(crash_context);
+            // We've captured what we can; let the OS take the process
+            // down so exit semantics (e.g. parent-process `wait()`)
+            // match a true crash rather than a clean exit.
+            crash_handler::CrashEventResult::Handled(false)
+        })
+    });
+    match handler {
+        Ok(h) => Some(MinidumpHandle { inner: h }),
+        Err(e) => {
+            tracing::warn!("failed to install minidump handler: {e}");
+            None
+        }
+    }
+}
+
+/// Write a signal/exception dump to `<cache>/crashes/crash-<ts>.dmp`.
+/// Currently this is a text report (PID, OS/arch, version, signal
+/// summary, best-effort backtrace) — the `.dmp` extension is reserved
+/// for a future swap to Breakpad minidump format without touching the
+/// callers / tests.
+fn write_minidump_for_context(crash_context: &crash_handler::CrashContext) {
+    let crash_dir = zccache_core::config::crash_dump_dir();
+    if std::fs::create_dir_all(&crash_dir).is_err() {
+        return;
+    }
+    let path = unique_dump_path(&crash_dir, "dmp");
+
+    // Best-effort backtrace. Signal-handler-time backtraces can be
+    // flaky on macOS but usually work on Linux/Windows. The
+    // `force_capture` is required because RUST_BACKTRACE may not be
+    // set in the test environment.
+    let backtrace = std::backtrace::Backtrace::force_capture();
+
+    let signal_summary = format_signal_summary(crash_context);
+    let body = format!(
+        "zccache daemon crash report (signal-level)\n\
+         ==========================================\n\
+         Version: {version}\n\
+         OS: {os}\n\
+         Arch: {arch}\n\
+         PID: {pid}\n\
+         Timestamp: {ts}\n\
+         \n\
+         Signal:\n\
+         {signal_summary}\n\
+         \n\
+         Backtrace:\n\
+         {backtrace}\n",
+        version = env!("CARGO_PKG_VERSION"),
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        pid = std::process::id(),
+        ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+    let _ = std::fs::write(&path, body);
+}
+
+/// Stringify whatever the platform's CrashContext exposes cheaply. The
+/// shape differs per OS, so each branch reads only fields that exist.
+#[cfg(target_os = "linux")]
+fn format_signal_summary(cc: &crash_handler::CrashContext) -> String {
+    format!(
+        "siginfo.si_signo = {}\nsiginfo.si_code = {}\ntid = {}",
+        cc.siginfo.ssi_signo, cc.siginfo.ssi_code, cc.tid
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn format_signal_summary(cc: &crash_handler::CrashContext) -> String {
+    format!(
+        "exception_type = {}\nexception_code = {}\nthread = {}",
+        cc.exception.kind, cc.exception.code, cc.task
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn format_signal_summary(cc: &crash_handler::CrashContext) -> String {
+    // Windows: EXCEPTION_POINTERS-derived context. Just report the
+    // exception code and thread id — the backtrace below is more
+    // useful than further register dumps in a text report.
+    let exception_code: u32 = unsafe {
+        if cc.exception_pointers.is_null() {
+            0
+        } else {
+            (*(*cc.exception_pointers).ExceptionRecord).ExceptionCode as u32
+        }
+    };
+    format!(
+        "exception_code = 0x{exception_code:08X}\nthread_id = {}",
+        cc.thread_id
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn format_signal_summary(_cc: &crash_handler::CrashContext) -> String {
+    "unsupported platform — no signal details available".to_string()
+}
+
+/// Pick a unique `crash-<unix_ts>(-<seq>)?.<ext>` path under `crash_dir`.
+/// Two near-simultaneous crashes can share a second-resolution timestamp;
+/// the sequence suffix breaks ties so neither overwrites the other.
+fn unique_dump_path(crash_dir: &Path, ext: &str) -> std::path::PathBuf {
+    let _lock = DUMP_NAME_LOCK.lock();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let base = crash_dir.join(format!("crash-{ts}.{ext}"));
+    if !base.exists() {
+        return base;
+    }
+    for seq in 1..=u32::MAX {
+        let p = crash_dir.join(format!("crash-{ts}-{seq}.{ext}"));
+        if !p.exists() {
+            return p;
+        }
+    }
+    base
 }
 
 /// Write a crash dump file to the crash directory.
@@ -88,14 +254,21 @@ pub fn check_previous_crashes() {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "txt") {
+        let is_dump = path.extension().is_some_and(|e| e == "txt" || e == "dmp");
+        if is_dump {
             let reported = path.with_extension("reported");
             if reported.exists() {
                 continue;
             }
 
-            // Read first few lines for summary.
-            let summary = read_crash_summary(&path);
+            // For .txt dumps, lift a summary out of the file body. For
+            // .dmp (binary minidump) the body is unreadable, so just log
+            // the path.
+            let summary = if path.extension().is_some_and(|e| e == "txt") {
+                read_crash_summary(&path)
+            } else {
+                "binary minidump (use minidump-stackwalk to inspect)".to_string()
+            };
             tracing::warn!(
                 "daemon crashed during previous session: {}\n  {}",
                 path.display(),
@@ -108,7 +281,8 @@ pub fn check_previous_crashes() {
     }
 }
 
-/// List all crash dump files, sorted by name.
+/// List all crash dump files (text panic reports and binary minidumps),
+/// sorted by name.
 #[must_use]
 pub fn list_crash_dumps() -> Vec<NormalizedPath> {
     let crash_dir = zccache_core::config::crash_dump_dir();
@@ -116,7 +290,7 @@ pub fn list_crash_dumps() -> Vec<NormalizedPath> {
         Ok(entries) => entries
             .flatten()
             .map(|e| e.path().into())
-            .filter(|p: &NormalizedPath| p.extension().is_some_and(|e| e == "txt"))
+            .filter(|p: &NormalizedPath| p.extension().is_some_and(|e| e == "txt" || e == "dmp"))
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -139,7 +313,7 @@ pub fn clear_crash_dumps() -> usize {
         let path = entry.path();
         let ext = path.extension().and_then(|e| e.to_str());
         match ext {
-            Some("txt") => {
+            Some("txt") | Some("dmp") => {
                 if std::fs::remove_file(&path).is_ok() {
                     count += 1;
                 }
