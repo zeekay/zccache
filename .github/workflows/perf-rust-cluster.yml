@@ -9,7 +9,7 @@ name: zccache Perf Cluster (Rust)
 #   - bench job pins the freshly-built zccache into soldr via
 #     `soldr update-zccache` before scenarios run;
 #   - fail loudly when either source build fails or when
-#     `soldr update-zccache --status` reports pinned=false.
+#     `soldr update-zccache --status` reports the pin is missing.
 
 on:
   workflow_dispatch:
@@ -406,8 +406,15 @@ jobs:
           chmod +x staged/zccache/zccache staged/zccache/zccache-daemon staged/zccache/zccache-fp
           soldr update-zccache "$(pwd)/staged/zccache" --json | tee zccache-pin.json
           soldr update-zccache --status --json | tee zccache-pin-status.json
-          if ! jq -e '.pinned == true' zccache-pin-status.json >/dev/null; then
-            echo "::error::soldr update-zccache reports pinned=false after pinning"
+          # `.pinned` was a boolean in the original `update-zccache` subcommand,
+          # but in the current (alias-backed) implementation it's an object
+          # containing `binaries`, `source_kind`, `source_value`, `version`, ...
+          # — or `null` when no pin is in effect. Treat any non-null value as
+          # success; additionally require `source_kind == "path"` so a residual
+          # managed-version pin can't masquerade as a successful local pin.
+          if ! jq -e '.pinned != null and .pinned.source_kind == "path"' \
+              zccache-pin-status.json >/dev/null; then
+            echo "::error::soldr update-zccache reports no local-path pin after pinning"
             cat zccache-pin-status.json
             exit 1
           fi
