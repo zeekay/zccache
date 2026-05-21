@@ -3,8 +3,30 @@ name: Windows
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "NOTICE*"
+      - "AUTHORS*"
+      - "CODEOWNERS"
+      - "CONTRIBUTING*"
+      - ".gitignore"
+      - ".gitattributes"
+      - ".editorconfig"
+      - "tasks/**"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "NOTICE*"
+      - "AUTHORS*"
+      - "CODEOWNERS"
+      - "CONTRIBUTING*"
+      - ".gitignore"
+      - ".gitattributes"
+      - ".editorconfig"
+      - "tasks/**"
 
 jobs:
   windows:
