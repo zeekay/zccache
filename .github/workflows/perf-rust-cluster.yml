@@ -629,12 +629,130 @@ jobs:
             esac
           }
 
+          # ---- formatting helpers ----------------------------------
+
+          # ms -> human (Xh Ymin / Ymin Zs / Z.Xs / Xms / —).
+          fmt_ms() {
+            local ms="$1"
+            if [[ -z "${ms}" || "${ms}" == "null" ]]; then echo "—"; return; fi
+            awk -v m="${ms}" 'BEGIN {
+              if (m+0 >= 60000) { printf "%dm%02ds", int(m/60000), int((m%60000)/1000) }
+              else if (m+0 >= 1000) { printf "%.2fs", m/1000 }
+              else { printf "%dms", m }
+            }'
+          }
+
+          # bytes -> human (GiB / MiB / KiB / B / —).
+          fmt_bytes() {
+            local b="$1"
+            if [[ -z "${b}" || "${b}" == "null" ]]; then echo "—"; return; fi
+            awk -v x="${b}" 'BEGIN {
+              if (x+0 >= 1073741824) { printf "%.2f GiB", x/1073741824 }
+              else if (x+0 >= 1048576) { printf "%.1f MiB", x/1048576 }
+              else if (x+0 >= 1024) { printf "%.1f KiB", x/1024 }
+              else if (x+0 > 0) { printf "%d B", x }
+              else { printf "0 B" }
+            }'
+          }
+
+          # rate (0.0–1.0) -> "XX.X%". Missing -> "—".
+          fmt_pct() {
+            local r="$1"
+            if [[ -z "${r}" || "${r}" == "null" ]]; then echo "—"; return; fi
+            awk -v r="${r}" 'BEGIN { printf "%.1f%%", r*100 }'
+          }
+
+          # count over total -> "N (X.Y%)". Used for Hits/Misses/Ignored
+          # so each cell carries its own ratio inline — no separate
+          # percentage column needed and the cell remains self-explanatory
+          # when copy-pasted out of context.
+          fmt_count_pct() {
+            local n="$1" total="$2"
+            if [[ -z "${n}" || "${n}" == "null" ]]; then echo "—"; return; fi
+            if [[ -z "${total}" || "${total}" == "null" || "${total}" == "0" ]]; then
+              echo "${n}"
+              return
+            fi
+            awk -v n="${n}" -v t="${total}" 'BEGIN { printf "%d (%.1f%%)", n, (n/t)*100 }'
+          }
+
+          # Single-line, self-contained summary suitable for inline
+          # GHA annotations (::error / ::warning). Includes every
+          # field the table shows so the annotation in the sidebar
+          # tells the full story without opening the step summary.
+          # All inputs come from this loop iteration's scope.
+          fmt_annotation() {
+            printf '%s/%s: speedup=%sx (need >=%sx); cold=%s warm=%s; compiles=%s hits=%s misses=%s ignored=%s errors=%s; hit=%s miss=%s ignore=%s; bytes_W=%s bytes_R=%s; time_saved=%s; daemon_RSS=%s compile_RSS=%s' \
+              "${fixture}" "${scenario}" \
+              "${speedup}" "${MIN_SPEEDUP}" \
+              "$(fmt_ms "${cold_ms}")" "$(fmt_ms "${warm_ms}")" \
+              "${compiles:-—}" "${hits:-—}" "${misses:-—}" "${non_cache:-—}" "${errs:-—}" \
+              "$(fmt_pct "${hit_rate}")" "$(ratio_pct "${misses}" "${compiles}")" "$(ratio_pct "${non_cache}" "${compiles}")" \
+              "$(fmt_bytes "${bytes_w}")" "$(fmt_bytes "${bytes_r}")" \
+              "$(fmt_ms "${time_saved}")" \
+              "$(fmt_bytes "${daemon_rss}")" "$(fmt_bytes "${compile_rss}")"
+          }
+
+          # `<count> / <total>` -> "X.Y%". Used by fmt_annotation for
+          # the comma-separated rate triple; the table itself uses
+          # fmt_count_pct which embeds the ratio next to the count.
+          ratio_pct() {
+            local n="$1" total="$2"
+            if [[ -z "${n}" || "${n}" == "null" || -z "${total}" || "${total}" == "null" || "${total}" == "0" ]]; then
+              echo "—"
+              return
+            fi
+            awk -v n="${n}" -v t="${total}" 'BEGIN { printf "%.1f%%", (n/t)*100 }'
+          }
+
+          # ---- header --------------------------------------------------
+
+          # 17-column table. Wide on purpose: collapses what used to be
+          # a half-dozen separate `::error::` lines into a single
+          # scannable row per cell. Hits/Misses/Ignored embed their
+          # share of `compiles` inline (e.g. "115 (78.8%)") so the
+          # hit / miss / ignore ratios are present without spending
+          # three more columns. Columns:
+          #   identity (2) | gate (3) | timing (2) | counts (5) |
+          #   throughput (3) | resource (2).
           {
             echo "## Evaluate ${M_PLATFORM}"
             echo
-            echo "| fixture | scenario | cold ms | warm ms | speedup | threshold | mode | result |"
-            echo "| --- | --- | --- | --- | --- | --- | --- | --- |"
+            echo "| Fixture | Scenario | Verdict | Speedup | Need | Cold | Warm | Compiles | Hits | Misses | Ignored | Errors | Unique Srcs | Bytes W | Time Saved | Daemon RSS | Compile RSS |"
+            echo "| --- | --- | :---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # Verdict cell: bold-marked so PASS/FAIL/WARN jumps out at a
+          # glance when scanning the per-platform table in the run page.
+          fmt_verdict() {
+            case "$1" in
+              PASS) echo "**PASS**" ;;
+              FAIL) echo "**FAIL**" ;;
+              WARN) echo "**WARN**" ;;
+              *)    echo "$1" ;;
+            esac
+          }
+
+          # Emit one table row. Caller fills in cold_ms, warm_ms,
+          # speedup, verdict + the cache/resource cells (which may be
+          # "—" when the underlying JSON is missing). Kept inline so
+          # the column order is in one place; any new column gets
+          # added here + in the header above.
+          emit_row() {
+            local verdict="$1"
+            printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+              "${fixture}" "${scenario}" \
+              "$(fmt_verdict "${verdict}")" "${speedup:-—}x" ">=${MIN_SPEEDUP}x" \
+              "$(fmt_ms "${cold_ms}")" "$(fmt_ms "${warm_ms}")" \
+              "${compiles:-—}" \
+              "$(fmt_count_pct "${hits}" "${compiles}")" \
+              "$(fmt_count_pct "${misses}" "${compiles}")" \
+              "$(fmt_count_pct "${non_cache}" "${compiles}")" \
+              "${errs:-—}" "${unique_srcs:-—}" \
+              "$(fmt_bytes "${bytes_w}")" "$(fmt_ms "${time_saved}")" \
+              "$(fmt_bytes "${daemon_rss}")" "$(fmt_bytes "${compile_rss}")" \
+              >> "$GITHUB_STEP_SUMMARY"
+          }
 
           status=0
           for fixture in medium sqlite-link; do
@@ -661,40 +779,76 @@ jobs:
               cold_key="$(cold_key_for "${scenario}")"
               warm_key="$(warm_key_for "${scenario}")"
 
+              # Reset per-cell so a missing report doesn't bleed
+              # last cell's stats into this row.
+              cold_ms="" warm_ms="" speedup="—"
+              compiles="" hits="" misses="" non_cache="" errs="" hit_rate=""
+              bytes_w="" bytes_r="" time_saved="" unique_srcs=""
+              daemon_rss="" compile_rss=""
+
               result_json="$(find "${fixture_root}" -type f -path "*/${scenario}/result.json" | head -n1)"
               if [[ -z "${result_json}" ]]; then
-                echo "| ${fixture} | ${scenario} | - | - | - | >= ${MIN_SPEEDUP}x | ${mode} | MISSING |" >> "$GITHUB_STEP_SUMMARY"
+                emit_row "MISSING"
                 if [[ "${mode}" == "fail" ]]; then
-                  echo "::error::${scenario}/result.json not found in ${fixture} artifact"
+                  echo "::error::${fixture}/${scenario}: result.json not found in artifact (bench cell may have crashed before emit)"
                   status=1
                 else
-                  echo "::warning::${scenario}/result.json not found in ${fixture} artifact"
+                  echo "::warning::${fixture}/${scenario}: result.json not found in artifact (bench cell may have crashed before emit)"
                 fi
                 continue
               fi
 
               cold_ms="$(jq -r --arg k "${cold_key}" '.[$k] // empty' "${result_json}")"
               warm_ms="$(jq -r --arg k "${warm_key}" '.[$k] // empty' "${result_json}")"
+              daemon_rss="$(jq -r '.peak_daemon_rss_bytes // empty' "${result_json}")"
+              compile_rss="$(jq -r '.peak_compile_rss_bytes // empty' "${result_json}")"
+
+              # Pull warm-side per-session counters from the cache
+              # report. Naming varies by scenario:
+              #   cold-tar-untar-warm + touch-no-change -> warm-cache-report.json
+              #   worktree-share                        -> b-cache-report.json
+              #   anything else                         -> first *-cache-report.json that is not the cold/a side
+              warm_report=""
+              for cand in 'warm-cache-report.json' 'b-cache-report.json'; do
+                f="$(find "${fixture_root}" -type f -path "*/${scenario}/${cand}" | head -n1)"
+                if [[ -n "${f}" ]]; then warm_report="${f}"; break; fi
+              done
+              if [[ -z "${warm_report}" ]]; then
+                warm_report="$(find "${fixture_root}" -type f -path "*/${scenario}/*-cache-report.json" \
+                  ! -name 'cold-*' ! -name 'a-*' | head -n1)"
+              fi
+              if [[ -n "${warm_report}" ]]; then
+                compiles="$(jq -r '.last_session.compilations // empty' "${warm_report}")"
+                hits="$(jq -r '.last_session.hits // empty' "${warm_report}")"
+                misses="$(jq -r '.last_session.misses // empty' "${warm_report}")"
+                non_cache="$(jq -r '.last_session.non_cacheable // empty' "${warm_report}")"
+                errs="$(jq -r '.last_session.errors // empty' "${warm_report}")"
+                hit_rate="$(jq -r '.last_session.hit_rate // empty' "${warm_report}")"
+                bytes_w="$(jq -r '.last_session.bytes_written // empty' "${warm_report}")"
+                bytes_r="$(jq -r '.last_session.bytes_read // empty' "${warm_report}")"
+                time_saved="$(jq -r '.last_session.time_saved_ms // empty' "${warm_report}")"
+                unique_srcs="$(jq -r '.last_session.unique_sources // empty' "${warm_report}")"
+              fi
 
               if [[ -z "${cold_ms}" || -z "${warm_ms}" ]]; then
-                echo "| ${fixture} | ${scenario} | ${cold_ms:--} | ${warm_ms:--} | - | >= ${MIN_SPEEDUP}x | ${mode} | BAD-JSON |" >> "$GITHUB_STEP_SUMMARY"
+                emit_row "BAD-JSON"
                 if [[ "${mode}" == "fail" ]]; then
-                  echo "::error::${fixture}/${scenario} result.json missing ${cold_key}/${warm_key}"
+                  echo "::error::${fixture}/${scenario}: result.json missing ${cold_key}/${warm_key}"
                   status=1
                 else
-                  echo "::warning::${fixture}/${scenario} result.json missing ${cold_key}/${warm_key}"
+                  echo "::warning::${fixture}/${scenario}: result.json missing ${cold_key}/${warm_key}"
                 fi
                 continue
               fi
 
               # Treat a 0ms warm build as a measurement bug, not a win.
               if (( warm_ms <= 0 )); then
-                echo "| ${fixture} | ${scenario} | ${cold_ms} | ${warm_ms} | - | >= ${MIN_SPEEDUP}x | ${mode} | BAD-WARM |" >> "$GITHUB_STEP_SUMMARY"
+                emit_row "BAD-WARM"
                 if [[ "${mode}" == "fail" ]]; then
-                  echo "::error::${fixture}/${scenario} ${warm_key}=${warm_ms} is non-positive"
+                  echo "::error::${fixture}/${scenario}: ${warm_key}=${warm_ms}ms is non-positive (measurement bug, not a perf win)"
                   status=1
                 else
-                  echo "::warning::${fixture}/${scenario} ${warm_key}=${warm_ms} is non-positive"
+                  echo "::warning::${fixture}/${scenario}: ${warm_key}=${warm_ms}ms is non-positive (measurement bug, not a perf win)"
                 fi
                 continue
               fi
@@ -703,16 +857,20 @@ jobs:
               pass="$(awk -v s="${speedup}" -v t="${MIN_SPEEDUP}" 'BEGIN { print (s >= t) ? "1" : "0" }')"
 
               if [[ "${pass}" == "1" ]]; then
-                echo "| ${fixture} | ${scenario} | ${cold_ms} | ${warm_ms} | ${speedup}x | >= ${MIN_SPEEDUP}x | ${mode} | PASS |" >> "$GITHUB_STEP_SUMMARY"
-                echo "${fixture}/${scenario}: ${speedup}x >= ${MIN_SPEEDUP}x — PASS"
+                emit_row "PASS"
+                echo "PASS  ${fixture}/${scenario}: speedup=${speedup}x (need >=${MIN_SPEEDUP}x), cold=$(fmt_ms "${cold_ms}") warm=$(fmt_ms "${warm_ms}"), hits=${hits:-?}/${compiles:-?} ($(fmt_pct "${hit_rate}"))"
               else
                 if [[ "${mode}" == "fail" ]]; then
-                  echo "| ${fixture} | ${scenario} | ${cold_ms} | ${warm_ms} | ${speedup}x | >= ${MIN_SPEEDUP}x | fail | FAIL |" >> "$GITHUB_STEP_SUMMARY"
-                  echo "::error::${fixture}/${scenario} only ${speedup}x faster (need >= ${MIN_SPEEDUP}x)"
+                  emit_row "FAIL"
+                  echo "::error::$(fmt_annotation)"
                   status=1
                 else
-                  echo "| ${fixture} | ${scenario} | ${cold_ms} | ${warm_ms} | ${speedup}x | >= ${MIN_SPEEDUP}x | warn | WARN |" >> "$GITHUB_STEP_SUMMARY"
-                  echo "::warning::${fixture}/${scenario} only ${speedup}x faster (need >= ${MIN_SPEEDUP}x); soft gate — not failing today"
+                  emit_row "WARN"
+                  # Soft gate: emit a warning that still has the
+                  # full context, so a future tightening to a hard
+                  # gate (see workflow header) doesn't need a
+                  # message rewrite.
+                  echo "::warning::$(fmt_annotation) [soft gate — not failing today]"
                 fi
               fi
             done
