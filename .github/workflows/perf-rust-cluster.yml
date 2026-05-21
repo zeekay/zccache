@@ -249,36 +249,79 @@ jobs:
         run: |
           which mold || sudo apt-get install -y mold
 
-      - name: Restore cargo cache for zccache build
+      # Binary cache keys: `<repo>-<platform>-<sha>-<2day-bucket>`.
+      #
+      # `<2day-bucket>` is `floor(unix_epoch_seconds / 172800)`; it ticks once
+      # every 2 days, which is how we enforce the "expire stale binaries after
+      # 2 days" rule without depending on a TTL feature actions/cache does
+      # not offer. Same SHA built within the same 2-day window → cache hit,
+      # skip the whole rust-cache/build/stage chain. Same SHA but the bucket
+      # rolled over → cache miss, rebuild from scratch (and refresh the entry).
+      - name: Compute binary cache keys
         if: steps.gate.outputs.selected == 'true'
+        id: keys
+        working-directory: soldr-src
+        run: |
+          set -euo pipefail
+          bucket="$(( $(date +%s) / 172800 ))"
+          soldr_sha="$(git rev-parse HEAD)"
+          echo "bucket=${bucket}"       >> "$GITHUB_OUTPUT"
+          echo "soldr_sha=${soldr_sha}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Binary cache keys"
+            echo ""
+            echo "| repo | key |"
+            echo "| --- | --- |"
+            echo "| zccache | zccache-${{ matrix.platform }}-${{ github.sha }}-${bucket} |"
+            echo "| soldr   | soldr-${{ matrix.platform }}-${soldr_sha}-${bucket} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore prebuilt zccache binaries
+        if: steps.gate.outputs.selected == 'true'
+        id: cache_zccache
+        uses: actions/cache@v4
+        with:
+          path: staged/zccache
+          key: zccache-${{ matrix.platform }}-${{ github.sha }}-${{ steps.keys.outputs.bucket }}
+
+      - name: Restore cargo cache for zccache build
+        if: steps.gate.outputs.selected == 'true' && steps.cache_zccache.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: perf-rust-cluster-zccache-${{ matrix.platform }}
           workspaces: . -> target
 
       - name: Build zccache trio (release)
-        if: steps.gate.outputs.selected == 'true'
+        if: steps.gate.outputs.selected == 'true' && steps.cache_zccache.outputs.cache-hit != 'true'
         env:
           RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: |
           cargo build --release --bin zccache --bin zccache-daemon --bin zccache-fp
 
       - name: Stage zccache binaries
-        if: steps.gate.outputs.selected == 'true'
+        if: steps.gate.outputs.selected == 'true' && steps.cache_zccache.outputs.cache-hit != 'true'
         run: |
           mkdir -p staged/zccache
           cp target/release/zccache target/release/zccache-daemon target/release/zccache-fp staged/zccache/
           chmod +x staged/zccache/zccache staged/zccache/zccache-daemon staged/zccache/zccache-fp
 
-      - name: Restore cargo cache for soldr build
+      - name: Restore prebuilt soldr binary
         if: steps.gate.outputs.selected == 'true'
+        id: cache_soldr
+        uses: actions/cache@v4
+        with:
+          path: staged/soldr
+          key: soldr-${{ matrix.platform }}-${{ steps.keys.outputs.soldr_sha }}-${{ steps.keys.outputs.bucket }}
+
+      - name: Restore cargo cache for soldr build
+        if: steps.gate.outputs.selected == 'true' && steps.cache_soldr.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: perf-rust-cluster-soldr-${{ matrix.platform }}
           workspaces: soldr-src -> target
 
       - name: Build soldr (release)
-        if: steps.gate.outputs.selected == 'true'
+        if: steps.gate.outputs.selected == 'true' && steps.cache_soldr.outputs.cache-hit != 'true'
         env:
           RUSTFLAGS: -C link-arg=-fuse-ld=mold
         working-directory: soldr-src
@@ -286,7 +329,7 @@ jobs:
           cargo build --release -p soldr-cli
 
       - name: Stage soldr binary
-        if: steps.gate.outputs.selected == 'true'
+        if: steps.gate.outputs.selected == 'true' && steps.cache_soldr.outputs.cache-hit != 'true'
         run: |
           mkdir -p staged/soldr
           cp soldr-src/target/release/soldr staged/soldr/
