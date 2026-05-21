@@ -198,16 +198,23 @@ fn run_server(args: Args) {
         .expect("failed to create tokio runtime");
 
     // Load dep graph from disk (before entering async block).
-    let dep_graph = if args.no_depgraph_cache {
-        let path = zccache_depgraph::depgraph_file_path();
+    //
+    // Issue #320: a fresh daemon pointed at a populated cache dir is auto-
+    // classified as warm by loading the persisted graph here. On version
+    // mismatch or corruption the outcome carries a warning that we surface
+    // both on stderr (for operators) and via the daemon server (which forwards
+    // it into per-session logs) so the cold fallback is never silent.
+    let path = zccache_depgraph::depgraph_file_path();
+    let (dep_graph, depgraph_load_warning) = if args.no_depgraph_cache {
         let _ = std::fs::remove_file(&path);
         tracing::info!("depgraph cache disabled — starting with empty graph");
-        None
+        (None, None)
     } else {
-        let path = zccache_depgraph::depgraph_file_path();
         let start = std::time::Instant::now();
-        match zccache_depgraph::load_from_file(&path) {
-            Ok(graph) => {
+        let outcome = zccache_depgraph::classify_load(&path);
+        let warning = outcome.warning(&path);
+        match outcome {
+            zccache_depgraph::DepGraphLoadOutcome::Loaded { graph } => {
                 let stats = graph.stats();
                 tracing::info!(
                     contexts = stats.context_count,
@@ -215,24 +222,30 @@ fn run_server(args: Args) {
                     elapsed_ms = start.elapsed().as_millis() as u64,
                     "loaded depgraph from disk"
                 );
-                Some(graph)
+                (Some(graph), None)
             }
-            Err(zccache_depgraph::SnapshotError::Io(ref e))
-                if e.kind() == std::io::ErrorKind::NotFound =>
-            {
-                None
-            }
-            Err(zccache_depgraph::SnapshotError::VersionMismatch { file, expected }) => {
+            zccache_depgraph::DepGraphLoadOutcome::Missing => (None, None),
+            zccache_depgraph::DepGraphLoadOutcome::VersionMismatch {
+                file_version,
+                expected_version,
+            } => {
                 tracing::warn!(
-                    file_version = file,
-                    expected_version = expected,
+                    file_version,
+                    expected_version,
                     "depgraph version mismatch — starting with empty graph"
                 );
-                None
+                if let Some(ref w) = warning {
+                    eprintln!("{w}");
+                }
+                (None, warning)
             }
-            Err(e) => {
-                tracing::warn!("depgraph load failed: {e} — starting with empty graph");
-                None
+            zccache_depgraph::DepGraphLoadOutcome::Corrupt { ref message }
+            | zccache_depgraph::DepGraphLoadOutcome::IoError { ref message } => {
+                tracing::warn!("depgraph load failed: {message} — starting with empty graph");
+                if let Some(ref w) = warning {
+                    eprintln!("{w}");
+                }
+                (None, warning)
             }
         }
     };
@@ -250,6 +263,14 @@ fn run_server(args: Args) {
         // Inject pre-loaded dep graph if we have one.
         if let Some(graph) = dep_graph {
             server.set_dep_graph(graph);
+        }
+
+        // Forward any depgraph load warning so SessionStart can mirror it
+        // into the per-session log (`last-session.log`). Without this the
+        // cold fallback after a version-mismatch / corrupt file would be
+        // invisible to operators looking at per-build logs.
+        if let Some(warning) = depgraph_load_warning {
+            server.set_depgraph_load_warning(warning);
         }
 
         // Wire up Ctrl+C to trigger graceful shutdown

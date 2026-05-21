@@ -34,7 +34,8 @@ pub use session::{
     FinalizedSessionStats, Session, SessionConfig, SessionId, SessionManager, SessionStatsTracker,
 };
 pub use snapshot::{
-    depgraph_file_path, load_from_file, save_to_file, SnapshotError, DEPGRAPH_VERSION,
+    classify_load, depgraph_file_path, load_from_file, save_to_file, DepGraphLoadOutcome,
+    SnapshotError, DEPGRAPH_VERSION,
 };
 pub use system_includes::{discovery_args, parse_system_include_output, SystemIncludeCache};
 pub use watcher_support::WatchSet;
