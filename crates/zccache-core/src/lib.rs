@@ -4,6 +4,7 @@
 //! and configuration structures used across all zccache crates.
 
 pub mod config;
+pub mod crash;
 pub mod error;
 pub mod lifecycle;
 pub mod path;

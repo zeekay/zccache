@@ -3541,6 +3541,7 @@ dependencies = [
  "rayon",
  "reqwest",
  "running-process-core",
+ "sadness-generator",
  "serde",
  "serde_json",
  "tar",
@@ -3580,6 +3581,8 @@ dependencies = [
 name = "zccache-core"
 version = "1.8.1"
 dependencies = [
+ "crash-handler",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -3594,7 +3597,6 @@ version = "1.8.1"
 dependencies = [
  "bincode",
  "clap",
- "crash-handler",
  "criterion",
  "dashmap",
  "filetime",

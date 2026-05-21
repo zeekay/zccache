@@ -45,6 +45,10 @@ reqwest = { workspace = true }
 zip = { workspace = true }
 fs2 = { workspace = true }
 pyo3 = { version = "0.23", features = ["extension-module", "generate-import-lib", "abi3-py310"], optional = true }
+# Cross-platform crash-trigger primitives; used by the
+# `cli-crash-trigger` fixture binary. Tiny crate, regular dep rather
+# than dev-dep so the `[[bin]]` target sees it.
+sadness-generator = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true }
@@ -67,6 +71,15 @@ pkg-fmt = "tgz"
 [[bin]]
 name = "zccache"
 path = "src/main.rs"
+
+# Test-only fixture binary used by `tests/cli_crash_test.rs`. Lives in
+# the regular `src/bin/` slot so `env!("CARGO_BIN_EXE_cli-crash-trigger")`
+# works inside integration tests; it is not packaged into the wheel
+# because the release workflow ships only the `zccache` binary.
+[[bin]]
+name = "cli-crash-trigger"
+path = "src/bin/cli_crash_trigger.rs"
+required-features = []
 
 # 1.5.0: adds `zccache status --json` and the `zccache analyze` subcommand.
 # Touching this comment busts the cached Cargo fingerprint that was holding

@@ -129,6 +129,17 @@ On startup, the daemon attempts to load the snapshot:
 
 The `dep_graph_persisted` flag is also flipped to `true` when a periodic or shutdown save completes successfully, so a daemon that started cold but has since flushed reports itself as persisted. `zccache status` surfaces this as either `vN, persisted, X.YZ MB on disk` or `vN, not persisted`.
 
+### Crash Dumper (shared with CLI)
+
+Both `zccache-cli` and `zccache-daemon` call `zccache_core::crash::install(<bin-stem>)` at the top of `main`. That call wires up:
+
+1. A Rust panic hook that writes `<cache>/crashes/crash-<ts>-<bin>-panic.txt` (full backtrace; runs in normal context so `Backtrace::force_capture()` is safe).
+2. A native signal / SEH handler (via the `crash-handler` crate) that catches SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT on Unix and structured exceptions on Windows. Writes `crash-<ts>-<bin>-<sig>.txt` with siginfo and the OS-supplied register state. No in-handler stack walking — async-signal-unsafe.
+
+Auto-surfacing: every successful `install()` refreshes `<cache>/last_run_<bin>.txt`. The CLI then calls `zccache_core::crash::note_previous_crashes()` which emits one stderr line per CLI invocation if any dump in `<cache>/crashes/` is newer than that marker. The daemon uses `check_previous_crashes()` instead, which logs via `tracing::warn` and writes `.reported` sentinels to suppress duplicates across daemon restarts.
+
+The dumper is intentionally text-only for v1 — minidumps via `MiniDumpWriteDump` / `minidump-writer` are out of scope (see issue #313).
+
 ### Artifact Store Recovery
 
 **Orphaned temp directories:** On startup, `{cache_root}/tmp/` is deleted recursively. This removes any incomplete artifact writes from a previous crash.

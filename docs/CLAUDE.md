@@ -18,6 +18,7 @@ Architecture docs are split by subsystem. Read only what's relevant to your curr
 | `zccache-core` | [overview.md](architecture/overview.md) |
 | `zccache-symbols` | Crate README — 128-byte release footer, `<dump>.symref` sidecars, `zccache-stamp` CI helper |
 | Perf measurement workflows | [/PERF.md](../PERF.md) — `perf-rust-cluster.yml`, scenarios, gate semantics |
+| Crash dumper (CLI + daemon) | [runtime.md](architecture/runtime.md) (Crash Dumper) — `zccache_core::crash::install` covers both binaries |
 | Platform-specific issues | [portability.md](architecture/portability.md) |
 | Compile journal record shape | [journal-schema.md](journal-schema.md) |
 
