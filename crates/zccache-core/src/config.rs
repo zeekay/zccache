@@ -467,6 +467,17 @@ pub fn index_path_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
     cache_dir.join("index.bin")
 }
 
+/// Returns the on-disk path for the persisted `MetadataCache` snapshot.
+///
+/// Bincode blob written by `MetadataCache::save_to_disk` on flush + shutdown,
+/// read by `MetadataCache::load_from_disk` on daemon startup. Sibling of
+/// [`index_path_from_cache_dir`] so that whatever bundles the cache dir (e.g.
+/// `soldr save`/`soldr load`) picks both files up automatically.
+#[must_use]
+pub fn metadata_path_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
+    cache_dir.join("metadata.bin")
+}
+
 fn crash_dump_dir_from_cache_dir(cache_dir: &NormalizedPath) -> NormalizedPath {
     cache_dir.join("crashes")
 }
@@ -533,6 +544,10 @@ mod tests {
         assert_eq!(
             index_path_from_cache_dir(&cache_dir),
             override_dir.join("index.bin")
+        );
+        assert_eq!(
+            metadata_path_from_cache_dir(&cache_dir),
+            override_dir.join("metadata.bin")
         );
         assert_eq!(
             crash_dump_dir_from_cache_dir(&cache_dir),

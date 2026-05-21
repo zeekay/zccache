@@ -521,6 +521,13 @@ struct SharedState {
     profiler: PhaseProfiler,
     /// On-disk artifact cache for hardlink optimization on cache hits.
     artifact_dir: NormalizedPath,
+    /// On-disk path for the persisted [`MetadataCache`] snapshot.
+    ///
+    /// Written on flush (`Clear`) and shutdown (`Shutdown`); read at
+    /// daemon startup so warm-side daemons spawned after `soldr load`
+    /// start with their fast path already populated instead of an
+    /// empty `DashMap`. See `zccache_fscache::persistence`.
+    metadata_path: NormalizedPath,
     /// Temporary directory for injected depfiles.
     depfile_tmpdir: NormalizedPath,
     /// Ultra-fast hit cache: context_key → (clock, artifact_key_hex, timestamp).
@@ -842,6 +849,33 @@ impl DaemonServer {
             tokio::sync::mpsc::unbounded_channel::<(String, ArtifactIndex)>();
         let index_writer_shutdown = Arc::new(Notify::new());
 
+        // Try to restore the metadata cache from disk. A wrong-version /
+        // corrupt snapshot falls back to an empty cache (the
+        // `MetadataCache::lookup` stat-verify safety net still guards
+        // correctness on every subsequent lookup).
+        let metadata_path = zccache_core::config::metadata_path_from_cache_dir(cache_dir);
+        let cache_system =
+            match zccache_fscache::MetadataCache::load_from_disk(metadata_path.as_path()) {
+                Ok(metadata) => {
+                    let loaded = metadata.len();
+                    if loaded > 0 {
+                        tracing::info!(
+                            loaded,
+                            path = %metadata_path.display(),
+                            "metadata cache restored from disk"
+                        );
+                    }
+                    CacheSystem::with_metadata(metadata)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %metadata_path.display(),
+                        "failed to load metadata cache, starting empty: {e}"
+                    );
+                    CacheSystem::new()
+                }
+            };
+
         Ok(Self {
             listener,
             shutdown: Arc::clone(&shutdown),
@@ -851,7 +885,7 @@ impl DaemonServer {
                 system_includes: Mutex::new(SystemIncludeCache::new()),
                 dep_graph: DepGraph::new(),
                 artifacts,
-                cache_system: CacheSystem::new(),
+                cache_system,
                 watcher: Mutex::new(None),
                 watched_dirs: Mutex::new(HashSet::new()),
                 shutdown,
@@ -860,6 +894,7 @@ impl DaemonServer {
                 stats: StatsCollector::new(),
                 profiler: PhaseProfiler::new(),
                 artifact_dir,
+                metadata_path,
                 depfile_tmpdir: {
                     let dir = zccache_core::config::depfile_dir_from_cache_dir(cache_dir)
                         .join(format!("{}-{instance}", std::process::id()));
@@ -1202,6 +1237,35 @@ impl DaemonServer {
                             );
                         }
                         Err(e) => tracing::warn!("depgraph save failed: {e}"),
+                    }
+
+                    // Persist the in-memory MetadataCache so the next
+                    // daemon (in particular the warm side of soldr
+                    // save/load) starts with its fast path populated.
+                    // Failure here is a perf regression, not a
+                    // correctness bug — log and move on so shutdown
+                    // never hangs on disk I/O.
+                    let meta_start = std::time::Instant::now();
+                    let metadata_entries = self.state.cache_system.metadata().len();
+                    match self
+                        .state
+                        .cache_system
+                        .metadata()
+                        .save_to_disk(self.state.metadata_path.as_path())
+                    {
+                        Ok(()) => {
+                            if metadata_entries > 0 {
+                                tracing::info!(
+                                    entries = metadata_entries,
+                                    elapsed_ms = meta_start.elapsed().as_millis() as u64,
+                                    "metadata cache persisted"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            path = %self.state.metadata_path.display(),
+                            "metadata cache save failed: {e}"
+                        ),
                     }
 
                     // Clean up our own depfile temp directory.
@@ -1833,6 +1897,23 @@ async fn handle_clear(state: &SharedState) -> Response {
     // Clear the in-memory artifact index and persist the empty state.
     state.artifact_store.clear();
     let _ = state.artifact_store.flush();
+
+    // Persist the (now empty) metadata cache so the prior on-disk
+    // snapshot stays consistent with the live state. Empty snapshots
+    // skip the write entirely, but if a previous snapshot exists we
+    // also remove it — without that, a subsequent daemon would
+    // restore stale entries that `Clear` was meant to wipe.
+    if let Err(e) = state
+        .cache_system
+        .metadata()
+        .save_to_disk(state.metadata_path.as_path())
+    {
+        tracing::warn!(
+            path = %state.metadata_path.display(),
+            "metadata cache save during Clear failed: {e}"
+        );
+    }
+    let _ = std::fs::remove_file(state.metadata_path.as_path());
 
     // Delete on-disk depgraph snapshot.
     let _ = std::fs::remove_file(zccache_depgraph::depgraph_file_path());
