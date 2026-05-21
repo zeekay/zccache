@@ -11,7 +11,29 @@ name: Integration
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "NOTICE*"
+      - "AUTHORS*"
+      - "CODEOWNERS"
+      - "CONTRIBUTING*"
+      - ".gitignore"
+      - ".gitattributes"
+      - ".editorconfig"
+      - "tasks/**"
   pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "NOTICE*"
+      - "AUTHORS*"
+      - "CODEOWNERS"
+      - "CONTRIBUTING*"
+      - ".gitignore"
+      - ".gitattributes"
+      - ".editorconfig"
+      - "tasks/**"
 
 concurrency:
   group: integration-${{ github.ref }}

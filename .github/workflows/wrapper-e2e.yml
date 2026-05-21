@@ -12,8 +12,30 @@ name: Wrapper end-to-end
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "NOTICE*"
+      - "AUTHORS*"
+      - "CODEOWNERS"
+      - "CONTRIBUTING*"
+      - ".gitignore"
+      - ".gitattributes"
+      - ".editorconfig"
+      - "tasks/**"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "NOTICE*"
+      - "AUTHORS*"
+      - "CODEOWNERS"
+      - "CONTRIBUTING*"
+      - ".gitignore"
+      - ".gitattributes"
+      - ".editorconfig"
+      - "tasks/**"
 
 jobs:
   wrapper-e2e:

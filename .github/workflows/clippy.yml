@@ -3,6 +3,17 @@ name: Clippy
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "NOTICE*"
+      - "AUTHORS*"
+      - "CODEOWNERS"
+      - "CONTRIBUTING*"
+      - ".gitignore"
+      - ".gitattributes"
+      - ".editorconfig"
+      - "tasks/**"
 
 env:
   CARGO_TERM_COLOR: always
