@@ -717,6 +717,13 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // Crash coverage first thing: panic hook + native signal/SEH
+    // handler so a fault inside arg parsing or symbol install still
+    // leaves a dump under `~/.zccache/crashes/`. Guard stays alive
+    // until main returns. See issue #313.
+    let _crash_guard = zccache_core::crash::install("zccache");
+    zccache_core::crash::note_previous_crashes();
+
     let args: Vec<String> = std::env::args().collect();
 
     // Best-effort: if the user opted in via env, fetch matching debug

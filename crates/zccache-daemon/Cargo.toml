@@ -46,13 +46,9 @@ dashmap = { workspace = true }
 rayon = { workspace = true }
 bincode = { workspace = true }
 serde_json = "1"
-# Signal/exception handler that catches SIGSEGV/SIGABRT/SIGILL/etc. on
-# Unix and structured exceptions on Windows — covers the FFI/abort gap
-# the Rust panic hook can't see. The handler currently writes a text
-# dump (same format as the panic hook) into a `.dmp`-suffixed file so a
-# future swap to Breakpad minidump format via minidump-writer is purely
-# additive — no test or filename-convention churn.
-crash-handler = "0.6"
+# Signal/exception handler facade lives in `zccache-core::crash`. The
+# daemon's `crash` module re-exports the install entry points so legacy
+# callers keep compiling; see issue #313 for the consolidation.
 # Cross-platform primitives for triggering specific crash kinds; used by
 # the `crash-trigger` test fixture binary. Tiny crate, regular dep
 # rather than dev-dep so the [[bin]] target can see it.

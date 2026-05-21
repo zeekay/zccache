@@ -28,6 +28,7 @@ RUST_PUBLISH_ORDER = [
     "zccache-watcher",
     "zccache-fingerprint",
     "zccache-test-support",
+    "zccache-symbols",
     "zccache-cli",
     "zccache-daemon",
 ]
