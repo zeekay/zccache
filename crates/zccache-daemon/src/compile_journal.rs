@@ -183,6 +183,66 @@ impl JournalEntry {
             self_profile_ns: None,
         }
     }
+
+    /// Issue #256: populate the extended profile-mode fields on an entry.
+    ///
+    /// Called only when the owning session opted in via
+    /// `session-start --profile`. Pure transformation - no I/O.
+    /// `spans` is owned by the compile handler; passing `None`
+    /// emits a record without `self_profile_ns`.
+    #[must_use]
+    pub fn with_profile_fields(mut self, spans: Option<SelfProfileSpans>) -> Self {
+        let derived_name = derive_crate_name(&self.args);
+        let derived_type = derive_crate_type(&self.args);
+        self.output_ext = derive_output_ext(derived_type).map(str::to_string);
+        self.crate_type = derived_type.map(str::to_string);
+        self.crate_name = derived_name;
+        self.self_profile_ns = spans.map(SelfProfileSpans::finish);
+        self
+    }
+}
+
+/// Issue #256: accumulator for the four `self_profile_ns` span buckets.
+///
+/// Use `handle_compile` to time the hashing, lookup, decompress,
+/// and store phases and call the matching `add_*_ns` method.
+/// Buckets that never receive a sample serialize as `0`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SelfProfileSpans {
+    pub hash_inputs_ns: u128,
+    pub lookup_ns: u128,
+    pub decompress_ns: u128,
+    pub store_ns: u128,
+}
+
+impl SelfProfileSpans {
+    /// Freeze the accumulated counters into the wire shape.
+    #[must_use]
+    pub fn finish(self) -> SelfProfileNs {
+        SelfProfileNs {
+            hash_inputs: self.hash_inputs_ns,
+            lookup: self.lookup_ns,
+            decompress: self.decompress_ns,
+            store: self.store_ns,
+        }
+    }
+
+    /// Add to the `hash_inputs` bucket.
+    pub fn add_hash_inputs_ns(&mut self, ns: u128) {
+        self.hash_inputs_ns = self.hash_inputs_ns.saturating_add(ns);
+    }
+    /// Add to the `lookup` bucket.
+    pub fn add_lookup_ns(&mut self, ns: u128) {
+        self.lookup_ns = self.lookup_ns.saturating_add(ns);
+    }
+    /// Add to the `decompress` bucket.
+    pub fn add_decompress_ns(&mut self, ns: u128) {
+        self.decompress_ns = self.decompress_ns.saturating_add(ns);
+    }
+    /// Add to the `store` bucket.
+    pub fn add_store_ns(&mut self, ns: u128) {
+        self.store_ns = self.store_ns.saturating_add(ns);
+    }
 }
 
 // ─── Derivation helpers (pure functions, no daemon state) ──────────────────
@@ -1902,5 +1962,110 @@ mod tests {
             "expected at most {JOURNAL_MAX_FILES} rotated files, got {}",
             remaining.len()
         );
+    }
+
+    // Issue #256 -- with_profile_fields and SelfProfileSpans.
+
+    fn make_ctx(args: Vec<&str>) -> JournalContext {
+        JournalContext {
+            compiler: "/usr/bin/rustc".to_string(),
+            args: args.into_iter().map(String::from).collect(),
+            cwd: "/proj".to_string(),
+            env: None,
+            session_id: Some("session-1".to_string()),
+        }
+    }
+
+    #[test]
+    fn with_profile_fields_populates_crate_name_type_and_ext() {
+        let ctx = make_ctx(vec![
+            "--crate-name",
+            "soldr_cli",
+            "--crate-type",
+            "bin",
+            "src/main.rs",
+        ]);
+        let entry = JournalEntry::new(ctx, "hit", 0, 1_234, None).with_profile_fields(None);
+        assert_eq!(entry.crate_name.as_deref(), Some("soldr_cli"));
+        assert_eq!(entry.crate_type.as_deref(), Some("bin"));
+        assert_eq!(entry.output_ext.as_deref(), Some("exe"));
+        assert!(entry.self_profile_ns.is_none());
+    }
+
+    #[test]
+    fn with_profile_fields_threads_self_profile_spans() {
+        let ctx = make_ctx(vec!["--crate-name", "x", "--crate-type", "lib"]);
+        let mut spans = SelfProfileSpans::default();
+        spans.add_hash_inputs_ns(11);
+        spans.add_lookup_ns(22);
+        spans.add_decompress_ns(33);
+        spans.add_store_ns(44);
+        let entry = JournalEntry::new(ctx, "hit", 0, 0, None).with_profile_fields(Some(spans));
+        let sp = entry.self_profile_ns.unwrap();
+        assert_eq!(sp.hash_inputs, 11);
+        assert_eq!(sp.lookup, 22);
+        assert_eq!(sp.decompress, 33);
+        assert_eq!(sp.store, 44);
+    }
+
+    #[test]
+    fn legacy_entry_without_with_profile_fields_omits_all_new_fields() {
+        // Issue #256 acceptance criterion: when --profile is OFF the
+        // journal record must serialize without crate_name, crate_type,
+        // output_ext, self_profile_ns, or miss_diff.
+        let ctx = make_ctx(vec!["--crate-name", "x", "--crate-type", "lib"]);
+        let entry = JournalEntry::new(ctx, "hit", 0, 5, None);
+        let json = serde_json::to_string(&entry).unwrap();
+        for absent in [
+            "\"crate_name\"",
+            "\"crate_type\"",
+            "\"output_ext\"",
+            "\"miss_diff\"",
+            "\"self_profile_ns\"",
+        ] {
+            assert!(
+                !json.contains(absent),
+                "non-profile entry must omit {absent}, got: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_entry_roundtrips_through_serde() {
+        // Issue #256 acceptance criterion: a journal line with every
+        // extended field set must serialize and deserialize losslessly.
+        let ctx = make_ctx(vec!["--crate-name", "y", "--crate-type", "proc-macro"]);
+        let mut spans = SelfProfileSpans::default();
+        spans.add_hash_inputs_ns(100);
+        spans.add_lookup_ns(200);
+        let mut entry = JournalEntry::new(ctx, "miss", 0, 999, Some(miss_reason::UNKNOWN))
+            .with_profile_fields(Some(spans));
+        entry.miss_diff = Some(MissDiff {
+            changed_files: vec!["src/lib.rs".to_string()],
+            changed_flags: vec!["-C".into(), "debuginfo=2".into()],
+            changed_deps: vec!["serde@1.0.213".into()],
+        });
+        let json = serde_json::to_string(&entry).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["crate_name"], "y");
+        assert_eq!(v["crate_type"], "proc-macro");
+        assert_eq!(v["output_ext"], "so");
+        assert_eq!(v["miss_reason"], "unknown");
+        assert_eq!(v["miss_diff"]["changed_files"][0], "src/lib.rs");
+        assert_eq!(v["miss_diff"]["changed_flags"][1], "debuginfo=2");
+        assert_eq!(v["miss_diff"]["changed_deps"][0], "serde@1.0.213");
+        assert_eq!(v["self_profile_ns"]["hash_inputs"], 100);
+        assert_eq!(v["self_profile_ns"]["lookup"], 200);
+    }
+
+    #[test]
+    fn self_profile_spans_saturate_on_overflow() {
+        // Issue #256: span accumulator must not panic when a malformed
+        // measurement returns u128::MAX. Saturating arithmetic preserves
+        // the journal contract: a span never observes a smaller value.
+        let mut spans = SelfProfileSpans::default();
+        spans.add_hash_inputs_ns(u128::MAX);
+        spans.add_hash_inputs_ns(5);
+        assert_eq!(spans.hash_inputs_ns, u128::MAX);
     }
 }

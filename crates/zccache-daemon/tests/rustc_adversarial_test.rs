@@ -45,6 +45,7 @@ async fn do_start_session(client: &mut ClientConn, cwd: &str) -> String {
             log_file: None,
             track_stats: false,
             journal_path: None,
+            profile: false,
         })
         .await
         .unwrap();

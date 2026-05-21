@@ -893,6 +893,7 @@ pub fn client_session_start(
             log_file,
             track_stats,
             journal_path,
+            profile: false,
         })
         .await
         .map_err(|e| format!("failed to send to daemon: {e}"))?;

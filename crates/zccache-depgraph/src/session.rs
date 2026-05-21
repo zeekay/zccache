@@ -167,6 +167,10 @@ pub struct SessionConfig {
     pub track_stats: bool,
     /// Path for per-session JSONL compile journal (must end in .jsonl).
     pub journal_path: Option<NormalizedPath>,
+    /// Issue #256: opt in to the extended journal schema. When true,
+    /// the daemon populates crate_name, crate_type, output_ext, and
+    /// self_profile_ns on every compile-journal line for this session.
+    pub profile: bool,
 }
 
 /// An active session.
@@ -190,6 +194,8 @@ pub struct Session {
     pub stats_tracker: Option<SessionStatsTracker>,
     /// Path to the per-session JSONL journal file (if journal was requested).
     pub journal_path: Option<NormalizedPath>,
+    /// Issue #256: extended-journal opt-in. See SessionConfig::profile.
+    pub profile: bool,
 }
 
 /// Manages active sessions.
@@ -234,6 +240,7 @@ impl SessionManager {
             last_activity: now,
             stats_tracker,
             journal_path,
+            profile: config.profile,
         };
 
         self.sessions.insert(id, session);
@@ -370,6 +377,7 @@ mod tests {
             log_file: None,
             track_stats: false,
             journal_path: None,
+            profile: false,
         }
     }
 

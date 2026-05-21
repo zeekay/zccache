@@ -408,6 +408,7 @@ End of search list.
         log_file: None,
         track_stats: false,
         journal_path: None,
+        profile: false,
     });
     assert!(mgr.exists(&session_id));
 
@@ -764,6 +765,7 @@ fn stress_concurrent_session_operations() {
                     log_file: None,
                     track_stats: false,
                     journal_path: None,
+                    profile: false,
                 });
                 ids.push(id);
                 mgr.touch(&id);

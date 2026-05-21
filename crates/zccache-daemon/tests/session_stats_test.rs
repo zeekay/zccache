@@ -120,6 +120,7 @@ async fn session_stats_mid_session_query() {
                 log_file: None,
                 track_stats: true,
                 journal_path: None,
+                profile: false,
             })
             .await
             .unwrap();
@@ -215,6 +216,7 @@ async fn session_stats_not_tracked_returns_none() {
                 log_file: None,
                 track_stats: false,
                 journal_path: None,
+                profile: false,
             })
             .await
             .unwrap();

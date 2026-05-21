@@ -47,6 +47,40 @@ The Rust source of truth is the `miss_reason` module in
 `crates/zccache-daemon/src/compile_journal.rs`. `miss_reason::ALL` is the
 append-only iteration of the closed set.
 
+## Issue #256: `session-start --profile` and the extended schema
+
+The optional fields `crate_name`, `crate_type`, `output_ext`,
+`miss_diff`, and `self_profile_ns` are populated only when the
+session was created with `zccache session-start --profile`.
+Without the flag, the journal record uses the legacy lean shape
+and incurs zero new allocations on the daemon hot path.
+
+`crate_name`, `crate_type`, and `output_ext` are derived from the
+rustc argument vector by the `derive_crate_name` /
+`derive_crate_type` / `derive_output_ext` helpers in
+`crates/zccache-daemon/src/compile_journal.rs`. `crate_type` takes
+one of `lib`, `bin`, `proc-macro`, `build-script`, `test`,
+`bench`, `example`; the matching `output_ext` is `rlib`, `exe`,
+`so` for proc-macro, etc.
+
+`self_profile_ns` is a four-bucket nanosecond histogram of the
+daemon-internal phases for a single compile:
+
+- `hash_inputs` -- time spent computing the cache key inputs.
+- `lookup` -- time spent in the artifact/depgraph lookup path.
+- `decompress` -- time spent decompressing an artifact on a hit.
+- `store` -- time spent persisting an artifact on a miss.
+
+Buckets that did not run for a given compile serialize as `0`.
+
+`miss_diff` is an evidence bucket: only the dimension that flipped
+is populated. Empty arrays are omitted from serialization.
+
+The `zccache analyze` subcommand rolls journals up offline and
+reads only the documented fields; it tolerates malformed lines
+(emits a stderr warning and skips the row) and missing journals
+(exits zero with a `(no journal)` message).
+
 ## Stability & versioning
 
 The journal is **additive-by-default**: new optional fields may appear in

@@ -1571,6 +1571,7 @@ async fn perf_c_zccache_vs_bare() {
             log_file: None,
             track_stats: true,
             journal_path: None,
+            profile: false,
         })
         .await
         .unwrap();
@@ -1810,6 +1811,7 @@ async fn perf_warm_cache_zccache_vs_sccache() {
             log_file: None,
             track_stats: true,
             journal_path: None,
+            profile: false,
         })
         .await
         .unwrap();
@@ -2136,6 +2138,7 @@ async fn perf_response_file() {
             log_file: None,
             track_stats: true,
             journal_path: None,
+            profile: false,
         })
         .await
         .unwrap();
@@ -2621,6 +2624,7 @@ async fn perf_rustc_zccache_vs_sccache() {
         log_file: None,
         track_stats: true,
         journal_path: None,
+        profile: false,
     })
     .await
     .unwrap();
@@ -2898,6 +2902,7 @@ async fn start_zccache_session(client: &mut ClientConn, working_dir: &str) -> St
             log_file: None,
             track_stats: true,
             journal_path: None,
+            profile: false,
         })
         .await
         .unwrap();
