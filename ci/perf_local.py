@@ -48,7 +48,12 @@ IMAGE_SOLDR = "zccache-perf-soldr-builder"
 IMAGE_ZCCACHE = "zccache-perf-zccache-builder"
 IMAGE_RUNNER = "zccache-perf-runner"
 
-VALID_SCENARIOS = ("cold-tar-untar-warm", "worktree-share", "touch-no-change")
+VALID_SCENARIOS = (
+    "cold-tar-untar-warm",
+    "worktree-share",
+    "touch-no-change",
+    "restore-no-clean-warm",
+)
 VALID_FIXTURES = ("medium", "sqlite-link")
 DEFAULT_SCENARIO = "cold-tar-untar-warm"
 DEFAULT_FIXTURE = "medium"
