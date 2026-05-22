@@ -47,9 +47,11 @@ for bin in zccache zccache-daemon zccache-fp; do
     fi
 done
 
+# The soldr binary is mounted read-only from the host's binaries/ dir.
+# The builder image set +x on it at build time so no chmod is needed
+# here (and chmod would fail on a read-only mount).
 # `soldr update-zccache` expects a writable copy under its managed dir.
 # We point it at /zccache-bin (read-only mount is fine; soldr copies out).
-chmod +x /usr/local/bin/soldr
 soldr update-zccache /zccache-bin --json | tee /results/zccache-pin.json
 soldr update-zccache --status --json | tee /results/zccache-pin-status.json
 

@@ -19,13 +19,22 @@
 #     -v <repo>/.perf-local/binaries/zccache:/out \
 #     zccache-perf-zccache-builder
 
-FROM rust:1.94.1-bookworm-slim
+FROM rust:1.94.1-slim-bookworm
 
-# Build deps for any cc-rs / pkg-config crates that show up in
-# zccache's transitive graph. Pin to a specific apt snapshot would be
-# nice but bookworm-slim doesn't expose snapshot pins out-of-box.
+# Build deps for any cc-rs / pkg-config / C-FFI crates that show up in
+# zccache's transitive graph. Notable consumers:
+#   - tikv-jemalloc-sys: invokes its bundled autogen.sh + make to build
+#     libjemalloc.a from C source (needs build-essential + autoconf;
+#     without them the build.rs panics with "No such file or directory"
+#     when it tries to exec `make`)
+#   - libssl-dev: openssl-sys
+#   - pkg-config: every -sys crate that uses it for system-lib discovery
+# Pin to a specific apt snapshot would be nice but slim-bookworm doesn't
+# expose snapshot pins out-of-box.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
+        build-essential \
+        autoconf \
         pkg-config \
         libssl-dev \
         ca-certificates \

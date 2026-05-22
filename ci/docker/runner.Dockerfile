@@ -30,7 +30,7 @@
 #     -e FIXTURE=medium \
 #     zccache-perf-runner
 
-FROM rust:1.94.1-bookworm-slim
+FROM rust:1.94.1-slim-bookworm
 
 # Scenario script deps. tar+zstd let `soldr save`/`soldr load` round-trip
 # the .tar.zst snapshots; jq parses result.json + cache reports.
