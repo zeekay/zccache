@@ -34,10 +34,48 @@ FORBIDDEN_SCRIPT_DIRS = re.compile(
     re.VERBOSE,
 )
 
+# Commands that only READ content (URLs, API responses, file dumps) and never
+# execute it. A `bench/foo.py` or `tests/bar.py` substring in their args is a
+# path being fetched, not Python code being run. Skip the
+# `FORBIDDEN_SCRIPT_DIRS` check for these so the agent can inspect external
+# code (issue investigation, cross-repo references) without the hook firing.
+READ_ONLY_FETCHERS = {
+    "gh",        # gh api / gh repo view / gh search etc.
+    "curl",
+    "wget",
+    "git",       # git clone / git fetch — clones can include test dirs
+    "cat",       # local file dump (Read is preferred but cat is fine for piping)
+    "head",
+    "tail",
+    "less",
+    "more",
+    "grep",      # Grep tool is preferred, but bare grep against fetched output is safe
+    "rg",
+}
+
 DENY_PYTHON_IN_CODE = (
     "Do not use Python for benchmarks or tests. "
     "Write them in Rust instead. Python is only for CI scripts and packaging."
 )
+
+
+def _command_uses_read_only_fetcher(command):
+    """True when every pipeline segment starts with a known read-only tool.
+
+    A command like `gh api .../tests/foo.py | head -20` is safe because it
+    only retrieves content; we should not block it just because a fetched
+    path happens to contain `tests/`. We require every segment to be a
+    fetcher so that `gh api ... | python -` still gets blocked.
+    """
+    segments = re.split(r"\|", command)
+    for seg in segments:
+        words = _command_words(seg.strip())
+        if not words:
+            continue
+        first = words[0].lstrip("./\\")
+        if first not in READ_ONLY_FETCHERS:
+            return False
+    return True
 
 
 def _is_env_assignment(word):
@@ -63,7 +101,9 @@ def _resolve_uv_run_tool(seg):
 
 def check_command(command):
     """Return (tool, reason) if forbidden, otherwise None."""
-    if FORBIDDEN_SCRIPT_DIRS.search(command):
+    if FORBIDDEN_SCRIPT_DIRS.search(command) and not _command_uses_read_only_fetcher(
+        command
+    ):
         return ("python", DENY_PYTHON_IN_CODE)
 
     segments = re.split(r"&&|\|\||;", command)
