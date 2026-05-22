@@ -59,6 +59,7 @@ on:
           - cold-tar-untar-warm
           - worktree-share
           - touch-no-change
+          - restore-no-clean-warm
       debug:
         description: Verbose tracing + retain raw RSS CSVs
         type: boolean
@@ -168,6 +169,7 @@ jobs:
                   cold)     scen="cold-tar-untar-warm" ;;
                   worktree) scen="worktree-share" ;;
                   touch)    scen="touch-no-change" ;;
+                  restore)  scen="restore-no-clean-warm" ;;
                   *)        bad=1 ;;
                 esac
                 if [[ -n "${rest}" || "${bad}" == "1" ]]; then
@@ -407,7 +409,7 @@ jobs:
           # are not selected are filtered out of the per-cell loop
           # below, so a cell with zero selected scenarios still skips
           # the rest of the steps but does not consume bench-time.
-          ALL_SCENARIOS="cold-tar-untar-warm worktree-share touch-no-change"
+          ALL_SCENARIOS="cold-tar-untar-warm worktree-share touch-no-change restore-no-clean-warm"
           selected_scenarios=""
           for s in ${ALL_SCENARIOS}; do
             if in_subset "${REQ_SCENARIOS}" "${s}"; then
