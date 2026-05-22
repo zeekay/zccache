@@ -171,6 +171,12 @@ fn run_server(args: Args) {
 
     tracing::info!(%endpoint, idle_timeout, "zccache-daemon starting");
 
+    // Issue #273: on Windows, warn once on stderr if the cache dir is
+    // not on Defender's exclusion list. Non-fatal; no-ops off Windows
+    // and when `ZCCACHE_QUIET` is set.
+    let cache_root = zccache_core::config::default_cache_dir();
+    zccache_core::defender::maybe_emit_first_run_banner(cache_root.as_path());
+
     // Persist a "spawn" lifecycle event to disk. tracing logs go to
     // stderr which is detached to NUL, so this file-based sink is the
     // only way an operator (or CI) can correlate daemon lifetime with

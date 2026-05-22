@@ -119,6 +119,35 @@ stores them with the primary link artifact. Later cache hits restore the full
 artifact set to the output directory, so tools such as `clang-tool-chain` runtime
 deployment work without per-build-system post-link hooks.
 
+### Windows: Defender exclusions
+
+Windows Defender's real-time scanner inspects every freshly written file before
+the write returns. zccache writes hundreds of `.rmeta` / `.rlib` / `.o` files per
+cold build, and on an unexcluded cache directory each one pays the Defender
+round-trip — multi-minute slowdowns are routine and invisible to zccache's own
+telemetry (the daemon sees its writes complete normally; the wall clock balloons
+between `write()` and the bytes reaching disk).
+
+The fix is a one-time exclusion. zccache ships a helper so you don't have to
+hand-craft the PowerShell:
+
+```powershell
+# Show whether the cache root is excluded. Read-only — no elevation needed.
+zccache defender-exclusions check
+
+# Add the exclusion. Requires an elevated PowerShell or Administrator cmd.
+zccache defender-exclusions add
+
+# Undo.
+zccache defender-exclusions remove
+```
+
+On Windows, the daemon prints a one-line stderr warning at startup if the cache
+directory isn't excluded yet. Silence it with `ZCCACHE_QUIET=1`. The
+`defender-exclusions` subcommand is available on every platform — non-Windows
+hosts print `Defender exclusion is Windows-only.` and exit 0 so cross-platform
+scripts can call it unconditionally.
+
 ## Install
 
 ```bash
