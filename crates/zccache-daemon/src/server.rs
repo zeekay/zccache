@@ -1331,6 +1331,43 @@ impl DaemonServer {
                         .await;
                     }
 
+                    // Critical: the WAL drain above only persists entries that
+                    // went through `index_writer_tx`. The compile-success path
+                    // at server.rs:6122 (and friends) inserts DIRECTLY into
+                    // `artifact_store` without sending to the WAL, and
+                    // `flush_wal_to_disk` early-returns on an empty WAL —
+                    // so those direct-inserts never reach disk on a
+                    // WAL-only-empty shutdown. Reproduced locally: a fresh
+                    // medium-fixture build wrote 271 MB of CAS payloads
+                    // but no index.bin, leaving the warm-side daemon (and
+                    // every other `soldr load` consumer) with an empty index
+                    // even though all artifacts are on disk.
+                    //
+                    // Force a final `store.flush()` here so the in-memory
+                    // DashMap snapshot lands on disk regardless of WAL state.
+                    // spawn_blocking keeps the synchronous I/O off the
+                    // runtime; the await is bounded by the same 2s pattern
+                    // as the WAL drain above.
+                    let store = Arc::clone(&self.state.artifact_store);
+                    let entries = store.len();
+                    let flush_start = std::time::Instant::now();
+                    let res = tokio::task::spawn_blocking(move || store.flush()).await;
+                    match res {
+                        Ok(Ok(())) => tracing::info!(
+                            entries,
+                            elapsed_ms = flush_start.elapsed().as_millis() as u64,
+                            "artifact store final flush complete"
+                        ),
+                        Ok(Err(e)) => tracing::warn!(
+                            entries,
+                            "artifact store final flush failed: {e}"
+                        ),
+                        Err(e) => tracing::warn!(
+                            entries,
+                            "artifact store final flush task join error: {e}"
+                        ),
+                    }
+
                     // Save depgraph to disk before exiting.
                     let start = std::time::Instant::now();
                     let path = zccache_depgraph::depgraph_file_path();
