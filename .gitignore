@@ -31,9 +31,6 @@ Thumbs.db
 # zccache cache directory
 .zccache/
 
-# Local perf harness scratch (ci/perf_local.py + ci/docker/* output)
-.perf-local/
-
 # Local bench scratch (Stop-hook cold-cache benchmark output + helper script)
 tasks/bench-output/
 tasks/bench-stop-hook.sh
