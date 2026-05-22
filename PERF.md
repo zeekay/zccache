@@ -201,16 +201,62 @@ Pick the budget at ~3× the post-fix measurement so machine variance doesn't mak
 
 ## Local dry-runs
 
-You can run any single scenario locally without GHA:
+### Recommended: Docker harness (`ci/perf_local.py`)
+
+Three-image Docker harness that reproduces one perf-cluster cell on the host
+machine without burning a GHA cycle:
+
+```bash
+uv run python ci/perf_local.py                      # cold-tar-untar-warm × medium (default)
+uv run python ci/perf_local.py --scenario worktree-share
+uv run python ci/perf_local.py --fixture sqlite-link
+uv run python ci/perf_local.py --rebuild-images     # force docker build of all 3 images
+uv run python ci/perf_local.py --skip-soldr-build   # fast iteration after zccache-only change
+```
+
+Architecture:
+
+- **`zccache-perf-soldr-builder`** — rust:alpine + musl-dev. Builds the
+  static `soldr` binary at `.perf-local/binaries/soldr/soldr`.
+- **`zccache-perf-zccache-builder`** — rust:bookworm. Builds the
+  `zccache` trio at `.perf-local/binaries/zccache/`.
+- **`zccache-perf-runner`** — rust:bookworm + bash/tar/zstd/jq. Mounts
+  both binary dirs + the zccache source for `perf/scenarios/`, runs the
+  scenario, writes `result.json` + cache reports under
+  `.perf-local/results/<scenario>/`.
+
+Source code is **volume-mounted** into the builder containers, and
+`target/` lives in a persistent host-side volume — so cargo incremental
+recompiles only the crates that changed. First run is full (~5-8 min);
+subsequent runs after editing one crate finish in seconds. Image
+rebuilds are only needed when a `ci/docker/*.Dockerfile` changes
+(force with `--rebuild-images`).
+
+The orchestrator prints the same rich Evaluate-style summary table the
+GHA workflow emits, so a local result is directly comparable to a cluster
+result row-for-row.
+
+See [`ci/docker/README.md`](ci/docker/README.md) for the full mount layout.
+
+### Bare-bash dry-run (no Docker, Linux only)
+
+For when Docker isn't available and you're on a Linux host that already has
+the perf script's deps installed (bash, tar, zstd, jq, plus a soldr +
+zccache pair on PATH):
 
 ```bash
 # Set up the fixture, then run one scenario (writes result.json to stdout)
 bash perf/lib/extract.sh medium /tmp/perf-medium && bash perf/scenarios/cold-tar-untar-warm/run.sh /tmp/perf-medium/medium
 ```
 
-Swap `medium` → `sqlite-link` for the smaller fixture, and `cold-tar-untar-warm` → `worktree-share` / `touch-no-change` for the other two scenarios. The scripts are POSIX bash and do not require any GHA-only env vars; `measure::append_summary_md` is a no-op when `$GITHUB_STEP_SUMMARY` is unset.
+Swap `medium` → `sqlite-link` for the other fixture, and `cold-tar-untar-warm`
+→ `worktree-share` / `touch-no-change` for the other two scenarios. The
+scripts are POSIX bash and do not require any GHA-only env vars;
+`measure::append_summary_md` is a no-op when `$GITHUB_STEP_SUMMARY` is unset.
 
-To diff between runs, re-pipe the result.json into a file and `jq -r 'to_entries | map("\(.key)=\(.value)") | join(" ")'` it — keys appear in a stable order, so visual diff works.
+To diff between runs, re-pipe the result.json into a file and
+`jq -r 'to_entries | map("\(.key)=\(.value)") | join(" ")'` it — keys appear
+in a stable order, so visual diff works.
 
 ## Related
 
