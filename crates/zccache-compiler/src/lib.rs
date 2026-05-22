@@ -469,8 +469,28 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     })
 }
 
-/// Cacheable rustc crate types: these don't invoke the system linker.
-const RUSTC_CACHEABLE_CRATE_TYPES: &[&str] = &["lib", "rlib", "staticlib"];
+/// Cacheable rustc crate types.
+///
+/// - `lib`, `rlib`, `staticlib`: archive outputs, no system linker.
+/// - `proc-macro`: a host-side dylib loaded by rustc at compile time.
+///   The output is a single deterministic shared library; sccache
+///   caches the same set. The artifact key already covers source
+///   content, deps, and compiler identity, so the safety contract
+///   is the same as any other rustc invocation.
+const RUSTC_CACHEABLE_CRATE_TYPES: &[&str] = &["lib", "rlib", "staticlib", "proc-macro"];
+
+/// Host dynamic-library file-name pattern for proc-macros, matching
+/// rustc's output naming. Linux/macOS use the `lib` prefix; Windows
+/// doesn't.
+fn rustc_proc_macro_filename(crate_name: &str, extra: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{crate_name}{extra}.dll")
+    } else if cfg!(target_os = "macos") {
+        format!("lib{crate_name}{extra}.dylib")
+    } else {
+        format!("lib{crate_name}{extra}.so")
+    }
+}
 
 /// Rustc flags that take a following argument (value in next argv element).
 const RUSTC_FLAGS_WITH_VALUE: &[&str] = &[
@@ -662,18 +682,14 @@ fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
         }
     }
 
-    // Determine primary output extension based on --emit and --crate-type.
-    // If --emit includes "link", the primary is rlib/staticlib.
-    // If --emit is metadata-only (no link), the primary is rmeta.
+    // Determine primary output filename based on --emit and --crate-type.
+    // - `--emit metadata` (no link) → rmeta sidecar
+    // - `proc-macro` → host-side dylib (.so/.dylib/.dll, lib prefix on unix)
+    // - `staticlib` → static archive (.a)
+    // - everything else cacheable → rlib
     let has_link_emit = emit_types.iter().any(|t| t == "link");
-    let primary_ext = if !has_link_emit && emit_types.iter().any(|t| t == "metadata") {
-        "rmeta"
-    } else {
-        match crate_types.first().map(|s| s.as_str()) {
-            Some("staticlib") => "a",
-            _ => "rlib",
-        }
-    };
+    let is_proc_macro = crate_types.iter().any(|t| t == "proc-macro");
+    let metadata_only = !has_link_emit && emit_types.iter().any(|t| t == "metadata");
 
     // Derive output path
     let output = if let Some(o) = output_file {
@@ -681,9 +697,18 @@ fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     } else if let Some(ref dir) = out_dir {
         let name = crate_name.as_deref().unwrap_or("unknown");
         let suffix = extra_filename.as_deref().unwrap_or("");
+        let filename = if metadata_only {
+            format!("lib{name}{suffix}.rmeta")
+        } else if is_proc_macro {
+            rustc_proc_macro_filename(name, suffix)
+        } else if crate_types.iter().any(|t| t == "staticlib") {
+            format!("lib{name}{suffix}.a")
+        } else {
+            format!("lib{name}{suffix}.rlib")
+        };
         // Use NormalizedPath::join to handle platform path separators correctly
         NormalizedPath::new(dir)
-            .join(format!("lib{name}{suffix}.{primary_ext}"))
+            .join(filename)
             .to_string_lossy()
             .into_owned()
     } else {
@@ -693,7 +718,16 @@ fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
         });
-        format!("lib{name}.{primary_ext}")
+        let filename = if metadata_only {
+            format!("lib{name}.rmeta")
+        } else if is_proc_macro {
+            rustc_proc_macro_filename(name, "")
+        } else if crate_types.iter().any(|t| t == "staticlib") {
+            format!("lib{name}.a")
+        } else {
+            format!("lib{name}.rlib")
+        };
+        filename
     };
 
     ParsedInvocation::Cacheable(CacheableCompilation {
@@ -1498,12 +1532,61 @@ mod tests {
     }
 
     #[test]
-    fn rustc_proc_macro_is_non_cacheable() {
+    fn rustc_proc_macro_is_cacheable() {
+        // Proc-macros are host-side dylibs whose output is deterministic for
+        // a given source + dep set + rustc — caching them is the same
+        // safety contract as any other rustc invocation. Targets the
+        // 18× proc-macro non-cacheables on the warm-rebuild scenario.
         let result = parse_invocation(
             "rustc",
             &args(&["--crate-type", "proc-macro", "src/lib.rs"]),
         );
-        assert!(matches!(result, ParsedInvocation::NonCacheable { .. }));
+        assert!(matches!(result, ParsedInvocation::Cacheable(_)));
+    }
+
+    #[test]
+    fn rustc_proc_macro_primary_output_uses_dylib_extension() {
+        // Without this, the daemon's `collect_rustc_output_files` would
+        // stat a non-existent `.rlib` path post-compile, return an empty
+        // outputs vec, and take the early-return branch that skips
+        // `dep_graph.update()` — leaving the context Cold forever and
+        // causing every warm rebuild to recompile the proc-macro
+        // (regression observed in the iter4 OODA pass).
+        let result = parse_invocation(
+            "rustc",
+            &args(&[
+                "--crate-name",
+                "serde_derive",
+                "--crate-type",
+                "proc-macro",
+                "--out-dir",
+                "/tmp/deps",
+                "-C",
+                "extra-filename=-abc123",
+                "/path/to/src/lib.rs",
+            ]),
+        );
+        let cc = match result {
+            ParsedInvocation::Cacheable(c) => c,
+            other => panic!("expected cacheable, got: {other:?}"),
+        };
+        let out = cc.output_file.to_string_lossy();
+        if cfg!(target_os = "windows") {
+            assert!(
+                out.ends_with("serde_derive-abc123.dll"),
+                "expected proc-macro .dll, got {out}"
+            );
+        } else if cfg!(target_os = "macos") {
+            assert!(
+                out.ends_with("libserde_derive-abc123.dylib"),
+                "expected proc-macro .dylib, got {out}"
+            );
+        } else {
+            assert!(
+                out.ends_with("libserde_derive-abc123.so"),
+                "expected proc-macro .so, got {out}"
+            );
+        }
     }
 
     #[test]
