@@ -25,33 +25,22 @@ RUST_TOOLS = {
 PYTHON_TOOLS = {"python", "python3", "pip", "pip3"}
 LEGACY_RUST_TRAMPOLINES = {"_cargo", "_rustc", "_rustfmt"}
 
-FORBIDDEN_SCRIPT_DIRS = re.compile(
-    r"""(?:^|[\s/\\])      # start or separator
-        (?:bench|tests?)   # forbidden directories
+# Path-shape: any path component named `bench`, `test`, or `tests` followed
+# by a `.py` file. Used as a per-argument check on segments we've already
+# identified as Python invocations — NOT a top-level command-string match
+# (that's what made the old check too broad).
+#
+# Anchored to `(^|sep)` so `tests-fixture/foo.py` (no path separator
+# directly before `tests`) doesn't false-positive. Backslash + forward-slash
+# both count as separators so Windows paths match identically.
+FORBIDDEN_PATH_RE = re.compile(
+    r"""(?:^|[/\\])        # start or path separator
+        (?:bench|tests?)   # forbidden directory name
         [/\\]              # path separator
         \S*\.py            # any .py file
     """,
     re.VERBOSE,
 )
-
-# Commands that only READ content (URLs, API responses, file dumps) and never
-# execute it. A `bench/foo.py` or `tests/bar.py` substring in their args is a
-# path being fetched, not Python code being run. Skip the
-# `FORBIDDEN_SCRIPT_DIRS` check for these so the agent can inspect external
-# code (issue investigation, cross-repo references) without the hook firing.
-READ_ONLY_FETCHERS = {
-    "gh",        # gh api / gh repo view / gh search etc.
-    "curl",
-    "wget",
-    "git",       # git clone / git fetch — clones can include test dirs
-    "cat",       # local file dump (Read is preferred but cat is fine for piping)
-    "head",
-    "tail",
-    "less",
-    "more",
-    "grep",      # Grep tool is preferred, but bare grep against fetched output is safe
-    "rg",
-}
 
 DENY_PYTHON_IN_CODE = (
     "Do not use Python for benchmarks or tests. "
@@ -59,23 +48,9 @@ DENY_PYTHON_IN_CODE = (
 )
 
 
-def _command_uses_read_only_fetcher(command):
-    """True when every pipeline segment starts with a known read-only tool.
-
-    A command like `gh api .../tests/foo.py | head -20` is safe because it
-    only retrieves content; we should not block it just because a fetched
-    path happens to contain `tests/`. We require every segment to be a
-    fetcher so that `gh api ... | python -` still gets blocked.
-    """
-    segments = re.split(r"\|", command)
-    for seg in segments:
-        words = _command_words(seg.strip())
-        if not words:
-            continue
-        first = words[0].lstrip("./\\")
-        if first not in READ_ONLY_FETCHERS:
-            return False
-    return True
+def _args_contain_forbidden_test_path(words):
+    """True if any argument matches a `bench/` or `tests/` Python file path."""
+    return any(FORBIDDEN_PATH_RE.search(w) for w in words)
 
 
 def _is_env_assignment(word):
@@ -100,12 +75,18 @@ def _resolve_uv_run_tool(seg):
 
 
 def check_command(command):
-    """Return (tool, reason) if forbidden, otherwise None."""
-    if FORBIDDEN_SCRIPT_DIRS.search(command) and not _command_uses_read_only_fetcher(
-        command
-    ):
-        return ("python", DENY_PYTHON_IN_CODE)
+    """Return (tool, reason) if forbidden, otherwise None.
 
+    The forbidden-test-path check (Python-on-bench/tests-*.py) runs per
+    segment, after env-var stripping, and ONLY when the segment is a
+    Python invocation. This is the deliberate narrowing from a prior
+    implementation that matched the test-path regex against the entire
+    command string — that approach false-positive-blocked `gh api .../
+    tests/foo.py`, `wc -l tests/foo.py`, `uv run pytest tests/foo.py`,
+    and any other command that happened to reference a test path as an
+    argument. Now only `python tests/foo.py` (and `uv run python
+    tests/foo.py`) trigger the block.
+    """
     segments = re.split(r"&&|\|\||;", command)
 
     for seg in segments:
@@ -145,6 +126,16 @@ def check_command(command):
                     f"Use `soldr {tool} ...` instead of `uv run {tool} ...`. "
                     "`uv run <rust-tool>` bypasses soldr's toolchain selection.",
                 )
+            # `uv run python tests/foo.py` — Python is the executor and a
+            # forbidden path is in the args. Block.
+            if tool in PYTHON_TOOLS and not tool.startswith("pip"):
+                if _args_contain_forbidden_test_path(words):
+                    return ("python", DENY_PYTHON_IN_CODE)
+            # `uv run --script tests/foo.py` — `tool` IS the path being
+            # executed as a Python script. Block when it's under bench/
+            # or tests/.
+            if FORBIDDEN_PATH_RE.search(tool):
+                return ("python", DENY_PYTHON_IN_CODE)
             continue
 
         if normalized.startswith("uv pip "):
@@ -172,6 +163,12 @@ def check_command(command):
                     f"Use `{suggestion}` instead of bare `{first}`. "
                     "All pip operations must go through uv.",
                 )
+            # `python tests/foo.py` — give the specific test-file message
+            # rather than the generic "use uv run". Both block, the
+            # specific one tells the author WHY their test file shouldn't
+            # be Python.
+            if _args_contain_forbidden_test_path(words):
+                return ("python", DENY_PYTHON_IN_CODE)
             return (
                 first,
                 f"Use `uv run ...` instead of bare `{first}`. "
