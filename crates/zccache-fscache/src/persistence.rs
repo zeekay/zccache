@@ -51,6 +51,7 @@
 
 use crate::metadata::{Confidence, FileMetadata, MetadataCache};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::Path;
 use std::time::{Instant, SystemTime};
 use zccache_core::NormalizedPath;
@@ -133,9 +134,14 @@ impl MetadataCache {
         // Empty snapshot: skip the write, no file is better than an
         // empty file (avoids confusing future debugging "did this run?").
         if entries.is_empty() {
+            tracing::debug!(
+                path = %path.display(),
+                "metadata cache flush: 0 persistable entries, skipping write"
+            );
             return Ok(());
         }
 
+        let entry_count = entries.len();
         let snapshot = PersistedMetadata {
             version: FORMAT_VERSION,
             entries,
@@ -152,13 +158,17 @@ impl MetadataCache {
             .unwrap_or_else(|| "metadata.bin".into());
         let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
 
-        let result = (|| -> std::io::Result<()> {
-            std::fs::write(&tmp, &bytes)?;
-            std::fs::rename(&tmp, path)?;
-            Ok(())
-        })();
+        let result = write_atomic_durable(&tmp, path, &bytes);
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
+        }
+        if result.is_ok() {
+            tracing::info!(
+                path = %path.display(),
+                entries = entry_count,
+                bytes = bytes.len(),
+                "metadata cache flushed to disk"
+            );
         }
         result
     }
@@ -190,6 +200,10 @@ impl MetadataCache {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!(
+                    path = %path.display(),
+                    "metadata cache file not found, starting empty"
+                );
                 return Ok(Self::new());
             }
             Err(e) => return Err(e),
@@ -207,6 +221,7 @@ impl MetadataCache {
 
         let cache = Self::new();
         let now = Instant::now();
+        let entry_count = snapshot.entries.len();
         for (key, entry) in snapshot.entries {
             cache.insert(
                 key,
@@ -219,8 +234,38 @@ impl MetadataCache {
                 },
             );
         }
+        tracing::info!(
+            path = %path.display(),
+            loaded = entry_count,
+            "metadata cache loaded from disk"
+        );
         Ok(cache)
     }
+}
+
+/// Atomic, durable write — same contract as
+/// `zccache_artifact::store::write_atomic_durable`. Duplicated here to
+/// avoid a cross-crate dep from `zccache-fscache` on `zccache-artifact`;
+/// the two crates are intentionally siblings in the dep graph.
+///
+/// Without the file's `sync_all`, the daemon can exit before the page
+/// cache commits the rename's data block, leaving `soldr save` tarring
+/// a 0-byte (or stale) snapshot. Parent-dir fsync is best-effort —
+/// unsupported on Windows but the dominant durability concern there is
+/// the metadata rename itself, which is already atomic.
+fn write_atomic_durable(tmp: &Path, target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    {
+        let mut f = std::fs::File::create(tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(tmp, target)?;
+    if let Some(parent) = target.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 // Internal helper kept private so it cannot accidentally become part of

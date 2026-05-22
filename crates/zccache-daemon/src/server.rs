@@ -128,6 +128,10 @@ async fn run_index_writer(
                 while let Ok((k, v)) = rx.try_recv() {
                     wal.insert(k, v);
                 }
+                tracing::info!(
+                    pending = wal.len(),
+                    "index-writer shutdown signal received, draining and flushing"
+                );
                 flush_wal_to_disk(&store, &mut wal).await;
                 return;
             }
@@ -151,7 +155,7 @@ async fn flush_wal_to_disk(
     let store = Arc::clone(store);
     let res = tokio::task::spawn_blocking(move || store.flush()).await;
     match res {
-        Ok(Ok(())) => tracing::trace!(committed = count, "WAL flushed to disk"),
+        Ok(Ok(())) => tracing::info!(committed = count, "WAL flushed to disk"),
         Ok(Err(e)) => tracing::warn!(count, "WAL flush to disk failed: {e}"),
         Err(e) => tracing::warn!(count, "WAL flush task join error: {e}"),
     }

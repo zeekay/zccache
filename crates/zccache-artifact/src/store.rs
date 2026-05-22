@@ -99,13 +99,32 @@ impl ArtifactStore {
     /// Open the index at `path`. Reads the entire blob into memory; treats a
     /// missing or corrupt file as an empty index (the file will be created on
     /// the next `flush()`).
+    ///
+    /// Always logs the outcome (loaded N / file not found / corrupt) at INFO
+    /// or WARN so a warm-after-restore daemon's log line tells you whether
+    /// the on-disk index survived the snapshot/load round-trip. Silent
+    /// "started empty" was the symptom that hid the cold-tar-untar-warm
+    /// 0-hit-rate bug across two perf-cluster runs.
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let entries = DashMap::new();
         match std::fs::read(path) {
             Ok(bytes) => match bincode::deserialize::<Vec<(String, ArtifactIndex)>>(&bytes) {
                 Ok(rows) => {
+                    let count = rows.len();
                     for (k, v) in rows {
                         entries.insert(k, v);
+                    }
+                    if count > 0 {
+                        tracing::info!(
+                            path = %path.display(),
+                            loaded = count,
+                            "artifact index loaded"
+                        );
+                    } else {
+                        tracing::info!(
+                            path = %path.display(),
+                            "artifact index loaded as empty (file present, 0 entries)"
+                        );
                     }
                 }
                 Err(e) => {
@@ -115,7 +134,12 @@ impl ArtifactStore {
                     );
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!(
+                    path = %path.display(),
+                    "artifact index file not found, starting empty"
+                );
+            }
             Err(e) => return Err(e),
         };
         Ok(Self {
@@ -217,16 +241,53 @@ impl ArtifactStore {
             .path
             .as_path()
             .with_file_name(format!(".{name}.tmp-{}", std::process::id()));
-        let result = (|| -> std::io::Result<()> {
-            std::fs::write(&tmp, &bytes)?;
-            std::fs::rename(&tmp, self.path.as_path())?;
-            Ok(())
-        })();
+        let target = self.path.as_path();
+        let result = write_atomic_durable(&tmp, target, &bytes);
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
+        if result.is_ok() {
+            tracing::info!(
+                path = %self.path.display(),
+                count = snapshot.len(),
+                bytes = bytes.len(),
+                "artifact index flushed to disk"
+            );
+        }
         result
     }
+}
+
+/// Atomic, durable write: write to `tmp`, fsync the file, rename to
+/// `target`, then best-effort fsync the parent directory so the rename
+/// is durable.
+///
+/// Required by both `ArtifactStore::flush` (index.bin) and
+/// `MetadataCache::save_to_disk` (metadata.bin) — without the file fsync,
+/// the daemon can exit before the rename's data block is committed to
+/// disk, leaving `soldr save` tarring a 0-byte (or stale) file. Without
+/// the parent-dir fsync, the rename itself can be lost on a power-cut
+/// before the directory entry is durable.
+///
+/// Parent-dir fsync is best-effort: opening a directory for fsync is
+/// unsupported on Windows and on some test filesystems, but the rename's
+/// metadata commit is the dominant durability concern there too. The
+/// data fsync is the one that matters for the soldr save/load case
+/// surfaced by perf-cluster runs 26255457227 + 26258412256.
+fn write_atomic_durable(tmp: &Path, target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    {
+        let mut f = std::fs::File::create(tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(tmp, target)?;
+    if let Some(parent) = target.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
