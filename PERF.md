@@ -46,7 +46,10 @@ Branch syntax: **`perf/<plat>-<fix>-<scen>`** with one short token per axis. `al
 | Scenario | `cold` | `cold-tar-untar-warm` |
 | Scenario | `worktree` | `worktree-share` |
 | Scenario | `touch` | `touch-no-change` |
+| Scenario | `restore` | `restore-no-clean-warm` |
 | any axis | `all` | wildcard — run every value on this axis |
+
+The full scope table below is exhaustive for the original three scenarios; for the newer `restore` token, every pattern in the table has a parallel `…-restore` form (e.g. `perf/linux-medium-restore` runs the single cell linux × medium × restore-no-clean-warm).
 
 Short tokens keep the branch name unambiguous (the real names contain hyphens that would collide with the axis separator).
 
