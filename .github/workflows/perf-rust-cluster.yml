@@ -571,7 +571,22 @@ jobs:
         include:
           - platform: linux
             runs_on: ubuntu-24.04
+            # Every scenario gates on speedup >= min_speedup.
             min_speedup: "4.5"
+            # Optional per-scenario warm-ms ceiling. Combined with
+            # the speedup gate as AND (gate fails if either fails).
+            # Empty string = no warm-ms ceiling for that scenario.
+            #
+            # restore-no-clean-warm: 1500ms — cold-side compile time
+            # dominates the speedup ratio, so a real 20× warm
+            # regression would still pass a speedup-only gate.
+            # The warm-ms ceiling is the binding constraint here.
+            # 1500ms is conservative; tighten once GHA noise is
+            # known. See PERF.md.
+            max_warm_ms_cold: ""
+            max_warm_ms_restore: "1500"
+            max_warm_ms_worktree: ""
+            max_warm_ms_touch: ""
     runs-on: ${{ matrix.runs_on }}
     steps:
       - name: Gate cell against resolved scope
@@ -611,10 +626,14 @@ jobs:
       - name: Evaluate scenarios for ${{ matrix.platform }}
         if: steps.gate.outputs.selected == 'true'
         env:
-          MIN_SPEEDUP:   ${{ matrix.min_speedup }}
-          REQ_FIXTURES:  ${{ needs.setup.outputs.fixtures }}
-          REQ_SCENARIOS: ${{ needs.setup.outputs.scenarios }}
-          M_PLATFORM:    ${{ matrix.platform }}
+          MIN_SPEEDUP:          ${{ matrix.min_speedup }}
+          MAX_WARM_MS_COLD:     ${{ matrix.max_warm_ms_cold }}
+          MAX_WARM_MS_RESTORE:  ${{ matrix.max_warm_ms_restore }}
+          MAX_WARM_MS_WORKTREE: ${{ matrix.max_warm_ms_worktree }}
+          MAX_WARM_MS_TOUCH:    ${{ matrix.max_warm_ms_touch }}
+          REQ_FIXTURES:         ${{ needs.setup.outputs.fixtures }}
+          REQ_SCENARIOS:        ${{ needs.setup.outputs.scenarios }}
+          M_PLATFORM:           ${{ matrix.platform }}
         run: |
           set -uo pipefail
 
@@ -630,9 +649,22 @@ jobs:
           # stabilize (see workflow header).
           mode_for() {
             case "$1" in
-              cold-tar-untar-warm) echo "fail" ;;
+              cold-tar-untar-warm|restore-no-clean-warm) echo "fail" ;;
               worktree-share|touch-no-change) echo "warn" ;;
               *) echo "warn" ;;
+            esac
+          }
+
+          # Optional per-scenario warm-ms ceiling (combined as AND
+          # with the speedup gate). Empty = no ceiling for that
+          # scenario.
+          max_warm_ms_for() {
+            case "$1" in
+              cold-tar-untar-warm)   echo "${MAX_WARM_MS_COLD}" ;;
+              restore-no-clean-warm) echo "${MAX_WARM_MS_RESTORE}" ;;
+              worktree-share)        echo "${MAX_WARM_MS_WORKTREE}" ;;
+              touch-no-change)       echo "${MAX_WARM_MS_TOUCH}" ;;
+              *)                     echo "" ;;
             esac
           }
 
@@ -702,11 +734,15 @@ jobs:
           # GHA annotations (::error / ::warning). Includes every
           # field the table shows so the annotation in the sidebar
           # tells the full story without opening the step summary.
-          # All inputs come from this loop iteration's scope.
+          # All inputs come from this loop iteration's scope; `need`
+          # is the per-scenario threshold label (e.g. ">=4.5x" or
+          # "<=1500ms") so the annotation is accurate for both
+          # speedup-gated and absolute-warm-gated scenarios.
           fmt_annotation() {
-            printf '%s/%s: speedup=%sx (need >=%sx); cold=%s warm=%s; compiles=%s hits=%s misses=%s ignored=%s errors=%s; hit=%s miss=%s ignore=%s; bytes_W=%s bytes_R=%s; time_saved=%s; daemon_RSS=%s compile_RSS=%s' \
+            local need="$1"
+            printf '%s/%s: speedup=%sx (need %s); cold=%s warm=%s; compiles=%s hits=%s misses=%s ignored=%s errors=%s; hit=%s miss=%s ignore=%s; bytes_W=%s bytes_R=%s; time_saved=%s; daemon_RSS=%s compile_RSS=%s' \
               "${fixture}" "${scenario}" \
-              "${speedup}" "${MIN_SPEEDUP}" \
+              "${speedup}" "${need}" \
               "$(fmt_ms "${cold_ms}")" "$(fmt_ms "${warm_ms}")" \
               "${compiles:-—}" "${hits:-—}" "${misses:-—}" "${non_cache:-—}" "${errs:-—}" \
               "$(fmt_pct "${hit_rate}")" "$(ratio_pct "${misses}" "${compiles}")" "$(ratio_pct "${non_cache}" "${compiles}")" \
@@ -760,11 +796,18 @@ jobs:
           # "—" when the underlying JSON is missing). Kept inline so
           # the column order is in one place; any new column gets
           # added here + in the header above.
+          #
+          # `need` (second arg) is the threshold-label cell, e.g.
+          # ">=4.5x" for speedup-gated scenarios or "<=1500ms" for
+          # the absolute-warm-ms gate on restore-no-clean-warm.
+          # Pre-result rows (MISSING / BAD-JSON / BAD-WARM) pass "—"
+          # since the threshold isn't applicable.
           emit_row() {
             local verdict="$1"
+            local need="${2:-—}"
             printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
               "${fixture}" "${scenario}" \
-              "$(fmt_verdict "${verdict}")" "${speedup:-—}x" ">=${MIN_SPEEDUP}x" \
+              "$(fmt_verdict "${verdict}")" "${speedup:-—}x" "${need}" \
               "$(fmt_ms "${cold_ms}")" "$(fmt_ms "${warm_ms}")" \
               "${compiles:-—}" \
               "$(fmt_count_pct "${hits}" "${compiles}")" \
@@ -791,7 +834,7 @@ jobs:
               continue
             fi
 
-            for scenario in cold-tar-untar-warm worktree-share touch-no-change; do
+            for scenario in cold-tar-untar-warm worktree-share touch-no-change restore-no-clean-warm; do
               if ! in_subset "${REQ_SCENARIOS}" "${scenario}"; then
                 echo "scenario ${scenario} not selected by dispatch input; skipping"
                 continue
@@ -876,23 +919,45 @@ jobs:
               fi
 
               speedup="$(awk -v c="${cold_ms}" -v w="${warm_ms}" 'BEGIN { printf "%.2f", c / w }')"
-              pass="$(awk -v s="${speedup}" -v t="${MIN_SPEEDUP}" 'BEGIN { print (s >= t) ? "1" : "0" }')"
 
-              if [[ "${pass}" == "1" ]]; then
-                emit_row "PASS"
-                echo "PASS  ${fixture}/${scenario}: speedup=${speedup}x (need >=${MIN_SPEEDUP}x), cold=$(fmt_ms "${cold_ms}") warm=$(fmt_ms "${warm_ms}"), hits=${hits:-?}/${compiles:-?} ($(fmt_pct "${hit_rate}"))"
+              # Uniform AND-style gate:
+              #   pass = (speedup >= min_speedup) AND (warm_ms <= max_warm_ms)
+              # The warm-ms half is optional and only evaluated for
+              # scenarios that opt in (via the matrix `max_warm_ms_<scen>`
+              # field, surfaced here by `max_warm_ms_for`). Scenarios
+              # with no warm-ms ceiling gate on speedup only.
+              #
+              # Why both: some scenarios (e.g. restore-no-clean-warm)
+              # have cold-side compile noise that dominates the speedup
+              # ratio, so a real warm regression can hide behind a still-
+              # passing speedup ratio. The warm-ms ceiling catches that.
+              # Others (cold-tar-untar-warm) want speedup as the signal
+              # of cache contribution and don't need a warm-ms ceiling.
+              speedup_pass="$(awk -v s="${speedup}" -v t="${MIN_SPEEDUP}" 'BEGIN { print (s >= t) ? "1" : "0" }')"
+              max_warm="$(max_warm_ms_for "${scenario}")"
+              warm_pass="1"
+              warm_clause=""
+              if [[ -n "${max_warm}" ]]; then
+                warm_pass="$(awk -v w="${warm_ms}" -v t="${max_warm}" 'BEGIN { print (w+0 <= t+0) ? "1" : "0" }')"
+                warm_clause=" AND <=${max_warm}ms"
+              fi
+              need=">=${MIN_SPEEDUP}x${warm_clause}"
+
+              if [[ "${speedup_pass}" == "1" && "${warm_pass}" == "1" ]]; then
+                emit_row "PASS" "${need}"
+                echo "PASS  ${fixture}/${scenario}: speedup=${speedup}x warm=$(fmt_ms "${warm_ms}") (need ${need}), cold=$(fmt_ms "${cold_ms}"), hits=${hits:-?}/${compiles:-?} ($(fmt_pct "${hit_rate}"))"
               else
                 if [[ "${mode}" == "fail" ]]; then
-                  emit_row "FAIL"
-                  echo "::error::$(fmt_annotation)"
+                  emit_row "FAIL" "${need}"
+                  echo "::error::$(fmt_annotation "${need}")"
                   status=1
                 else
-                  emit_row "WARN"
+                  emit_row "WARN" "${need}"
                   # Soft gate: emit a warning that still has the
                   # full context, so a future tightening to a hard
                   # gate (see workflow header) doesn't need a
                   # message rewrite.
-                  echo "::warning::$(fmt_annotation) [soft gate — not failing today]"
+                  echo "::warning::$(fmt_annotation "${need}") [soft gate — not failing today]"
                 fi
               fi
             done

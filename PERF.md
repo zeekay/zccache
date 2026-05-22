@@ -144,11 +144,36 @@ Short tokens keep the branch name unambiguous (the real names contain hyphens th
 
 ## Gate semantics
 
-- **`cold-tar-untar-warm` < 3x** (cold/warm ratio in the Evaluate step) → **fails the workflow**. Hard gate.
-- **`worktree-share` < 3x** → emits `::warning::`, doesn't fail. Soft gate today; promotes to hard once the baseline stabilizes.
-- **`touch-no-change` < 3x** → same as worktree-share, soft today.
+Every scenario gates on **`speedup >= min_speedup` AND (optionally) `warm_ms
+<= max_warm_ms_<scen>`** — both must hold for PASS. The warm-ms ceiling is
+opt-in per scenario; scenarios with no ceiling gate on speedup alone.
 
-Threshold lives on the `evaluate` matrix row (`min_speedup: "3.0"`).
+Linux thresholds today:
+
+| Scenario | min_speedup | max_warm_ms | Mode |
+|---|---:|---:|---|
+| `cold-tar-untar-warm` | `4.5x` | — | **hard** (fails workflow) |
+| `restore-no-clean-warm` | `4.5x` | `1500ms` | **hard** (fails workflow) |
+| `worktree-share` | `4.5x` | — | soft (`::warning::`) |
+| `touch-no-change` | `4.5x` | — | soft (`::warning::`) |
+
+Why both gates instead of speedup-only: some scenarios have cold-side compile
+time that dominates the speedup ratio (e.g. `restore-no-clean-warm`: cargo
+populates `target/` from scratch on cold, so a real 20× warm regression — warm
+going from 75 ms back to 1500 ms — still reports a ~40x speedup and passes a
+speedup-only gate cleanly). The warm-ms ceiling catches user-visible regressions
+that hide behind a high ratio. Other scenarios (`cold-tar-untar-warm`) want
+speedup as the signal of cache contribution and don't currently set a warm-ms
+ceiling.
+
+Thresholds live on the `evaluate` matrix row (`min_speedup`,
+`max_warm_ms_<scen>`). Each platform row carries its own values; the workflow
+has only `linux` today, so the numbers above are linux-tuned. mac-arm / win
+rows will need their own thresholds because per-OS variance on the noise floor
+is significant. To add a warm-ms ceiling to a scenario that doesn't have one,
+set the corresponding `max_warm_ms_<scen>` field in the matrix include to a
+non-empty value (e.g. `"2000"`); the gate code picks it up via
+`max_warm_ms_for`.
 
 ## Reading the run
 
