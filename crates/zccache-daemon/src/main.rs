@@ -302,7 +302,34 @@ fn run_server(args: Args) {
 
 fn init_tracing(level: &str) {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    // When a parent process (notably soldr) launches us with a narrowed
+    // `RUST_LOG=zccache_daemon=info`, the directive *only* matches the
+    // `zccache_daemon` target — INFO logs emitted from sibling crates
+    // (`zccache_artifact`, `zccache_fscache`, `zccache_hash`, ...) are
+    // silently dropped, which has blocked perf-cluster diagnostics
+    // (runs 26255457227 / 26258412256 / 26260816043 — see PERF.md).
+    // Add explicit `<crate>=info` directives so the cross-crate logs
+    // always survive the filter regardless of how the env was set.
+    for target in [
+        "zccache_artifact",
+        "zccache_compiler",
+        "zccache_core",
+        "zccache_depgraph",
+        "zccache_download",
+        "zccache_fingerprint",
+        "zccache_fscache",
+        "zccache_gha",
+        "zccache_hash",
+        "zccache_ipc",
+        "zccache_protocol",
+        "zccache_symbols",
+        "zccache_watcher",
+    ] {
+        if let Ok(d) = format!("{target}=info").parse() {
+            filter = filter.add_directive(d);
+        }
+    }
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
