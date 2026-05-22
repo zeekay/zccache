@@ -477,7 +477,8 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
 ///   caches the same set. The artifact key already covers source
 ///   content, deps, and compiler identity, so the safety contract
 ///   is the same as any other rustc invocation.
-const RUSTC_CACHEABLE_CRATE_TYPES: &[&str] = &["lib", "rlib", "staticlib", "proc-macro"];
+const RUSTC_CACHEABLE_CRATE_TYPES: &[&str] =
+    &["lib", "rlib", "staticlib", "proc-macro", "bin"];
 
 /// Host dynamic-library file-name pattern for proc-macros, matching
 /// rustc's output naming. Linux/macOS use the `lib` prefix; Windows
@@ -489,6 +490,16 @@ fn rustc_proc_macro_filename(crate_name: &str, extra: &str) -> String {
         format!("lib{crate_name}{extra}.dylib")
     } else {
         format!("lib{crate_name}{extra}.so")
+    }
+}
+
+/// Host executable file-name pattern for `--crate-type bin`. Windows
+/// adds `.exe`; unix has no extension.
+fn rustc_bin_filename(crate_name: &str, extra: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{crate_name}{extra}.exe")
+    } else {
+        format!("{crate_name}{extra}")
     }
 }
 
@@ -523,8 +534,8 @@ const RUSTC_FLAGS_WITH_VALUE: &[&str] = &[
 
 /// Parse a rustc invocation to determine cacheability.
 ///
-/// Cacheable: `--crate-type` is `lib`, `rlib`, or `staticlib` (no system linker).
-/// Non-cacheable: `bin`, `dylib`, `cdylib`, `proc-macro`, or `-C incremental`.
+/// Cacheable: `--crate-type` is `lib`, `rlib`, `staticlib`, `proc-macro`, or `bin`.
+/// Non-cacheable: `dylib`, `cdylib`.
 fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     let mut crate_types: Vec<String> = Vec::new();
     let mut source_file: Option<String> = None;
@@ -685,10 +696,12 @@ fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     // Determine primary output filename based on --emit and --crate-type.
     // - `--emit metadata` (no link) → rmeta sidecar
     // - `proc-macro` → host-side dylib (.so/.dylib/.dll, lib prefix on unix)
+    // - `bin` → executable (no extension on unix, .exe on Windows)
     // - `staticlib` → static archive (.a)
     // - everything else cacheable → rlib
     let has_link_emit = emit_types.iter().any(|t| t == "link");
     let is_proc_macro = crate_types.iter().any(|t| t == "proc-macro");
+    let is_bin = crate_types.iter().any(|t| t == "bin");
     let metadata_only = !has_link_emit && emit_types.iter().any(|t| t == "metadata");
 
     // Derive output path
@@ -701,6 +714,8 @@ fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             format!("lib{name}{suffix}.rmeta")
         } else if is_proc_macro {
             rustc_proc_macro_filename(name, suffix)
+        } else if is_bin {
+            rustc_bin_filename(name, suffix)
         } else if crate_types.iter().any(|t| t == "staticlib") {
             format!("lib{name}{suffix}.a")
         } else {
@@ -722,6 +737,8 @@ fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             format!("lib{name}.rmeta")
         } else if is_proc_macro {
             rustc_proc_macro_filename(name, "")
+        } else if is_bin {
+            rustc_bin_filename(name, "")
         } else if crate_types.iter().any(|t| t == "staticlib") {
             format!("lib{name}.a")
         } else {
@@ -1520,9 +1537,47 @@ mod tests {
     }
 
     #[test]
-    fn rustc_bin_crate_is_non_cacheable() {
+    fn rustc_bin_crate_is_cacheable() {
+        // bin became cacheable in iter7 alongside a touch_mtime change
+        // so cargo's fingerprint doesn't invalidate downstream when a
+        // hit materializes the binary.
         let result = parse_invocation("rustc", &args(&["--crate-type", "bin", "src/main.rs"]));
-        assert!(matches!(result, ParsedInvocation::NonCacheable { .. }));
+        assert!(matches!(result, ParsedInvocation::Cacheable(_)));
+    }
+
+    #[test]
+    fn rustc_bin_primary_output_uses_executable_extension() {
+        let result = parse_invocation(
+            "rustc",
+            &args(&[
+                "--crate-name",
+                "build_script_build",
+                "--crate-type",
+                "bin",
+                "--out-dir",
+                "/tmp/build/foo-abc",
+                "-C",
+                "extra-filename=-abc",
+                "/path/to/build.rs",
+            ]),
+        );
+        let cc = match result {
+            ParsedInvocation::Cacheable(c) => c,
+            other => panic!("expected cacheable, got: {other:?}"),
+        };
+        let out = cc.output_file.to_string_lossy();
+        if cfg!(target_os = "windows") {
+            assert!(
+                out.ends_with("build_script_build-abc.exe"),
+                "expected bin .exe, got {out}"
+            );
+        } else {
+            assert!(
+                out.ends_with("build_script_build-abc"),
+                "expected bin executable, got {out}"
+            );
+            assert!(!out.ends_with(".rlib"), "bin must not get .rlib, got {out}");
+        }
     }
 
     #[test]
@@ -1596,10 +1651,11 @@ mod tests {
     }
 
     #[test]
-    fn rustc_no_crate_type_defaults_to_bin_non_cacheable() {
-        // Without --crate-type, rustc defaults to bin
+    fn rustc_no_crate_type_defaults_to_bin_cacheable() {
+        // Without --crate-type, rustc defaults to bin. bin is cacheable
+        // as of iter7 — see `rustc_bin_crate_is_cacheable`.
         let result = parse_invocation("rustc", &args(&["src/main.rs"]));
-        assert!(matches!(result, ParsedInvocation::NonCacheable { .. }));
+        assert!(matches!(result, ParsedInvocation::Cacheable(_)));
     }
 
     #[test]
@@ -1868,8 +1924,9 @@ mod tests {
     }
 
     #[test]
-    fn clippy_driver_non_cacheable_bin() {
-        // Binary crate type is not cacheable (same as rustc)
+    fn clippy_driver_bin_is_cacheable() {
+        // bin became cacheable in iter7. clippy-driver follows the same
+        // allowlist as rustc.
         let result = parse_invocation(
             "clippy-driver",
             &args(&[
@@ -1880,7 +1937,7 @@ mod tests {
                 "src/main.rs",
             ]),
         );
-        assert!(matches!(result, ParsedInvocation::NonCacheable { .. }));
+        assert!(matches!(result, ParsedInvocation::Cacheable(_)));
     }
 
     #[test]
