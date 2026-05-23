@@ -34,6 +34,9 @@ All volumes are managed by the orchestrator. The layout under `<repo>/.perf-loca
 ├── target/
 │   ├── soldr/                  # persistent cargo target/ for soldr (musl)
 │   └── zccache/                # persistent cargo target/ for zccache (gnu)
+├── cargo-home/                 # persistent CARGO_HOME (registry index + crate sources)
+│   ├── soldr/                  # so no-op rebuilds don't re-fetch ~175 MiB per run
+│   └── zccache/
 ├── binaries/
 │   ├── soldr/soldr             # static soldr binary produced by builder
 │   └── zccache/                # zccache trio produced by builder
@@ -43,6 +46,13 @@ All volumes are managed by the orchestrator. The layout under `<repo>/.perf-loca
 └── results/
     └── <scenario>/             # result.json + cache reports per run
 ```
+
+The `cargo-home/` volumes are required for fast incremental rebuilds: the
+Dockerfiles set `ENV CARGO_HOME=/cargo-home` so cargo's fingerprint check
+loads registry sources from there. Without a host-side mount, every run
+starts with an empty registry and pays a re-download + re-fingerprint
+cost (~20-25s for soldr, ~30s for zccache). Persisting them drops no-op
+rebuilds to under 15s wall time on Docker-for-Windows.
 
 Everything under `.perf-local/` is `.gitignore`d.
 
