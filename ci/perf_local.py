@@ -146,12 +146,19 @@ def ensure_soldr_source() -> Path:
 def ensure_volume_dirs() -> dict[str, Path]:
     """Create the .perf-local/ volume tree, return a name->path map."""
     layout = {
-        "soldr_src":      PERF_LOCAL / "soldr-src",
-        "target_soldr":   PERF_LOCAL / "target" / "soldr",
-        "target_zccache": PERF_LOCAL / "target" / "zccache",
-        "bin_soldr":      PERF_LOCAL / "binaries" / "soldr",
-        "bin_zccache":    PERF_LOCAL / "binaries" / "zccache",
-        "results":        PERF_LOCAL / "results",
+        "soldr_src":         PERF_LOCAL / "soldr-src",
+        "target_soldr":      PERF_LOCAL / "target" / "soldr",
+        "target_zccache":    PERF_LOCAL / "target" / "zccache",
+        # CARGO_HOME volumes. The Dockerfiles set `ENV CARGO_HOME=/cargo-home`
+        # so cargo's registry index + crate sources land here. Without a
+        # host-side mount, every container starts with an empty CARGO_HOME
+        # and re-fetches ~175 MiB to revalidate fingerprints — measured at
+        # +28s per no-op build. Persisting it cuts no-op builds to seconds.
+        "cargo_home_soldr":   PERF_LOCAL / "cargo-home" / "soldr",
+        "cargo_home_zccache": PERF_LOCAL / "cargo-home" / "zccache",
+        "bin_soldr":         PERF_LOCAL / "binaries" / "soldr",
+        "bin_zccache":       PERF_LOCAL / "binaries" / "zccache",
+        "results":           PERF_LOCAL / "results",
     }
     for path in layout.values():
         path.mkdir(parents=True, exist_ok=True)
@@ -174,9 +181,10 @@ def run_soldr_builder(layout: dict[str, Path]) -> None:
     print(f"[perf-local] building soldr binary -> {layout['bin_soldr']}")
     run([
         "docker", "run", "--rm",
-        "-v", host_volume(layout["soldr_src"],    "/src", "ro"),
-        "-v", host_volume(layout["target_soldr"], "/target"),
-        "-v", host_volume(layout["bin_soldr"],    "/out"),
+        "-v", host_volume(layout["soldr_src"],        "/src", "ro"),
+        "-v", host_volume(layout["target_soldr"],     "/target"),
+        "-v", host_volume(layout["cargo_home_soldr"], "/cargo-home"),
+        "-v", host_volume(layout["bin_soldr"],        "/out"),
         IMAGE_SOLDR,
     ])
 
@@ -185,9 +193,10 @@ def run_zccache_builder(layout: dict[str, Path]) -> None:
     print(f"[perf-local] building zccache trio -> {layout['bin_zccache']}")
     run([
         "docker", "run", "--rm",
-        "-v", host_volume(REPO_ROOT,                "/src", "ro"),
-        "-v", host_volume(layout["target_zccache"], "/target"),
-        "-v", host_volume(layout["bin_zccache"],    "/out"),
+        "-v", host_volume(REPO_ROOT,                    "/src", "ro"),
+        "-v", host_volume(layout["target_zccache"],     "/target"),
+        "-v", host_volume(layout["cargo_home_zccache"], "/cargo-home"),
+        "-v", host_volume(layout["bin_zccache"],        "/out"),
         IMAGE_ZCCACHE,
     ])
 
