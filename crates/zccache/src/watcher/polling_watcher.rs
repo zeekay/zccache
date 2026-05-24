@@ -716,6 +716,13 @@ mod tests {
             .unwrap();
         watcher.start().unwrap();
 
+        // Windows NTFS mtime granularity is ~1s; on GHA Windows runners the
+        // create→write pair can fall inside the same second, leaving the
+        // polling watcher unable to detect the change. Sleep past the
+        // granularity boundary before the second write so mtime strictly
+        // advances. Unix is fine without this (nanosecond mtimes) but the
+        // sleep is cheap enough to skip the platform gate.
+        std::thread::sleep(Duration::from_millis(1100));
         fs::write(root.join("watch.cpp"), "b\n").unwrap();
         let batch = wait_for_batch(&watcher);
         watcher.stop().unwrap();
