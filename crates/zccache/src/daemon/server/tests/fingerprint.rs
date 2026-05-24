@@ -39,6 +39,31 @@ fn find_git_root_detects_git_directory() {
 }
 
 #[test]
+fn path_remap_auto_enabled_recognizes_auto_case_insensitive() {
+    // Issue #353 prerequisite: confirm the auto-detection helper recognizes
+    // the env value the cwd-fallback branch keys on.
+    let env = vec![("ZCCACHE_PATH_REMAP".to_string(), "auto".to_string())];
+    assert!(path_remap_auto_enabled(Some(&env)));
+    let env = vec![("ZCCACHE_PATH_REMAP".to_string(), "AUTO".to_string())];
+    assert!(path_remap_auto_enabled(Some(&env)));
+    let env = vec![("ZCCACHE_PATH_REMAP".to_string(), "off".to_string())];
+    assert!(!path_remap_auto_enabled(Some(&env)));
+    assert!(!path_remap_auto_enabled(None));
+}
+
+#[test]
+fn diag_path_remap_state_tags() {
+    // Issue #353: the `auto_no_git` tag is the one observers grep for to
+    // distinguish "remap fired with cwd fallback" from "remap silently
+    // skipped because no env var".
+    let auto = vec![("ZCCACHE_PATH_REMAP".to_string(), "auto".to_string())];
+    assert_eq!(diag_path_remap_state(Some(&auto), true), "auto");
+    assert_eq!(diag_path_remap_state(Some(&auto), false), "auto_no_git");
+    assert_eq!(diag_path_remap_state(None, true), "off");
+    assert_eq!(diag_path_remap_state(None, false), "off");
+}
+
+#[test]
 fn resolve_worktree_root_prefers_client_env_override() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("repo/subdir");

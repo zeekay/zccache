@@ -76,18 +76,44 @@ pub(super) fn compile_worktree_root(
         return resolve_worktree_root(cwd, client_env);
     }
 
-    let cwd: NormalizedPath = cwd.into();
+    let cwd_normalized: NormalizedPath = cwd.into();
     if let Some(cached) = state.session_worktree_roots.get(sid) {
         if let Some(root) = cached.root.as_ref() {
-            if cwd.starts_with(root.as_path()) {
+            if cwd_normalized.starts_with(root.as_path()) {
                 return Some(root.clone());
             }
-        } else if cwd.starts_with(cached.working_dir.as_path()) {
+        } else if cwd_normalized.starts_with(cached.working_dir.as_path())
+            && !path_remap_auto_enabled(client_env)
+        {
+            // Cached "no worktree" applies only when PATH_REMAP isn't requested.
+            // Issue #353: when the user explicitly opts into auto-remap, prefer
+            // the cwd fallback (below) over the sticky None so the compiler
+            // still gets a `--remap-path-prefix=<cwd>=.` flag and embedded
+            // paths in debug info / macros become path-independent.
             return None;
         }
     }
 
-    resolve_worktree_root(&cwd, client_env)
+    if let Some(root) = resolve_worktree_root(cwd, client_env) {
+        return Some(root);
+    }
+
+    // Issue #353: `ZCCACHE_PATH_REMAP=auto` was requested but no `.git/`
+    // ancestor was found. Previously this silently fell through, so the
+    // compiler ran with absolute paths in its output even though the user
+    // asked for path normalization. Two GHA runners with byte-identical
+    // checkouts but no `.git/` (e.g., shallow / git-archive workflows) would
+    // produce divergent .rlib bytes and miss every cache lookup.
+    //
+    // Fall back to using the cwd itself as the worktree root: the remap flag
+    // gets added (`--remap-path-prefix=<cwd>=.`) and the depgraph context_key
+    // normalizes paths relative to a deterministic root. Behavior when the env
+    // var isn't set is unchanged.
+    if path_remap_auto_enabled(client_env) {
+        return Some(cwd_normalized);
+    }
+
+    None
 }
 
 pub(super) fn normalize_path_for_request_key(path: &Path, key_root: Option<&Path>) -> String {
