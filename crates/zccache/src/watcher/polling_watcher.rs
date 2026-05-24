@@ -610,7 +610,12 @@ mod tests {
     use tempfile::tempdir;
 
     fn wait_for_batch(watcher: &PollingWatcher) -> PollWatchBatch {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // 15s is the GHA Windows runner allowance — under contention the
+        // settle window can stretch past the original 3s budget, producing
+        // intermittent timeouts in `polling_watcher_callbacks_and_polling_share_events`.
+        // Local fastpath returns in low milliseconds; the wider ceiling
+        // only matters when the runner is stressed.
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(batch) = watcher
                 .poll_timeout(Duration::from_millis(100))
@@ -711,6 +716,13 @@ mod tests {
             .unwrap();
         watcher.start().unwrap();
 
+        // Windows NTFS mtime granularity is ~1s; on GHA Windows runners the
+        // create→write pair can fall inside the same second, leaving the
+        // polling watcher unable to detect the change. Sleep past the
+        // granularity boundary before the second write so mtime strictly
+        // advances. Unix is fine without this (nanosecond mtimes) but the
+        // sleep is cheap enough to skip the platform gate.
+        std::thread::sleep(Duration::from_millis(1100));
         fs::write(root.join("watch.cpp"), "b\n").unwrap();
         let batch = wait_for_batch(&watcher);
         watcher.stop().unwrap();
