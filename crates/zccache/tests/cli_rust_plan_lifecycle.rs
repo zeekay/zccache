@@ -268,6 +268,8 @@ fn rust_plan_for_workspace(root: &Path, target_dir: &Path) -> RustArtifactPlanV1
         ],
         cache_schema_version: 1,
         journal_log_path: None,
+        cache_profile: None,
+        dropped_artifact_classes: Vec::new(),
     }
 }
 
@@ -322,6 +324,8 @@ fn synthetic_full_plan(root: &Path, target_dir: &Path) -> RustArtifactPlanV1 {
         allowed_artifact_classes: vec![],
         cache_schema_version: 1,
         journal_log_path: None,
+        cache_profile: None,
+        dropped_artifact_classes: Vec::new(),
     }
 }
 
