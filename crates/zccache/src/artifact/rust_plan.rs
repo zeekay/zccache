@@ -20,7 +20,17 @@ const MAX_RUST_PLAN_TAR_THREADS: usize = 64;
 
 /// Supported Rust artifact plan schema version.
 pub const RUST_ARTIFACT_PLAN_SCHEMA_VERSION: u32 = 1;
-/// Supported cache bundle schema version.
+/// Supported cache bundle schema versions soldr may send. v1 is the legacy
+/// shape (thin-v1 / full). v2 is the `thin-v2` opt-in described in soldr#461:
+/// it adds the `cache_profile` and `dropped_artifact_classes` fields and
+/// splits the legacy `cargo_fingerprint` class into `cargo_fingerprint_meta`
+/// (kept) and `cargo_fingerprint_outputs` (dropped). zccache accepts both so
+/// older soldr builds keep working unchanged.
+pub const SUPPORTED_RUST_ARTIFACT_CACHE_SCHEMA_VERSIONS: &[u32] = &[1, 2];
+/// Cache schema version zccache writes into bundle manifests it creates.
+/// Pinned at 1 so the on-disk manifest format stays stable across the
+/// thin-v2 opt-in — the v2 wire fields are inputs to the save walker, not
+/// outputs in the manifest itself.
 pub const RUST_ARTIFACT_CACHE_SCHEMA_VERSION: u32 = 1;
 
 const BUNDLE_MANIFEST_NAME: &str = "manifest.json";
@@ -71,6 +81,13 @@ impl std::fmt::Display for RustPlanMode {
 }
 
 /// Artifact classes that a plan may allow.
+///
+/// New variants added for the soldr `thin-v2` profile (soldr#461):
+/// `CargoFingerprintMeta` / `CargoFingerprintOutputs` split the legacy
+/// `CargoFingerprint` umbrella into freshness inputs vs. outputs;
+/// `Incremental` / `BuildScriptBuild` / `Dwo` / `Pdb` / `Dsym` enumerate
+/// categories that thin-v2 explicitly drops so the wire-format
+/// `dropped_artifact_classes` list can name them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RustArtifactClass {
@@ -79,9 +96,34 @@ pub enum RustArtifactClass {
     DepInfo,
     ProcMacro,
     SharedLib,
+    /// Legacy thin-v1 umbrella over the `.fingerprint/<crate>/` directory.
+    /// Kept for backwards compatibility; thin-v2 splits this into
+    /// `CargoFingerprintMeta` (freshness inputs cargo reads) and
+    /// `CargoFingerprintOutputs` (everything else in that directory).
     CargoFingerprint,
+    /// Freshness-input files inside `<profile>/.fingerprint/<crate>-<hash>/`:
+    /// `invoked.timestamp`, `dep-*`, `output-*`, `lib-*`, `bin-*`. Cargo
+    /// reads these to decide skip-vs-rebuild, so thin-v2 keeps them.
+    CargoFingerprintMeta,
+    /// Non-meta files inside `<profile>/.fingerprint/<crate>-<hash>/`. Dropped
+    /// by thin-v2 — they are outputs of past compilations, not inputs to the
+    /// next freshness decision.
+    CargoFingerprintOutputs,
     BuildScriptMetadata,
     BuildScriptOutput,
+    /// Compiled build-script binary at `target/<profile>/build/*/build-script-build*`.
+    /// thin-v2 drops these — they are cheap to regenerate from cached deps.
+    BuildScriptBuild,
+    /// Anything under `target/<profile>/incremental/`. Always transient state;
+    /// thin-v2 names it explicitly so the drop list is exhaustive.
+    Incremental,
+    /// `.dwo` split-DWARF files under `deps/`. Dropped by thin-v2.
+    Dwo,
+    /// `.pdb` Windows debug files under `deps/`. Dropped by thin-v2.
+    Pdb,
+    /// `.dSYM/` macOS debug bundles under `deps/` (directory bundles — every
+    /// file inside the bundle is classified as `Dsym`). Dropped by thin-v2.
+    Dsym,
     FullTarget,
 }
 
@@ -121,8 +163,16 @@ pub struct RustPlanPackages {
 }
 
 /// Versioned v1 Rust artifact cache plan.
+///
+/// Wire-compat note (soldr#461): the previous version used
+/// `#[serde(deny_unknown_fields)]`, which made every future soldr addition
+/// a coordinated breaking change. The `thin-v2` rollout added
+/// `cache_profile` and `dropped_artifact_classes` as new top-level fields,
+/// so we now accept (and ignore) unknown fields here. The explicit fields
+/// below cover everything zccache acts on; anything else soldr ships in a
+/// future plan is silently dropped during deserialization rather than
+/// crashing the save/restore.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RustArtifactPlanV1 {
     pub schema_version: u32,
     pub mode: RustPlanMode,
@@ -138,6 +188,17 @@ pub struct RustArtifactPlanV1 {
     pub cache_schema_version: u32,
     #[serde(default)]
     pub journal_log_path: Option<NormalizedPath>,
+    /// Thin-slice pruning profile selected by soldr. `None` for legacy plans
+    /// (thin-v1 / full) that predate soldr#461; `Some("thin-v2")` opts in to
+    /// the fingerprint-aware prune.
+    #[serde(default)]
+    pub cache_profile: Option<String>,
+    /// Artifact classes soldr explicitly wants dropped from the saved bundle.
+    /// Honored regardless of what `allowed_artifact_classes` says — a file
+    /// whose class appears here is skipped even if its class is also in the
+    /// allow-list. Empty for legacy plans.
+    #[serde(default)]
+    pub dropped_artifact_classes: Vec<RustArtifactClass>,
 }
 
 impl RustArtifactPlanV1 {
@@ -164,12 +225,7 @@ impl RustArtifactPlanV1 {
         }
 
         let cache_schema_version = json_u32_field(&value, "cache_schema_version")?;
-        if cache_schema_version != RUST_ARTIFACT_CACHE_SCHEMA_VERSION {
-            return Err(RustPlanError::UnsupportedCacheSchemaVersion {
-                found: cache_schema_version,
-                supported: RUST_ARTIFACT_CACHE_SCHEMA_VERSION,
-            });
-        }
+        ensure_supported_cache_schema_version(cache_schema_version)?;
 
         let plan: Self = serde_json::from_value(value)?;
         plan.validate()?;
@@ -582,8 +638,17 @@ pub fn rust_plan_cache_key(plan: &RustArtifactPlanV1) -> String {
 }
 
 /// Compute the stable identity hash used by manifests.
+///
+/// The hash folds in `cache_profile` and `dropped_artifact_classes` (added
+/// in soldr#461) so a thin-v1 bundle and a thin-v2 bundle for the same
+/// otherwise-identical inputs get different keys and never alias each
+/// other — they ship different file sets and would corrupt each other's
+/// restore expectations if the cache_key collided.
 #[must_use]
 pub fn rust_plan_identity_hash(plan: &RustArtifactPlanV1) -> String {
+    let mut dropped: Vec<RustArtifactClass> = plan.dropped_artifact_classes.clone();
+    dropped.sort();
+    dropped.dedup();
     let payload = serde_json::json!({
         "schema_version": plan.schema_version,
         "mode": plan.mode,
@@ -596,6 +661,8 @@ pub fn rust_plan_identity_hash(plan: &RustArtifactPlanV1) -> String {
         "packages": plan.packages,
         "allowed_artifact_classes": plan.effective_allowed_classes().into_iter().collect::<Vec<_>>(),
         "cache_schema_version": plan.cache_schema_version,
+        "cache_profile": plan.cache_profile,
+        "dropped_artifact_classes": dropped,
     });
     let bytes = serde_json::to_vec(&payload).unwrap_or_default();
     crate::hash::hash_bytes(&bytes).to_hex()
@@ -915,7 +982,10 @@ fn select_artifacts(
     summary: &mut RustPlanSummary,
 ) -> Vec<SelectedArtifact> {
     let allowed = plan.effective_allowed_classes();
+    let dropped: BTreeSet<RustArtifactClass> =
+        plan.dropped_artifact_classes.iter().copied().collect();
     let excluded_names = excluded_package_names(&plan.packages);
+    let thin_v2 = plan.cache_profile.as_deref() == Some("thin-v2");
     let mut selected = Vec::new();
 
     for path in candidates {
@@ -929,17 +999,28 @@ fn select_artifacts(
         let rel = relative_path_string(rel_path);
 
         if has_component(rel_path, "incremental") {
+            // Always-transient; reported as `transient_state` for back-compat
+            // with existing summary consumers regardless of whether thin-v2
+            // also listed `Incremental` in `dropped_artifact_classes`.
             summary.skip(rel, "transient_state");
             continue;
         }
 
-        let class = classify_artifact(rel_path, plan.mode);
+        let class = classify_artifact(rel_path, plan.mode, thin_v2);
 
         if plan.mode == RustPlanMode::Thin {
             let Some(class) = class else {
                 summary.skip(rel, "artifact_class_disallowed_by_plan");
                 continue;
             };
+            // soldr#461: honor the drop list before consulting the allow list.
+            // A file matching any dropped class is skipped even if its class is
+            // also listed under `allowed_artifact_classes`. This is the
+            // load-bearing change that lets thin-v2 actually prune the bundle.
+            if dropped.contains(&class) {
+                summary.skip(rel, "artifact_class_disallowed_by_plan");
+                continue;
+            }
             if !allowed.contains(&class) {
                 summary.skip(rel, "artifact_class_disallowed_by_plan");
                 continue;
@@ -967,8 +1048,24 @@ fn select_artifacts(
     selected
 }
 
-fn classify_artifact(rel: &Path, mode: RustPlanMode) -> Option<RustArtifactClass> {
+fn classify_artifact(rel: &Path, mode: RustPlanMode, thin_v2: bool) -> Option<RustArtifactClass> {
+    // .dSYM/ is a directory bundle on macOS; every file *inside* an enclosing
+    // `*.dSYM` ancestor component is dsym. Check first so we don't try to
+    // classify `Contents/Info.plist` etc. by extension.
+    if path_has_dsym_ancestor(rel) {
+        return Some(RustArtifactClass::Dsym);
+    }
+
     if has_component(rel, ".fingerprint") {
+        // thin-v2 splits the legacy umbrella into Meta (kept) vs Outputs
+        // (dropped). Older plans keep the legacy single-class behavior so
+        // existing thin-v1 callers see no semantic change.
+        if thin_v2 {
+            if is_fingerprint_meta_file(rel) {
+                return Some(RustArtifactClass::CargoFingerprintMeta);
+            }
+            return Some(RustArtifactClass::CargoFingerprintOutputs);
+        }
         return Some(RustArtifactClass::CargoFingerprint);
     }
     if has_component(rel, "build") {
@@ -979,6 +1076,13 @@ fn classify_artifact(rel: &Path, mode: RustPlanMode) -> Option<RustArtifactClass
             if matches!(name, "output" | "invoked.timestamp" | "root-output") {
                 return Some(RustArtifactClass::BuildScriptMetadata);
             }
+            // soldr#461: name the compiled build-script binaries so the
+            // drop list can reach them. Cargo emits them as
+            // `target/<profile>/build/<crate>-<hash>/build-script-build`
+            // (possibly with a `.exe` suffix on Windows).
+            if is_build_script_build_file(name) {
+                return Some(RustArtifactClass::BuildScriptBuild);
+            }
         }
     }
 
@@ -986,6 +1090,8 @@ fn classify_artifact(rel: &Path, mode: RustPlanMode) -> Option<RustArtifactClass
         Some("rlib") => Some(RustArtifactClass::Rlib),
         Some("rmeta") => Some(RustArtifactClass::Rmeta),
         Some("d") => Some(RustArtifactClass::DepInfo),
+        Some("dwo") if has_component(rel, "deps") => Some(RustArtifactClass::Dwo),
+        Some("pdb") if has_component(rel, "deps") => Some(RustArtifactClass::Pdb),
         Some("so" | "dylib" | "dll") if is_likely_proc_macro_dylib(rel) => {
             Some(RustArtifactClass::ProcMacro)
         }
@@ -993,6 +1099,46 @@ fn classify_artifact(rel: &Path, mode: RustPlanMode) -> Option<RustArtifactClass
         _ if mode == RustPlanMode::Full => Some(RustArtifactClass::FullTarget),
         _ => None,
     }
+}
+
+/// True when `rel` has any ancestor path component ending in `.dSYM`. The
+/// match is case-insensitive on the suffix to tolerate filesystems that
+/// preserve the historical mixed case but mount case-folded.
+fn path_has_dsym_ancestor(rel: &Path) -> bool {
+    rel.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .map(|name| {
+                let lower = name.to_ascii_lowercase();
+                lower.ends_with(".dsym")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// True for files cargo writes inside `.fingerprint/<crate>-<hash>/` that
+/// feed its freshness decision. soldr's `docs/THIN_TARGET_CACHE_PRUNING.md`
+/// Section 4.3 enumerates these prefixes. Everything else in the directory
+/// (notably the `*.json` debug files) is treated as output.
+fn is_fingerprint_meta_file(rel: &Path) -> bool {
+    let Some(name) = rel.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    if name == "invoked.timestamp" {
+        return true;
+    }
+    matches!(
+        name.split('-').next(),
+        Some("dep" | "output" | "lib" | "bin")
+    ) && name.contains('-')
+}
+
+/// True for cargo's compiled build-script binaries. The base name is
+/// `build-script-build`; the `.exe` suffix appears on Windows targets.
+fn is_build_script_build_file(name: &str) -> bool {
+    let stem = name.strip_suffix(".exe").unwrap_or(name);
+    stem == "build-script-build" || stem.starts_with("build-script-build-")
 }
 
 fn is_likely_proc_macro_dylib(rel: &Path) -> bool {
@@ -1076,13 +1222,24 @@ fn json_u32_field(value: &serde_json::Value, field: &'static str) -> Result<u32,
 }
 
 fn ensure_supported_cache_schema_version(cache_schema_version: u32) -> Result<(), RustPlanError> {
-    if cache_schema_version != RUST_ARTIFACT_CACHE_SCHEMA_VERSION {
-        return Err(RustPlanError::UnsupportedCacheSchemaVersion {
+    if SUPPORTED_RUST_ARTIFACT_CACHE_SCHEMA_VERSIONS.contains(&cache_schema_version) {
+        Ok(())
+    } else {
+        // Report the most recent supported version in the error message so
+        // operators see "expected 2" once thin-v2 lands instead of always
+        // seeing the legacy "expected 1". The error type still carries the
+        // single canonical version field for compat with existing
+        // pattern-matching consumers.
+        let supported = SUPPORTED_RUST_ARTIFACT_CACHE_SCHEMA_VERSIONS
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(RUST_ARTIFACT_CACHE_SCHEMA_VERSION);
+        Err(RustPlanError::UnsupportedCacheSchemaVersion {
             found: cache_schema_version,
-            supported: RUST_ARTIFACT_CACHE_SCHEMA_VERSION,
-        });
+            supported,
+        })
     }
-    Ok(())
 }
 fn relative_path_string(path: &Path) -> String {
     path.components()
@@ -1196,6 +1353,8 @@ mod tests {
             ],
             cache_schema_version: 1,
             journal_log_path: Some(root.join("zccache-session.jsonl").into()),
+            cache_profile: None,
+            dropped_artifact_classes: Vec::new(),
         }
     }
 
@@ -1374,11 +1533,13 @@ mod tests {
         let cache = dir.path().join("cache");
 
         let err = save_rust_plan_local(&plan, &cache).unwrap_err();
+        // soldr#461: zccache now accepts both v1 (legacy) and v2 (thin-v2)
+        // wire schemas; the error reports the most-recent supported version.
         assert!(matches!(
             err,
             RustPlanError::UnsupportedCacheSchemaVersion {
                 found: 99,
-                supported: 1
+                supported: 2
             }
         ));
         assert!(!cache.exists());
@@ -1403,7 +1564,7 @@ mod tests {
             err,
             RustPlanError::UnsupportedCacheSchemaVersion {
                 found: 99,
-                supported: 1
+                supported: 2
             }
         ));
         assert!(sentinel.exists());
@@ -1997,5 +2158,298 @@ mod tests {
             assert_eq!(seq.content_hash, par.content_hash);
             assert_eq!(seq.class, par.class);
         }
+    }
+
+    // ─── soldr#461: thin-v2 wire-format support ──────────────────────────
+
+    /// Builds the full thin-v2 plan shape soldr emits today: explicit
+    /// `cache_profile`, the published allow-list, the published drop-list,
+    /// and `cache_schema_version: 2`. Tests below mutate this baseline.
+    fn sample_thin_v2_plan(root: &Path) -> RustArtifactPlanV1 {
+        RustArtifactPlanV1 {
+            allowed_artifact_classes: vec![
+                RustArtifactClass::CargoFingerprintMeta,
+                RustArtifactClass::DepInfo,
+                RustArtifactClass::BuildScriptMetadata,
+                RustArtifactClass::BuildScriptOutput,
+            ],
+            cache_schema_version: 2,
+            cache_profile: Some("thin-v2".to_string()),
+            dropped_artifact_classes: vec![
+                RustArtifactClass::Incremental,
+                RustArtifactClass::BuildScriptBuild,
+                RustArtifactClass::Rlib,
+                RustArtifactClass::Rmeta,
+                RustArtifactClass::ProcMacro,
+                RustArtifactClass::Dwo,
+                RustArtifactClass::Pdb,
+                RustArtifactClass::Dsym,
+                RustArtifactClass::CargoFingerprintOutputs,
+            ],
+            ..sample_plan(root, RustPlanMode::Thin)
+        }
+    }
+
+    #[test]
+    fn from_json_value_accepts_thin_v2_cache_profile_and_drop_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = sample_thin_v2_plan(dir.path());
+        let value = serde_json::to_value(&plan).unwrap();
+        let loaded = RustArtifactPlanV1::from_json_value(value).unwrap();
+        assert_eq!(loaded.cache_profile.as_deref(), Some("thin-v2"));
+        assert_eq!(loaded.cache_schema_version, 2);
+        assert!(loaded
+            .dropped_artifact_classes
+            .contains(&RustArtifactClass::Rlib));
+        assert!(loaded
+            .allowed_artifact_classes
+            .contains(&RustArtifactClass::CargoFingerprintMeta));
+    }
+
+    #[test]
+    fn from_json_value_ignores_unknown_forward_compat_fields() {
+        // soldr#461 dropped `#[serde(deny_unknown_fields)]` so future soldr
+        // versions can add fields without coordinated zccache releases.
+        let dir = tempfile::tempdir().unwrap();
+        let plan = sample_plan(dir.path(), RustPlanMode::Thin);
+        let mut value = serde_json::to_value(&plan).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "future_soldr_field_that_does_not_exist_yet".to_string(),
+            serde_json::json!({"any": "shape", "version": 9001}),
+        );
+        let loaded =
+            RustArtifactPlanV1::from_json_value(value).expect("unknown fields must be ignored");
+        assert_eq!(loaded.schema_version, 1);
+    }
+
+    #[test]
+    fn legacy_thin_v1_plan_without_new_fields_still_deserializes() {
+        // The legacy wire shape (no `cache_profile`, no
+        // `dropped_artifact_classes`, `cache_schema_version: 1`) must remain
+        // round-trippable so older soldr keeps working unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let plan = sample_plan(dir.path(), RustPlanMode::Thin);
+        let mut value = serde_json::to_value(&plan).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("cache_profile");
+        obj.remove("dropped_artifact_classes");
+        let loaded = RustArtifactPlanV1::from_json_value(value).unwrap();
+        assert!(loaded.cache_profile.is_none());
+        assert!(loaded.dropped_artifact_classes.is_empty());
+        assert_eq!(loaded.cache_schema_version, 1);
+    }
+
+    #[test]
+    fn from_json_value_accepts_cache_schema_version_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = sample_plan(dir.path(), RustPlanMode::Thin);
+        plan.cache_schema_version = 2;
+        let value = serde_json::to_value(&plan).unwrap();
+        let loaded = RustArtifactPlanV1::from_json_value(value).unwrap();
+        assert_eq!(loaded.cache_schema_version, 2);
+    }
+
+    #[test]
+    fn thin_v2_save_drops_rlib_rmeta_even_when_allowed_list_lists_them() {
+        // Confirms the load-bearing property from soldr#461: a file whose
+        // class appears in `dropped_artifact_classes` is skipped during
+        // save even if the same class is also in `allowed_artifact_classes`.
+        let dir = tempfile::tempdir().unwrap();
+        synthetic_target(dir.path());
+        let mut plan = sample_thin_v2_plan(dir.path());
+        // Force the conflict explicitly: keep the drop list, but ALSO put
+        // rlib/rmeta into the allow list so the drop semantics has to win.
+        plan.allowed_artifact_classes = vec![
+            RustArtifactClass::Rlib,
+            RustArtifactClass::Rmeta,
+            RustArtifactClass::DepInfo,
+            RustArtifactClass::CargoFingerprintMeta,
+            RustArtifactClass::BuildScriptMetadata,
+            RustArtifactClass::BuildScriptOutput,
+        ];
+        let cache = dir.path().join("cache");
+
+        let saved = save_rust_plan_local(&plan, &cache).unwrap();
+
+        // No `.rlib` / `.rmeta` survives the walk even though they are
+        // allowed — drop list wins.
+        let bundle_dir = rust_plan_bundle_dir(&cache, &rust_plan_cache_key(&plan));
+        let manifest = load_manifest(&bundle_dir);
+        for artifact in &manifest.artifacts {
+            assert!(
+                !artifact.relative_path.ends_with(".rlib"),
+                "thin-v2 drop list must skip .rlib; got {}",
+                artifact.relative_path
+            );
+            assert!(
+                !artifact.relative_path.ends_with(".rmeta"),
+                "thin-v2 drop list must skip .rmeta; got {}",
+                artifact.relative_path
+            );
+        }
+        // The drops route through the existing summary skip reason so the
+        // CI consumer doesn't need a new bucket.
+        assert!(saved
+            .skipped_reasons
+            .get("artifact_class_disallowed_by_plan")
+            .is_some_and(|n| *n >= 3));
+    }
+
+    #[test]
+    fn thin_v2_save_keeps_fingerprint_meta_but_drops_fingerprint_outputs() {
+        // Tests the split: files cargo reads to make a freshness decision
+        // (`dep-*`, `lib-*`, `bin-*`, `output-*`, `invoked.timestamp`) are
+        // kept; everything else in `.fingerprint/<crate>/` is dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target").join("debug");
+        // Meta files (kept):
+        write(
+            &target.join(".fingerprint/serde-abc/invoked.timestamp"),
+            b"ts",
+        );
+        write(&target.join(".fingerprint/serde-abc/dep-lib-serde"), b"dep");
+        write(
+            &target.join(".fingerprint/serde-abc/lib-serde"),
+            b"libstamp",
+        );
+        // Output file (dropped):
+        write(
+            &target.join(".fingerprint/serde-abc/serde-abc.json"),
+            b"output",
+        );
+        // Need at least one classifiable, non-fingerprint file so the
+        // walker has something else to think about (and to verify it
+        // doesn't get accidentally swept into the drop bucket).
+        write(&target.join("deps/serde-abc.d"), b"depinfo");
+        // Drop a transient incremental file so we exercise that path too.
+        write(&target.join("incremental/state.bin"), b"transient");
+
+        let plan = sample_thin_v2_plan(dir.path());
+        let cache = dir.path().join("cache");
+
+        save_rust_plan_local(&plan, &cache).unwrap();
+
+        let bundle_dir = rust_plan_bundle_dir(&cache, &rust_plan_cache_key(&plan));
+        let manifest = load_manifest(&bundle_dir);
+        let kept_paths: Vec<&str> = manifest
+            .artifacts
+            .iter()
+            .map(|a| a.relative_path.as_str())
+            .collect();
+
+        assert!(
+            kept_paths
+                .iter()
+                .any(|p| p.ends_with(".fingerprint/serde-abc/invoked.timestamp")),
+            "invoked.timestamp must be kept; got {kept_paths:?}",
+        );
+        assert!(
+            kept_paths
+                .iter()
+                .any(|p| p.ends_with(".fingerprint/serde-abc/dep-lib-serde")),
+            "dep-* must be kept; got {kept_paths:?}",
+        );
+        assert!(
+            kept_paths
+                .iter()
+                .any(|p| p.ends_with(".fingerprint/serde-abc/lib-serde")),
+            "lib-* must be kept; got {kept_paths:?}",
+        );
+        assert!(
+            !kept_paths
+                .iter()
+                .any(|p| p.ends_with(".fingerprint/serde-abc/serde-abc.json")),
+            "fingerprint output .json must be dropped; got {kept_paths:?}",
+        );
+        assert!(
+            kept_paths.iter().any(|p| p.ends_with("deps/serde-abc.d")),
+            "dep_info must still be kept; got {kept_paths:?}",
+        );
+    }
+
+    #[test]
+    fn thin_v2_classifier_recognizes_new_classes() {
+        // Smoke tests for the classifier branches the wire-format drop
+        // list relies on. These run with `thin_v2 = true` to exercise the
+        // `.fingerprint/` split; the other categories ignore the flag.
+        let bsb = if cfg!(windows) {
+            Path::new("debug/build/serde-abc/build-script-build.exe")
+        } else {
+            Path::new("debug/build/serde-abc/build-script-build")
+        };
+        assert_eq!(
+            classify_artifact(bsb, RustPlanMode::Thin, true),
+            Some(RustArtifactClass::BuildScriptBuild),
+        );
+
+        assert_eq!(
+            classify_artifact(
+                Path::new("debug/deps/libserde-abc.dwo"),
+                RustPlanMode::Thin,
+                true,
+            ),
+            Some(RustArtifactClass::Dwo),
+        );
+        assert_eq!(
+            classify_artifact(
+                Path::new("debug/deps/libserde-abc.pdb"),
+                RustPlanMode::Thin,
+                true,
+            ),
+            Some(RustArtifactClass::Pdb),
+        );
+        assert_eq!(
+            classify_artifact(
+                Path::new("debug/deps/app.dSYM/Contents/Info.plist"),
+                RustPlanMode::Thin,
+                true,
+            ),
+            Some(RustArtifactClass::Dsym),
+        );
+
+        // thin-v2 fingerprint split:
+        assert_eq!(
+            classify_artifact(
+                Path::new("debug/.fingerprint/serde-abc/invoked.timestamp"),
+                RustPlanMode::Thin,
+                true,
+            ),
+            Some(RustArtifactClass::CargoFingerprintMeta),
+        );
+        assert_eq!(
+            classify_artifact(
+                Path::new("debug/.fingerprint/serde-abc/serde-abc.json"),
+                RustPlanMode::Thin,
+                true,
+            ),
+            Some(RustArtifactClass::CargoFingerprintOutputs),
+        );
+        // Legacy (thin_v2 = false) keeps the umbrella class so older
+        // callers see no behavior change.
+        assert_eq!(
+            classify_artifact(
+                Path::new("debug/.fingerprint/serde-abc/invoked.timestamp"),
+                RustPlanMode::Thin,
+                false,
+            ),
+            Some(RustArtifactClass::CargoFingerprint),
+        );
+    }
+
+    #[test]
+    fn thin_v2_and_thin_v1_identity_hashes_differ() {
+        // Two plans with identical inputs but different `cache_profile`
+        // values must produce distinct cache keys, otherwise a thin-v1
+        // bundle could be served to a thin-v2 plan request (or vice
+        // versa) — and the file sets are different, so restore would
+        // produce a wrong target/ tree.
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = sample_plan(dir.path(), RustPlanMode::Thin);
+        let v2 = sample_thin_v2_plan(dir.path());
+        assert_ne!(
+            rust_plan_identity_hash(&v1),
+            rust_plan_identity_hash(&v2),
+            "thin-v1 and thin-v2 identity hashes must not collide",
+        );
     }
 }
