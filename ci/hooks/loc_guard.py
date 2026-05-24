@@ -57,7 +57,12 @@ def main():
     if loc > ERROR_THRESHOLD:
         print(
             f"LOC guard: {file_path} is {loc} lines (>{ERROR_THRESHOLD}). "
-            f"Split it into focused submodules before continuing.",
+            f"Split it into focused submodules before continuing. "
+            f"Refactor target: < {WARN_THRESHOLD} lines so the file has "
+            f"headroom and future edits don't re-trip this guard or the warn "
+            f"threshold. Convention: `foo.rs` → `foo/mod.rs` + per-domain "
+            f"submodules, with `pub use` re-exports in `mod.rs` so the public "
+            f"path is unchanged.",
             file=sys.stderr,
         )
         return 2
@@ -65,7 +70,10 @@ def main():
     if loc > WARN_THRESHOLD:
         print(
             f"LOC guard warning: {file_path} is {loc} lines (>{WARN_THRESHOLD}). "
-            f"Consider splitting it before it crosses {ERROR_THRESHOLD}.",
+            f"Refactor down to < {WARN_THRESHOLD} so future edits can land "
+            f"without nudging the file past {ERROR_THRESHOLD} and hard-blocking. "
+            f"Convention: `foo.rs` → `foo/mod.rs` + per-domain submodules, with "
+            f"`pub use` re-exports in `mod.rs` so the public path is unchanged.",
             file=sys.stderr,
         )
 
