@@ -8,19 +8,19 @@
 //!   [`DepGraph::from_snapshot`] conversion methods, and the tiny
 //!   `paths_to_strings` / `strings_to_paths` helpers used by both
 //!   conversion and tests.
-//! - [`persistence`]: file I/O — [`save_to_file`], [`load_from_file`],
+//! - `persistence`: file I/O — [`save_to_file`], [`load_from_file`],
 //!   [`classify_load`], [`depgraph_file_path`], and [`DepGraphLoadOutcome`].
-//! - [`tests`] (cfg(test) only): split per concern — roundtrip, persistence,
+//! - `tests` (cfg(test) only): split per concern — roundtrip, persistence,
 //!   behavioral.
 
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::core::NormalizedPath;
+use crate::hash::ContentHash;
 use dashmap::DashMap;
 use rayon::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
-use crate::core::NormalizedPath;
-use crate::hash::ContentHash;
 
 use super::context::{ArtifactKey, CompileContext, ContextKey};
 use super::graph::{ContextEntry, ContextState, DepGraph, FileEntry};
