@@ -610,7 +610,12 @@ mod tests {
     use tempfile::tempdir;
 
     fn wait_for_batch(watcher: &PollingWatcher) -> PollWatchBatch {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // 15s is the GHA Windows runner allowance — under contention the
+        // settle window can stretch past the original 3s budget, producing
+        // intermittent timeouts in `polling_watcher_callbacks_and_polling_share_events`.
+        // Local fastpath returns in low milliseconds; the wider ceiling
+        // only matters when the runner is stressed.
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if let Some(batch) = watcher
                 .poll_timeout(Duration::from_millis(100))
