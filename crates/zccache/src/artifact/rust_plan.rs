@@ -1048,11 +1048,7 @@ fn select_artifacts(
     selected
 }
 
-fn classify_artifact(
-    rel: &Path,
-    mode: RustPlanMode,
-    thin_v2: bool,
-) -> Option<RustArtifactClass> {
+fn classify_artifact(rel: &Path, mode: RustPlanMode, thin_v2: bool) -> Option<RustArtifactClass> {
     // .dSYM/ is a directory bundle on macOS; every file *inside* an enclosing
     // `*.dSYM` ancestor component is dsym. Check first so we don't try to
     // classify `Contents/Info.plist` etc. by extension.
@@ -2312,7 +2308,10 @@ mod tests {
             b"ts",
         );
         write(&target.join(".fingerprint/serde-abc/dep-lib-serde"), b"dep");
-        write(&target.join(".fingerprint/serde-abc/lib-serde"), b"libstamp");
+        write(
+            &target.join(".fingerprint/serde-abc/lib-serde"),
+            b"libstamp",
+        );
         // Output file (dropped):
         write(
             &target.join(".fingerprint/serde-abc/serde-abc.json"),
