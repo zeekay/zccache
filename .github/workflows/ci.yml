@@ -38,8 +38,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@0425f54e37b65c5c36be1fb73628019b3e1aabed
+      - uses: zackees/setup-soldr@be9cd32c413a696e85c13eaeef25400666dd5317
         with:
+          zccache-seed-strict: true
           toolchain: 1.94.1
           cache: true
           build-cache: false
@@ -56,8 +57,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@0425f54e37b65c5c36be1fb73628019b3e1aabed
+      - uses: zackees/setup-soldr@be9cd32c413a696e85c13eaeef25400666dd5317
         with:
+          zccache-seed-strict: true
           toolchain: 1.94.1
           cache: true
           cache-key-suffix: dylint
@@ -91,8 +93,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@0425f54e37b65c5c36be1fb73628019b3e1aabed
+      - uses: zackees/setup-soldr@be9cd32c413a696e85c13eaeef25400666dd5317
         with:
+          zccache-seed-strict: true
           cache: true
           toolchain: 1.94.1
           cache-key-suffix: msrv
@@ -106,8 +109,9 @@ jobs:
       RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@0425f54e37b65c5c36be1fb73628019b3e1aabed
+      - uses: zackees/setup-soldr@be9cd32c413a696e85c13eaeef25400666dd5317
         with:
+          zccache-seed-strict: true
           toolchain: 1.94.1
           cache: true
           cache-key-suffix: docs

@@ -59,8 +59,9 @@ jobs:
 
       - name: setup soldr with cook prebuild (Unix)
         if: runner.os != 'Windows'
-        uses: zackees/setup-soldr@0425f54e37b65c5c36be1fb73628019b3e1aabed
+        uses: zackees/setup-soldr@be9cd32c413a696e85c13eaeef25400666dd5317
         with:
+          zccache-seed-strict: true
           cache: true
           cache-key-suffix: wrapper-e2e-${{ matrix.os }}
           prebuild-deps: soldr-cook
@@ -68,10 +69,27 @@ jobs:
 
       - name: setup soldr without cook prebuild (Windows)
         if: runner.os == 'Windows'
-        uses: zackees/setup-soldr@0425f54e37b65c5c36be1fb73628019b3e1aabed
+        uses: zackees/setup-soldr@be9cd32c413a696e85c13eaeef25400666dd5317
         with:
+          zccache-seed-strict: true
           cache: true
           cache-key-suffix: wrapper-e2e-${{ matrix.os }}
+
+      - name: restore source tree after dependency cook
+        shell: bash
+        run: |
+          # `soldr-cook` builds a cargo-chef recipe. If it leaves placeholder
+          # manifests or default source files behind, reset the checkout before
+          # building the wrapper under test.
+          changed="$(git status --short -- Cargo.toml Cargo.lock rust-toolchain.toml crates)"
+          if [ -n "$changed" ]; then
+            echo "Restoring tracked source files after soldr-cook:"
+            printf '%s\n' "$changed"
+            git restore --source=HEAD --worktree -- Cargo.toml Cargo.lock rust-toolchain.toml crates
+          fi
+          git clean -fd -- crates
+          test ! -e crates/zccache/src/main.rs
+          grep -q 'version.workspace = true' crates/zccache/Cargo.toml
 
       - name: print toolchain
         run: |
@@ -109,6 +127,11 @@ jobs:
             Remove-Item -Force
 
       - name: build zccache release binaries
+        env:
+          # The binary installed below is the wrapper under test. Keep soldr's
+          # zccache compile cache, but do not restore target artifacts that can
+          # reintroduce cargo-chef placeholder executables after cleanup.
+          SOLDR_TARGET_CACHE_MODE: off
         run: |
           soldr cargo build --release --target-dir target -p zccache --bin zccache -p zccache --bin zccache-daemon
 
@@ -118,20 +141,28 @@ jobs:
           install_dir="$HOME/.local/bin"
           mkdir -p "$install_dir"
           # soldr may pin a target triple, in which case the artifacts
-          # live under `target/<triple>/release/`. cargo-chef can also
-          # leave placeholder local-package binaries in target/release.
-          # Install only a candidate that behaves like the real CLI.
-          z=""
-          while IFS= read -r candidate; do
-            version="$("$candidate" --version 2>/dev/null || true)"
-            echo "zccache candidate: $candidate => ${version:-<no output>}"
-            case "$version" in
-              zccache\ *) z="$candidate"; break ;;
-            esac
-          done < <(find target -path '*release/zccache' -type f -not -path '*/deps/*' | sort)
-          test -n "$z" || { echo "usable zccache binary not found under target/"; find target -name 'zccache' -type f; exit 1; }
-          zd="$(dirname "$z")/zccache-daemon"
-          test -f "$zd" || { echo "zccache-daemon binary not found next to $z"; find target -name 'zccache-daemon' -type f; exit 1; }
+          # live under `target/<triple>/release/`. Ignore cargo-chef
+          # placeholder binaries by requiring a real `--version` response.
+          pick_release_binary() {
+            local name="$1"
+            local prefix="$2"
+            local candidate version
+            while IFS= read -r candidate; do
+              version="$("$candidate" --version 2>&1 || true)"
+              if printf '%s\n' "$version" | grep -Eq "^${prefix} [0-9]"; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+              echo "Ignoring non-release candidate $candidate (--version: ${version:-<empty>})" >&2
+            done < <(find target -path "*release/$name" -type f -not -path '*/deps/*' | sort)
+            echo "$name binary not found under target/" >&2
+            find target -name "$name" -type f >&2 || true
+            return 1
+          }
+          z=$(pick_release_binary zccache zccache)
+          zd=$(pick_release_binary zccache-daemon zccache-daemon)
+          echo "Selected zccache: $z ($("$z" --version))"
+          echo "Selected zccache-daemon: $zd ($("$zd" --version))"
           install -m755 "$z"  "$install_dir/zccache"
           install -m755 "$zd" "$install_dir/zccache-daemon"
           echo "$install_dir" >> "$GITHUB_PATH"
@@ -148,31 +179,36 @@ jobs:
         run: |
           $installDir = "$env:USERPROFILE\.local\bin"
           New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-          # Same triple-subdir-or-flat layout as Unix. cargo-chef can
-          # leave placeholder local-package binaries in target\release,
-          # so choose the candidate that behaves like the real CLI.
-          $z = $null
-          $candidates = Get-ChildItem -Recurse target -Filter zccache.exe |
-            Where-Object { $_.FullName -match '\\release\\' -and $_.FullName -notmatch '\\deps\\' } |
-            Sort-Object FullName
-          foreach ($candidate in $candidates) {
-            $version = (& $candidate.FullName --version 2>$null) -join "`n"
-            if (-not $version) { $version = "<no output>" }
-            Write-Host "zccache candidate: $($candidate.FullName) => $version"
-            if ($version -match '^zccache\s') {
-              $z = $candidate
-              break
+          # Same triple-subdir-or-flat layout as Unix; resolve the actual
+          # release binaries and ignore cargo-chef placeholders.
+          function Select-ZccacheBinary {
+            param(
+              [Parameter(Mandatory = $true)][string]$Name,
+              [Parameter(Mandatory = $true)][string]$Prefix
+            )
+            $candidates = Get-ChildItem -Recurse target -Filter $Name |
+              Where-Object { $_.FullName -match '\\release\\' -and $_.FullName -notmatch '\\deps\\' } |
+              Sort-Object FullName
+            foreach ($candidate in $candidates) {
+              $version = (& $candidate.FullName --version 2>&1) -join "`n"
+              if ($LASTEXITCODE -eq 0 -and $version -match "^$([regex]::Escape($Prefix))\s+\d") {
+                return $candidate
+              }
+              if ([string]::IsNullOrWhiteSpace($version)) { $version = "<empty>" }
+              Write-Host "Ignoring non-release candidate $($candidate.FullName) (--version: $version)"
             }
+            throw "$Name binary not found under target/"
           }
-          if (-not $z) { Write-Error "usable zccache.exe not found under target/"; exit 1 }
-          $zd = Join-Path $z.DirectoryName "zccache-daemon.exe"
-          if (-not (Test-Path $zd)) { Write-Error "zccache-daemon.exe not found next to $($z.FullName)"; exit 1 }
-          Copy-Item $z.FullName "$installDir/zccache.exe" -Force
-          Copy-Item $zd "$installDir/zccache-daemon.exe" -Force
+          $z  = Select-ZccacheBinary -Name zccache.exe -Prefix zccache
+          $zd = Select-ZccacheBinary -Name zccache-daemon.exe -Prefix zccache-daemon
+          Write-Host "Selected zccache: $($z.FullName) ($(& $z.FullName --version))"
+          Write-Host "Selected zccache-daemon: $($zd.FullName) ($(& $zd.FullName --version))"
+          Copy-Item $z.FullName  "$installDir/zccache.exe"        -Force
+          Copy-Item $zd.FullName "$installDir/zccache-daemon.exe" -Force
           Add-Content $env:GITHUB_PATH $installDir
 
       - name: Stop setup-soldr builder cache before wrapper smoke test
-        uses: zackees/setup-soldr/cleanup@0425f54e37b65c5c36be1fb73628019b3e1aabed
+        uses: zackees/setup-soldr/cleanup@be9cd32c413a696e85c13eaeef25400666dd5317
 
       - name: smoke compile through wrapper (Unix)
         if: runner.os != 'Windows'
