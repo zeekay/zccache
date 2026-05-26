@@ -8,7 +8,7 @@ GitHub Actions workflow definitions.
 - **benchmark-stats.yml** - Manual/scheduled zccache vs bare compiler vs sccache benchmark publisher for the README images and rendered stats page.
 - **perf-guard.yml** - Main-only Rust, C, and C++ perf-regression guard that runs language jobs in parallel, fails below the zccache vs bare compiler or pinned-sccache speed floors, and uploads Markdown/JSON run artifacts.
 
-Normal build/test workflows use `zackees/setup-soldr` for Rust build acceleration, excluding `release-auto.yml`. Jobs that run zccache self-tests stop the setup-soldr builder daemon before the test phase, run tests with a fresh `ZCCACHE_CACHE_DIR`, and request `SOLDR_CACHE_LIFECYCLE=command` for the isolated test cache when supported by soldr.
+Normal build/test workflows use `zackees/setup-soldr` for Rust build acceleration, excluding `release-auto.yml`. Jobs that run zccache self-tests stop the setup-soldr builder daemon before the test phase, run tests with a fresh `SOLDR_CACHE_DIR`, and request `SOLDR_CACHE_LIFECYCLE=command` for the isolated test cache when supported by soldr.
 
 Exceptions:
 

@@ -63,12 +63,12 @@ jobs:
       - name: Test (full workspace)
         shell: bash
         env:
+          SOLDR_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/integration
           SOLDR_CACHE_LIFECYCLE: command
           SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
-          ZCCACHE_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/integration
         run: |
           set +e
-          echo "Using isolated test ZCCACHE_CACHE_DIR=$ZCCACHE_CACHE_DIR"
+          echo "Using isolated test SOLDR_CACHE_DIR=$SOLDR_CACHE_DIR"
           start=$SECONDS
           soldr cargo test --workspace --no-fail-fast 2>&1 | tee test-output.txt
           status=${PIPESTATUS[0]}
@@ -87,6 +87,6 @@ jobs:
         if: always()
         shell: bash
         env:
-          ZCCACHE_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/integration
+          SOLDR_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/integration
         run: |
-          zccache stop || true
+          soldr cache shutdown --archive-logs "$SOLDR_CACHE_DIR/cache/zccache/logs/archive" || true
