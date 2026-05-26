@@ -18,10 +18,33 @@ crates/zccache/src/cli/symbols.rs
 crates/zccache/src/bin/zccache.rs
 crates/zccache-cli/src/lib.rs
 crates/zccache/src/cli/snapshot_fp.rs
+crates/zccache/src/cli/commands/args.rs
+crates/zccache/src/cli/commands/cache_ops.rs
+crates/zccache/src/cli/commands/symbols.rs
+crates/zccache/src/cli/commands/wrap.rs
+crates/zccache/src/cli/defender.rs
+crates/zccache/src/cli/runtime.rs
+# Crash, lifecycle, and defender code crosses OS process and file-system
+# boundaries. These modules still use raw paths while the normalized path
+# API is being threaded through the surrounding runtime contracts.
+crates/zccache/src/core/crash.rs
+crates/zccache/src/core/defender.rs
+crates/zccache/src/core/lifecycle.rs
 # Daemon server still spawns child processes and hands them raw PathBuf
 # command lines; migration depends on the IPC types adopting
 # NormalizedPath end-to-end.
 crates/zccache/src/daemon/server/mod.rs
+crates/zccache/src/daemon/server/handle_exec.rs
+crates/zccache/src/daemon/server/handle_link.rs
+crates/zccache/src/daemon/server/link_helpers.rs
+crates/zccache/src/daemon/server/persist.rs
+crates/zccache/src/daemon/server/run.rs
+# Daemon trampoline mirrors the launch-cwd release pattern tracked by the
+# unrooted-tempdir lint and has not yet been moved to NormalizedPath.
+crates/zccache/src/daemon/trampoline.rs
+# Symbol sidecar generation manipulates adjacent dump-file paths and remains
+# on PathBuf until the symbol cache API is normalized.
+crates/zccache/src/symbols/cache.rs
 # zccache-download holds the FetchRequest archive_path / destination
 # fields as PathBuf; the download daemon serializes those over the wire,
 # so the migration is a protocol-shaped change.

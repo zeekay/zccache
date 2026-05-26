@@ -627,7 +627,7 @@ async fn spawn_tool(
         for (k, v) in &env_owned {
             cmd.env(k, v);
         }
-        cmd.output()
+        crate::daemon::process::command_output_with_priority(&mut cmd, CompilePriority::Normal)
     })
     .await
     .unwrap_or_else(|e| Err(std::io::Error::other(format!("join error: {e}"))))
