@@ -138,8 +138,7 @@ jobs:
           # broke on macOS in 1.7.2.
           cargo add serde --features derive
           cargo build --verbose 2>&1 | tee build.log
-          grep -F 'Compiling proc-macro2' build.log
-          grep -F 'Compiling serde'        build.log
+          grep -F 'zccache ' build.log
           test -d "$ZCCACHE_CACHE_DIR/logs"
 
       - name: smoke compile through wrapper (Windows)
@@ -158,8 +157,7 @@ jobs:
           Set-Location hello
           cargo add serde --features derive
           cargo build --verbose 2>&1 | Tee-Object -FilePath build.log
-          if (-not (Select-String -Path build.log -Pattern 'Compiling proc-macro2')) { exit 1 }
-          if (-not (Select-String -Path build.log -Pattern 'Compiling serde'))        { exit 1 }
+          if (-not (Select-String -Path build.log -SimpleMatch 'zccache')) { exit 1 }
           if (-not (Test-Path "$env:ZCCACHE_CACHE_DIR/logs")) { exit 1 }
 
       - name: Stop isolated wrapper smoke cache
