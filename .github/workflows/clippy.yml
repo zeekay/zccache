@@ -25,9 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@v0
+      - uses: zackees/setup-soldr@8eb35c6b4b45bc96d33f8490edd97df654a15aa0
         with:
-          version: "0.7.18"
           toolchain: 1.94.1
           cache: true
           cache-key-suffix: clippy

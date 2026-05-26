@@ -49,15 +49,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@v0
+      - uses: zackees/setup-soldr@8eb35c6b4b45bc96d33f8490edd97df654a15aa0
         with:
-          version: "0.7.18"
           toolchain: 1.94.1
           cache: true
+          prebuild-deps: soldr-cook
+          prebuild-deps-flags: ""
+      - name: Build integration test binaries
+        shell: bash
+        run: soldr cargo test --workspace --no-fail-fast --no-run
+      - name: Stop setup-soldr builder cache before tests
+        uses: zackees/setup-soldr/cleanup@8eb35c6b4b45bc96d33f8490edd97df654a15aa0
       - name: Test (full workspace)
         shell: bash
+        env:
+          SOLDR_CACHE_LIFECYCLE: command
+          SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
+          ZCCACHE_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/integration
         run: |
           set +e
+          echo "Using isolated test ZCCACHE_CACHE_DIR=$ZCCACHE_CACHE_DIR"
           start=$SECONDS
           soldr cargo test --workspace --no-fail-fast 2>&1 | tee test-output.txt
           status=${PIPESTATUS[0]}
@@ -72,37 +83,10 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
           exit $status
-      - name: Stop zccache before cache save
+      - name: Stop isolated test cache
         if: always()
         shell: bash
+        env:
+          ZCCACHE_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/integration
         run: |
-          python - <<'PY'
-          import json
-          import os
-          import subprocess
-
-          status = subprocess.run(
-              ["soldr", "status", "--json"],
-              capture_output=True,
-              text=True,
-              check=False,
-          )
-          if status.returncode != 0:
-              raise SystemExit(0)
-
-          try:
-              payload = json.loads(status.stdout)
-          except json.JSONDecodeError:
-              raise SystemExit(0)
-
-          zccache = payload.get("zccache") or {}
-          binary = zccache.get("binary_path")
-          cache_dir = zccache.get("cache_dir") or zccache.get("state_dir")
-          if not binary:
-              raise SystemExit(0)
-
-          env = os.environ.copy()
-          if cache_dir:
-              env["ZCCACHE_CACHE_DIR"] = cache_dir
-          subprocess.run([binary, "stop"], env=env, check=False)
-          PY
+          zccache stop || true

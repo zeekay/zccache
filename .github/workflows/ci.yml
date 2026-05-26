@@ -38,13 +38,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@v0
+      - uses: zackees/setup-soldr@8eb35c6b4b45bc96d33f8490edd97df654a15aa0
         with:
-          version: "0.7.18"
           toolchain: 1.94.1
           cache: true
           build-cache: false
           target-cache: false
+          prebuild-deps: none
       - name: Install Rust components
         run: rustup component add rustfmt
       - name: Check formatting
@@ -56,9 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@v0
+      - uses: zackees/setup-soldr@8eb35c6b4b45bc96d33f8490edd97df654a15aa0
         with:
-          version: "0.7.18"
           toolchain: 1.94.1
           cache: true
           cache-key-suffix: dylint
@@ -92,9 +91,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@v0
+      - uses: zackees/setup-soldr@8eb35c6b4b45bc96d33f8490edd97df654a15aa0
         with:
-          version: "0.7.18"
           cache: true
           toolchain: 1.94.1
           cache-key-suffix: msrv
@@ -108,9 +106,8 @@ jobs:
       RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@v0
+      - uses: zackees/setup-soldr@8eb35c6b4b45bc96d33f8490edd97df654a15aa0
         with:
-          version: "0.7.18"
           toolchain: 1.94.1
           cache: true
           cache-key-suffix: docs

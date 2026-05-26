@@ -24,18 +24,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@v0
+      - uses: zackees/setup-soldr@8eb35c6b4b45bc96d33f8490edd97df654a15aa0
         with:
-          version: "0.7.18"
           toolchain: 1.94.1
           cache: true
           cache-key-suffix: coverage
+          prebuild-deps: soldr-cook
+          prebuild-deps-flags: ""
       - name: Install Rust coverage component
         run: rustup component add llvm-tools-preview
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Stop setup-soldr builder cache before coverage tests
+        uses: zackees/setup-soldr/cleanup@8eb35c6b4b45bc96d33f8490edd97df654a15aa0
       - name: Generate coverage
-        run: soldr cargo llvm-cov --workspace --lcov --output-path lcov.info
+        env:
+          SOLDR_CACHE_LIFECYCLE: command
+          SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
+          ZCCACHE_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/coverage
+        run: |
+          echo "Using isolated coverage ZCCACHE_CACHE_DIR=$ZCCACHE_CACHE_DIR"
+          soldr cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Stop isolated coverage cache
+        if: always()
+        shell: bash
+        env:
+          ZCCACHE_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/coverage
+        run: zccache stop || true
       - name: Upload to Codecov
         uses: codecov/codecov-action@v6
         with:

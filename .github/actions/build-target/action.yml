@@ -10,7 +10,7 @@ inputs:
     required: false
     default: ""
   cache_key:
-    description: Cache key suffix passed to Swatinem/rust-cache as shared-key.
+    description: Cache key suffix passed to setup-soldr.
     required: true
   include_python:
     description: Build and stage Python extension artifacts.
@@ -62,11 +62,6 @@ runs:
         toolchain: 1.94.1
         targets: ${{ inputs.target }}
 
-    - name: Rust cache
-      uses: Swatinem/rust-cache@v2
-      with:
-        shared-key: ${{ inputs.cache_key }}
-
     - name: Install musl tools
       if: inputs.target == 'x86_64-unknown-linux-musl'
       shell: bash
@@ -97,6 +92,15 @@ runs:
         TARGET_UPPER=$(echo "${{ inputs.target }}" | tr '[:lower:]-' '[:upper:]_')
         echo "CARGO_TARGET_${TARGET_UPPER}_LINKER=${{ inputs.linker }}" >> "$GITHUB_ENV"
 
+    - name: Setup soldr build cache
+      uses: zackees/setup-soldr@8eb35c6b4b45bc96d33f8490edd97df654a15aa0
+      with:
+        toolchain: 1.94.1
+        cache: true
+        cache-key-suffix: build-${{ inputs.cache_key }}
+        prebuild-deps: soldr-cook
+        prebuild-deps-flags: "--release --target ${{ inputs.target }}"
+
     # Static-link the MSVC C runtime (vcruntime + UCRT) for Windows release
     # binaries. Without `+crt-static` the published `zccache.exe` declares
     # imports against `VCRUNTIME140.dll` and the `api-ms-win-crt-*` UCRT
@@ -119,8 +123,8 @@ runs:
         if [[ "${{ inputs.target }}" == *pc-windows-msvc ]]; then
           export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
         fi
-        cargo build --release --target ${{ inputs.target }} -p zccache --bin zccache
-        cargo build --release --target ${{ inputs.target }} -p zccache --bin zccache-daemon
+        soldr cargo build --release --target ${{ inputs.target }} -p zccache --bin zccache
+        soldr cargo build --release --target ${{ inputs.target }} -p zccache --bin zccache-daemon
         # zccache-fp is a bin shipped *inside* the umbrella `zccache` crate
         # (see crates/zccache/Cargo.toml `[[bin]] name = "zccache-fp"`). The
         # sibling `zccache-fingerprint` crate is a pyo3 cdylib for the Python
@@ -128,7 +132,7 @@ runs:
         # then `cp`s `target/.../zccache-fp` into `staging/`, which is why
         # building the wrong target left it complaining `cannot stat
         # 'target/.../zccache-fp': No such file or directory`.
-        cargo build --release --target ${{ inputs.target }} -p zccache --bin zccache-fp
+        soldr cargo build --release --target ${{ inputs.target }} -p zccache --bin zccache-fp
 
     # Windows DLL load smoke gate (see zccache#269). If the just-built
     # `zccache.exe` cannot complete loader init on this host, `--version`
@@ -172,9 +176,9 @@ runs:
         # carry the `python` feature, so `-p zccache --features python` is a
         # workflow-only build-target bug that latently broke the release path.
         # Surfaced when 1.9.1 became the first version bump after that split.
-        cargo build --release --target ${{ inputs.target }} -p zccache-cli --features python --lib
-        cargo build --release --target ${{ inputs.target }} -p zccache-watcher --features python --lib
-        cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint --features python --lib
+        soldr cargo build --release --target ${{ inputs.target }} -p zccache-cli --features python --lib
+        soldr cargo build --release --target ${{ inputs.target }} -p zccache-watcher --features python --lib
+        soldr cargo build --release --target ${{ inputs.target }} -p zccache-fingerprint --features python --lib
 
     - name: Stage artifacts
       shell: bash
@@ -318,7 +322,7 @@ runs:
         # binary. Built for the HOST (no --target) so we don't need
         # the target's runtime to run the helper itself. Just appends
         # bytes — never executes the (possibly cross-compiled) target.
-        cargo build --release --bin zccache-stamp
+        soldr cargo build --release --bin zccache-stamp
 
     - name: Stamp release binaries with release marker
       shell: bash
@@ -371,4 +375,3 @@ runs:
           --input-dir staging \
           --debug-input-dir staging-debug \
           --output-dir standalone
-
