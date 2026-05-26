@@ -120,24 +120,25 @@ jobs:
       - name: smoke compile through wrapper (Unix)
         if: runner.os != 'Windows'
         env:
-          # `zccache` is on PATH (from the install step above). cargo
-          # resolves RUSTC_WRAPPER via the usual PATH lookup, so a bare
-          # name works on every OS without runner-specific paths.
-          RUSTC_WRAPPER: zccache
           SOLDR_CACHE_LIFECYCLE: command
           SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
           ZCCACHE_CACHE_DIR: ${{ runner.temp }}/wrapper-e2e-zccache
         run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          export SOLDR_RUSTC_WRAPPER="$HOME/.local/bin/zccache"
           echo "Using isolated wrapper-smoke ZCCACHE_CACHE_DIR=$ZCCACHE_CACHE_DIR"
+          echo "Using SOLDR_RUSTC_WRAPPER=$SOLDR_RUSTC_WRAPPER"
+          command -v zccache
+          zccache --version
           cd "$(mktemp -d)"
-          cargo new --lib hello
+          soldr cargo new --lib hello
           cd hello
           # serde-derive pulls in proc-macro2 + serde_derive, both of
           # which have build scripts. cargo will run the wrapper for
           # each build-script rustc invocation — the exact path that
           # broke on macOS in 1.7.2.
-          cargo add serde --features derive
-          cargo build --verbose 2>&1 | tee build.log
+          soldr cargo add serde --features derive
+          soldr cargo build --verbose 2>&1 | tee build.log
           grep -F 'zccache ' build.log
           test -d "$ZCCACHE_CACHE_DIR/logs"
 
@@ -145,18 +146,22 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          RUSTC_WRAPPER: zccache
           SOLDR_CACHE_LIFECYCLE: command
           SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
           ZCCACHE_CACHE_DIR: ${{ runner.temp }}/wrapper-e2e-zccache
         run: |
+          $wrapper = Join-Path $env:USERPROFILE ".local\bin\zccache.exe"
+          $env:PATH = "$(Split-Path -Parent $wrapper);$env:PATH"
+          $env:SOLDR_RUSTC_WRAPPER = $wrapper
           Write-Host "Using isolated wrapper-smoke ZCCACHE_CACHE_DIR=$env:ZCCACHE_CACHE_DIR"
+          Write-Host "Using SOLDR_RUSTC_WRAPPER=$env:SOLDR_RUSTC_WRAPPER"
+          & $wrapper --version
           $tmp = New-Item -ItemType Directory -Path "$env:TEMP/zc-e2e-$(Get-Random)" -Force
           Set-Location $tmp
-          cargo new --lib hello
+          soldr cargo new --lib hello
           Set-Location hello
-          cargo add serde --features derive
-          cargo build --verbose 2>&1 | Tee-Object -FilePath build.log
+          soldr cargo add serde --features derive
+          soldr cargo build --verbose 2>&1 | Tee-Object -FilePath build.log
           if (-not (Select-String -Path build.log -SimpleMatch 'zccache')) { exit 1 }
           if (-not (Test-Path "$env:ZCCACHE_CACHE_DIR/logs")) { exit 1 }
 
