@@ -57,7 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: zackees/setup-soldr@8eb35c6b4b45bc96d33f8490edd97df654a15aa0
+      - uses: zackees/setup-soldr@386201437808bbe52f97b05e531b0276f8e5cebf
         with:
           cache: true
           cache-key-suffix: wrapper-e2e-${{ matrix.os }}
@@ -115,7 +115,7 @@ jobs:
           Add-Content $env:GITHUB_PATH $installDir
 
       - name: Stop setup-soldr builder cache before wrapper smoke test
-        uses: zackees/setup-soldr/cleanup@8eb35c6b4b45bc96d33f8490edd97df654a15aa0
+        uses: zackees/setup-soldr/cleanup@386201437808bbe52f97b05e531b0276f8e5cebf
 
       - name: smoke compile through wrapper (Unix)
         if: runner.os != 'Windows'
