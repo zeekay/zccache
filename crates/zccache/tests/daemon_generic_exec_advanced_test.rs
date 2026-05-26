@@ -68,6 +68,16 @@ async fn connect_client(endpoint: &str) -> ClientConn {
     zccache::ipc::connect(endpoint).await.expect("connect")
 }
 
+async fn shutdown_daemon(mut client: ClientConn, server: JoinHandle<()>, shutdown: Arc<Notify>) {
+    let _ = client.send(&Request::Shutdown).await;
+    let _ = client.recv::<Response>().await;
+    shutdown.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("daemon shutdown timed out")
+        .expect("daemon task panicked");
+}
+
 // ─── Request builder ─────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -888,14 +898,11 @@ async fn cache_restore_with_normalized_mtimes_still_hits() {
     };
 
     {
-        let (endpoint, _srv, shutdown) = start_daemon(cache.path()).await;
+        let (endpoint, server, shutdown) = start_daemon(cache.path()).await;
         let mut client = connect_client(&endpoint).await;
         client.send(&make_req()).await.unwrap();
         let _ = client.recv::<Response>().await.unwrap();
-        let _ = client.send(&Request::Shutdown).await;
-        let _ = client.recv::<Response>().await;
-        shutdown.notify_one();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        shutdown_daemon(client, server, shutdown).await;
     }
 
     // Normalize the input's mtime to a fixed past value, mirroring what
@@ -905,7 +912,7 @@ async fn cache_restore_with_normalized_mtimes_still_hits() {
 
     // Bring a fresh daemon up on the same cache root and verify the warm
     // hit still works.
-    let (endpoint, _srv, shutdown) = start_daemon(cache.path()).await;
+    let (endpoint, server, shutdown) = start_daemon(cache.path()).await;
     let mut client = connect_client(&endpoint).await;
     client.send(&make_req()).await.unwrap();
     let resp = client.recv::<Response>().await.unwrap();
@@ -919,9 +926,7 @@ async fn cache_restore_with_normalized_mtimes_still_hits() {
         other => panic!("unexpected: {other:?}"),
     }
 
-    let _ = client.send(&Request::Shutdown).await;
-    let _ = client.recv::<Response>().await;
-    shutdown.notify_one();
+    shutdown_daemon(client, server, shutdown).await;
 }
 
 // ─── Caller missing required input → diagnostic ─────────────────────────
