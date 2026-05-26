@@ -15,11 +15,12 @@
 # Daemon trampoline chdirs to $TMPDIR so the parent's launch-cwd directory
 # can be deleted on Windows. The path is the chdir destination, not a
 # scratch location. See `release_cwd()`.
-crates/zccache-daemon/src/trampoline.rs
+crates/zccache/src/daemon/trampoline.rs
 
 # Same release_cwd pattern, duplicated in the cli's compiler-wrap path so
 # the cli doesn't need a runtime dep on the daemon crate.
 crates/zccache-cli/src/main.rs
+crates/zccache/src/cli/commands/wrap.rs
 
 # zccache-test-support is a dev-only crate. The temp-dir cleanup helper
 # walks $TMPDIR looking for stale test fixtures; it does not create state
@@ -31,4 +32,4 @@ crates/zccache-test-support/src/lib.rs
 # paths at lines 2235/6817 are transient sidecars whose lifetime is bounded
 # by the compiler subprocess and which deliberately don't live under the
 # user-visible `~/.zccache/` tree. Migrating those is a follow-up.
-crates/zccache-daemon/src/server.rs
+crates/zccache/src/daemon/server/run.rs
