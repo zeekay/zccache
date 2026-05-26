@@ -490,6 +490,39 @@ fn compile_miss_reason(
     }
 }
 
+/// Issue #339: derive a `SelfProfileSpans` approximation from the total
+/// request latency. Splits the latency across the four `self_profile_ns`
+/// buckets that the JSON schema names so consumers see non-zero per-phase
+/// values for the relevant outcome. The split is intentionally coarse —
+/// real per-phase plumbing would require threading `&mut SelfProfileSpans`
+/// through every early-return in `handle_compile` (100+ sites). For
+/// observability v1 the wall-clock-summed approximation is the unblocking
+/// choice; a v2 follow-up can swap in genuine per-site spans without
+/// changing the wire field.
+fn derive_approx_spans(outcome: &str, total_ns: u128) -> Option<SelfProfileSpans> {
+    let mut spans = SelfProfileSpans::default();
+    match outcome {
+        "hit" | "link_hit" => {
+            // Hit path: hash_inputs (input fingerprint) → lookup (artifact
+            // resolution) → decompress (materialize cached bytes). No store.
+            let third = total_ns / 3;
+            spans.add_hash_inputs_ns(third);
+            spans.add_lookup_ns(third);
+            spans.add_decompress_ns(total_ns - 2 * third);
+        }
+        "miss" | "link_miss" => {
+            // Miss path: hash_inputs → lookup → store (write new artifact).
+            // No decompress (nothing cached to materialize).
+            let quarter = total_ns / 4;
+            spans.add_hash_inputs_ns(quarter);
+            spans.add_lookup_ns(quarter);
+            spans.add_store_ns(total_ns - 2 * quarter);
+        }
+        _ => return None,
+    }
+    Some(spans)
+}
+
 #[cfg(test)]
 mod self_profile_tests {
     use super::*;
@@ -552,37 +585,4 @@ mod self_profile_tests {
     fn error_outcome_returns_none() {
         assert!(derive_approx_spans("error", 100).is_none());
     }
-}
-
-/// Issue #339: derive a `SelfProfileSpans` approximation from the total
-/// request latency. Splits the latency across the four `self_profile_ns`
-/// buckets that the JSON schema names so consumers see non-zero per-phase
-/// values for the relevant outcome. The split is intentionally coarse —
-/// real per-phase plumbing would require threading `&mut SelfProfileSpans`
-/// through every early-return in `handle_compile` (100+ sites). For
-/// observability v1 the wall-clock-summed approximation is the unblocking
-/// choice; a v2 follow-up can swap in genuine per-site spans without
-/// changing the wire field.
-fn derive_approx_spans(outcome: &str, total_ns: u128) -> Option<SelfProfileSpans> {
-    let mut spans = SelfProfileSpans::default();
-    match outcome {
-        "hit" | "link_hit" => {
-            // Hit path: hash_inputs (input fingerprint) → lookup (artifact
-            // resolution) → decompress (materialize cached bytes). No store.
-            let third = total_ns / 3;
-            spans.add_hash_inputs_ns(third);
-            spans.add_lookup_ns(third);
-            spans.add_decompress_ns(total_ns - 2 * third);
-        }
-        "miss" | "link_miss" => {
-            // Miss path: hash_inputs → lookup → store (write new artifact).
-            // No decompress (nothing cached to materialize).
-            let quarter = total_ns / 4;
-            spans.add_hash_inputs_ns(quarter);
-            spans.add_lookup_ns(quarter);
-            spans.add_store_ns(total_ns - 2 * quarter);
-        }
-        _ => return None,
-    }
-    Some(spans)
 }

@@ -767,6 +767,11 @@ async fn store_exec_artifact(state: &Arc<SharedState>, key_hex: String, artifact
             .filter_map(|o| o.payload.as_bytes().cloned())
             .collect();
         let persist_meta = cached.meta.clone();
+        if payloads.is_empty() {
+            // Stdout/stderr-only artifacts have no payload files to persist,
+            // so expose their index entry to the final shutdown flush now.
+            state.artifact_store.insert(&key_hex, &persist_meta);
+        }
         let state_ref = Arc::clone(state);
         let sem = Arc::clone(&state.persist_semaphore);
         tokio::spawn(async move {
