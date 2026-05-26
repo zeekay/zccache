@@ -485,3 +485,49 @@ fn request_fingerprint_includes_rust_key_env() {
 
     assert_ne!(a, b);
 }
+
+/// Issue #396 — `CARGO_TARGET_DIR` is output-placement state and must NOT
+/// alter the request fingerprint. Without this filter, two worktrees whose
+/// only difference is the target-dir leaf name produce divergent fingerprints
+/// and never share the request-level fast path, even with
+/// `ZCCACHE_PATH_REMAP=auto`.
+#[test]
+fn request_fingerprint_ignores_cargo_target_dir() {
+    let args = vec!["src/lib.rs".to_string()];
+    let env_a = vec![
+        ("CARGO_PKG_VERSION".to_string(), "1.0.0".to_string()),
+        (
+            "CARGO_TARGET_DIR".to_string(),
+            "/repo/.claude/worktrees/parent-cache-main-target".to_string(),
+        ),
+    ];
+    let env_b = vec![
+        ("CARGO_PKG_VERSION".to_string(), "1.0.0".to_string()),
+        (
+            "CARGO_TARGET_DIR".to_string(),
+            "/repo/.claude/worktrees/parent-cache-sub-target".to_string(),
+        ),
+    ];
+
+    let a = request_fingerprint(
+        Path::new("/usr/bin/rustc"),
+        &args,
+        Path::new("/workspace"),
+        Some(Path::new("/workspace")),
+        Some(&env_a),
+    );
+    let b = request_fingerprint(
+        Path::new("/usr/bin/rustc"),
+        &args,
+        Path::new("/workspace"),
+        Some(Path::new("/workspace")),
+        Some(&env_b),
+    );
+
+    assert_eq!(
+        a, b,
+        "CARGO_TARGET_DIR is output-placement state and must NOT enter the \
+         request fingerprint; worktrees with different target-dir leaf names \
+         should share the request-level fast path (issue #396)"
+    );
+}

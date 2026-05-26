@@ -88,7 +88,7 @@ pub mod miss_reason {
 pub struct JournalEntry {
     /// ISO 8601 UTC timestamp.
     pub ts: String,
-    /// Outcome: "hit", "miss", "error", "link_hit", "link_miss".
+    /// Outcome: "hit", "miss", "error", "cached_error", "link_hit", "link_miss".
     pub outcome: &'static str,
     /// Full path to compiler/tool.
     pub compiler: String,

@@ -19,7 +19,11 @@ pub fn extract_outcome(response: &Response) -> Option<(&'static str, i32, Option
             exit_code, cached, ..
         } => {
             if *exit_code != 0 {
-                Some(("error", *exit_code, None))
+                if *cached {
+                    Some(("cached_error", *exit_code, None))
+                } else {
+                    Some(("error", *exit_code, None))
+                }
             } else if *cached {
                 Some(("hit", *exit_code, None))
             } else {

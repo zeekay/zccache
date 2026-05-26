@@ -321,11 +321,18 @@ pub(super) fn request_env_fingerprint_vars(
         .flatten()
         .filter_map(|(key, value)| {
             let key = key.as_str();
+            // Mirror `VOLATILE_CARGO_ENV_VARS` in `depgraph::context`: the
+            // request-level fingerprint must drop the same path-cascading
+            // CARGO_* vars the rustc context key drops, otherwise the
+            // fast-path miss/hit decision diverges from the slow-path key
+            // computation and worktrees with different target-dir leaf names
+            // never reach the artifact lookup (issue #396).
             let include = key.starts_with("CARGO_")
                 && key != "CARGO_MAKEFLAGS"
                 && key != "CARGO_INCREMENTAL"
                 && key != "CARGO_MANIFEST_DIR"
-                && key != "CARGO_MANIFEST_PATH";
+                && key != "CARGO_MANIFEST_PATH"
+                && key != "CARGO_TARGET_DIR";
             include.then_some((key, value.as_str()))
         })
         .collect();

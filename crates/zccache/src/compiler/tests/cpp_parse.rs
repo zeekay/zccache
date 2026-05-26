@@ -18,6 +18,22 @@ fn basic_cacheable_compilation() {
 }
 
 #[test]
+fn assembler_sources_are_cacheable() {
+    for source in ["ring.S", "plain.s"] {
+        let output = source.replace('.', "_") + ".o";
+        let result = parse_invocation("clang", &args(&["-c", source, "-o", output.as_str()]));
+        match result {
+            ParsedInvocation::Cacheable(c) => {
+                assert_eq!(c.source_file, NormalizedPath::new(source));
+                assert_eq!(c.output_file, NormalizedPath::new(output));
+                assert_eq!(c.family, CompilerFamily::Clang);
+            }
+            other => panic!("expected cacheable assembler source, got: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn no_c_flag_is_non_cacheable() {
     let result = parse_invocation("gcc", &args(&["hello.cpp", "-o", "hello"]));
     assert!(matches!(result, ParsedInvocation::NonCacheable { .. }));

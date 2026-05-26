@@ -251,7 +251,7 @@ impl AnalyzeReport {
                 cb.misses += 1;
                 cb.total_ns = cb.total_ns.saturating_add(latency_ns);
             }
-            "error" => {
+            "error" | "cached_error" => {
                 self.compile_count += 1;
                 self.error_count += 1;
                 let cb = self.by_crate.entry(crate_key).or_default();
@@ -743,7 +743,7 @@ fn is_compile_journal_entry(value: &serde_json::Value) -> bool {
     let outcome = value.get("outcome").and_then(|v| v.as_str());
     let has_known_outcome = matches!(
         outcome,
-        Some("hit" | "miss" | "error" | "link_hit" | "link_miss")
+        Some("hit" | "miss" | "error" | "cached_error" | "link_hit" | "link_miss")
     );
     has_known_outcome
         && value.get("compiler").and_then(|v| v.as_str()).is_some()

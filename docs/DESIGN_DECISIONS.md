@@ -636,7 +636,7 @@ v1 is deliberately minimal. The goal is a correct, useful tool for the most comm
 
 **Context:** Debugging build failures, auditing cache behavior, and replaying builds all require knowing the exact commands that were executed. The daemon's `daemon.log` is human-readable but not machine-parseable, and it doesn't capture enough detail (full args, env, working directory) to replay a build.
 
-**Decision:** Record every compile and link command to `~/.zccache/logs/compile_journal.jsonl` as one JSON object per line. The schema captures: ISO 8601 timestamp, outcome (`hit`/`miss`/`error`/`link_hit`/`link_miss`), full compiler path, full argument list, working directory, environment variables (when explicitly passed), exit code, session ID, and wall-clock latency in nanoseconds.
+**Decision:** Record every compile and link command to `~/.zccache/logs/compile_journal.jsonl` as one JSON object per line. The schema captures: ISO 8601 timestamp, outcome (`hit`/`miss`/`error`/`cached_error`/`link_hit`/`link_miss`), full compiler path, full argument list, working directory, environment variables (when explicitly passed), exit code, session ID, and wall-clock latency in nanoseconds.
 
 **Rationale:**
 - **JSONL** is trivially parseable by `jq`, Python, and any JSON library. One object per line means no framing issues and the file is append-only.

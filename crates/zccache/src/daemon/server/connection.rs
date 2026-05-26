@@ -111,6 +111,7 @@ pub(super) async fn handle_connection(
                         total_compilations: snap.compilations,
                         non_cacheable: snap.non_cacheable,
                         compile_errors: snap.compile_errors,
+                        compile_errors_cached: snap.compile_errors_cached,
                         time_saved_ms: snap.time_saved_ms(),
                         total_links: snap.link_total,
                         link_hits: snap.link_hits,
@@ -232,6 +233,7 @@ pub(super) async fn handle_connection(
                                     misses: f.misses,
                                     non_cacheable: f.non_cacheable,
                                     errors: f.errors,
+                                    errors_cached: f.errors_cached,
                                     time_saved_ms: f.time_saved_ms,
                                     unique_sources: f.unique_sources,
                                     bytes_read: f.bytes_read,
@@ -273,6 +275,7 @@ pub(super) async fn handle_connection(
                                     misses: f.misses,
                                     non_cacheable: f.non_cacheable,
                                     errors: f.errors,
+                                    errors_cached: f.errors_cached,
                                     time_saved_ms: f.time_saved_ms,
                                     unique_sources: f.unique_sources,
                                     bytes_read: f.bytes_read,
@@ -432,6 +435,7 @@ pub(super) async fn handle_connection(
         // Log to compile journal for journalable requests.
         if let Some(ctx) = journal_ctx {
             if let Some((outcome, exit_code, miss_reason)) = extract_outcome(&response) {
+                let miss_reason = compile_miss_reason(&ctx, outcome, miss_reason);
                 let latency_ns = journal_start.elapsed().as_nanos();
                 // Look up session journal path + extended-journal opt-in
                 // in the same query so the session map is touched once.
@@ -470,9 +474,53 @@ pub(super) async fn handle_connection(
     }
 }
 
+fn compile_miss_reason(
+    ctx: &JournalContext,
+    outcome: &str,
+    default_reason: Option<&'static str>,
+) -> Option<&'static str> {
+    if outcome != "miss" || default_reason != Some(miss_reason::UNKNOWN) {
+        return default_reason;
+    }
+    match crate::compiler::parse_invocation(&ctx.compiler, &ctx.args) {
+        crate::compiler::ParsedInvocation::NonCacheable { .. } => {
+            Some(miss_reason::UNCACHEABLE_INPUT)
+        }
+        _ => default_reason,
+    }
+}
+
 #[cfg(test)]
 mod self_profile_tests {
     use super::*;
+
+    fn test_journal_ctx(compiler: &str, args: &[&str]) -> JournalContext {
+        JournalContext {
+            compiler: compiler.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            cwd: ".".to_string(),
+            env: None,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn parse_time_non_cacheable_miss_is_attributed() {
+        let ctx = test_journal_ctx("rustc", &["--version"]);
+        assert_eq!(
+            compile_miss_reason(&ctx, "miss", Some(miss_reason::UNKNOWN)),
+            Some(miss_reason::UNCACHEABLE_INPUT)
+        );
+    }
+
+    #[test]
+    fn cacheable_miss_keeps_default_reason() {
+        let ctx = test_journal_ctx("rustc", &["--crate-name", "demo", "src/lib.rs"]);
+        assert_eq!(
+            compile_miss_reason(&ctx, "miss", Some(miss_reason::UNKNOWN)),
+            Some(miss_reason::UNKNOWN)
+        );
+    }
 
     #[test]
     fn hit_split_has_non_zero_hash_lookup_decompress() {

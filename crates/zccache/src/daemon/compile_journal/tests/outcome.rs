@@ -86,14 +86,13 @@ fn test_extract_outcome_non_compile() {
 
 #[test]
 fn test_extract_outcome_compile_cached_nonzero_exit() {
-    // exit_code != 0 takes priority over cached flag
     let resp = Response::CompileResult {
         exit_code: 1,
         stdout: Arc::new(vec![]),
         stderr: Arc::new(vec![]),
         cached: true,
     };
-    assert_eq!(extract_outcome(&resp), Some(("error", 1, None)));
+    assert_eq!(extract_outcome(&resp), Some(("cached_error", 1, None)));
 }
 
 #[test]
@@ -139,6 +138,7 @@ fn test_extract_outcome_all_non_journalable() {
             total_compilations: 0,
             non_cacheable: 0,
             compile_errors: 0,
+            compile_errors_cached: 0,
             time_saved_ms: 0,
             total_links: 0,
             link_hits: 0,
@@ -174,6 +174,7 @@ fn test_extract_outcome_all_non_journalable() {
                 misses: 0,
                 non_cacheable: 0,
                 errors: 0,
+                errors_cached: 0,
                 time_saved_ms: 0,
                 unique_sources: 0,
                 bytes_read: 0,

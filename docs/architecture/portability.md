@@ -51,6 +51,22 @@ caller-provided arguments. This makes the auto remap a broad fallback rule:
 if the caller also provided a narrower overlapping remap, the compiler sees
 the caller's remap later and it remains the winning rule.
 
+### Cache identity is target-dir-shape independent
+
+`CARGO_TARGET_DIR` does not contribute to the rustc request fingerprint or
+context key. Two worktrees pointing at the same source tree, the same zccache
+cache, and `ZCCACHE_PATH_REMAP=auto` share rustc cache hits even when each
+picks a different relative target-dir leaf name (for example
+`.claude/worktrees/parent-cache-main-target` vs
+`.claude/worktrees/parent-cache-sub-target`). The filter is mechanically
+identical to the existing `CARGO_MANIFEST_DIR` / `CARGO_MANIFEST_PATH` filter
+(issue #139): output-placement and crate-location state are stripped from the
+cache key. The constant of record is `VOLATILE_CARGO_ENV_VARS` in
+`depgraph::context` — the request fingerprint mirrors the same set so the
+fast-path miss/hit decision does not diverge from the slow-path key
+computation (issue #396). Cargo `--out-dir`, `-L`, and `--extern` directory
+prefixes derived from `CARGO_TARGET_DIR` are already non-cache-key state.
+
 ## File Identity
 
 `FileId` is obtained via:

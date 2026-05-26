@@ -4,7 +4,7 @@ use super::CompilerFamily;
 
 /// Source file extensions we recognize as C/C++.
 pub(crate) const SOURCE_EXTENSIONS: &[&str] = &[
-    "c", "cc", "cpp", "cxx", "c++", "C", "m", "mm", "i", "ii", "cppm", "ixx",
+    "c", "cc", "cpp", "cxx", "c++", "C", "m", "mm", "i", "ii", "cppm", "ixx", "s", "S",
 ];
 
 /// File extensions that imply module-interface mode even without `-x c++-module`.

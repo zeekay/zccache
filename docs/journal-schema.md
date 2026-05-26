@@ -11,7 +11,7 @@ scripts) can rely on.
 | Field          | Type            | Always present | Notes |
 |----------------|-----------------|----------------|-------|
 | `ts`           | string          | yes            | ISO 8601 UTC timestamp of the record write. |
-| `outcome`      | string          | yes            | One of `hit`, `miss`, `error`, `link_hit`, `link_miss`. |
+| `outcome`      | string          | yes            | One of `hit`, `miss`, `error`, `cached_error`, `link_hit`, `link_miss`. |
 | `compiler`     | string          | yes            | Absolute path to the compiler binary as the client invoked it. |
 | `args`         | array of string | yes            | Full argument list, suitable for replay. |
 | `cwd`          | string          | yes            | Working directory at request time. |
@@ -38,10 +38,12 @@ set instead of guessing. The closed set today:
 | `input_fingerprint_mismatch`   | A context exists but the source/header/flag fingerprint differs from the cached entry. The most actionable bucket — points at unexpected input drift. |
 | `no_artifact_for_key`          | The cache key resolved, but the artifact bytes on disk are gone (GC'd, never persisted, or corrupted). |
 | `version_skew`                 | Compiler version, target triple, or zccache schema differs from the cached entry. |
-| `uncacheable_input`            | The invocation parsed but is intrinsically uncacheable (PGO profile emit, host-specific link flags, etc.). |
+| `uncacheable_input`            | The invocation parsed but is intrinsically uncacheable or was rejected before cache-key construction (version probes, stdin-only probes, unsupported flags, etc.). |
 | `unknown`                      | Fallback. Emitted whenever the daemon detected a miss but has not yet attributed a precise reason. Follow-up work narrows `unknown` into the concrete buckets above. Consumers should still treat the field as present so dashboards don't crash on absent keys. |
 
-Hit and error records never carry `miss_reason`.
+Hit and error records never carry `miss_reason`. `cached_error` records are
+replayed rustc failures; they are distinct from fresh `error` records and
+also omit `miss_reason`.
 
 The Rust source of truth is the `miss_reason` module in
 `crates/zccache-daemon/src/compile_journal.rs`. `miss_reason::ALL` is the

@@ -28,6 +28,8 @@ pub struct SessionStatsTracker {
     pub non_cacheable: u64,
     /// Compilations with non-zero exit.
     pub errors: u64,
+    /// Non-zero compile results served from cache.
+    pub errors_cached: u64,
     /// Estimated time saved in nanoseconds.
     pub time_saved_ns: u64,
     /// Distinct source files compiled.
@@ -47,6 +49,7 @@ pub struct FinalizedSessionStats {
     pub misses: u64,
     pub non_cacheable: u64,
     pub errors: u64,
+    pub errors_cached: u64,
     pub time_saved_ms: u64,
     pub unique_sources: u64,
     pub bytes_read: u64,
@@ -63,6 +66,7 @@ impl SessionStatsTracker {
             misses: 0,
             non_cacheable: 0,
             errors: 0,
+            errors_cached: 0,
             time_saved_ns: 0,
             sources: HashSet::new(),
             bytes_read: 0,
@@ -98,6 +102,12 @@ impl SessionStatsTracker {
         self.errors += 1;
     }
 
+    /// Record a cached compile error replay.
+    pub fn record_cached_error(&mut self) {
+        self.compilations += 1;
+        self.errors_cached += 1;
+    }
+
     /// Finalize into a plain stats struct given the session's creation time.
     #[must_use]
     pub fn finalize(&self, created_at: Instant) -> FinalizedSessionStats {
@@ -108,6 +118,7 @@ impl SessionStatsTracker {
             misses: self.misses,
             non_cacheable: self.non_cacheable,
             errors: self.errors,
+            errors_cached: self.errors_cached,
             time_saved_ms: self.time_saved_ns / 1_000_000,
             unique_sources: self.sources.len() as u64,
             bytes_read: self.bytes_read,
@@ -568,6 +579,7 @@ mod tests {
         assert_eq!(t.misses, 0);
         assert_eq!(t.non_cacheable, 0);
         assert_eq!(t.errors, 0);
+        assert_eq!(t.errors_cached, 0);
         assert_eq!(t.bytes_read, 0);
         assert_eq!(t.bytes_written, 0);
         assert!(t.sources.is_empty());
@@ -600,9 +612,11 @@ mod tests {
         let mut t = SessionStatsTracker::new();
         t.record_non_cacheable();
         t.record_error();
-        assert_eq!(t.compilations, 1);
+        t.record_cached_error();
+        assert_eq!(t.compilations, 2);
         assert_eq!(t.non_cacheable, 1);
         assert_eq!(t.errors, 1);
+        assert_eq!(t.errors_cached, 1);
     }
 
     #[test]
@@ -620,6 +634,7 @@ mod tests {
         assert_eq!(f.hits, 1);
         assert_eq!(f.misses, 1);
         assert_eq!(f.non_cacheable, 1);
+        assert_eq!(f.errors_cached, 0);
         assert_eq!(f.time_saved_ms, 5); // 5_000_000ns / 1_000_000
         assert_eq!(f.unique_sources, 2);
         assert_eq!(f.bytes_read, 1024);

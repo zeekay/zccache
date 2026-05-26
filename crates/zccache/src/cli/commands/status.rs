@@ -78,6 +78,9 @@ pub(crate) async fn cmd_status(endpoint: &str, json: bool) -> ExitCode {
             if s.compile_errors > 0 {
                 println!("  Errors:        {}", s.compile_errors);
             }
+            if s.compile_errors_cached > 0 {
+                println!("  Cached errors: {}", s.compile_errors_cached);
+            }
             println!();
             println!(
                 "  Artifacts:     {} ({})",

@@ -236,8 +236,8 @@ pub(crate) fn print_session_stats_human(
     };
     eprintln!("{label}");
     eprintln!(
-        "  {} compilations: {} hits, {} misses, {} non-cacheable",
-        stats.compilations, stats.hits, stats.misses, stats.non_cacheable
+        "  {} compilations: {} hits, {} misses, {} non-cacheable, {} cached errors",
+        stats.compilations, stats.hits, stats.misses, stats.non_cacheable, stats.errors_cached
     );
     eprintln!("  Hit rate: {hit_rate}");
     if stats.time_saved_ms > 0 {
@@ -301,6 +301,7 @@ pub(crate) fn session_stats_json(
         "misses": stats.misses,
         "non_cacheable": stats.non_cacheable,
         "errors": stats.errors,
+        "errors_cached": stats.errors_cached,
         "time_saved_ms": stats.time_saved_ms,
         "unique_sources": stats.unique_sources,
         "bytes_read": stats.bytes_read,

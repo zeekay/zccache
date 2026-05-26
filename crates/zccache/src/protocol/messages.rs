@@ -340,6 +340,8 @@ pub struct DaemonStatus {
     pub non_cacheable: u64,
     /// Compilations that exited with non-zero status.
     pub compile_errors: u64,
+    /// Non-zero compile results served from cache.
+    pub compile_errors_cached: u64,
     /// Estimated wall-clock time saved in milliseconds.
     pub time_saved_ms: u64,
     /// Total link/archive requests received.
@@ -421,6 +423,9 @@ pub struct SessionStats {
     pub non_cacheable: u64,
     /// Compilations that exited with non-zero status.
     pub errors: u64,
+    /// Non-zero compile results served from cache.
+    #[serde(default)]
+    pub errors_cached: u64,
     /// Estimated wall-clock time saved in milliseconds.
     pub time_saved_ms: u64,
     /// Distinct source files compiled.
@@ -620,6 +625,7 @@ mod tests {
             misses: 15,
             non_cacheable: 5,
             errors: 2,
+            errors_cached: 1,
             time_saved_ms: 8000,
             unique_sources: 42,
             bytes_read: 1024 * 1024,
@@ -638,6 +644,7 @@ mod tests {
             misses: 0,
             non_cacheable: 0,
             errors: 0,
+            errors_cached: 0,
             time_saved_ms: 0,
             unique_sources: 0,
             bytes_read: 0,
@@ -659,6 +666,7 @@ mod tests {
             misses: 12,
             non_cacheable: 31,
             errors: 3,
+            errors_cached: 2,
             time_saved_ms: 223,
             unique_sources: 115,
             bytes_read: 143_812_577,
@@ -703,6 +711,7 @@ mod tests {
         }"#;
         let decoded: SessionStats = serde_json::from_str(legacy).expect("legacy decode");
         assert!(decoded.phase_profile.is_none());
+        assert_eq!(decoded.errors_cached, 0);
     }
 
     #[test]
@@ -718,6 +727,7 @@ mod tests {
             total_compilations: 1247,
             non_cacheable: 15,
             compile_errors: 3,
+            compile_errors_cached: 2,
             time_saved_ms: 750_000,
             total_links: 50,
             link_hits: 38,
@@ -805,6 +815,7 @@ mod tests {
             misses: 3,
             non_cacheable: 1,
             errors: 0,
+            errors_cached: 0,
             time_saved_ms: 8200,
             unique_sources: 30,
             bytes_read: 2_000_000,
@@ -910,6 +921,7 @@ mod tests {
             misses: 2,
             non_cacheable: 1,
             errors: 0,
+            errors_cached: 0,
             time_saved_ms: 3000,
             unique_sources: 9,
             bytes_read: 50_000,
@@ -966,6 +978,7 @@ mod tests {
             total_compilations: 0,
             non_cacheable: 0,
             compile_errors: 0,
+            compile_errors_cached: 0,
             time_saved_ms: 0,
             total_links: 0,
             link_hits: 0,
@@ -985,14 +998,15 @@ mod tests {
 
     // Compile-time check: PROTOCOL_VERSION must be positive.
     const _: () = assert!(super::super::PROTOCOL_VERSION > 0);
-    // Compile-time check: PROTOCOL_VERSION == 11 after `GenericToolExec`
-    // gained Path A (include scan) + Path B (depfile) + non_deterministic
-    // + key_args_filter — fully implementing issue #272. v10 was the prior
-    // pin when `GenericToolExec` was added. v9 was the pin after
-    // SessionStats gained `phase_profile`. v8 was the pin after
+    // Compile-time check: PROTOCOL_VERSION == 12 after cached-error counters
+    // were added for rustc negative-result caching. v11 was the pin after
+    // `GenericToolExec` gained Path A (include scan) + Path B (depfile) +
+    // non_deterministic + key_args_filter, fully implementing issue #272.
+    // v10 was the prior pin when `GenericToolExec` was added. v9 was the pin
+    // after SessionStats gained `phase_profile`. v8 was the pin after
     // Compile/CompileEphemeral gained `stdin` and ArtifactPayload replaced
     // ArtifactOutput.data: Arc<Vec<u8>> (issue #296 Option B).
-    const _FINGERPRINT_VERSION: () = assert!(super::super::PROTOCOL_VERSION == 11);
+    const _FINGERPRINT_VERSION: () = assert!(super::super::PROTOCOL_VERSION == 12);
 
     #[test]
     fn fingerprint_check_roundtrip() {

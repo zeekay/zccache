@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 
 use super::compile_journal::{
-    extract_outcome, CompileJournal, JournalContext, JournalEntry, SelfProfileSpans,
+    extract_outcome, miss_reason, CompileJournal, JournalContext, JournalEntry, SelfProfileSpans,
 };
 use super::fingerprint::FingerprintManager;
 use super::process::CompilePriority;

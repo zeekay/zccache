@@ -11,7 +11,9 @@ pub use messages::*;
 /// new/removed/reordered enum variants or struct field changes.
 /// Patch releases that don't change the protocol keep the same version.
 ///
-/// v11 (current): `Request::GenericToolExec` gained Path A (include scan)
+/// v12 (current): `DaemonStatus` and `SessionStats` gained cached-error
+///                  counters for rustc negative-result caching.
+/// v11: `Request::GenericToolExec` gained Path A (include scan)
 ///                  + Path B (depfile) + `non_deterministic` +
 ///                  `key_args_filter` fields completing issue #272.
 /// v10: added `Request::GenericToolExec` / `Response::GenericToolExecResult`
@@ -21,7 +23,7 @@ pub use messages::*;
 ///     so per-session aggregate phase timing reaches clients.
 /// v8: `Compile` / `CompileEphemeral` gained `stdin: Vec<u8>` and
 ///     `ArtifactPayload` replaced `ArtifactOutput.data: Arc<Vec<u8>>`.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 use bytes::{Buf, BufMut, BytesMut};
 

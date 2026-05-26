@@ -234,6 +234,7 @@ fn analyze_journal_rejects_session_stats_json() {
         misses: 3,
         non_cacheable: 2,
         errors: 1,
+        errors_cached: 0,
         time_saved_ms: 250,
         unique_sources: 8,
         bytes_read: 1024,

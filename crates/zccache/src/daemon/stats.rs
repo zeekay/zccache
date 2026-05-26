@@ -16,6 +16,8 @@ pub struct StatsCollector {
     non_cacheable: AtomicU64,
     /// Compilations that exited non-zero.
     compile_errors: AtomicU64,
+    /// Non-zero compile results served from cache.
+    compile_errors_cached: AtomicU64,
     /// Total sessions created.
     sessions_total: AtomicU64,
     /// Cumulative nanoseconds spent on cache hits.
@@ -44,6 +46,7 @@ pub struct StatsSnapshot {
     pub misses: u64,
     pub non_cacheable: u64,
     pub compile_errors: u64,
+    pub compile_errors_cached: u64,
     pub sessions_total: u64,
     pub hit_time_ns: u64,
     pub miss_time_ns: u64,
@@ -80,6 +83,7 @@ impl StatsCollector {
             misses: AtomicU64::new(0),
             non_cacheable: AtomicU64::new(0),
             compile_errors: AtomicU64::new(0),
+            compile_errors_cached: AtomicU64::new(0),
             sessions_total: AtomicU64::new(0),
             hit_time_ns: AtomicU64::new(0),
             miss_time_ns: AtomicU64::new(0),
@@ -122,6 +126,11 @@ impl StatsCollector {
         self.compile_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a cached compile error replay.
+    pub fn record_cached_error(&self) {
+        self.compile_errors_cached.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record a new session creation.
     pub fn record_session(&self) {
         self.sessions_total.fetch_add(1, Ordering::Relaxed);
@@ -154,6 +163,7 @@ impl StatsCollector {
         self.misses.store(0, Ordering::Relaxed);
         self.non_cacheable.store(0, Ordering::Relaxed);
         self.compile_errors.store(0, Ordering::Relaxed);
+        self.compile_errors_cached.store(0, Ordering::Relaxed);
         self.sessions_total.store(0, Ordering::Relaxed);
         self.hit_time_ns.store(0, Ordering::Relaxed);
         self.miss_time_ns.store(0, Ordering::Relaxed);
@@ -174,6 +184,7 @@ impl StatsCollector {
             misses: self.misses.load(Ordering::Relaxed),
             non_cacheable: self.non_cacheable.load(Ordering::Relaxed),
             compile_errors: self.compile_errors.load(Ordering::Relaxed),
+            compile_errors_cached: self.compile_errors_cached.load(Ordering::Relaxed),
             sessions_total: self.sessions_total.load(Ordering::Relaxed),
             hit_time_ns: self.hit_time_ns.load(Ordering::Relaxed),
             miss_time_ns: self.miss_time_ns.load(Ordering::Relaxed),
@@ -510,6 +521,7 @@ mod tests {
         assert_eq!(s.misses, 0);
         assert_eq!(s.non_cacheable, 0);
         assert_eq!(s.compile_errors, 0);
+        assert_eq!(s.compile_errors_cached, 0);
         assert_eq!(s.sessions_total, 0);
         assert_eq!(s.bytes_read, 0);
         assert_eq!(s.bytes_written, 0);
@@ -545,9 +557,11 @@ mod tests {
         c.record_non_cacheable();
         c.record_non_cacheable();
         c.record_error();
+        c.record_cached_error();
         let s = c.snapshot();
         assert_eq!(s.non_cacheable, 2);
         assert_eq!(s.compile_errors, 1);
+        assert_eq!(s.compile_errors_cached, 1);
     }
 
     #[test]
@@ -606,6 +620,7 @@ mod tests {
                 misses: 0,
                 non_cacheable: 0,
                 compile_errors: 0,
+                compile_errors_cached: 0,
                 sessions_total: 0,
                 hit_time_ns: 0,
                 miss_time_ns: 0,

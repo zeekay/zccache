@@ -13,6 +13,79 @@ pub(super) fn compile_failure_stderr(message: String) -> Response {
     }
 }
 
+fn rustc_depinfo_exists(rustc_args: &crate::depgraph::RustcParsedArgs, cwd: &Path) -> bool {
+    if !rustc_args.emit_types.iter().any(|emit| emit == "dep-info") {
+        return false;
+    }
+    let name = rustc_args.crate_name.as_deref().unwrap_or("unknown");
+    let ext_suffix = rustc_args.extra_filename.as_deref().unwrap_or("");
+    let dir = rustc_args.out_dir.as_deref().unwrap_or(cwd);
+    dir.join(format!("{name}{ext_suffix}.d")).exists()
+}
+
+fn should_cache_rustc_error(
+    rustc_args: &crate::depgraph::RustcParsedArgs,
+    exit_code: i32,
+    cwd: &Path,
+) -> bool {
+    exit_code > 0
+        && rustc_depinfo_exists(rustc_args, cwd)
+        && !rustc_args.emit_types.iter().any(|emit| emit == "link")
+}
+
+#[allow(clippy::too_many_arguments)] // Localized error-cache insertion path.
+fn maybe_store_rustc_error_artifact(
+    state: &SharedState,
+    context_key: &ContextKey,
+    source_path: &NormalizedPath,
+    cwd_path: &NormalizedPath,
+    ctx: &CompileContext,
+    rustc_args: &crate::depgraph::RustcParsedArgs,
+    stdout: &Arc<Vec<u8>>,
+    stderr: &Arc<Vec<u8>>,
+    exit_code: i32,
+    snap_clock: Clock,
+) -> Option<String> {
+    if !should_cache_rustc_error(rustc_args, exit_code, cwd_path) {
+        return None;
+    }
+
+    let scan_result = scan_rustc_deps(rustc_args, source_path, cwd_path);
+    let tracked_paths: Vec<NormalizedPath> = std::iter::once(source_path.clone())
+        .chain(scan_result.resolved.iter().cloned())
+        .chain(ctx.force_includes.iter().cloned())
+        .collect();
+    state.cache_system.register_tracked(&tracked_paths);
+
+    let mut hash_map: HashMap<NormalizedPath, ContentHash> = HashMap::new();
+    for path in &tracked_paths {
+        let hash_path =
+            resolve_pch_source(path, &state.pch_source_map).unwrap_or_else(|| path.clone());
+        let hash = hash_file(&state.cache_system, &hash_path, snap_clock).ok()?;
+        hash_map.insert(path.clone(), hash);
+    }
+
+    let get_hash = |p: &Path| {
+        let path = NormalizedPath::new(p);
+        hash_map.get(&path).copied()
+    };
+    let artifact_key = state.dep_graph.update(context_key, scan_result, get_hash)?;
+    let artifact_key_hex = artifact_key.hash().to_hex();
+    let meta = ArtifactIndex::new(
+        Vec::new(),
+        Vec::new(),
+        Arc::clone(stdout),
+        Arc::clone(stderr),
+        exit_code,
+    );
+    state.artifact_store.insert(&artifact_key_hex, &meta);
+    state.artifacts.insert(
+        artifact_key_hex.clone(),
+        CachedArtifact::from_file_payloads(meta, Vec::new()),
+    );
+    Some(artifact_key_hex)
+}
+
 /// Handle a Compile request: parse args, check depgraph, run compiler or return cached.
 #[allow(clippy::too_many_arguments)] // Hot dispatch path; refactor parked.
 pub(super) async fn handle_compile(
@@ -170,17 +243,27 @@ pub(super) async fn handle_compile(
                                     let t_bookkeeping = std::time::Instant::now();
                                     state.stats.record_compilation();
                                     let latency_ns = compile_start.elapsed().as_nanos() as u64;
-                                    state.stats.record_hit(latency_ns, artifact_bytes);
-                                    let src = source_path.clone();
-                                    record_session_stat(&state.sessions, &sid, move |t| {
-                                        t.record_hit(src, latency_ns, artifact_bytes);
-                                    });
+                                    let cached_error = exit_code != 0;
+                                    if cached_error {
+                                        state.stats.record_cached_error();
+                                        record_session_stat(&state.sessions, &sid, |t| {
+                                            t.record_cached_error();
+                                        });
+                                    } else {
+                                        state.stats.record_hit(latency_ns, artifact_bytes);
+                                        let src = source_path.clone();
+                                        record_session_stat(&state.sessions, &sid, move |t| {
+                                            t.record_hit(src, latency_ns, artifact_bytes);
+                                        });
+                                    }
                                     write_session_log(
                                         &state.sessions,
                                         &sid,
                                         &format!(
                                             "[{}] {} -> {}",
-                                            if same_root {
+                                            if cached_error {
+                                                "CACHED_ERROR_REQUEST"
+                                            } else if same_root {
                                                 "HIT_REQUEST"
                                             } else {
                                                 "HIT_WORKTREE_REQUEST"
@@ -191,19 +274,21 @@ pub(super) async fn handle_compile(
                                     );
                                     let bookkeeping_ns = t_bookkeeping.elapsed().as_nanos() as u64;
                                     let total_ns = compile_start.elapsed().as_nanos() as u64;
-                                    state.profiler.record_hit(&HitPhases {
-                                        parse_args_ns: 0,
-                                        build_context_ns: 0,
-                                        hash_source_ns: 0,
-                                        hash_headers_ns: 0,
-                                        depgraph_check_ns: 0,
-                                        request_cache_lookup_ns,
-                                        cross_root_validate_ns,
-                                        artifact_lookup_ns,
-                                        write_output_ns,
-                                        bookkeeping_ns,
-                                        total_ns,
-                                    });
+                                    if !cached_error {
+                                        state.profiler.record_hit(&HitPhases {
+                                            parse_args_ns: 0,
+                                            build_context_ns: 0,
+                                            hash_source_ns: 0,
+                                            hash_headers_ns: 0,
+                                            depgraph_check_ns: 0,
+                                            request_cache_lookup_ns,
+                                            cross_root_validate_ns,
+                                            artifact_lookup_ns,
+                                            write_output_ns,
+                                            bookkeeping_ns,
+                                            total_ns,
+                                        });
+                                    }
 
                                     return Response::CompileResult {
                                         exit_code,
@@ -460,26 +545,38 @@ pub(super) async fn handle_compile(
                         } else {
                             let write_output_ns = t6.elapsed().as_nanos() as u64;
 
-                            // Downgrade output metadata (file was re-written) but
-                            // DON'T advance the journal clock — the output content is
-                            // the same cached artifact, and advancing the global clock
-                            // would invalidate fast-hit entries for unrelated source
-                            // files in the same batch.
-                            state.cache_system.metadata().downgrade(&output_path);
+                            let cached_error = exit_code != 0;
+                            if !cached_error {
+                                // Downgrade output metadata (file was re-written) but
+                                // DON'T advance the journal clock — the output content is
+                                // the same cached artifact, and advancing the global clock
+                                // would invalidate fast-hit entries for unrelated source
+                                // files in the same batch.
+                                state.cache_system.metadata().downgrade(&output_path);
+                            }
 
                             let t7 = std::time::Instant::now();
                             let latency_ns = compile_start.elapsed().as_nanos() as u64;
-                            state.stats.record_hit(latency_ns, artifact_bytes);
-                            let src = source_path.clone();
-                            record_session_stat(&state.sessions, &sid, move |t| {
-                                t.record_hit(src, latency_ns, artifact_bytes);
-                            });
+                            if cached_error {
+                                state.stats.record_cached_error();
+                                record_session_stat(&state.sessions, &sid, |t| {
+                                    t.record_cached_error();
+                                });
+                            } else {
+                                state.stats.record_hit(latency_ns, artifact_bytes);
+                                let src = source_path.clone();
+                                record_session_stat(&state.sessions, &sid, move |t| {
+                                    t.record_hit(src, latency_ns, artifact_bytes);
+                                });
+                            }
                             write_session_log(
                                 &state.sessions,
                                 &sid,
                                 &format!(
                                     "[{}] {} -> {}",
-                                    if worktree_equivalent_context {
+                                    if cached_error {
+                                        "CACHED_ERROR_FAST"
+                                    } else if worktree_equivalent_context {
                                         "HIT_WORKTREE_FAST"
                                     } else {
                                         "HIT_FAST"
@@ -511,19 +608,21 @@ pub(super) async fn handle_compile(
                             );
 
                             let total_ns = compile_start.elapsed().as_nanos() as u64;
-                            state.profiler.record_hit(&HitPhases {
-                                parse_args_ns,
-                                build_context_ns,
-                                hash_source_ns: 0,
-                                hash_headers_ns: 0,
-                                depgraph_check_ns: 0,
-                                request_cache_lookup_ns: 0,
-                                cross_root_validate_ns: 0,
-                                artifact_lookup_ns,
-                                write_output_ns,
-                                bookkeeping_ns,
-                                total_ns,
-                            });
+                            if !cached_error {
+                                state.profiler.record_hit(&HitPhases {
+                                    parse_args_ns,
+                                    build_context_ns,
+                                    hash_source_ns: 0,
+                                    hash_headers_ns: 0,
+                                    depgraph_check_ns: 0,
+                                    request_cache_lookup_ns: 0,
+                                    cross_root_validate_ns: 0,
+                                    artifact_lookup_ns,
+                                    write_output_ns,
+                                    bookkeeping_ns,
+                                    total_ns,
+                                });
+                            }
 
                             return Response::CompileResult {
                                 exit_code,
@@ -742,22 +841,34 @@ pub(super) async fn handle_compile(
                         // Downgrade output metadata but don't advance journal
                         // clock — same cached artifact content, advancing would
                         // invalidate fast-hit entries for other source files.
-                        state.cache_system.metadata().downgrade(&output_path);
+                        let cached_error = exit_code != 0;
+                        if !cached_error {
+                            state.cache_system.metadata().downgrade(&output_path);
+                        }
 
                         // ── Phase: bookkeeping ───────────────────────────────
                         let t7 = std::time::Instant::now();
                         let latency_ns = compile_start.elapsed().as_nanos() as u64;
-                        state.stats.record_hit(latency_ns, artifact_bytes);
-                        let src = source_path.clone();
-                        record_session_stat(&state.sessions, &sid, move |t| {
-                            t.record_hit(src, latency_ns, artifact_bytes);
-                        });
+                        if cached_error {
+                            state.stats.record_cached_error();
+                            record_session_stat(&state.sessions, &sid, |t| {
+                                t.record_cached_error();
+                            });
+                        } else {
+                            state.stats.record_hit(latency_ns, artifact_bytes);
+                            let src = source_path.clone();
+                            record_session_stat(&state.sessions, &sid, move |t| {
+                                t.record_hit(src, latency_ns, artifact_bytes);
+                            });
+                        }
                         write_session_log(
                             &state.sessions,
                             &sid,
                             &format!(
                                 "[{}] {} -> {}",
-                                if worktree_equivalent_context {
+                                if cached_error {
+                                    "CACHED_ERROR"
+                                } else if worktree_equivalent_context {
                                     "HIT_WORKTREE"
                                 } else {
                                     "HIT"
@@ -802,19 +913,21 @@ pub(super) async fn handle_compile(
 
                         // Record phase profile
                         let total_ns = compile_start.elapsed().as_nanos() as u64;
-                        state.profiler.record_hit(&HitPhases {
-                            parse_args_ns,
-                            build_context_ns,
-                            hash_source_ns,
-                            hash_headers_ns,
-                            depgraph_check_ns,
-                            request_cache_lookup_ns: 0,
-                            cross_root_validate_ns: 0,
-                            artifact_lookup_ns,
-                            write_output_ns,
-                            bookkeeping_ns,
-                            total_ns,
-                        });
+                        if !cached_error {
+                            state.profiler.record_hit(&HitPhases {
+                                parse_args_ns,
+                                build_context_ns,
+                                hash_source_ns,
+                                hash_headers_ns,
+                                depgraph_check_ns,
+                                request_cache_lookup_ns: 0,
+                                cross_root_validate_ns: 0,
+                                artifact_lookup_ns,
+                                write_output_ns,
+                                bookkeeping_ns,
+                                total_ns,
+                            });
+                        }
 
                         return Response::CompileResult {
                             exit_code,
@@ -973,6 +1086,30 @@ pub(super) async fn handle_compile(
     if exit_code != 0 {
         state.stats.record_error();
         record_session_stat(&state.sessions, &sid, |t| t.record_error());
+        if let Some(rustc_args) = rustc_args_opt.as_ref() {
+            if let Some(artifact_key_hex) = maybe_store_rustc_error_artifact(
+                state,
+                &context_key,
+                &source_path,
+                &cwd_path,
+                &ctx,
+                rustc_args,
+                &stdout,
+                &stderr,
+                exit_code,
+                snap_clock,
+            ) {
+                write_session_log(
+                    &state.sessions,
+                    &sid,
+                    &format!(
+                        "[CACHED_ERROR_STORE] {} key={}",
+                        source_path.display(),
+                        &artifact_key_hex[..8]
+                    ),
+                );
+            }
+        }
     }
 
     // Only cache successful compilations
@@ -1492,5 +1629,37 @@ pub(super) async fn handle_compile(
         stdout,
         stderr,
         cached: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rustc_error_cache_requires_depinfo_and_no_link_emit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("probe.rs");
+        std::fs::write(&src, "fn main() {}\n").unwrap();
+        let args = vec![
+            "--crate-name".to_string(),
+            "probe".to_string(),
+            "--emit=dep-info,metadata".to_string(),
+            "--out-dir".to_string(),
+            tmp.path().to_string_lossy().into_owned(),
+            src.to_string_lossy().into_owned(),
+        ];
+        let parsed = crate::depgraph::parse_rustc_args(&args, tmp.path());
+
+        assert!(!should_cache_rustc_error(&parsed, 1, tmp.path()));
+
+        std::fs::write(tmp.path().join("probe.d"), "probe.d: probe.rs\n").unwrap();
+        assert!(should_cache_rustc_error(&parsed, 1, tmp.path()));
+        assert!(!should_cache_rustc_error(&parsed, -1, tmp.path()));
+
+        let mut link_args = args.clone();
+        link_args[2] = "--emit=dep-info,link".to_string();
+        let link_parsed = crate::depgraph::parse_rustc_args(&link_args, tmp.path());
+        assert!(!should_cache_rustc_error(&link_parsed, 1, tmp.path()));
     }
 }
