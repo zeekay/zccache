@@ -16,6 +16,7 @@ crates/zccache/src/cli/symbols.rs
 # raw paths. Track migration separately so the lint can keep catching new
 # violations elsewhere.
 crates/zccache/src/bin/zccache.rs
+crates/zccache/src/bin/zccache-stamp.rs
 crates/zccache-cli/src/lib.rs
 crates/zccache/src/cli/snapshot_fp.rs
 crates/zccache/src/cli/commands/args.rs
