@@ -10,6 +10,26 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "shell_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run python ci/hooks/tool_guard.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "functions.shell_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run python ci/hooks/tool_guard.py",
+            "timeout": 5
+          }
+        ]
       }
     ]
   }

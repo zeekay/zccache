@@ -47,6 +47,14 @@ DENY_PYTHON_IN_CODE = (
     "Write them in Rust instead. Python is only for CI scripts and packaging."
 )
 
+SHELL_TOOL_NAMES = {
+    "Bash",
+    "Shell",
+    "PowerShell",
+    "shell_command",
+    "functions.shell_command",
+}
+
 
 def _args_contain_forbidden_test_path(words):
     """True if any argument matches a `bench/` or `tests/` Python file path."""
@@ -197,7 +205,7 @@ def main():
     except json.JSONDecodeError:
         sys.exit(0)
 
-    if data.get("tool_name", "") != "Bash":
+    if data.get("tool_name", "") not in SHELL_TOOL_NAMES:
         sys.exit(0)
 
     command = data.get("tool_input", {}).get("command", "")
