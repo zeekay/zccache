@@ -638,7 +638,7 @@ pub(crate) enum GhaCacheCommands {
 pub(crate) enum RustPlanCommands {
     /// Validate a soldr-generated Rust artifact plan.
     Validate {
-        /// Path to the plan JSON file.
+        /// Path to the protobuf plan file, or a legacy JSON plan.
         #[arg(long)]
         plan: String,
         /// Print a machine-readable JSON summary.
@@ -659,7 +659,7 @@ pub(crate) enum RustPlanCommands {
     },
     /// Restore Rust target artifacts from a saved plan bundle.
     Restore {
-        /// Path to the plan JSON file.
+        /// Path to the protobuf plan file, or a legacy JSON plan.
         #[arg(long)]
         plan: String,
         /// Print a machine-readable JSON summary.
@@ -681,9 +681,33 @@ pub(crate) enum RustPlanCommands {
         #[arg(long = "cache-dir")]
         cache_dir: Option<String>,
     },
+    /// Restore Rust target artifacts from base and delta plan bundles.
+    RestoreLayered {
+        /// Path to the protobuf plan file, or a legacy JSON plan.
+        #[arg(long)]
+        plan: String,
+        /// Print a machine-readable JSON summary.
+        #[arg(long)]
+        json: bool,
+        /// Active zccache session ID whose compile-cache stats should be included.
+        #[arg(long = "session-id")]
+        session_id: Option<String>,
+        /// IPC endpoint for session stats lookup.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Journal/log path to report in the summary, overriding the plan path.
+        #[arg(long)]
+        journal: Option<String>,
+        /// Local cache directory containing the base bundle.
+        #[arg(long = "base-cache-dir")]
+        base_cache_dir: String,
+        /// Local cache directory containing the delta bundle.
+        #[arg(long = "delta-cache-dir")]
+        delta_cache_dir: String,
+    },
     /// Save Rust target artifacts selected by a plan.
     Save {
-        /// Path to the plan JSON file.
+        /// Path to the protobuf plan file, or a legacy JSON plan.
         #[arg(long)]
         plan: String,
         /// Print a machine-readable JSON summary.
@@ -704,6 +728,30 @@ pub(crate) enum RustPlanCommands {
         /// Local cache directory used for bundle storage.
         #[arg(long = "cache-dir")]
         cache_dir: Option<String>,
+    },
+    /// Save only Rust target artifacts that differ from a base plan bundle.
+    SaveDelta {
+        /// Path to the protobuf plan file, or a legacy JSON plan.
+        #[arg(long)]
+        plan: String,
+        /// Print a machine-readable JSON summary.
+        #[arg(long)]
+        json: bool,
+        /// Active zccache session ID whose compile-cache stats should be included.
+        #[arg(long = "session-id")]
+        session_id: Option<String>,
+        /// IPC endpoint for session stats lookup.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Journal/log path to report in the summary, overriding the plan path.
+        #[arg(long)]
+        journal: Option<String>,
+        /// Local cache directory containing the base bundle.
+        #[arg(long = "base-cache-dir")]
+        base_cache_dir: String,
+        /// Local cache directory that will receive the delta bundle.
+        #[arg(long = "delta-cache-dir")]
+        delta_cache_dir: String,
     },
 }
 

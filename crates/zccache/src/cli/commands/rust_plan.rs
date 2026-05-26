@@ -1,8 +1,9 @@
 //! `zccache rust-plan` subcommands and helpers.
 
 use crate::artifact::{
-    restore_rust_plan_local, rust_plan_bundle_dir, rust_plan_cache_key, save_rust_plan_local,
-    RustArtifactPlanV1, RustPlanError, RustPlanOperation, RustPlanSummary,
+    restore_rust_plan_layered_local, restore_rust_plan_local, rust_plan_bundle_dir,
+    rust_plan_cache_key, save_rust_plan_delta_local, save_rust_plan_local, RustArtifactPlanV1,
+    RustPlanError, RustPlanOperation, RustPlanSummary,
 };
 use crate::core::NormalizedPath;
 use crate::gha::{GhaCache, GhaError};
@@ -129,6 +130,41 @@ pub(crate) async fn cmd_rust_plan(action: RustPlanCommands) -> ExitCode {
                 }
             }
         }
+        RustPlanCommands::RestoreLayered {
+            plan,
+            json,
+            session_id,
+            endpoint,
+            journal,
+            base_cache_dir,
+            delta_cache_dir,
+        } => {
+            let plan = match load_rust_plan_for_cli(&plan, RustPlanOperation::Restore, json) {
+                Ok(plan) => plan,
+                Err(code) => return code,
+            };
+            match restore_rust_plan_layered_local(
+                &plan,
+                Path::new(&base_cache_dir),
+                Path::new(&delta_cache_dir),
+            ) {
+                Ok(mut summary) => {
+                    enrich_rust_plan_summary(
+                        &mut summary,
+                        session_id.as_deref(),
+                        endpoint.as_deref(),
+                        journal.as_deref(),
+                    )
+                    .await;
+                    print_rust_plan_summary(&summary, json);
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    print_rust_plan_error(RustPlanOperation::Restore, &err, json);
+                    ExitCode::FAILURE
+                }
+            }
+        }
         RustPlanCommands::Save {
             plan,
             json,
@@ -165,6 +201,41 @@ pub(crate) async fn cmd_rust_plan(action: RustPlanCommands) -> ExitCode {
                         &err,
                         json,
                     );
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        RustPlanCommands::SaveDelta {
+            plan,
+            json,
+            session_id,
+            endpoint,
+            journal,
+            base_cache_dir,
+            delta_cache_dir,
+        } => {
+            let plan = match load_rust_plan_for_cli(&plan, RustPlanOperation::Save, json) {
+                Ok(plan) => plan,
+                Err(code) => return code,
+            };
+            match save_rust_plan_delta_local(
+                &plan,
+                Path::new(&base_cache_dir),
+                Path::new(&delta_cache_dir),
+            ) {
+                Ok(mut summary) => {
+                    enrich_rust_plan_summary(
+                        &mut summary,
+                        session_id.as_deref(),
+                        endpoint.as_deref(),
+                        journal.as_deref(),
+                    )
+                    .await;
+                    print_rust_plan_summary(&summary, json);
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    print_rust_plan_error(RustPlanOperation::Save, &err, json);
                     ExitCode::FAILURE
                 }
             }
@@ -227,7 +298,7 @@ fn resolve_rust_plan_backend(backend: RustPlanBackendArg) -> RustPlanBackendArg 
 }
 
 pub(crate) fn rust_plan_gha_version(cache_key: &str) -> String {
-    GhaCache::version_hash(&["zccache-rust-plan-v1", cache_key])
+    GhaCache::version_hash(&["zccache-rust-plan-v2-protobuf", cache_key])
 }
 
 async fn restore_rust_plan_gha(

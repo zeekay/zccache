@@ -216,6 +216,8 @@ def main():
     if result:
         _, reason = result
         deny(reason)
+        print(reason, file=sys.stderr)
+        sys.exit(2)
 
     sys.exit(0)
 
