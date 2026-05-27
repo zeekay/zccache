@@ -137,6 +137,19 @@ def test_build_target_dereferences_debug_sidecar_symlinks() -> None:
     assert 'cp -L "$src" staging-debug/' in action
 
 
+def test_build_target_uses_isolated_stamp_target_dir() -> None:
+    action = (
+        Path(__file__).resolve().parents[2]
+        / ".github/actions/build-target/action.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "HOST_TARGET=$(soldr rustc -vV" in action
+    assert '--target-dir "$STAMP_TARGET_DIR" -p zccache --bin zccache-stamp' in action
+    assert 'STAMP="$STAMP_TARGET_DIR/release/zccache-stamp.exe"' in action
+    assert 'STAMP="$STAMP_TARGET_DIR/release/zccache-stamp"' in action
+    assert "target/release/zccache-stamp" not in action
+
+
 def test_stage_debug_tree_skips_empty_input(tmp_path: Path) -> None:
     debug_input_dir = tmp_path / "staging-debug"
     output_dir = tmp_path / "output"
