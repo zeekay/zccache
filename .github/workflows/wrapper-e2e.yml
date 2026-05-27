@@ -109,11 +109,20 @@ jobs:
           install_dir="$HOME/.local/bin"
           mkdir -p "$install_dir"
           # soldr may pin a target triple, in which case the artifacts
-          # live under `target/<triple>/release/`. Find them either way.
-          z=$(find target -path '*release/zccache' -type f -not -path '*/deps/*' | head -1)
-          zd=$(find target -path '*release/zccache-daemon' -type f -not -path '*/deps/*' | head -1)
-          test -n "$z"  || { echo "zccache binary not found under target/"; find target -name 'zccache' -type f; exit 1; }
-          test -n "$zd" || { echo "zccache-daemon binary not found under target/"; find target -name 'zccache-daemon' -type f; exit 1; }
+          # live under `target/<triple>/release/`. cargo-chef can also
+          # leave placeholder local-package binaries in target/release.
+          # Install only a candidate that behaves like the real CLI.
+          z=""
+          while IFS= read -r candidate; do
+            version="$("$candidate" --version 2>/dev/null || true)"
+            echo "zccache candidate: $candidate => ${version:-<no output>}"
+            case "$version" in
+              zccache\ *) z="$candidate"; break ;;
+            esac
+          done < <(find target -path '*release/zccache' -type f -not -path '*/deps/*' | sort)
+          test -n "$z" || { echo "usable zccache binary not found under target/"; find target -name 'zccache' -type f; exit 1; }
+          zd="$(dirname "$z")/zccache-daemon"
+          test -f "$zd" || { echo "zccache-daemon binary not found next to $z"; find target -name 'zccache-daemon' -type f; exit 1; }
           install -m755 "$z"  "$install_dir/zccache"
           install -m755 "$zd" "$install_dir/zccache-daemon"
           echo "$install_dir" >> "$GITHUB_PATH"
@@ -130,14 +139,27 @@ jobs:
         run: |
           $installDir = "$env:USERPROFILE\.local\bin"
           New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-          # Same triple-subdir-or-flat layout as Unix; resolve the actual
-          # path before copying.
-          $z  = Get-ChildItem -Recurse target -Filter zccache.exe        | Where-Object { $_.FullName -match '\\release\\' -and $_.FullName -notmatch '\\deps\\' } | Select-Object -First 1
-          $zd = Get-ChildItem -Recurse target -Filter zccache-daemon.exe | Where-Object { $_.FullName -match '\\release\\' -and $_.FullName -notmatch '\\deps\\' } | Select-Object -First 1
-          if (-not $z)  { Write-Error "zccache.exe not found under target/";        exit 1 }
-          if (-not $zd) { Write-Error "zccache-daemon.exe not found under target/"; exit 1 }
-          Copy-Item $z.FullName  "$installDir/zccache.exe"        -Force
-          Copy-Item $zd.FullName "$installDir/zccache-daemon.exe" -Force
+          # Same triple-subdir-or-flat layout as Unix. cargo-chef can
+          # leave placeholder local-package binaries in target\release,
+          # so choose the candidate that behaves like the real CLI.
+          $z = $null
+          $candidates = Get-ChildItem -Recurse target -Filter zccache.exe |
+            Where-Object { $_.FullName -match '\\release\\' -and $_.FullName -notmatch '\\deps\\' } |
+            Sort-Object FullName
+          foreach ($candidate in $candidates) {
+            $version = (& $candidate.FullName --version 2>$null) -join "`n"
+            if (-not $version) { $version = "<no output>" }
+            Write-Host "zccache candidate: $($candidate.FullName) => $version"
+            if ($version -match '^zccache\s') {
+              $z = $candidate
+              break
+            }
+          }
+          if (-not $z) { Write-Error "usable zccache.exe not found under target/"; exit 1 }
+          $zd = Join-Path $z.DirectoryName "zccache-daemon.exe"
+          if (-not (Test-Path $zd)) { Write-Error "zccache-daemon.exe not found next to $($z.FullName)"; exit 1 }
+          Copy-Item $z.FullName "$installDir/zccache.exe" -Force
+          Copy-Item $zd "$installDir/zccache-daemon.exe" -Force
           Add-Content $env:GITHUB_PATH $installDir
 
       - name: Stop setup-soldr builder cache before wrapper smoke test
