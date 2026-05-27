@@ -101,6 +101,26 @@ SHELL_TOOL_NAMES = {
 }
 
 
+def extract_command(data):
+    """Return shell text from Codex/Claude tool payload variants."""
+    tool_input = data.get("tool_input") or data.get("toolInput") or {}
+    if isinstance(tool_input, str):
+        return tool_input
+    if not isinstance(tool_input, dict):
+        return ""
+
+    for key in ("command", "script"):
+        value = tool_input.get(key)
+        if isinstance(value, str):
+            return value
+
+    argv = tool_input.get("argv")
+    if isinstance(argv, list):
+        return " ".join(str(part) for part in argv)
+
+    return ""
+
+
 def _args_contain_forbidden_test_path(words):
     """True if any argument matches a `bench/` or `tests/` Python file path."""
     return any(FORBIDDEN_PATH_RE.search(w) for w in words)
@@ -379,7 +399,7 @@ def main():
     if data.get("tool_name", "") not in SHELL_TOOL_NAMES:
         sys.exit(0)
 
-    command = data.get("tool_input", {}).get("command", "")
+    command = extract_command(data)
     if not command:
         sys.exit(0)
 

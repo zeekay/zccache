@@ -21,6 +21,10 @@ def _check(command: str):
     return tool_guard.check_command(command)
 
 
+def _extract(payload):
+    return tool_guard.extract_command(payload)
+
+
 # ── bare-tool blocking ──────────────────────────────────────────────────────
 
 
@@ -39,6 +43,37 @@ def test_bare_rustc_blocked():
 
 def test_bare_rustfmt_blocked():
     assert _check("rustfmt foo.rs") is not None
+
+
+def test_extract_command_from_shell_command_payload():
+    assert (
+        _extract(
+            {
+                "tool_name": "functions.shell_command",
+                "tool_input": {"command": "cargo build"},
+            }
+        )
+        == "cargo build"
+    )
+
+
+def test_extract_command_from_shell_script_payload():
+    assert (
+        _extract({"tool_name": "Shell", "tool_input": {"script": "cargo build"}})
+        == "cargo build"
+    )
+
+
+def test_extract_command_from_argv_payload():
+    assert (
+        _extract(
+            {
+                "tool_name": "PowerShell",
+                "tool_input": {"argv": ["cargo", "build"]},
+            }
+        )
+        == "cargo build"
+    )
 
 
 # ── rustup gating (regression guard) ────────────────────────────────────────

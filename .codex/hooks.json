@@ -12,6 +12,26 @@
         ]
       },
       {
+        "matcher": "Shell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run python ci/hooks/tool_guard.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run python ci/hooks/tool_guard.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
         "matcher": "shell_command",
         "hooks": [
           {
