@@ -62,6 +62,7 @@ jobs:
           zccache-seed-strict: true
           toolchain: 1.94.1
           cache: true
+          cargo-registry-cache: false
           cache-key-suffix: dylint
       - name: Install Dylint nightly toolchain
         run: soldr rustup toolchain install nightly-2026-03-26 --component llvm-tools-preview --component rust-src --component rustc-dev --profile minimal
