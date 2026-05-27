@@ -177,6 +177,13 @@ def test_build_target_exposes_cross_cache_controls() -> None:
     assert 'rm -rf "$TARGET_DIR"' in action
 
 
+def test_build_target_configures_target_c_compiler_for_cross_c_sources() -> None:
+    action = _repo_text(".github/actions/build-target/action.yml")
+
+    assert 'TARGET_CC=$(echo "${{ inputs.target }}" | tr \'-\' \'_\')' in action
+    assert 'echo "CC_${TARGET_CC}=${{ inputs.linker }}" >> "$GITHUB_ENV"' in action
+
+
 def test_build_target_can_synthesize_macos_dsym_sidecars() -> None:
     action = _repo_text(".github/actions/build-target/action.yml")
 
