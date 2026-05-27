@@ -144,9 +144,15 @@ def test_build_target_uses_isolated_stamp_target_dir() -> None:
     ).read_text(encoding="utf-8")
 
     assert "HOST_TARGET=$(soldr rustc -vV" in action
-    assert '--target-dir "$STAMP_TARGET_DIR" -p zccache --bin zccache-stamp' in action
-    assert 'STAMP="$STAMP_TARGET_DIR/release/zccache-stamp.exe"' in action
-    assert 'STAMP="$STAMP_TARGET_DIR/release/zccache-stamp"' in action
+    assert (
+        '--target "$HOST_TARGET" --target-dir "$STAMP_TARGET_DIR" '
+        "-p zccache --bin zccache-stamp"
+    ) in action
+    assert 'echo "ZCCACHE_STAMP_HOST_TARGET=$HOST_TARGET"' in action
+    assert (
+        'STAMP="$STAMP_TARGET_DIR/$STAMP_HOST_TARGET/release/'
+        'zccache-stamp$STAMP_EXT"'
+    ) in action
     assert "target/release/zccache-stamp" not in action
 
 
