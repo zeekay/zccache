@@ -27,12 +27,11 @@ def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
 
 
 def rustc_host() -> str:
-    # Invoke rustc through `rustup run` so the call works even when PATH
-    # is fronted by shims (e.g. soldr) that do not understand the
-    # `+<toolchain>` directive that only the rustup `cargo`/`rustc`
-    # wrappers parse.
+    # Invoke rustc through `soldr rustup run` so the call works even when
+    # PATH is fronted by shims while still using soldr's pinned Rust front
+    # door for tool selection.
     output = subprocess.check_output(
-        ["rustup", "run", TOOLCHAIN_CHANNEL, "rustc", "-vV"],
+        ["soldr", "rustup", "run", TOOLCHAIN_CHANNEL, "rustc", "-vV"],
         text=True,
     )
     for line in output.splitlines():
@@ -43,7 +42,7 @@ def rustc_host() -> str:
 
 def rustc_toolchain_root(full_toolchain: str) -> Path:
     rustc = subprocess.check_output(
-        ["rustup", "which", "--toolchain", full_toolchain, "rustc"],
+        ["soldr", "rustup", "which", "--toolchain", full_toolchain, "rustc"],
         text=True,
     ).strip()
     return Path(rustc).resolve().parent.parent
@@ -126,14 +125,14 @@ def main() -> int:
             rpath = f"-C link-args=-Wl,-rpath,{toolchain_root / 'lib'}"
             env["RUSTFLAGS"] = f"{env.get('RUSTFLAGS', '')} {rpath}".strip()
 
-        # Use `rustup run` instead of `cargo +<toolchain>` because the
+        # Use `soldr rustup run` instead of `cargo +<toolchain>` because the
         # cargo on PATH may be a shim (e.g. soldr's) that does not parse
         # the `+<toolchain>` directive — that directive is only honored
-        # by the rustup-managed cargo wrapper. `rustup run` selects the
-        # toolchain explicitly and works regardless of which `cargo`
-        # comes first on PATH.
+        # by the rustup-managed cargo wrapper. The outer `soldr` command
+        # keeps Rust entrypoint selection consistent while rustup selects
+        # the requested nightly toolchain.
         run(
-            ["rustup", "run", TOOLCHAIN_CHANNEL, "cargo", "build"],
+            ["soldr", "rustup", "run", TOOLCHAIN_CHANNEL, "cargo", "build"],
             cwd=package,
             env=env,
         )

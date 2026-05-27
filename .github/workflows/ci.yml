@@ -47,7 +47,7 @@ jobs:
           target-cache: false
           prebuild-deps: none
       - name: Install Rust components
-        run: rustup component add rustfmt
+        run: soldr rustup component add rustfmt
       - name: Check formatting
         run: soldr cargo fmt --all -- --check
 
@@ -64,11 +64,13 @@ jobs:
           cache: true
           cache-key-suffix: dylint
       - name: Install Dylint nightly toolchain
-        run: rustup toolchain install nightly-2026-03-26 --component llvm-tools-preview --component rust-src --component rustc-dev --profile minimal
+        run: soldr rustup toolchain install nightly-2026-03-26 --component llvm-tools-preview --component rust-src --component rustc-dev --profile minimal
       - name: Install stable Rust components
-        run: rustup component add rustfmt
+        run: soldr rustup component add rustfmt
       - name: Install Dylint
-        run: soldr cargo install cargo-dylint dylint-link --version 5.0.0
+        run: |
+          soldr cargo install --git https://github.com/trailofbits/dylint --rev 4bd91ce7729b74c7ee5664bbb588f7baf30b4a09 cargo-dylint
+          soldr cargo install --git https://github.com/trailofbits/dylint --rev 4bd91ce7729b74c7ee5664bbb588f7baf30b4a09 dylint-link
       - name: Build compatible Dylint driver
         run: python3 ci/build_dylint_driver.py
       - name: Check Dylint Library Formatting (ban_std_pathbuf)
@@ -78,11 +80,11 @@ jobs:
       - name: Test Dylint Library (ban_std_pathbuf)
         run: |
           export PATH="${CARGO_HOME}/bin:${PATH}"
-          cargo +nightly-2026-03-26 test --manifest-path dylints/ban_std_pathbuf/Cargo.toml
+          soldr rustup run nightly-2026-03-26 cargo test --manifest-path dylints/ban_std_pathbuf/Cargo.toml
       - name: Test Dylint Library (ban_unrooted_tempdir)
         run: |
           export PATH="${CARGO_HOME}/bin:${PATH}"
-          cargo +nightly-2026-03-26 test --manifest-path dylints/ban_unrooted_tempdir/Cargo.toml
+          soldr rustup run nightly-2026-03-26 cargo test --manifest-path dylints/ban_unrooted_tempdir/Cargo.toml
       - name: Run Dylint
         run: |
           export PATH="${CARGO_HOME}/bin:${PATH}"

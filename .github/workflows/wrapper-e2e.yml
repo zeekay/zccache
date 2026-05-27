@@ -94,7 +94,7 @@ jobs:
       - name: print toolchain
         run: |
           soldr --version
-          rustc --version || true
+          soldr rustc --version || true
 
       # Force soldr to honor the workspace-relative `target/` dir so the
       # next step can copy the artifacts out predictably across OSes —

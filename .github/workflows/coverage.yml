@@ -33,7 +33,7 @@ jobs:
           prebuild-deps: soldr-cook
           prebuild-deps-flags: ""
       - name: Install Rust coverage component
-        run: rustup component add llvm-tools-preview
+        run: soldr rustup component add llvm-tools-preview
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Stop setup-soldr builder cache before coverage tests
