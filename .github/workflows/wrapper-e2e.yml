@@ -57,12 +57,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: zackees/setup-soldr@0425f54e37b65c5c36be1fb73628019b3e1aabed
+      - name: setup soldr with cook prebuild (Unix)
+        if: runner.os != 'Windows'
+        uses: zackees/setup-soldr@0425f54e37b65c5c36be1fb73628019b3e1aabed
         with:
           cache: true
           cache-key-suffix: wrapper-e2e-${{ matrix.os }}
           prebuild-deps: soldr-cook
           prebuild-deps-flags: "--release"
+
+      - name: setup soldr without cook prebuild (Windows)
+        if: runner.os == 'Windows'
+        uses: zackees/setup-soldr@0425f54e37b65c5c36be1fb73628019b3e1aabed
+        with:
+          cache: true
+          cache-key-suffix: wrapper-e2e-${{ matrix.os }}
 
       - name: print toolchain
         run: |
