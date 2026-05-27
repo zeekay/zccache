@@ -69,8 +69,8 @@ jobs:
         run: soldr rustup component add rustfmt
       - name: Install Dylint
         run: |
-          soldr cargo install --git https://github.com/trailofbits/dylint --rev 4bd91ce7729b74c7ee5664bbb588f7baf30b4a09 cargo-dylint
-          soldr cargo install --git https://github.com/trailofbits/dylint --rev 4bd91ce7729b74c7ee5664bbb588f7baf30b4a09 dylint-link
+          soldr cargo install cargo-dylint --version 5.0.0 --locked
+          soldr cargo install dylint-link --version 5.0.0 --locked
       - name: Build compatible Dylint driver
         run: python3 ci/build_dylint_driver.py
       - name: Check Dylint Library Formatting (ban_std_pathbuf)
