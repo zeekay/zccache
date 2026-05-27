@@ -14,11 +14,13 @@ pub use kv::{
     is_valid_namespace, Key, KvError, KvResult, KvStore, INLINE_THRESHOLD, MAX_VALUE_BYTES,
 };
 pub use rust_plan::{
-    restore_rust_plan_local, rust_plan_bundle_dir, rust_plan_cache_key, save_rust_plan_local,
-    RustArtifactBundleManifest, RustArtifactClass, RustArtifactPlanV1, RustBundledArtifact,
-    RustPlanArtifactEffectiveness, RustPlanCompatibility, RustPlanError, RustPlanInputs,
-    RustPlanMode, RustPlanOperation, RustPlanPackages, RustPlanSkippedSample, RustPlanSummary,
-    RustToolchainIdentity, RUST_ARTIFACT_CACHE_SCHEMA_VERSION, RUST_ARTIFACT_PLAN_SCHEMA_VERSION,
+    restore_rust_plan_layered_local, restore_rust_plan_local, rust_plan_bundle_dir,
+    rust_plan_cache_key, save_rust_plan_delta_local, save_rust_plan_local,
+    RustArtifactBundleLayerKind, RustArtifactBundleManifest, RustArtifactClass, RustArtifactPlanV1,
+    RustBundledArtifact, RustPlanArtifactEffectiveness, RustPlanCompatibility, RustPlanError,
+    RustPlanInputs, RustPlanMode, RustPlanOperation, RustPlanPackages, RustPlanSkippedSample,
+    RustPlanSummary, RustToolchainIdentity, RUST_ARTIFACT_CACHE_SCHEMA_VERSION,
+    RUST_ARTIFACT_PLAN_SCHEMA_VERSION,
 };
 pub use store::{ArtifactIndex, ArtifactStore};
 

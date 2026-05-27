@@ -417,11 +417,12 @@ fn rust_plan_auto_backend_without_gha_env_uses_local_backend() {
     write_synthetic_full_target(&target_dir);
 
     let plan = synthetic_full_plan(root, &target_dir);
-    let plan_path = root.join("auto-plan.json");
-    write_file(
+    let plan_path = root.join("auto-plan.pb");
+    fs::write(
         &plan_path,
-        &serde_json::to_string_pretty(&plan).expect("serialize plan"),
-    );
+        plan.to_proto_bytes().expect("serialize protobuf rust plan"),
+    )
+    .expect("write protobuf rust plan");
 
     let plan_path_str = plan_path.to_string_lossy().to_string();
     let cache_dir_str = cache_dir.to_string_lossy().to_string();

@@ -18,13 +18,32 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(windows)]
-#[global_allocator]
-static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 use std::process::ExitCode;
 
+#[cfg(windows)]
 fn main() -> ExitCode {
+    match std::thread::Builder::new()
+        .name("zccache-cli".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_main)
+    {
+        Ok(handle) => match handle.join() {
+            Ok(code) => code,
+            Err(_) => ExitCode::FAILURE,
+        },
+        Err(err) => {
+            eprintln!("zccache: failed to start CLI thread: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn main() -> ExitCode {
+    run_main()
+}
+
+fn run_main() -> ExitCode {
     // Crash coverage first thing: panic hook + native signal/SEH
     // handler so a fault inside arg parsing or symbol install still
     // leaves a dump under `~/.zccache/crashes/`. Guard stays alive

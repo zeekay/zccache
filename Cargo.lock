@@ -3719,6 +3719,7 @@ dependencies = [
  "memmap2",
  "mimalloc",
  "notify",
+ "prost",
  "rayon",
  "redb",
  "regex",

@@ -33,6 +33,7 @@ sha2 = { workspace = true }
 # protocol
 bincode = { workspace = true }
 bytes = { workspace = true }
+prost = { workspace = true }
 
 # ipc + test-support: needs full tokio
 tokio = { workspace = true }
@@ -190,4 +191,3 @@ harness = false
 name = "exec"
 harness = false
 required-features = ["test-support"]
-

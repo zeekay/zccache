@@ -79,6 +79,44 @@ fn rust_plan_cli_parses_validate_restore_save() {
             }
         })
     ));
+
+    let restore_layered = Cli::try_parse_from([
+        "zccache",
+        "rust-plan",
+        "restore-layered",
+        "--plan",
+        "plan.json",
+        "--base-cache-dir",
+        ".cache/base",
+        "--delta-cache-dir",
+        ".cache/delta",
+    ])
+    .unwrap();
+    assert!(matches!(
+        restore_layered.command,
+        Some(Commands::RustPlan {
+            action: RustPlanCommands::RestoreLayered { .. }
+        })
+    ));
+
+    let save_delta = Cli::try_parse_from([
+        "zccache",
+        "rust-plan",
+        "save-delta",
+        "--plan",
+        "plan.json",
+        "--base-cache-dir",
+        ".cache/base",
+        "--delta-cache-dir",
+        ".cache/delta",
+    ])
+    .unwrap();
+    assert!(matches!(
+        save_delta.command,
+        Some(Commands::RustPlan {
+            action: RustPlanCommands::SaveDelta { .. }
+        })
+    ));
 }
 
 #[test]

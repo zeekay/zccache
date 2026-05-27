@@ -37,8 +37,9 @@ Cargo workspace model by itself.
 
 ## Plan Inputs
 
-The v1 JSON plan carries the minimum information needed for deterministic
-restore/save decisions:
+The v1 plan carries the minimum information needed for deterministic
+restore/save decisions. zccache accepts compact protobuf plans and legacy JSON
+plans during migration:
 
 - selected mode: `thin` or `full`
 - workspace root
@@ -151,9 +152,9 @@ beyond the inputs it is given.
 The stable CLI surface for `soldr` and `setup-soldr` is:
 
 ```text
-zccache rust-plan validate --plan <plan.json> [--json] [--cache-dir <dir>] [--session-id <id>] [--endpoint <ipc>] [--journal <path.jsonl>]
-zccache rust-plan restore  --plan <plan.json> [--json] [--backend auto|local|gha] [--cache-dir <dir>] [--session-id <id>] [--endpoint <ipc>] [--journal <path.jsonl>]
-zccache rust-plan save     --plan <plan.json> [--json] [--backend auto|local|gha] [--cache-dir <dir>] [--session-id <id>] [--endpoint <ipc>] [--journal <path.jsonl>]
+zccache rust-plan validate --plan <plan.pb> [--json] [--cache-dir <dir>] [--session-id <id>] [--endpoint <ipc>] [--journal <path.jsonl>]
+zccache rust-plan restore  --plan <plan.pb> [--json] [--backend auto|local|gha] [--cache-dir <dir>] [--session-id <id>] [--endpoint <ipc>] [--journal <path.jsonl>]
+zccache rust-plan save     --plan <plan.pb> [--json] [--backend auto|local|gha] [--cache-dir <dir>] [--session-id <id>] [--endpoint <ipc>] [--journal <path.jsonl>]
 ```
 
 Command behavior:
@@ -188,18 +189,51 @@ The local backend is the reference backend. It writes a zccache-owned bundle at:
 
 ```text
 <cache-dir>/rust-plan/<cache_key>/
-  manifest.json
+  manifest.pb
   files/<normalized target-relative artifact paths>
 ```
 
-`manifest.json` records the manifest schema version, plan schema version, cache
-schema version, mode, cache key, creation time, plan identity hash, and artifact
-entries. Each artifact entry records the normalized target-relative path, class,
-size, and content hash.
+`manifest.pb` is a compact protobuf manifest. It records the manifest schema
+version, plan schema version, cache schema version, mode, cache key, creation
+time, plan identity hash, bundle layer kind, optional base cache key, optional
+deleted paths, and artifact entries. Each artifact entry records the normalized
+target-relative path, class, size, content hash, and mtime in Unix nanoseconds.
+
+Restore-critical metadata and soldr-to-zccache interop files use protobuf.
+JSON plan files are still accepted for migration, but new plan files, bundle
+manifests, and layer metadata are not JSON.
 
 Restore validates manifest compatibility, prevents path traversal, verifies
-payload size and content hash, recreates parent directories, and refreshes file
-times so Cargo sees a coherent restored tree.
+payload size and content hash, recreates parent directories, and restores file
+mtimes from manifest metadata so Cargo sees a coherent restored tree. zccache
+still accepts legacy local `manifest.json` bundles for migration, but new
+bundles write `manifest.pb`.
+
+### Layered local restore
+
+The local backend also supports a base-plus-delta workflow for soldr cook
+caches:
+
+```text
+zccache rust-plan save-delta \
+  --plan <plan.pb> \
+  --base-cache-dir <base-cache-dir> \
+  --delta-cache-dir <delta-cache-dir>
+
+zccache rust-plan restore-layered \
+  --plan <plan.pb> \
+  --base-cache-dir <base-cache-dir> \
+  --delta-cache-dir <delta-cache-dir>
+```
+
+`save-delta` compares selected target artifacts against the base manifest by
+path, size, content hash, and mtime. Only changed or new artifacts are copied
+into the delta bundle. Paths present in the base but absent from the current
+selected set are recorded as protobuf tombstones.
+
+`restore-layered` restores the base bundle first, then overlays the delta
+bundle. Delta artifacts win, missing artifacts fall back to the base bundle,
+and tombstones remove stale base artifacts.
 
 ### GitHub Actions backend
 
@@ -278,6 +312,10 @@ Expected CI flow:
 4. Cargo builds through the zccache session/wrapper.
 5. `soldr` runs `zccache rust-plan save --plan <plan> --json --backend auto`.
 6. `setup-soldr` presents the zccache JSON summaries in CI output.
+
+For cook-cache delta mode, soldr/setup-soldr provide separate base and delta
+local cache directories and use `restore-layered` before the build and
+`save-delta` after the build.
 
 ---
 
