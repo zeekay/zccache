@@ -19,6 +19,22 @@ def _load_package_release():
 package_release = _load_package_release()
 
 
+def _repo_text(*parts: str) -> str:
+    return (Path(__file__).resolve().parents[2] / Path(*parts)).read_text(
+        encoding="utf-8"
+    )
+
+
+def _matrix_entry(workflow_text: str, target: str) -> str:
+    marker = f"          - target: {target}\n"
+    start = workflow_text.index(marker)
+    next_start = workflow_text.find("\n          - target:", start + len(marker))
+    steps_start = workflow_text.find("\n    steps:", start)
+    end_candidates = [pos for pos in (next_start, steps_start) if pos != -1]
+    assert end_candidates
+    return workflow_text[start : min(end_candidates)]
+
+
 def _write_fake_binary(path: Path) -> None:
     path.write_bytes(b"binary\n")
 
@@ -128,20 +144,14 @@ def test_stage_debug_tree_handles_dsym_directories(tmp_path: Path) -> None:
 
 
 def test_build_target_dereferences_debug_sidecar_symlinks() -> None:
-    action = (
-        Path(__file__).resolve().parents[2]
-        / ".github/actions/build-target/action.yml"
-    ).read_text(encoding="utf-8")
+    action = _repo_text(".github/actions/build-target/action.yml")
 
     assert 'cp -RL "$src" staging-debug/' in action
     assert 'cp -L "$src" staging-debug/' in action
 
 
 def test_build_target_uses_isolated_stamp_target_dir() -> None:
-    action = (
-        Path(__file__).resolve().parents[2]
-        / ".github/actions/build-target/action.yml"
-    ).read_text(encoding="utf-8")
+    action = _repo_text(".github/actions/build-target/action.yml")
 
     assert "HOST_TARGET=$(soldr rustc -vV" in action
     assert (
@@ -154,6 +164,63 @@ def test_build_target_uses_isolated_stamp_target_dir() -> None:
         'zccache-stamp$STAMP_EXT"'
     ) in action
     assert "target/release/zccache-stamp" not in action
+
+
+def test_build_target_exposes_cross_cache_controls() -> None:
+    action = _repo_text(".github/actions/build-target/action.yml")
+
+    assert "prebuild_deps:" in action
+    assert "clear_target_after_setup:" in action
+    assert "prebuild-deps: ${{ inputs.prebuild_deps }}" in action
+    assert "if: inputs.clear_target_after_setup == 'true'" in action
+    assert 'TARGET_DIR="target/${{ inputs.target }}"' in action
+    assert 'rm -rf "$TARGET_DIR"' in action
+
+
+def test_build_target_can_synthesize_macos_dsym_sidecars() -> None:
+    action = _repo_text(".github/actions/build-target/action.yml")
+
+    assert "copy_or_create_dsym()" in action
+    assert 'dsymutil "$TARGET_DIR/$bin" -o "staging-debug/$dsym"' in action
+    assert 'copy_or_create_dsym "zccache" "zccache.dSYM"' in action
+    assert 'copy_or_create_dsym "zccache-daemon" "zccache-daemon.dSYM"' in action
+    assert 'copy_or_create_dsym "zccache-fp" "zccache-fp.dSYM"' in action
+
+
+def test_release_and_build_workflows_disable_cook_cache_for_cross_targets() -> None:
+    cross_targets = {
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "aarch64-pc-windows-msvc",
+    }
+    native_targets = {
+        "x86_64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+    }
+
+    for workflow_path in (
+        ".github/workflows/build.yml",
+        ".github/workflows/release-auto.yml",
+    ):
+        workflow = _repo_text(workflow_path)
+        assert "prebuild_deps: ${{ matrix.prebuild_deps || 'soldr-cook' }}" in workflow
+        assert (
+            "clear_target_after_setup: "
+            "${{ matrix.clear_target_after_setup || 'false' }}"
+        ) in workflow
+
+        for target in cross_targets:
+            block = _matrix_entry(workflow, target)
+            assert "prebuild_deps: none" in block
+            assert 'clear_target_after_setup: "true"' in block
+
+        for target in native_targets:
+            block = _matrix_entry(workflow, target)
+            assert "prebuild_deps: none" not in block
+            assert "clear_target_after_setup:" not in block
 
 
 def test_stage_debug_tree_skips_empty_input(tmp_path: Path) -> None:

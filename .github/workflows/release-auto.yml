@@ -215,6 +215,8 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             binary_ext: ""
+            prebuild_deps: none
+            clear_target_after_setup: "true"
             include_python: "false"
             upload_binaries: "false"
             upload_release: "true"
@@ -224,6 +226,8 @@ jobs:
             binary_ext: ""
             linker: aarch64-unknown-linux-musl-gcc
             strip: aarch64-unknown-linux-musl-strip
+            prebuild_deps: none
+            clear_target_after_setup: "true"
             include_python: "false"
             upload_binaries: "false"
             upload_release: "true"
@@ -240,6 +244,8 @@ jobs:
             binary_ext: ""
             linker: aarch64-linux-gnu-gcc
             strip: aarch64-linux-gnu-strip
+            prebuild_deps: none
+            clear_target_after_setup: "true"
             include_python: "true"
             upload_binaries: "true"
             upload_release: "false"
@@ -254,6 +260,8 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             binary_ext: ""
+            prebuild_deps: none
+            clear_target_after_setup: "true"
             include_python: "true"
             upload_binaries: "true"
             upload_release: "true"
@@ -268,6 +276,8 @@ jobs:
           - target: aarch64-pc-windows-msvc
             os: windows-latest
             binary_ext: ".exe"
+            prebuild_deps: none
+            clear_target_after_setup: "true"
             include_python: "true"
             upload_binaries: "true"
             upload_release: "true"
@@ -283,6 +293,8 @@ jobs:
           target: ${{ matrix.target }}
           binary_ext: ${{ matrix.binary_ext }}
           cache_key: release-${{ matrix.target }}
+          prebuild_deps: ${{ matrix.prebuild_deps || 'soldr-cook' }}
+          clear_target_after_setup: ${{ matrix.clear_target_after_setup || 'false' }}
           include_python: ${{ matrix.include_python }}
           linker: ${{ matrix.linker || '' }}
           strip: ${{ matrix.strip || '' }}

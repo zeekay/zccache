@@ -25,6 +25,8 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             binary_ext: ""
+            prebuild_deps: none
+            clear_target_after_setup: "true"
             include_python: false
 
           - target: aarch64-unknown-linux-musl
@@ -33,6 +35,8 @@ jobs:
             cross: true
             linker: aarch64-unknown-linux-musl-gcc
             strip: aarch64-unknown-linux-musl-strip
+            prebuild_deps: none
+            clear_target_after_setup: "true"
             include_python: false
 
           - target: x86_64-unknown-linux-gnu
@@ -46,6 +50,8 @@ jobs:
             cross: true
             linker: aarch64-linux-gnu-gcc
             strip: aarch64-linux-gnu-strip
+            prebuild_deps: none
+            clear_target_after_setup: "true"
             include_python: true
 
           - target: x86_64-apple-darwin
@@ -56,6 +62,8 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             binary_ext: ""
+            prebuild_deps: none
+            clear_target_after_setup: "true"
             include_python: true
 
           - target: x86_64-pc-windows-msvc
@@ -66,6 +74,8 @@ jobs:
           - target: aarch64-pc-windows-msvc
             os: windows-latest
             binary_ext: ".exe"
+            prebuild_deps: none
+            clear_target_after_setup: "true"
             include_python: true
 
     steps:
@@ -79,6 +89,8 @@ jobs:
           target: ${{ matrix.target }}
           binary_ext: ${{ matrix.binary_ext }}
           cache_key: ${{ matrix.target }}
+          prebuild_deps: ${{ matrix.prebuild_deps || 'soldr-cook' }}
+          clear_target_after_setup: ${{ matrix.clear_target_after_setup || 'false' }}
           include_python: ${{ matrix.include_python && 'true' || 'false' }}
           python_version: "3.13"
           linker: ${{ matrix.linker || '' }}

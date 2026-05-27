@@ -12,6 +12,14 @@ inputs:
   cache_key:
     description: Cache key suffix passed to setup-soldr.
     required: true
+  prebuild_deps:
+    description: setup-soldr prebuild dependency mode.
+    required: false
+    default: soldr-cook
+  clear_target_after_setup:
+    description: Clear restored target artifacts after setup-soldr; use for cross-target builds.
+    required: false
+    default: "false"
   include_python:
     description: Build and stage Python extension artifacts.
     required: false
@@ -98,8 +106,18 @@ runs:
         toolchain: 1.94.1
         cache: true
         cache-key-suffix: build-${{ inputs.cache_key }}
-        prebuild-deps: soldr-cook
+        prebuild-deps: ${{ inputs.prebuild_deps }}
         prebuild-deps-flags: "--release --target ${{ inputs.target }}"
+
+    - name: Clear restored target artifacts
+      if: inputs.clear_target_after_setup == 'true'
+      shell: bash
+      run: |
+        TARGET_DIR="target/${{ inputs.target }}"
+        if [ -e "$TARGET_DIR" ] || [ -L "$TARGET_DIR" ]; then
+          echo "Removing restored target artifacts from $TARGET_DIR"
+          rm -rf "$TARGET_DIR"
+        fi
 
     # Static-link the MSVC C runtime (vcruntime + UCRT) for Windows release
     # binaries. Without `+crt-static` the published `zccache.exe` declares
@@ -267,6 +285,16 @@ runs:
             fi
           fi
         }
+        copy_or_create_dsym() {
+          local bin="$1"
+          local dsym="$2"
+          copy_debug "$TARGET_DIR/$dsym"
+          if [ ! -e "staging-debug/$dsym" ] && [ ! -L "staging-debug/$dsym" ]; then
+            if command -v dsymutil >/dev/null 2>&1 && [ -e "$TARGET_DIR/$bin" ]; then
+              dsymutil "$TARGET_DIR/$bin" -o "staging-debug/$dsym"
+            fi
+          fi
+        }
         TARGET_DIR="target/${{ inputs.target }}/release"
         TARGET="${{ inputs.target }}"
         case "$TARGET" in
@@ -276,9 +304,9 @@ runs:
             copy_debug "$TARGET_DIR/zccache_fp.pdb"
             ;;
           *apple-darwin)
-            copy_debug "$TARGET_DIR/zccache.dSYM"
-            copy_debug "$TARGET_DIR/zccache-daemon.dSYM"
-            copy_debug "$TARGET_DIR/zccache-fp.dSYM"
+            copy_or_create_dsym "zccache" "zccache.dSYM"
+            copy_or_create_dsym "zccache-daemon" "zccache-daemon.dSYM"
+            copy_or_create_dsym "zccache-fp" "zccache-fp.dSYM"
             ;;
           *)
             copy_debug "$TARGET_DIR/zccache.dwp"
