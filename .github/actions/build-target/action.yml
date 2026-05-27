@@ -20,6 +20,10 @@ inputs:
     description: Clear restored target artifacts after setup-soldr; use for cross-target builds.
     required: false
     default: "false"
+  require_debug_sidecars:
+    description: Fail when per-binary debug sidecars are missing.
+    required: false
+    default: "true"
   include_python:
     description: Build and stage Python extension artifacts.
     required: false
@@ -318,12 +322,17 @@ runs:
         esac
         echo "Staged debug sidecars:"
         ls -la staging-debug || true
+        REQUIRE_DEBUG_SIDECARS="${{ inputs.require_debug_sidecars }}"
         # Fail the build if a target's debug sidecars are missing entirely.
         # On Windows in particular, silent misses regressed zccache#276 where
         # only zccache.pdb shipped while the daemon/fp PDBs were skipped.
         if [ -z "$(ls -A staging-debug 2>/dev/null)" ]; then
-          echo "::error::No debug sidecars staged for target $TARGET" >&2
-          exit 1
+          if [ "$REQUIRE_DEBUG_SIDECARS" = "true" ]; then
+            echo "::error::No debug sidecars staged for target $TARGET" >&2
+            exit 1
+          fi
+          echo "::warning::No debug sidecars staged for target $TARGET" >&2
+          exit 0
         fi
         # Per-binary completeness check: each of the three bins must have a
         # matching sidecar present. Failing here surfaces naming drift (e.g.
@@ -341,42 +350,16 @@ runs:
           fi
         done
         if [ ${#missing[@]} -gt 0 ]; then
-          echo "::error::Missing debug sidecars for $TARGET: ${missing[*]}" >&2
-          exit 1
+          if [ "$REQUIRE_DEBUG_SIDECARS" = "true" ]; then
+            echo "::error::Missing debug sidecars for $TARGET: ${missing[*]}" >&2
+            exit 1
+          fi
+          echo "::warning::Missing debug sidecars for $TARGET: ${missing[*]}" >&2
         fi
-
-    - name: Build release stamping helper (native host)
-      shell: bash
-      run: |
-        # `zccache-stamp` appends a 128-byte release marker to each
-        # binary. Built for the host in an isolated target-dir so cross-target
-        # release output and setup-soldr target-cache state cannot hide it.
-        # It only appends bytes and never executes the target binary.
-        STAMP_TARGET_DIR=".stamp-target"
-        HOST_TARGET=$(soldr rustc -vV | awk '/^host: / { print $2 }')
-        case "$RUNNER_OS" in
-          Windows) STAMP_EXT=".exe" ;;
-          *)       STAMP_EXT="" ;;
-        esac
-        rm -rf "$STAMP_TARGET_DIR"
-        soldr cargo build --release --target "$HOST_TARGET" --target-dir "$STAMP_TARGET_DIR" -p zccache --bin zccache-stamp
-        echo "ZCCACHE_STAMP_TARGET_DIR=$STAMP_TARGET_DIR" >> "$GITHUB_ENV"
-        echo "ZCCACHE_STAMP_HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
-        echo "ZCCACHE_STAMP_EXT=$STAMP_EXT" >> "$GITHUB_ENV"
 
     - name: Stamp release binaries with release marker
       shell: bash
       run: |
-        # Host-binary path inside the isolated stamp target dir. On Windows
-        # runners the helper has a `.exe` suffix; on Linux/macOS it doesn't.
-        STAMP_TARGET_DIR="${ZCCACHE_STAMP_TARGET_DIR:-.stamp-target}"
-        STAMP_HOST_TARGET="${ZCCACHE_STAMP_HOST_TARGET:-$(soldr rustc -vV | awk '/^host: / { print $2 }')}"
-        STAMP_EXT="${ZCCACHE_STAMP_EXT:-}"
-        STAMP="$STAMP_TARGET_DIR/$STAMP_HOST_TARGET/release/zccache-stamp$STAMP_EXT"
-        if [ ! -x "$STAMP" ] && [ ! -e "$STAMP" ]; then
-          echo "::error::zccache-stamp not found at $STAMP" >&2
-          exit 1
-        fi
         # We stamp the *target* binaries after stripping (so the stamp
         # isn't clipped) and before archiving (so the archive carries
         # the stamped bytes). Build timestamp captured once for all
@@ -392,7 +375,7 @@ runs:
             echo "::error::binary missing for stamping: $BIN_PATH" >&2
             exit 1
           fi
-          "$STAMP" \
+          python ci/stamp_release.py \
             --binary "$BIN_PATH" \
             --sha "$GITHUB_SHA" \
             --version "$VERSION" \

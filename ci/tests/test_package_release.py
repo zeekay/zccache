@@ -5,6 +5,8 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+import pytest
+
 
 def _load_package_release():
     module_path = Path(__file__).resolve().parents[1] / "package_release.py"
@@ -16,7 +18,18 @@ def _load_package_release():
     return module
 
 
+def _load_stamp_release():
+    module_path = Path(__file__).resolve().parents[1] / "stamp_release.py"
+    spec = importlib.util.spec_from_file_location("stamp_release", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 package_release = _load_package_release()
+stamp_release = _load_stamp_release()
 
 
 def _repo_text(*parts: str) -> str:
@@ -150,20 +163,12 @@ def test_build_target_dereferences_debug_sidecar_symlinks() -> None:
     assert 'cp -L "$src" staging-debug/' in action
 
 
-def test_build_target_uses_isolated_stamp_target_dir() -> None:
+def test_build_target_stamps_release_binaries_with_python_footer() -> None:
     action = _repo_text(".github/actions/build-target/action.yml")
 
-    assert "HOST_TARGET=$(soldr rustc -vV" in action
-    assert (
-        '--target "$HOST_TARGET" --target-dir "$STAMP_TARGET_DIR" '
-        "-p zccache --bin zccache-stamp"
-    ) in action
-    assert 'echo "ZCCACHE_STAMP_HOST_TARGET=$HOST_TARGET"' in action
-    assert (
-        'STAMP="$STAMP_TARGET_DIR/$STAMP_HOST_TARGET/release/'
-        'zccache-stamp$STAMP_EXT"'
-    ) in action
-    assert "target/release/zccache-stamp" not in action
+    assert "python ci/stamp_release.py" in action
+    assert "zccache-stamp" not in action
+    assert 'soldr cargo build --release --target "$HOST_TARGET"' not in action
 
 
 def test_build_target_exposes_cross_cache_controls() -> None:
@@ -171,6 +176,7 @@ def test_build_target_exposes_cross_cache_controls() -> None:
 
     assert "prebuild_deps:" in action
     assert "clear_target_after_setup:" in action
+    assert "require_debug_sidecars:" in action
     assert "prebuild-deps: ${{ inputs.prebuild_deps }}" in action
     assert "if: inputs.clear_target_after_setup == 'true'" in action
     assert 'TARGET_DIR="target/${{ inputs.target }}"' in action
@@ -192,6 +198,15 @@ def test_build_target_can_synthesize_macos_dsym_sidecars() -> None:
     assert 'copy_or_create_dsym "zccache" "zccache.dSYM"' in action
     assert 'copy_or_create_dsym "zccache-daemon" "zccache-daemon.dSYM"' in action
     assert 'copy_or_create_dsym "zccache-fp" "zccache-fp.dSYM"' in action
+
+
+def test_build_target_can_treat_debug_sidecars_as_optional() -> None:
+    action = _repo_text(".github/actions/build-target/action.yml")
+
+    assert 'REQUIRE_DEBUG_SIDECARS="${{ inputs.require_debug_sidecars }}"' in action
+    assert 'if [ "$REQUIRE_DEBUG_SIDECARS" = "true" ]; then' in action
+    assert "::warning::No debug sidecars staged for target $TARGET" in action
+    assert "::warning::Missing debug sidecars for $TARGET: ${missing[*]}" in action
 
 
 def test_release_and_build_workflows_disable_cook_cache_for_cross_targets() -> None:
@@ -218,6 +233,10 @@ def test_release_and_build_workflows_disable_cook_cache_for_cross_targets() -> N
             "clear_target_after_setup: "
             "${{ matrix.clear_target_after_setup || 'false' }}"
         ) in workflow
+        assert (
+            "require_debug_sidecars: "
+            "${{ matrix.require_debug_sidecars || 'true' }}"
+        ) in workflow
 
         for target in cross_targets:
             block = _matrix_entry(workflow, target)
@@ -228,6 +247,40 @@ def test_release_and_build_workflows_disable_cook_cache_for_cross_targets() -> N
             block = _matrix_entry(workflow, target)
             assert "prebuild_deps: none" not in block
             assert "clear_target_after_setup:" not in block
+
+        windows_arm_block = _matrix_entry(workflow, "aarch64-pc-windows-msvc")
+        assert 'require_debug_sidecars: "false"' in windows_arm_block
+
+
+def test_stamp_release_marker_layout_and_append(tmp_path: Path) -> None:
+    marker = stamp_release.encode_marker(
+        git_sha="0123456789abcdef0123456789abcdef01234567",
+        version="1.11.4",
+        triple="x86_64-unknown-linux-gnu",
+        build_timestamp=1_700_000_123,
+    )
+
+    assert len(marker) == 128
+    assert marker[0:40] == b"0123456789abcdef0123456789abcdef01234567"
+    assert marker[40:46] == b"1.11.4"
+    assert marker[56:80] == b"x86_64-unknown-linux-gnu"
+    assert marker[88:96] == (1_700_000_123).to_bytes(8, "little")
+    assert marker[120:128] == b"ZCCSYMv1"
+
+    binary = tmp_path / "zccache"
+    binary.write_bytes(b"binary")
+    stamp_release.append_marker(binary, marker)
+    assert binary.read_bytes() == b"binary" + marker
+
+
+def test_stamp_release_rejects_oversized_fields() -> None:
+    with pytest.raises(ValueError):
+        stamp_release.encode_marker(
+            git_sha="0" * 40,
+            version="1.11.4",
+            triple="x86_64-some-extremely-long-triple-that-cannot-fit",
+            build_timestamp=1,
+        )
 
 
 def test_stage_debug_tree_skips_empty_input(tmp_path: Path) -> None:

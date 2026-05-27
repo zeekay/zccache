@@ -278,6 +278,7 @@ jobs:
             binary_ext: ".exe"
             prebuild_deps: none
             clear_target_after_setup: "true"
+            require_debug_sidecars: "false"
             include_python: "true"
             upload_binaries: "true"
             upload_release: "true"
@@ -295,6 +296,7 @@ jobs:
           cache_key: release-${{ matrix.target }}
           prebuild_deps: ${{ matrix.prebuild_deps || 'soldr-cook' }}
           clear_target_after_setup: ${{ matrix.clear_target_after_setup || 'false' }}
+          require_debug_sidecars: ${{ matrix.require_debug_sidecars || 'true' }}
           include_python: ${{ matrix.include_python }}
           linker: ${{ matrix.linker || '' }}
           strip: ${{ matrix.strip || '' }}

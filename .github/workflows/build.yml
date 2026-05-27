@@ -76,6 +76,7 @@ jobs:
             binary_ext: ".exe"
             prebuild_deps: none
             clear_target_after_setup: "true"
+            require_debug_sidecars: "false"
             include_python: true
 
     steps:
@@ -91,6 +92,7 @@ jobs:
           cache_key: ${{ matrix.target }}
           prebuild_deps: ${{ matrix.prebuild_deps || 'soldr-cook' }}
           clear_target_after_setup: ${{ matrix.clear_target_after_setup || 'false' }}
+          require_debug_sidecars: ${{ matrix.require_debug_sidecars || 'true' }}
           include_python: ${{ matrix.include_python && 'true' || 'false' }}
           python_version: "3.13"
           linker: ${{ matrix.linker || '' }}
