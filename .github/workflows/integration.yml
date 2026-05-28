@@ -54,6 +54,7 @@ jobs:
           zccache-seed-strict: true
           toolchain: 1.94.1
           cache: true
+          linker: fast
           prebuild-deps: soldr-cook
           prebuild-deps-flags: ""
       - name: Build integration test binaries

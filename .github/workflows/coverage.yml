@@ -30,6 +30,7 @@ jobs:
           toolchain: 1.94.1
           cache: true
           cache-key-suffix: coverage
+          linker: fast
           prebuild-deps: soldr-cook
           prebuild-deps-flags: ""
       - name: Install Rust coverage component

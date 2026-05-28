@@ -23,6 +23,7 @@ jobs:
           toolchain: 1.94.1
           cache: true
           cache-key-suffix: check-${{ inputs.os }}
+          linker: fast
           prebuild-deps: soldr-cook
           prebuild-deps-flags: ""
       - name: Check
@@ -46,6 +47,7 @@ jobs:
           toolchain: 1.94.1
           cache: true
           cache-key-suffix: test-${{ inputs.os }}
+          linker: fast
           prebuild-deps: soldr-cook
           prebuild-deps-flags: ""
       # Platform Test runs unit tests in libraries and binaries only — it
