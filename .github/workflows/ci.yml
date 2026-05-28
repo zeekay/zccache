@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@55d85af93815ee549bcf420d613f1f4f2f90433f
+      - uses: zackees/setup-soldr@9b1b9ce70106b793fe8000a2a31a0dfd3f22488a
         with:
           zccache-seed-strict: true
           toolchain: 1.94.1
@@ -59,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - id: setup-soldr
-        uses: zackees/setup-soldr@55d85af93815ee549bcf420d613f1f4f2f90433f
+        uses: zackees/setup-soldr@9b1b9ce70106b793fe8000a2a31a0dfd3f22488a
         with:
           zccache-seed-strict: true
           toolchain: 1.94.1
@@ -106,7 +106,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@55d85af93815ee549bcf420d613f1f4f2f90433f
+      - uses: zackees/setup-soldr@9b1b9ce70106b793fe8000a2a31a0dfd3f22488a
         with:
           zccache-seed-strict: true
           cache: true
@@ -123,7 +123,7 @@ jobs:
       RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@55d85af93815ee549bcf420d613f1f4f2f90433f
+      - uses: zackees/setup-soldr@9b1b9ce70106b793fe8000a2a31a0dfd3f22488a
         with:
           zccache-seed-strict: true
           toolchain: 1.94.1

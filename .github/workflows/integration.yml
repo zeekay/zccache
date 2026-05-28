@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: zackees/setup-soldr@55d85af93815ee549bcf420d613f1f4f2f90433f
+      - uses: zackees/setup-soldr@9b1b9ce70106b793fe8000a2a31a0dfd3f22488a
         with:
           zccache-seed-strict: true
           toolchain: 1.94.1
@@ -61,7 +61,7 @@ jobs:
         shell: bash
         run: soldr cargo test --workspace --no-fail-fast --no-run
       - name: Stop setup-soldr builder cache before tests
-        uses: zackees/setup-soldr/cleanup@55d85af93815ee549bcf420d613f1f4f2f90433f
+        uses: zackees/setup-soldr/cleanup@9b1b9ce70106b793fe8000a2a31a0dfd3f22488a
       - name: Test (full workspace)
         shell: bash
         env:
