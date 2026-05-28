@@ -36,6 +36,7 @@ jobs:
           cache: false
           build-cache: false
           target-cache: false
+          linker: fast
 
       - name: Build perf benchmark binary
         shell: bash
@@ -94,6 +95,7 @@ jobs:
           cache: false
           build-cache: false
           target-cache: false
+          linker: fast
 
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:

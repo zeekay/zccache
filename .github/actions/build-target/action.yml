@@ -133,6 +133,7 @@ runs:
         toolchain: 1.94.1
         cache: true
         cache-key-suffix: build-${{ inputs.cache_key }}
+        linker: fast
         prebuild-deps: ${{ inputs.prebuild_deps }}
         prebuild-deps-flags: "--release --target ${{ inputs.target }}"
 

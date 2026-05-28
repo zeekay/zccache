@@ -45,6 +45,7 @@ jobs:
           cache: true
           build-cache: false
           target-cache: false
+          linker: fast
           prebuild-deps: none
       - name: Install Rust components
         run: soldr rustup component add rustfmt
@@ -64,6 +65,7 @@ jobs:
           cache: true
           cargo-registry-cache: false
           cache-key-suffix: dylint
+          linker: fast
       - name: Install Dylint nightly toolchain
         run: soldr rustup toolchain install nightly-2026-03-26 --component llvm-tools-preview --component rust-src --component rustc-dev --profile minimal
       - name: Install stable Rust components
@@ -102,6 +104,7 @@ jobs:
           cache: true
           toolchain: 1.94.1
           cache-key-suffix: msrv
+          linker: fast
       - name: Check MSRV
         run: soldr cargo check --workspace
 
@@ -118,5 +121,6 @@ jobs:
           toolchain: 1.94.1
           cache: true
           cache-key-suffix: docs
+          linker: fast
       - name: Build docs
         run: soldr cargo doc --workspace --no-deps
