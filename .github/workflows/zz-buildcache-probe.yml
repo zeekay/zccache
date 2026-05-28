@@ -1,0 +1,41 @@
+name: zz buildcache probe
+
+# Isolated, single-job probe to verify ONE thing: does a job's own build-cache
+# restore produce zccache hits (setup-soldr#237 keying + #398 artifact payload).
+#
+# Why this exists instead of the full CI matrix:
+#  - one job only -> no parallel jobs racing on the shared content-addressed
+#    cook-base/soldr-mini caches (setup-soldr#241).
+#  - prebuild-deps: none -> no cook; the build-cache is the SOLE warm path, so a
+#    warm hit can only come from restoring this job's own saved store.
+#  - a unique cache-key-suffix -> no coincidental sharing with any real job.
+#  - bump KEY_SALT below to mint a fresh, never-before-saved key (actions/cache
+#    keys are immutable, so a stale key from an older code rev would otherwise
+#    mask the fix).
+#
+# Procedure: push once (cold -> 0 hits, saves), push again (warm -> restores its
+# own store -> hits if the fix works). Triggers only on this throwaway branch;
+# ci.yml etc. are main-scoped and the PR is closed, so nothing else runs.
+
+on:
+  push:
+    branches: [test/coarse-key-237-e2e]
+
+jobs:
+  probe:
+    name: build-cache probe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: zackees/setup-soldr@9b1b9ce70106b793fe8000a2a31a0dfd3f22488a
+        with:
+          zccache-seed-strict: true
+          toolchain: 1.94.1
+          cache: true
+          build-cache: true
+          cache-key-suffix: e2e-buildcache-probe-v1
+          linker: fast
+          prebuild-deps: none
+      - name: check workspace (sole warm path is the build-cache)
+        shell: bash
+        run: soldr cargo check --workspace
