@@ -46,6 +46,12 @@ jobs:
           build-cache: false
           linker: fast
           prebuild-deps: none
+          # setup-soldr#305: enable solo-toolchain-cache so warm runs
+          # restore the rustup-installed toolchain from a tiny long-lived
+          # cache instead of paying ~8s for `rustup toolchain install`
+          # every time. Cache key is (rustc release × components × targets
+          # × soldr version) — invalidates only on real toolchain bumps.
+          solo-toolchain-cache: true
       - name: Install Rust components
         run: soldr rustup component add rustfmt
       - name: Check formatting
@@ -116,6 +122,8 @@ jobs:
           prebuild-deps: soldr-cook
           prebuild-deps-flags: ""
           verify-compile-cache: warn
+          # setup-soldr#305: see Formatting job comment above.
+          solo-toolchain-cache: true
       - name: Check MSRV
         run: soldr cargo check --workspace
 
@@ -136,5 +144,7 @@ jobs:
           prebuild-deps: soldr-cook
           prebuild-deps-flags: ""
           verify-compile-cache: warn
+          # setup-soldr#305: see Formatting job comment above.
+          solo-toolchain-cache: true
       - name: Build docs
         run: soldr cargo doc --workspace --no-deps
