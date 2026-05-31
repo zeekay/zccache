@@ -6,17 +6,21 @@ name: Cache Cleanup
 # dominated by per-commit cook-delta + zccache-test entries,
 # nullifying the warm-run wins from setup-soldr#305 / #310 / #313.
 #
-# Observed regrowth rate: 11 cook-delta entries in < 1 h (every push
-# creates a new ~200-300 MB entry). 6h cadence wasn't fast enough.
-# Switched to hourly.
+# Triggered on-demand:
+# - workflow_dispatch: manual trigger
+# - workflow_run: after CI / Integration / Coverage complete (those
+#   are the workflows that ADD large per-commit cache entries). The
+#   first step gates on actual cache size so cleanup is a no-op
+#   unless usage is over the high-water mark (8 GB).
 #
 # Strategy: for each per-commit key family, keep the newest 5,
 # prune the rest unconditionally.
 
 on:
-  schedule:
-    - cron: "27 * * * *" # every hour at :27
   workflow_dispatch:
+  workflow_run:
+    workflows: ["CI", "Integration", "Coverage", "Benchmark Stats", "Perf Cluster Rust"]
+    types: [completed]
 
 jobs:
   prune-per-commit-caches:
@@ -25,7 +29,33 @@ jobs:
     permissions:
       actions: write
     steps:
-      - name: Prune cook-delta + zccache-test + cargo-target entries (keep newest 5 per family)
+      - name: Gate on cache usage (skip when under 8 GB high-water mark)
+        id: gate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Skip the cleanup when cache usage is under the high-water
+            // mark. The 10 GB cap is GitHub's soft limit (LRU eviction
+            // engages above it). Triggering at 8 GB leaves 2 GB
+            // headroom for in-flight workflow saves to complete
+            // without forcing eviction of small long-lived caches.
+            const HIGH_WATER_GB = 8;
+            const usage = await github.rest.actions.getActionsCacheUsage(context.repo);
+            const sizeGb = usage.data.active_caches_size_in_bytes / 1024 / 1024 / 1024;
+            console.log(
+              `Repo cache: ${usage.data.active_caches_count} entries, ` +
+              `${sizeGb.toFixed(2)} GB (high-water: ${HIGH_WATER_GB} GB)`
+            );
+            if (sizeGb < HIGH_WATER_GB) {
+              console.log("Under high-water mark — skipping cleanup.");
+              core.setOutput("needed", "false");
+            } else {
+              console.log("Over high-water mark — cleanup needed.");
+              core.setOutput("needed", "true");
+            }
+
+      - name: Prune per-commit cache families (keep newest 5)
+        if: steps.gate.outputs.needed == 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -76,6 +106,7 @@ jobs:
             );
 
       - name: Report repo cache usage
+        if: steps.gate.outputs.needed == 'true'
         uses: actions/github-script@v7
         with:
           script: |
