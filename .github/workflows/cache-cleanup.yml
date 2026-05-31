@@ -1,0 +1,68 @@
+name: Cache Cleanup
+
+# setup-soldr#320 / setup-soldr#316: prune stale cook-delta cache entries to
+# prevent LRU eviction of small long-lived caches (solo-toolchain,
+# cargo-registry). Cook-delta is keyed per-commit (~200MB each); with N
+# recent commits the entries push the small caches out of the 10GB
+# repo cache budget, nullifying the warm-run wins from setup-soldr#305
+# / #310 / #313.
+#
+# Strategy: keep the newest 3 cook-delta entries (covers recent push +
+# retry + in-flight PR), prune anything older than 24h.
+
+on:
+  schedule:
+    - cron: "23 */6 * * *" # every 6 hours at :23
+  workflow_dispatch:
+
+jobs:
+  prune-cook-deltas:
+    name: Prune stale cook-delta cache entries
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Prune cook-delta entries (keep newest 3, prune >24h old)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const repo = context.repo;
+            const caches = await github.paginate(
+              github.rest.actions.getActionsCacheList,
+              { ...repo, per_page: 100, sort: "created_at", direction: "desc" }
+            );
+            const cookDeltas = caches.filter(c =>
+              c.key && c.key.startsWith("cook-delta-v2-")
+            );
+            console.log(`Found ${cookDeltas.length} cook-delta entries`);
+            const candidates = cookDeltas.slice(3);
+            const cutoffMs = Date.now() - 24 * 3600 * 1000;
+            const stale = candidates.filter(c =>
+              new Date(c.created_at).getTime() < cutoffMs
+            );
+            let prunedBytes = 0;
+            for (const c of stale) {
+              await github.rest.actions.deleteActionsCacheById({
+                ...repo,
+                cache_id: c.id,
+              });
+              prunedBytes += c.size_in_bytes;
+              console.log(
+                `Deleted ${c.key} (${(c.size_in_bytes / 1024 / 1024).toFixed(0)} MB, age ` +
+                `${((Date.now() - new Date(c.created_at).getTime()) / 3600000).toFixed(1)}h)`
+              );
+            }
+            console.log(
+              `Pruned ${stale.length} stale cook-delta entries ` +
+              `(${(prunedBytes / 1024 / 1024 / 1024).toFixed(2)} GB recovered)`
+            );
+
+      - name: Report repo cache usage
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const usage = await github.rest.actions.getActionsCacheUsage(context.repo);
+            console.log(
+              `Repo cache after cleanup: ${usage.data.active_caches_count} entries, ` +
+              `${(usage.data.active_caches_size_in_bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+            );
