@@ -37,12 +37,14 @@ jobs:
           # build-cache so the daemon-isolated llvm-cov phase starts warm.
           seed-isolated-build-cache: ${{ runner.temp }}/zccache-self-tests/coverage
           verify-compile-cache: warn
+          # setup-soldr#305: see Formatting job comment in ci.yml.
+          solo-toolchain-cache: true
       - name: Install Rust coverage component
         run: soldr rustup component add llvm-tools-preview
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Stop setup-soldr builder cache before coverage tests
-        uses: zackees/setup-soldr/cleanup@v0.9.33
+        uses: zackees/setup-soldr/cleanup@v0.9.35
       - name: Generate coverage
         env:
           SOLDR_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/coverage

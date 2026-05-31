@@ -35,6 +35,8 @@ jobs:
           prebuild-deps: soldr-cook
           prebuild-deps-flags: ""
           verify-compile-cache: warn
+          # setup-soldr#305: see Formatting job comment in ci.yml.
+          solo-toolchain-cache: true
       - name: Install Clippy
         run: soldr rustup component add clippy
       - name: Run Clippy
