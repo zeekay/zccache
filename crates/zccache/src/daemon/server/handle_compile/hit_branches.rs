@@ -118,6 +118,7 @@ pub(super) struct FastHitProbe<'a> {
     pub(super) client_env: Option<&'a [(String, String)]>,
     pub(super) is_rustc: bool,
     pub(super) worktree_equivalent_context: bool,
+    pub(super) worktree_bound: bool,
     pub(super) compile_start: Instant,
     pub(super) parse_args_ns: u64,
     pub(super) build_context_ns: u64,
@@ -139,6 +140,7 @@ pub(super) fn try_fast_hit(probe: FastHitProbe<'_>) -> Option<Response> {
         client_env,
         is_rustc,
         worktree_equivalent_context,
+        worktree_bound,
         compile_start,
         parse_args_ns,
         build_context_ns,
@@ -210,6 +212,7 @@ pub(super) fn try_fast_hit(probe: FastHitProbe<'_>) -> Option<Response> {
             output_path,
             input_paths,
             request_cache_key_root.as_ref(),
+            worktree_bound,
         ),
     );
     Some(response)
@@ -231,6 +234,7 @@ pub(super) struct DepgraphHitProbe<'a> {
     pub(super) client_env: Option<&'a [(String, String)]>,
     pub(super) is_rustc: bool,
     pub(super) worktree_equivalent_context: bool,
+    pub(super) worktree_bound: bool,
     pub(super) compile_start: Instant,
     pub(super) parse_args_ns: u64,
     pub(super) build_context_ns: u64,
@@ -256,6 +260,7 @@ pub(super) fn try_depgraph_cached_hit(probe: DepgraphHitProbe<'_>) -> Option<Res
         client_env,
         is_rustc,
         worktree_equivalent_context,
+        worktree_bound,
         compile_start,
         parse_args_ns,
         build_context_ns,
@@ -325,6 +330,7 @@ pub(super) fn try_depgraph_cached_hit(probe: DepgraphHitProbe<'_>) -> Option<Res
                 output_path,
                 input_paths,
                 request_cache_key_root.as_ref(),
+                worktree_bound,
             ),
         );
     }

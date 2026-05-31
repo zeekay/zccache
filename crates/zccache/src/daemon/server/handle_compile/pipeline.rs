@@ -238,9 +238,14 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
     } else {
         crate::compiler::SourceMode::Normal
     };
-    let worktree_salt = if worktree_root.is_some()
-        && requires_worktree_in_key(compilation.family, source_mode_for_key)
-    {
+    // Issue #489: PCH/MSVC artifacts embed absolute paths the path-remap
+    // family can't scrub, so the request-level cache must refuse to share
+    // their entries across worktrees regardless of how root-relative the
+    // captured paths look. `requires_worktree_in_key` is the single source
+    // of truth — we mirror it here into both the context-key salt and the
+    // request-cache `worktree_bound` flag so the two cache layers agree.
+    let worktree_bound = requires_worktree_in_key(compilation.family, source_mode_for_key);
+    let worktree_salt = if worktree_root.is_some() && worktree_bound {
         Some(default_key_root.as_path())
     } else {
         None
@@ -337,6 +342,7 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
         client_env: client_env.as_deref(),
         is_rustc,
         worktree_equivalent_context,
+        worktree_bound,
         compile_start,
         parse_args_ns,
         build_context_ns,
@@ -545,6 +551,7 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
                 client_env: client_env.as_deref(),
                 is_rustc,
                 worktree_equivalent_context,
+                worktree_bound,
                 compile_start,
                 parse_args_ns,
                 build_context_ns,
