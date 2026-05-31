@@ -22,10 +22,16 @@ jobs:
     permissions:
       actions: write
     steps:
-      - name: Prune cook-delta entries (keep newest 3, prune >24h old)
+      - name: Prune cook-delta entries (keep newest 5, prune the rest)
         uses: actions/github-script@v7
         with:
           script: |
+            // First iteration used a 24h age filter, but real data
+            // (21 entries accumulated in < 24h) showed cook-deltas
+            // arrive faster than the age filter prunes. Switch to a
+            // count-based policy: keep the 5 most recent, prune all
+            // older regardless of age. The 5-entry window covers
+            // recent push + retry + ~3 in-flight PRs.
             const repo = context.repo;
             const caches = await github.paginate(
               github.rest.actions.getActionsCacheList,
@@ -35,11 +41,7 @@ jobs:
               c.key && c.key.startsWith("cook-delta-v2-")
             );
             console.log(`Found ${cookDeltas.length} cook-delta entries`);
-            const candidates = cookDeltas.slice(3);
-            const cutoffMs = Date.now() - 24 * 3600 * 1000;
-            const stale = candidates.filter(c =>
-              new Date(c.created_at).getTime() < cutoffMs
-            );
+            const stale = cookDeltas.slice(5);
             let prunedBytes = 0;
             for (const c of stale) {
               await github.rest.actions.deleteActionsCacheById({
