@@ -454,12 +454,22 @@ pub(super) fn request_cache_input_paths(
     paths
 }
 
+/// Build a request-cache entry.
+///
+/// `worktree_bound` must be `true` for any artifact whose bytes embed
+/// absolute paths that no remap pass scrubs — PCH/GCH (`-include`-baked
+/// header AST) and MSVC compiles (PDB/`/Fp`/`/Fd` paths). Setting it forces
+/// `cross_root_shareable = false`, so the entry only matches lookups from
+/// its originating worktree even when every captured path is technically
+/// root-relative. See [`requires_worktree_in_key`] for the truth table and
+/// issue #489 for the diagnostic / DLL-load failure that motivated this.
 pub(super) fn request_cache_entry(
     context_key: ContextKey,
     source_path: &NormalizedPath,
     output_path: &NormalizedPath,
     input_paths: Vec<NormalizedPath>,
     key_root: Option<&NormalizedPath>,
+    worktree_bound: bool,
 ) -> RequestCacheEntry {
     let root = key_root.cloned();
     let root_path = key_root.map(|root| root.as_path());
@@ -469,7 +479,8 @@ pub(super) fn request_cache_entry(
         .iter()
         .map(|path| CachedRequestPath::capture(path, root_path))
         .collect();
-    let cross_root_shareable = root.is_some()
+    let cross_root_shareable = !worktree_bound
+        && root.is_some()
         && source_path.is_root_relative()
         && output_path.is_root_relative()
         && input_paths.iter().all(CachedRequestPath::is_root_relative);

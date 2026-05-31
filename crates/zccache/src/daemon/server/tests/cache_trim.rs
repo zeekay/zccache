@@ -212,6 +212,7 @@ fn request_cache_resolved_inputs_requires_cross_root_shareable_entry() {
         &output_a,
         vec![source_a.clone(), header_a],
         Some(&NormalizedPath::new(&root_a)),
+        false,
     );
 
     let resolved = request_cache_resolved_inputs(&entry, &NormalizedPath::new(&root_b)).unwrap();
@@ -223,6 +224,69 @@ fn request_cache_resolved_inputs_requires_cross_root_shareable_entry() {
             NormalizedPath::new(root_b.join("include/common.h")),
         ]
     );
+}
+
+// Issue #489: PCH (and MSVC) artifacts bake absolute include paths into the
+// compiled output. `path_remap=off` does not change that — there is no
+// `-ffile-prefix-map` family of scrubbers that touches the PCH AST table. So
+// even when every captured path looks root-relative, a request-level cache
+// entry tagged `worktree_bound` must NEVER be served across worktrees, or the
+// HIT serves a PCH whose embedded paths reference the original worktree.
+//
+// Before the fix, `cross_root_shareable` was derived solely from "are all
+// paths root-relative?" — which is `true` for PCH (the `.h` lives inside the
+// worktree), so a stale fastled10 PCH leaked into a fastled7 build and
+// produced compiler diagnostics referencing `fastled10` paths + downstream
+// DLL load failures (Windows error 126).
+#[test]
+fn request_cache_entry_worktree_bound_rejects_cross_worktree_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root_a = NormalizedPath::new(tmp.path().join("fastled10"));
+    let root_b = NormalizedPath::new(tmp.path().join("fastled7"));
+    let source_a: NormalizedPath = root_a.as_path().join("src/FastLED.h").into();
+    let output_a: NormalizedPath = root_a
+        .as_path()
+        .join(".build/meson-quick/ci/meson/native/FastLED.h.pch")
+        .into();
+
+    let pch_entry = request_cache_entry(
+        test_context_key("src/FastLED.h"),
+        &source_a,
+        &output_a,
+        vec![source_a.clone()],
+        Some(&root_a),
+        true,
+    );
+
+    // Same-root lookup: still HITs (sanity).
+    assert!(request_cache_entry_matches_root(&pch_entry, Some(&root_a)));
+
+    // Cross-root lookup: MUST NOT hit, even though every captured path was
+    // root-relative when the entry was built.
+    assert!(
+        !request_cache_entry_matches_root(&pch_entry, Some(&root_b)),
+        "PCH entries are worktree-bound and must not match across worktrees",
+    );
+    assert!(
+        !pch_entry.cross_root_shareable,
+        "worktree-bound entries must opt out of cross-root sharing entirely",
+    );
+
+    // Sanity contrast: an otherwise-identical NON-PCH entry (`worktree_bound = false`)
+    // remains cross-root-shareable. The flag is the single discriminator.
+    let object_entry = request_cache_entry(
+        test_context_key("src/main.cc"),
+        &source_a,
+        &output_a,
+        vec![source_a.clone()],
+        Some(&root_a),
+        false,
+    );
+    assert!(request_cache_entry_matches_root(
+        &object_entry,
+        Some(&root_b)
+    ));
+    assert!(object_entry.cross_root_shareable);
 }
 
 #[test]
