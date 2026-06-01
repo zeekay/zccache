@@ -125,8 +125,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          toolchain="$(awk -F'[="]+' '/^channel/ {print $2; exit}' rust-toolchain.toml)"
-          if [[ -z "$toolchain" ]]; then
+          # Parse `channel = "1.94.1"` from rust-toolchain.toml.
+          # Previous awk-with-multi-char-FS extracted the space
+          # between `=` and the opening quote into $2 instead of the
+          # actual value into $3, so `rustup default ' '` errored
+          # with "toolchain ' ' is not installed". Use sed with a
+          # capture group for unambiguous extraction.
+          toolchain="$(sed -nE 's/^channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)"
+          if [[ -z "$toolchain" || "$toolchain" =~ ^[[:space:]]*$ ]]; then
             echo "could not read channel from rust-toolchain.toml" >&2
             exit 1
           fi
