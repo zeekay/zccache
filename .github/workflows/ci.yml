@@ -46,19 +46,12 @@ jobs:
           build-cache: false
           linker: fast
           prebuild-deps: none
-          # solo-toolchain-cache restores a partial rustup state on warm
-          # runs where rustfmt appears installed in the manifest but
-          # `cargo-fmt` is missing from the toolchain bin/ directory.
-          # Result: `cargo fmt` fails with "the 'cargo-fmt' binary is
-          # not applicable to the '1.94.1-x86_64-unknown-linux-gnu'
-          # toolchain" on every push-to-main since the cache started
-          # landing exact-hits. Disabling the cache for this lightweight
-          # job costs ~8 s per run — cheap insurance vs. losing CI
-          # signal on Formatting. Re-enable once setup-soldr packages
-          # the rustfmt binary into the cached toolchain layout.
-          solo-toolchain-cache: false
-      - name: Install Rust components
-        run: soldr rustup component add rustfmt
+          # Re-enabled after setup-soldr#334: rustfmt is now declared
+          # in rust-toolchain.toml's `components = ["rustfmt"]`, so
+          # setup-soldr installs it during the toolchain phase and
+          # the solo-cache snapshot captures both the manifest AND
+          # the cargo-fmt binary. Warm restore is consistent.
+          solo-toolchain-cache: true
       - name: Check formatting
         run: soldr cargo fmt --all -- --check
 
