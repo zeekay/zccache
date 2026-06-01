@@ -27,12 +27,12 @@ use super::error::IpcError;
 /// `IpcError::Io(_)` or `IpcError::ConnectionClosed` without involving
 /// this timeout.
 ///
-/// Five minutes is intentionally generous. If a real workload exceeds it,
-/// switch that single call site to `recv_with_timeout` with a longer
-/// budget rather than bumping the const — the const is also the upper
-/// bound on hung-daemon detection latency for `ensure_daemon`'s
-/// auto-recovery path, and shortening it is the easier fix once the
-/// daemon side is fast enough.
+/// Five minutes is intentionally generous for Compile/Link responses. Cheap
+/// daemon-health probes that need fast recovery, such as `ensure_daemon`'s
+/// version `Status` probe, must override this with `recv_with_timeout` and a
+/// short per-call budget. If a real workload exceeds this default, switch that
+/// specific call site to `recv_with_timeout` with a longer budget rather than
+/// bumping the const.
 pub const DEFAULT_CLIENT_RECV_TIMEOUT: Duration = Duration::from_secs(300);
 
 // ── Platform-specific connection inner ──────────────────────────────

@@ -54,7 +54,10 @@ async fn check_daemon_version(endpoint: &str) -> VersionCheck {
     if conn.send(&crate::protocol::Request::Status).await.is_err() {
         return VersionCheck::CommError;
     }
-    match conn.recv::<crate::protocol::Response>().await {
+    match conn
+        .recv_with_timeout::<crate::protocol::Response>(super::status_probe_timeout())
+        .await
+    {
         Ok(Some(crate::protocol::Response::Status(s))) => {
             if s.version == crate::core::VERSION {
                 return VersionCheck::Ok;

@@ -9,6 +9,22 @@ mod runtime;
 pub mod snapshot_fp;
 pub mod symbols;
 
+/// Default per-call timeout for the `Status` probe used by daemon version
+/// checks. Two seconds keeps startup responsive when an existing daemon is
+/// alive but IPC-deaf, while still leaving normal Compile/Link roundtrips on
+/// the generous global client recv timeout.
+const STATUS_PROBE_DEFAULT_SECS: u64 = 2;
+
+/// Returns the per-call timeout for daemon version-probe Status recv calls,
+/// honoring `ZCCACHE_STATUS_PROBE_TIMEOUT_SECS` when it parses as `u64`.
+pub(crate) fn status_probe_timeout() -> std::time::Duration {
+    let secs = std::env::var("ZCCACHE_STATUS_PROBE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(STATUS_PROBE_DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 // Re-export daemon-lifecycle helpers moved to `runtime.rs` (issue #365 wave 6)
 // so the public API path is unchanged.
 #[allow(deprecated)]
