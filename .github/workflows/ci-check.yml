@@ -27,6 +27,10 @@ jobs:
           prebuild-deps: soldr-cook
           prebuild-deps-flags: ""
           verify-compile-cache: warn
+          # setup-soldr#305: skip ~7-11s `rustup toolchain install`
+          # on warm runs by restoring from a tiny per-platform cache.
+          # Was missing on Linux/macOS/Windows check+test jobs.
+          solo-toolchain-cache: true
       - name: Check
         shell: bash
         run: |
@@ -56,6 +60,9 @@ jobs:
           # across Linux/macOS/Windows.
           seed-isolated-build-cache: ${{ runner.temp }}/zccache-self-tests/test-${{ inputs.os }}
           verify-compile-cache: warn
+          # setup-soldr#305: skip ~7-11s `rustup toolchain install` on warm
+          # runs by restoring the toolchain from a tiny per-platform cache.
+          solo-toolchain-cache: true
       # Platform Test runs unit tests in libraries and binaries only — it
       # intentionally does NOT compile the integration test binaries under
       # `crates/*/tests/`. Most of those binaries' tests are #[ignore]'d, but
@@ -66,7 +73,7 @@ jobs:
         shell: bash
         run: soldr cargo test --workspace --lib --bins --no-fail-fast --no-run
       - name: Stop setup-soldr builder cache before tests
-        uses: zackees/setup-soldr/cleanup@v0.9.33
+        uses: zackees/setup-soldr/cleanup@v0.9.44
       - name: Test
         shell: bash
         env:
