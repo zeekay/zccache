@@ -54,15 +54,20 @@ jobs:
               core.setOutput("needed", "true");
             }
 
-      - name: Prune per-commit cache families (keep newest 5)
+      - name: Prune per-commit cache families (keep newest 3)
         if: steps.gate.outputs.needed == 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            // Per-commit cache families that accumulate one entry per
-            // push and dominate the 10 GB budget. Each family keeps
-            // its 5 newest entries (covers recent push + retry +
-            // ~3 in-flight PRs); the rest are pruned unconditionally.
+            // setup-soldr#346: per-commit cache families accumulate
+            // one entry per push and dominate the 10 GB budget. Each
+            // family keeps its 3 newest entries (recent push + retry
+            // + 1 in-flight PR); the rest are pruned unconditionally.
+            //
+            // Was KEEP=5 — observed at 14.6 GB usage which evicted
+            // small build-cache entries (per-platform-job builds got
+            // cold rebuilds, ~50 s wall-clock regression on macOS).
+            // Tightened to 3.
             const PREFIXES = [
               "cook-delta-v2-",
               "zccache-Linux-X64-test-",
@@ -73,8 +78,10 @@ jobs:
               "cargo-target-Windows-X64-bench-",
               "zccache-Linux-X64-bench-",
               "zccache-Windows-X64-bench-",
+              "zccache-macos-arm64-bench-",
+              "cargo-target-macos-arm64-bench-",
             ];
-            const KEEP = 5;
+            const KEEP = 3;
             const repo = context.repo;
             const caches = await github.paginate(
               github.rest.actions.getActionsCacheList,
@@ -116,6 +123,78 @@ jobs:
             }
             console.log(
               `Pruned ${totalPruned} per-commit entries (${(totalBytes / 1024 / 1024 / 1024).toFixed(2)} GB recovered)`
+            );
+
+      - name: Hard cap — prune oldest entries until under 8 GB
+        if: steps.gate.outputs.needed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // setup-soldr#346: even after count-based pruning, the
+            // sum of all categories can exceed the 10 GB cap. To
+            // prevent the LRU from evicting *small* long-lived caches
+            // (build-cache, solo-toolchain) that we WANT to keep,
+            // proactively delete the oldest entries from prune-
+            // eligible families until usage is under 8 GB.
+            const TARGET_GB = 8;
+            const ELIGIBLE_PREFIXES = [
+              "cook-delta-v2-",
+              "zccache-Linux-X64-test-",
+              "zccache-Linux-ARM64-test-",
+              "zccache-Windows-X64-test-",
+              "zccache-macos-arm64-test-",
+              "cargo-target-Linux-X64-bench-",
+              "cargo-target-Windows-X64-bench-",
+              "zccache-Linux-X64-bench-",
+              "zccache-Windows-X64-bench-",
+              "zccache-macos-arm64-bench-",
+              "cargo-target-macos-arm64-bench-",
+            ];
+            const repo = context.repo;
+            let usage = await github.rest.actions.getActionsCacheUsage(repo);
+            let sizeGb = usage.data.active_caches_size_in_bytes / 1024 / 1024 / 1024;
+            console.log(`After count-prune: ${sizeGb.toFixed(2)} GB. Target: ${TARGET_GB} GB.`);
+            if (sizeGb <= TARGET_GB) {
+              console.log("Already under hard cap — no further pruning needed.");
+              return;
+            }
+
+            // Build list of prune-eligible entries, OLDEST FIRST.
+            const caches = await github.paginate(
+              github.rest.actions.getActionsCacheList,
+              { ...repo, per_page: 100, sort: "created_at", direction: "asc" }
+            );
+            const eligible = caches.filter(c =>
+              c.key && ELIGIBLE_PREFIXES.some(p => c.key.startsWith(p))
+            );
+            console.log(`${eligible.length} prune-eligible entries available (oldest first).`);
+
+            let extraPruned = 0;
+            let extraBytes = 0;
+            const targetBytes = TARGET_GB * 1024 * 1024 * 1024;
+            for (const c of eligible) {
+              usage = await github.rest.actions.getActionsCacheUsage(repo);
+              if (usage.data.active_caches_size_in_bytes <= targetBytes) break;
+              try {
+                await github.rest.actions.deleteActionsCacheById({
+                  ...repo,
+                  cache_id: c.id,
+                });
+                extraBytes += c.size_in_bytes;
+                extraPruned += 1;
+                console.log(
+                  `  Hard-cap deleted ${c.key} ` +
+                  `(${(c.size_in_bytes / 1024 / 1024).toFixed(0)} MB, age ` +
+                  `${((Date.now() - new Date(c.created_at).getTime()) / 3600000).toFixed(1)}h)`
+                );
+              } catch (err) {
+                if (err.status === 404) continue;
+                throw err;
+              }
+            }
+            console.log(
+              `Hard cap: pruned ${extraPruned} additional entries ` +
+              `(${(extraBytes / 1024 / 1024 / 1024).toFixed(2)} GB recovered)`
             );
 
       - name: Report repo cache usage
