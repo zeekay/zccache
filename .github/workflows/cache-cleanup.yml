@@ -89,16 +89,29 @@ jobs:
               if (matching.length === 0) continue;
               console.log(`${prefix}: ${matching.length} entries, will prune ${stale.length}`);
               for (const c of stale) {
-                await github.rest.actions.deleteActionsCacheById({
-                  ...repo,
-                  cache_id: c.id,
-                });
-                totalBytes += c.size_in_bytes;
-                totalPruned += 1;
-                console.log(
-                  `  Deleted ${c.key} (${(c.size_in_bytes / 1024 / 1024).toFixed(0)} MB, age ` +
-                  `${((Date.now() - new Date(c.created_at).getTime()) / 3600000).toFixed(1)}h)`
-                );
+                try {
+                  await github.rest.actions.deleteActionsCacheById({
+                    ...repo,
+                    cache_id: c.id,
+                  });
+                  totalBytes += c.size_in_bytes;
+                  totalPruned += 1;
+                  console.log(
+                    `  Deleted ${c.key} (${(c.size_in_bytes / 1024 / 1024).toFixed(0)} MB, age ` +
+                    `${((Date.now() - new Date(c.created_at).getTime()) / 3600000).toFixed(1)}h)`
+                  );
+                } catch (err) {
+                  // Tolerate 404 — another cleanup workflow may have
+                  // raced and deleted this entry already. Workflow_run
+                  // fires this cleanup from multiple parent workflows
+                  // simultaneously, so concurrent deletes on the same
+                  // stale entry are expected.
+                  if (err.status === 404) {
+                    console.log(`  Skipped ${c.key} (already deleted by concurrent cleanup)`);
+                  } else {
+                    throw err;
+                  }
+                }
               }
             }
             console.log(
