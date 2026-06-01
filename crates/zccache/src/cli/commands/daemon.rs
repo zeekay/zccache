@@ -3,6 +3,7 @@
 use crate::core::NormalizedPath;
 use std::process::ExitCode;
 
+use super::super::status_probe_timeout;
 use super::util::{connect, resolve_endpoint, run_async};
 
 pub(crate) enum VersionCheck {
@@ -22,6 +23,12 @@ pub(crate) enum VersionCheck {
 }
 
 /// Connect to the daemon and compare its version to ours.
+///
+/// The Status recv is bounded by [`status_probe_timeout`] so that a wedged
+/// daemon (alive socket, no response) surfaces as `CommError` in seconds
+/// rather than the 5-minute global default. The caller's recovery path
+/// (`ensure_daemon` → `stop_stale_daemon` → `spawn_and_wait`) then runs
+/// promptly. See issue #554.
 pub(crate) async fn check_daemon_version(endpoint: &str) -> VersionCheck {
     let mut conn = match connect(endpoint).await {
         Ok(c) => c,
@@ -30,7 +37,10 @@ pub(crate) async fn check_daemon_version(endpoint: &str) -> VersionCheck {
     if conn.send(&crate::protocol::Request::Status).await.is_err() {
         return VersionCheck::CommError;
     }
-    match conn.recv::<crate::protocol::Response>().await {
+    match conn
+        .recv_with_timeout::<crate::protocol::Response>(status_probe_timeout())
+        .await
+    {
         Ok(Some(crate::protocol::Response::Status(s))) => {
             if s.version == crate::core::VERSION {
                 return VersionCheck::Ok;
