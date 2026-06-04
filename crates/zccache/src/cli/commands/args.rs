@@ -510,6 +510,19 @@ pub(crate) enum MesonCommands {
         /// LDFLAGS, PKG_CONFIG_PATH) are always included.
         #[arg(long = "input-env", value_name = "NAME")]
         input_env: Vec<String>,
+        /// Extra file paths whose content feeds the cache key. Repeatable.
+        /// Each file is hashed by content; the path is recorded as it
+        /// appeared on the command line.
+        ///
+        /// Use this when source-change detection lives outside the
+        /// meson.build set itself — e.g. a downstream caching layer that
+        /// hashes test/example/source globs and writes the digest to a
+        /// sidecar file. Pointing `--input-file` at that sidecar lets the
+        /// wrapper invalidate the cached configure tree when those globs
+        /// change, instead of forcing the caller to bypass the wrapper
+        /// entirely. See issue #654.
+        #[arg(long = "input-file", value_name = "PATH")]
+        input_file: Vec<String>,
         /// Extra `meson setup` arguments passed verbatim on a miss. They
         /// also enter the cache key so different option sets produce
         /// distinct cache entries.

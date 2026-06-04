@@ -193,3 +193,160 @@ fn changing_meson_build_busts_the_cache() {
         "changing meson.build must produce a fresh miss; got: {stderr_b}",
     );
 }
+
+// ============================================================================
+// `--input-file` — issue #654.
+// ============================================================================
+// The wrapper key by default covers meson.build / meson.options /
+// meson_options.txt content. Downstream projects whose source-change
+// detection lives OUTSIDE the meson.build set (e.g. FastLED's
+// metadata-cache layer that hashes test/example/source globs and writes
+// a sidecar digest) can extend the key by passing one or more
+// `--input-file PATH` flags. Each file's content enters the key; if any
+// file's content changes, the next invocation is a fresh miss.
+
+fn run_zccache_meson_configure_with_extra_inputs(
+    cache_dir: &Path,
+    source_dir: &Path,
+    build_dir: &Path,
+    extra_input_files: &[&Path],
+) -> std::process::Output {
+    let bin = zccache_bin();
+    let mut cmd = Command::new(bin.as_path());
+    cmd.env("ZCCACHE_CACHE_DIR", cache_dir);
+    cmd.env_remove("ZCCACHE_SESSION_ID");
+    cmd.arg("meson").arg("configure");
+    cmd.arg("--source-dir").arg(source_dir);
+    cmd.arg("--build-dir").arg(build_dir);
+    for f in extra_input_files {
+        cmd.arg("--input-file").arg(f);
+    }
+    cmd.output()
+        .expect("spawn zccache meson configure --input-file ...")
+}
+
+#[test]
+fn input_file_change_busts_the_cache() {
+    if !meson_available() {
+        eprintln!("SKIP: meson not on PATH");
+        return;
+    }
+    let cache = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    write_tiny_meson_project(&source);
+
+    // Sidecar digest file the downstream caller maintains.
+    let sidecar = project.path().join("sources.hash");
+    std::fs::write(&sidecar, "deadbeef-v1").unwrap();
+
+    let build = project.path().join("build");
+    let out_a =
+        run_zccache_meson_configure_with_extra_inputs(cache.path(), &source, &build, &[&sidecar]);
+    assert!(
+        out_a.status.success(),
+        "cold run must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out_a.stdout),
+        String::from_utf8_lossy(&out_a.stderr),
+    );
+    let stderr_a = String::from_utf8_lossy(&out_a.stderr);
+    assert!(stderr_a.contains("[zccache-meson] miss"));
+
+    std::fs::remove_dir_all(&build).unwrap();
+
+    // Sidecar content unchanged → expect a hit.
+    let out_b =
+        run_zccache_meson_configure_with_extra_inputs(cache.path(), &source, &build, &[&sidecar]);
+    assert!(out_b.status.success());
+    let stderr_b = String::from_utf8_lossy(&out_b.stderr);
+    assert!(
+        stderr_b.contains("[zccache-meson] hit"),
+        "unchanged --input-file content must still hit; got: {stderr_b}",
+    );
+
+    std::fs::remove_dir_all(&build).unwrap();
+
+    // Mutate the sidecar → expect a miss even though meson.build is unchanged.
+    std::fs::write(&sidecar, "cafef00d-v2").unwrap();
+
+    let out_c =
+        run_zccache_meson_configure_with_extra_inputs(cache.path(), &source, &build, &[&sidecar]);
+    assert!(out_c.status.success());
+    let stderr_c = String::from_utf8_lossy(&out_c.stderr);
+    assert!(
+        stderr_c.contains("[zccache-meson] miss"),
+        "mutating --input-file content must invalidate the cache; got: {stderr_c}",
+    );
+}
+
+#[test]
+fn input_file_is_distinct_from_no_input_file() {
+    if !meson_available() {
+        eprintln!("SKIP: meson not on PATH");
+        return;
+    }
+    // Same source tree, two cache populations: one with `--input-file`,
+    // one without. They must NOT share entries — the with-input-file run
+    // is a fresh miss even though the no-input-file run already populated
+    // the cache for the same meson.build.
+    let cache = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    write_tiny_meson_project(&source);
+
+    let sidecar = project.path().join("sources.hash");
+    std::fs::write(&sidecar, "anything").unwrap();
+
+    let build = project.path().join("build");
+    let out_a = run_zccache_meson_configure(cache.path(), &source, &build);
+    assert!(out_a.status.success());
+    std::fs::remove_dir_all(&build).unwrap();
+
+    let out_b =
+        run_zccache_meson_configure_with_extra_inputs(cache.path(), &source, &build, &[&sidecar]);
+    assert!(out_b.status.success());
+    let stderr_b = String::from_utf8_lossy(&out_b.stderr);
+    assert!(
+        stderr_b.contains("[zccache-meson] miss"),
+        "adding --input-file to a previously-cached entry must produce a fresh miss; got: {stderr_b}",
+    );
+}
+
+#[test]
+fn input_file_order_does_not_affect_key() {
+    if !meson_available() {
+        eprintln!("SKIP: meson not on PATH");
+        return;
+    }
+    // Two `--input-file` flags in opposite orders must produce the same
+    // cache key (the implementation sorts internally). This pins that
+    // contract so a caller using `BTreeMap`/`HashMap` iteration doesn't
+    // accidentally split cache entries by argv order.
+    let cache = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    write_tiny_meson_project(&source);
+
+    let a = project.path().join("a.hash");
+    let b = project.path().join("b.hash");
+    std::fs::write(&a, "alpha").unwrap();
+    std::fs::write(&b, "beta").unwrap();
+
+    let build = project.path().join("build");
+    let out_a =
+        run_zccache_meson_configure_with_extra_inputs(cache.path(), &source, &build, &[&a, &b]);
+    assert!(out_a.status.success());
+    std::fs::remove_dir_all(&build).unwrap();
+
+    let out_b =
+        run_zccache_meson_configure_with_extra_inputs(cache.path(), &source, &build, &[&b, &a]);
+    assert!(out_b.status.success());
+    let stderr_b = String::from_utf8_lossy(&out_b.stderr);
+    assert!(
+        stderr_b.contains("[zccache-meson] hit"),
+        "reordering --input-file flags must NOT change the key; got: {stderr_b}",
+    );
+}
