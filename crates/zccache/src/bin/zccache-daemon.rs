@@ -195,6 +195,12 @@ fn run_server(args: Args) {
     // stderr which is detached to NUL, so this file-based sink is the
     // only way an operator (or CI) can correlate daemon lifetime with
     // surrounding events after the fact.
+    //
+    // Per #637, the spawn record is still written before bind — losers
+    // of the parallel-spawn race exit cleanly at bind time without an
+    // ERROR log, but their spawn-attempt is still recorded here. A
+    // future PR moving the bind earlier (deferred-depgraph-load) would
+    // let us scope this to winners only.
     zccache::daemon::lifecycle::write_event(
         zccache::daemon::lifecycle::EVENT_SPAWN,
         serde_json::json!({
@@ -224,6 +230,9 @@ fn run_server(args: Args) {
     // mismatch or corruption the outcome carries a warning that we surface
     // both on stderr (for operators) and via the daemon server (which forwards
     // it into per-session logs) so the cold fallback is never silent.
+    //
+    // Future work (#637 follow-up): defer this load to a background task
+    // so the bind can land first without delaying accept-loop start.
     let path = zccache::depgraph::depgraph_file_path();
     let (dep_graph, depgraph_load_warning) = if args.no_depgraph_cache {
         let _ = std::fs::remove_file(&path);
@@ -282,9 +291,47 @@ fn run_server(args: Args) {
     };
 
     rt.block_on(async {
+        // ── Issue #637: discriminate loser-of-race from real bind failure ──
+        //
+        // Parallel `ninja -jN` builds on Windows produce a spawn race:
+        // multiple newly-launched daemons reach this bind at once, and
+        // only one wins the named pipe. The losers previously logged at
+        // ERROR level ("failed to bind ... Access is denied") and
+        // exited 1, even though "another daemon owns this endpoint" is
+        // a clean, expected outcome — not an error.
+        //
+        // Field measurement from the issue: 277 redundant daemon spawns
+        // produced 276 ERROR entries in `daemon-lifecycle.log`. Now
+        // the losers log at INFO level and exit 0 cleanly, so the
+        // lifecycle log only carries the genuinely-failing daemons (if
+        // any). The 277-daemon herd cause itself needs a follow-up
+        // (deferred-depgraph-load so the bind can land before the slow
+        // init starts; this PR is the safe minimum-blast-radius slice).
         let mut server = match zccache::daemon::DaemonServer::bind(&endpoint) {
             Ok(s) => s,
             Err(e) => {
+                // Windows named-pipe collision surfaces as PermissionDenied
+                // (ERROR_ACCESS_DENIED, the user's repro) or AlreadyExists.
+                // Unix-domain-socket equivalent is AddrInUse.
+                let is_pipe_in_use = matches!(
+                    &e,
+                    zccache::ipc::IpcError::Io(io_err) if matches!(
+                        io_err.kind(),
+                        std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::AddrInUse
+                            | std::io::ErrorKind::AlreadyExists
+                    )
+                );
+                if is_pipe_in_use {
+                    tracing::info!(
+                        %endpoint,
+                        error = %e,
+                        "another daemon already owns endpoint — deferring"
+                    );
+                    // Do NOT remove the lock file — it belongs to the
+                    // winning daemon, not us.
+                    std::process::exit(0);
+                }
                 tracing::error!("failed to bind {endpoint}: {e}");
                 zccache::ipc::remove_lock_file();
                 std::process::exit(1);
