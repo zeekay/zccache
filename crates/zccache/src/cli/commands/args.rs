@@ -523,6 +523,17 @@ pub(crate) enum MesonCommands {
         /// entirely. See issue #654.
         #[arg(long = "input-file", value_name = "PATH")]
         input_file: Vec<String>,
+        /// Skip the implicit recursive walk of `--source-dir` for
+        /// `meson.build` / `meson.options` / `meson_options.txt`. The
+        /// caller takes full responsibility for naming every input file
+        /// via `--input-file` instead. Use this when you know your
+        /// project's input set exactly and the implicit walk is paying
+        /// for itself in directory-traversal cost on large monorepos
+        /// (e.g. trees with `.venv`, `.cached`, `.fbuild`, `.pio`, or
+        /// other large scratch dirs not on the default skip list). See
+        /// issue #659.
+        #[arg(long = "no-walk", default_value_t = false)]
+        no_walk: bool,
         /// Extra `meson setup` arguments passed verbatim on a miss. They
         /// also enter the cache key so different option sets produce
         /// distinct cache entries.
