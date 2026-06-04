@@ -453,6 +453,17 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
+      # Issue #657: `actions/checkout@v6` above wipes the workspace,
+      # including `dist/wheels/` populated by the earlier download-
+      # artifact step. Re-download the artifact post-checkout so the
+      # verify step's `--wheels-dir dist/wheels` lookup succeeds.
+      # Without this, the verify step fails with "wheels directory does
+      # not exist" even though the actual publish step already ran
+      # successfully — release-auto reports failure on a green release.
+      - uses: actions/download-artifact@v8
+        with:
+          name: pypi-wheels
+          path: dist/wheels
       - name: Verify all wheels visible on PyPI
         run: |
           python -m ci.release_workflow verify-pypi \
