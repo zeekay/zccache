@@ -350,3 +350,133 @@ fn input_file_order_does_not_affect_key() {
         "reordering --input-file flags must NOT change the key; got: {stderr_b}",
     );
 }
+
+// ============================================================================
+// `--no-walk` — issue #659.
+// ============================================================================
+// Callers who know their meson.build set exactly and want to avoid the
+// implicit recursive walk of `--source-dir` (e.g. monorepos whose
+// scratch dirs aren't on the default skip list) can pass `--no-walk`
+// plus per-file `--input-file` flags. The wrapper then skips the source
+// walk entirely and keys only on the supplied inputs + (source, build,
+// env, args, meson-version) tuple.
+
+fn run_zccache_meson_configure_no_walk(
+    cache_dir: &Path,
+    source_dir: &Path,
+    build_dir: &Path,
+    extra_input_files: &[&Path],
+) -> std::process::Output {
+    let bin = zccache_bin();
+    let mut cmd = Command::new(bin.as_path());
+    cmd.env("ZCCACHE_CACHE_DIR", cache_dir);
+    cmd.env_remove("ZCCACHE_SESSION_ID");
+    cmd.arg("meson").arg("configure");
+    cmd.arg("--source-dir").arg(source_dir);
+    cmd.arg("--build-dir").arg(build_dir);
+    cmd.arg("--no-walk");
+    for f in extra_input_files {
+        cmd.arg("--input-file").arg(f);
+    }
+    cmd.output()
+        .expect("spawn zccache meson configure --no-walk")
+}
+
+#[test]
+fn no_walk_requires_at_least_one_input_file() {
+    if !meson_available() {
+        eprintln!("SKIP: meson not on PATH");
+        return;
+    }
+    let cache = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    write_tiny_meson_project(&source);
+
+    let build = project.path().join("build");
+    // No --input-file supplied — wrapper must refuse rather than emit a
+    // surprisingly-broad cache hit later.
+    let out = run_zccache_meson_configure_no_walk(cache.path(), &source, &build, &[]);
+    assert!(
+        !out.status.success(),
+        "--no-walk without --input-file must fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--no-walk requires at least one --input-file"),
+        "stderr must explain the constraint; got: {stderr}",
+    );
+}
+
+#[test]
+fn no_walk_hits_on_unchanged_input_files() {
+    if !meson_available() {
+        eprintln!("SKIP: meson not on PATH");
+        return;
+    }
+    let cache = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    write_tiny_meson_project(&source);
+
+    let inputs = source.join("meson.build");
+    let build = project.path().join("build");
+
+    let out_a = run_zccache_meson_configure_no_walk(cache.path(), &source, &build, &[&inputs]);
+    assert!(
+        out_a.status.success(),
+        "cold --no-walk run must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out_a.stdout),
+        String::from_utf8_lossy(&out_a.stderr),
+    );
+    let stderr_a = String::from_utf8_lossy(&out_a.stderr);
+    assert!(stderr_a.contains("[zccache-meson] miss"));
+
+    std::fs::remove_dir_all(&build).unwrap();
+
+    let out_b = run_zccache_meson_configure_no_walk(cache.path(), &source, &build, &[&inputs]);
+    assert!(out_b.status.success());
+    let stderr_b = String::from_utf8_lossy(&out_b.stderr);
+    assert!(
+        stderr_b.contains("[zccache-meson] hit"),
+        "second --no-walk run with unchanged --input-file must hit; got: {stderr_b}",
+    );
+}
+
+#[test]
+fn no_walk_is_keyed_distinctly_from_walked() {
+    if !meson_available() {
+        eprintln!("SKIP: meson not on PATH");
+        return;
+    }
+    // A run with --no-walk and a run without --no-walk produce different
+    // cache keys even when the explicitly-named input is the same file
+    // the implicit walk would have found. This is by design: the walked
+    // case hashes every meson.build under source-dir; the no-walk case
+    // hashes only what's listed. Cross-pollution between them would be a
+    // foot-gun.
+    let cache = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let source = project.path().join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    write_tiny_meson_project(&source);
+
+    let inputs = source.join("meson.build");
+    let build = project.path().join("build");
+
+    // Walked-mode populates the cache.
+    let out_a = run_zccache_meson_configure(cache.path(), &source, &build);
+    assert!(out_a.status.success());
+    std::fs::remove_dir_all(&build).unwrap();
+
+    // No-walk-mode with the same input — must NOT hit the walked entry.
+    let out_b = run_zccache_meson_configure_no_walk(cache.path(), &source, &build, &[&inputs]);
+    assert!(out_b.status.success());
+    let stderr_b = String::from_utf8_lossy(&out_b.stderr);
+    assert!(
+        stderr_b.contains("[zccache-meson] miss"),
+        "--no-walk run must NOT reuse a walked-mode cache entry; got: {stderr_b}",
+    );
+}

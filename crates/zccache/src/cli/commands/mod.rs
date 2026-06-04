@@ -391,9 +391,10 @@ fn dispatch(command: Commands, global_strict_paths: Option<&str>) -> ExitCode {
                 meson_bin,
                 input_env,
                 input_file,
+                no_walk,
                 meson_args,
             } => meson_cache::cmd_configure(
-                source_dir, build_dir, meson_bin, input_env, input_file, meson_args,
+                source_dir, build_dir, meson_bin, input_env, input_file, no_walk, meson_args,
             ),
         },
         Commands::Exec {

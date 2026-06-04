@@ -19,6 +19,10 @@
 //! - The `[meson.build, meson.options, meson_options.txt]` file set
 //!   discovered recursively under the source dir, each file's content
 //!   hashed and the (relative-path, content-hash) pairs sorted.
+//!   Pass `--no-walk` to skip this implicit discovery — the caller then
+//!   takes full responsibility for naming every input file via
+//!   `--input-file` (intended for monorepos whose default skip list
+//!   doesn't cover their scratch dirs; see issue #659).
 //! - The meson executable's `--version` output (cheap, stable).
 //! - The build-directory **absolute path** (same-build-dir restriction).
 //! - The source-directory **absolute path** (so a renamed source tree
@@ -71,6 +75,7 @@ pub(crate) fn cmd_configure(
     meson_bin: Option<PathBuf>,
     extra_input_env: Vec<String>,
     extra_input_file: Vec<String>,
+    no_walk: bool,
     meson_args: Vec<String>,
 ) -> ExitCode {
     if !source_dir.exists() {
@@ -107,18 +112,37 @@ pub(crate) fn cmd_configure(
         .map(|name| ((*name).to_string(), std::env::var(name).unwrap_or_default()))
         .collect();
 
-    let input_files = match discover_meson_inputs(&source_abs) {
-        Ok(set) => set,
-        Err(e) => {
-            eprintln!("[zccache-meson] error: scanning source dir failed: {e}");
-            return ExitCode::FAILURE;
+    // With `--no-walk` the caller takes full responsibility for naming
+    // every input file via `--input-file`. The implicit walk of the
+    // source directory is skipped entirely (no traversal, no read), and
+    // the empty discovery set is the documented signal — distinct from
+    // the "walked but found nothing" error path below.
+    let input_files = if no_walk {
+        BTreeMap::new()
+    } else {
+        match discover_meson_inputs(&source_abs) {
+            Ok(set) => set,
+            Err(e) => {
+                eprintln!("[zccache-meson] error: scanning source dir failed: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     };
 
-    if input_files.is_empty() {
+    if !no_walk && input_files.is_empty() {
         eprintln!(
             "[zccache-meson] error: no meson input files found under {}",
             source_abs.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // With `--no-walk` the caller must supply at least one `--input-file`
+    // — otherwise the cache key only sees the (source, build, version,
+    // env, args) tuple, which is rarely what anyone wants.
+    if no_walk && extra_input_file.is_empty() {
+        eprintln!(
+            "[zccache-meson] error: --no-walk requires at least one --input-file (otherwise the cache key has no source-content contribution)"
         );
         return ExitCode::FAILURE;
     }
@@ -263,13 +287,28 @@ fn walk_meson_dir(
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            // Skip common scratch dirs that meson doesn't read but might
-            // contain copies of meson.build inside vendored sources.
-            // Keep the list short and conservative.
+            // Skip common scratch / dependency / VCS directories. These
+            // are the dirs every real project has in tree that meson
+            // would never legitimately read configure inputs from. The
+            // list is intentionally conservative — only directories
+            // whose ENTIRE canonical purpose is "out of source-control
+            // build/cache state". Callers that need exact control over
+            // which dirs are walked (or want to skip the walk entirely)
+            // should use `--no-walk` plus explicit `--input-file`
+            // entries — see issue #659.
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if matches!(
                     name,
-                    "build" | ".build" | "target" | "node_modules" | ".git"
+                    ".git"
+                        | ".hg"
+                        | ".svn"
+                        | "build"
+                        | ".build"
+                        | "target"
+                        | "node_modules"
+                        | ".venv"
+                        | "venv"
+                        | ".cargo"
                 ) {
                     continue;
                 }
