@@ -27,10 +27,19 @@
 //!   `LDFLAGS`, `PKG_CONFIG_PATH` always; plus any extras supplied via
 //!   `--input-env`. Each as `NAME=VALUE` with absent vars contributing
 //!   `NAME=` (so set-vs-unset distinguishes).
+//! - Any extra `--input-file PATH` flags. Each file is read and its
+//!   content hashed alongside the meson.build set; the path is recorded
+//!   verbatim as it appeared on the command line. Repeats are
+//!   deduplicated and the set is sorted before hashing, so argv order
+//!   is irrelevant. Intended for downstream layers whose source-change
+//!   detection lives outside `meson.build` (e.g. a digest-of-globs
+//!   sidecar file). See issue #654.
 //! - The verbatim `meson_args` trailing argv (so different `-Dopt=…`
 //!   combinations produce distinct entries).
-//! - A version tag (`"zccache-meson-cache-v1"`) for forward-compat key
-//!   rotation when the capture/restore scheme evolves.
+//! - A version tag (`"zccache-meson-cache-v2"`) for forward-compat key
+//!   rotation when the capture/restore scheme evolves. Bumped from
+//!   `v1` -> `v2` alongside the `--input-file` addition so existing
+//!   cache entries don't collide with the new key layout.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -38,7 +47,7 @@ use std::process::{Command, ExitCode};
 
 use crate::core::config;
 
-const KEY_DOMAIN_TAG: &str = "zccache-meson-cache-v1";
+const KEY_DOMAIN_TAG: &str = "zccache-meson-cache-v2";
 
 /// Environment variables whose values always feed the cache key. Set
 /// regardless of `--input-env` so a forgotten extra never silently
@@ -61,6 +70,7 @@ pub(crate) fn cmd_configure(
     build_dir: PathBuf,
     meson_bin: Option<PathBuf>,
     extra_input_env: Vec<String>,
+    extra_input_file: Vec<String>,
     meson_args: Vec<String>,
 ) -> ExitCode {
     if !source_dir.exists() {
@@ -119,6 +129,7 @@ pub(crate) fn cmd_configure(
         &build_abs,
         &meson_version,
         &env_pairs,
+        &extra_input_file,
         &meson_args,
     ) {
         Ok(hex) => hex,
@@ -288,6 +299,7 @@ fn compute_cache_key(
     build_abs: &Path,
     meson_version: &str,
     env_pairs: &[(String, String)],
+    extra_input_files: &[String],
     meson_args: &[String],
 ) -> std::io::Result<String> {
     let mut hasher = blake3::Hasher::new_derive_key(KEY_DOMAIN_TAG);
@@ -315,6 +327,25 @@ fn compute_cache_key(
     for (rel, abs) in inputs {
         let bytes = std::fs::read(abs)?;
         hasher.update(rel.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(&bytes);
+        hasher.update(b"\0");
+    }
+    // User-supplied extra input files (issue #654). Each file's path is
+    // recorded as it appeared on the command line — sorted by that path
+    // so duplicate `--input-file foo --input-file foo` is idempotent and
+    // the key is stable across argv reordering. The empty list is a no-op
+    // and produces the same key contribution every time (just the
+    // section delimiter), so callers that don't pass `--input-file` see
+    // no behavior change beyond the v1 → v2 domain tag bump.
+    hasher.update(b"extra-inputs\0");
+    let mut sorted: Vec<&String> = extra_input_files.iter().collect();
+    sorted.sort();
+    sorted.dedup();
+    for path in sorted {
+        let bytes = std::fs::read(path)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("--input-file {path}: {e}")))?;
+        hasher.update(path.as_bytes());
         hasher.update(b"\0");
         hasher.update(&bytes);
         hasher.update(b"\0");
