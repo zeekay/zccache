@@ -406,7 +406,9 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
         compile_start,
         parse_args_ns,
         build_context_ns,
-    }) {
+    })
+    .await
+    {
         return response;
     }
 

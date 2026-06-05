@@ -217,6 +217,16 @@ fn store_rustc_outputs(
     let sem = Arc::clone(&state.persist_semaphore);
     let state_ref = Arc::clone(state_arc);
     let key_for_warn = key_hex.clone();
+    // Issue #610, DD-025 condition 1: register a pending-write entry
+    // BEFORE spawning so concurrent lookups can observe that the
+    // disk-side publication is in flight and (optionally) wait briefly
+    // for it instead of triggering a recompile-on-race. Completion is
+    // signalled from inside the spawn on both success and failure
+    // paths — a failed persist wakes waiters so they re-attempt the
+    // lookup, miss, and recompile (the DD-025 failure-mode-is-miss
+    // invariant).
+    let completion_key = key_for_warn.clone();
+    let _pending = pending_writes::register(&state.pending_cache_writes, artifact_key_hex);
     tokio::spawn(async move {
         let _permit = sem.acquire().await.unwrap();
         let written = tokio::task::spawn_blocking(move || {
@@ -248,6 +258,12 @@ fn store_rustc_outputs(
                 state_ref.artifacts.remove(&key_for_warn);
             }
         }
+        // Always complete the pending entry — failure paths wake any
+        // waiters so they re-attempt the lookup, miss, and recompile
+        // (the DD-025 failure-mode-is-miss invariant). JoinError also
+        // routes here because the registry must not retain entries
+        // past the spawn's lifetime.
+        pending_writes::complete(&state_ref.pending_cache_writes, &completion_key);
     });
     stats.persist_enqueue_ns = t_persist_enqueue.elapsed().as_nanos() as u64;
     // The synchronous-snapshot stats fields are zero in async mode —
@@ -355,6 +371,14 @@ fn store_single_output(
     };
     let sem = Arc::clone(&state.persist_semaphore);
     let state_ref = Arc::clone(state_arc);
+    let completion_key = artifact_key_hex.to_string();
+    // Issue #610, DD-025 condition 1: pending-write registration around
+    // the C/C++ cold-miss persist spawn. Concurrent lookups can observe
+    // that disk publication is in flight and (optionally) wait briefly
+    // for it instead of recompiling-on-race. Completion is signalled on
+    // both success and failure paths (failure wakes waiters → re-lookup
+    // misses → recompile; the DD-025 failure-mode-is-miss invariant).
+    let _pending = pending_writes::register(&state.pending_cache_writes, artifact_key_hex);
     tokio::spawn(async move {
         let _permit = sem.acquire().await.unwrap();
         let written = tokio::task::spawn_blocking(move || {
@@ -371,6 +395,9 @@ fn store_single_output(
         if let Ok((key_hex, meta)) = written {
             let _ = state_ref.index_writer_tx.send((key_hex, meta));
         }
+        // Always complete the pending entry, even on JoinError, so
+        // waiters cannot hang past the spawn's lifetime.
+        pending_writes::complete(&state_ref.pending_cache_writes, &completion_key);
     });
     stats.persist_enqueue_ns = t_persist_enqueue.elapsed().as_nanos() as u64;
 

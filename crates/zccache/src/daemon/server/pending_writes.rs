@@ -51,8 +51,6 @@
 //!   persist spawns.
 //! - **Scope**: per-daemon-process. Restart empties the registry.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::time::Duration;
 
