@@ -766,6 +766,9 @@ def build_image_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "bare": _format_seconds(row["bare_seconds"]),
             "sccache": _format_seconds(row["sccache_seconds"]),
             "zccache": _format_seconds(row["zccache_seconds"]),
+            "bare_seconds": row["bare_seconds"],
+            "sccache_seconds": row["sccache_seconds"],
+            "zccache_seconds": row["zccache_seconds"],
             "vs_sccache": _format_ratio(row["zccache_vs_sccache_ratio"]),
             "vs_bare": _format_ratio(row["zccache_vs_bare_ratio"]),
             "vs_sccache_percent": _format_percent_delta(row["zccache_vs_sccache_ratio"]),
@@ -777,11 +780,176 @@ def build_image_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+SECTION_STYLES: dict[str, dict[str, str]] = {
+    "cold": {
+        "title": "Cold",
+        "section": "#10233a",
+        "row": "#0f1b2d",
+        "row_alt": "#11243a",
+        "accent": "#79c0ff",
+    },
+    "warm": {
+        "title": "Warm",
+        "section": "#2f2110",
+        "row": "#241a0f",
+        "row_alt": "#2b1f12",
+        "accent": "#ffa657",
+    },
+}
+
+SERIES_ORDER: tuple[str, ...] = ("bare", "sccache", "zccache")
+
+# Cold/warm color pairs per series. Cold is the muted back layer, warm is the
+# vivid foreground that overlays it — the cache hit is the headline, and the
+# eye should land on it.  zccache uses GitHub-red so it pops against the
+# muted bare/sccache pair.  Issue #667.
+SERIES_COLOR_PAIRS: dict[str, dict[str, str]] = {
+    "bare":    {"cold": "#3b4046", "warm": "#8b949e"},
+    "sccache": {"cold": "#1f3a7a", "warm": "#79c0ff"},
+    "zccache": {"cold": "#5b1f1c", "warm": "#f85149"},
+}
+# Legacy single color (warm shade) — kept so anything still reading
+# SERIES_COLORS keeps working with the same visual identity.
+SERIES_COLORS: dict[str, str] = {
+    series: pair["warm"] for series, pair in SERIES_COLOR_PAIRS.items()
+}
+
+WARM_VIOLATION_OUTLINE = "#ffd43b"
+# How much slower (relative to cold) warm has to be before we flag it as a
+# violation.  Some noise is normal; >10% is meaningful.
+WARM_VIOLATION_MARGIN = 1.10
+
+
+def _section_max_seconds(rows: list[dict[str, Any]]) -> float:
+    """Largest finite duration across bare/sccache/zccache for a flat row set."""
+    candidates = [
+        value
+        for row in rows
+        for value in (row.get("bare_seconds"), row.get("sccache_seconds"), row.get("zccache_seconds"))
+        if isinstance(value, (int, float)) and value > 0
+    ]
+    if not candidates:
+        return 1.0
+    return float(max(candidates))
+
+
 def _section_rows(rows: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
     return [row for row in rows if row["mode"] == mode]
 
 
+_MODE_SUFFIX_RE = re.compile(r",\s*(Cold|Warm)\s*$", re.IGNORECASE)
+
+
+def _strip_mode_suffix(scenario: str) -> str:
+    """Drop a trailing ', Cold' / ', Warm' marker from a scenario label.
+
+    Combining cold and warm rows into one entry needs a stable root key; the
+    parser leaves the mode marker baked into the scenario name.  Rows that
+    don't carry the marker (already-canonical scenarios) are returned as-is.
+    """
+    return _MODE_SUFFIX_RE.sub("", scenario).strip()
+
+
+def build_combined_image_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge per-mode rows into one entry per (benchmark, scenario root).
+
+    Each combined entry exposes cold and warm seconds for every series so the
+    bar chart can render both bars side-by-side under the same scenario
+    heading.  Either side may be absent (warm-only benchmarks are common).
+    """
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str]] = []
+    for row in results:
+        scenario_root = _strip_mode_suffix(row.get("scenario", ""))
+        key = (row.get("benchmark", ""), scenario_root)
+        combined = groups.get(key)
+        if combined is None:
+            combined = {
+                "benchmark": row.get("benchmark", ""),
+                "benchmark_label": row.get("benchmark_label", ""),
+                "language": row.get("language", ""),
+                "bare_label": row.get("bare_label", "Bare"),
+                "scenario_root": scenario_root,
+                "compact_label": _compact_benchmark_label(
+                    str(row.get("language", "")), str(row.get("benchmark_label", ""))
+                ),
+                "compact_scenario": _compact_scenario(scenario_root),
+                "cold": {series: None for series in SERIES_ORDER},
+                "warm": {series: None for series in SERIES_ORDER},
+            }
+            groups[key] = combined
+            order.append(key)
+        mode = row.get("mode")
+        if mode not in ("cold", "warm"):
+            continue
+        for series in SERIES_ORDER:
+            value = row.get(f"{series}_seconds")
+            if isinstance(value, (int, float)) and value > 0:
+                combined[mode][series] = float(value)
+    return [groups[key] for key in order]
+
+
+def _normalization_reference(combined_row: dict[str, Any]) -> tuple[float, str]:
+    """Return (max_value, source) for normalizing every bar in a scenario.
+
+    Spec (#667): the max cold time is the 100% mark; everything scales against
+    it.  When no cold values exist (warm-only scenarios) we fall back to the
+    max warm so the bars still render at a useful scale.  Returns (1.0,
+    "none") when no usable data is present so callers can divide safely.
+    """
+    cold_values = [
+        v for v in combined_row.get("cold", {}).values()
+        if isinstance(v, (int, float)) and v > 0
+    ]
+    if cold_values:
+        return (float(max(cold_values)), "cold")
+    warm_values = [
+        v for v in combined_row.get("warm", {}).values()
+        if isinstance(v, (int, float)) and v > 0
+    ]
+    if warm_values:
+        return (float(max(warm_values)), "warm")
+    return (1.0, "none")
+
+
+def _warm_violations(combined_row: dict[str, Any]) -> dict[str, str]:
+    """Series -> human-readable violation reason.
+
+    Cache "regression" = warm visibly slower than cold (>10%).  We don't flag
+    parity differences (noise floor), only the kind of warm-too-slow result
+    that means something is wrong with the cache for that series.
+    """
+    flags: dict[str, str] = {}
+    cold = combined_row.get("cold", {})
+    warm = combined_row.get("warm", {})
+    for series in SERIES_ORDER:
+        cold_value = cold.get(series)
+        warm_value = warm.get(series)
+        if not isinstance(cold_value, (int, float)) or cold_value <= 0:
+            continue
+        if not isinstance(warm_value, (int, float)) or warm_value <= 0:
+            continue
+        if warm_value > cold_value * WARM_VIOLATION_MARGIN:
+            flags[series] = f"warm {warm_value:.3f}s > cold {cold_value:.3f}s"
+    return flags
+
+
+def _format_seconds_label(value: float | None) -> str:
+    """Tight value label for the bar annotation. n/a when no datum."""
+    if not isinstance(value, (int, float)) or value <= 0:
+        return "n/a"
+    return f"{value:.3f}s"
+
+
 def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> None:
+    """Render a per-language benchmark image as combined cold+warm bar charts.
+
+    One section per scenario.  Inside the section, one row per series (bare
+    <compiler> / sccache / zccache) showing the cold bar in the back and the
+    warm bar overlaid in front, both normalized against the per-scenario
+    cold-max (#667).  Warm-only scenarios fall back to warm-max so the bars
+    still scale.  Warm-slower-than-cold (>10%) is flagged with an outline.
+    """
     try:
         from PIL import Image, ImageDraw
     except ImportError as exc:
@@ -790,37 +958,62 @@ def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> N
             "`uv run --with pillow` or `python -m pip install Pillow`."
         ) from exc
 
-    rows = build_image_rows(group_results_by_language(payload["results"])[language])
+    language_results = group_results_by_language(payload["results"])[language]
+    combined_rows = build_combined_image_rows(language_results)
     title = f"zccache {LANGUAGE_LABELS[language]} benchmarks"
+
     width = 900
     margin = 20
-    row_h = 76
-    section_h = 28
-    header_h = 34
-    table_y = 106
-    footer_h = 44
-    section_count = 2
-    rendered_row_count = max(1, len(rows))
-    height = max(
-        390,
-        table_y + header_h + section_h * section_count + row_h * rendered_row_count + footer_h,
-    )
+    header_band_h = 116
+    chart_top = 134
+    footer_h = 56
+    legend_h = 40
+
+    bar_row_h = 44
+    scenario_label_h = 36
+    scenario_gap = 16
+    scenario_padding_top = 10
+    scenario_padding_bottom = 12
+    empty_section_h = 90
+
+    def scenario_block_height() -> int:
+        return (
+            scenario_padding_top
+            + scenario_label_h
+            + bar_row_h * len(SERIES_ORDER)
+            + scenario_padding_bottom
+        )
+
+    if combined_rows:
+        chart_h = (
+            legend_h
+            + (scenario_block_height() + scenario_gap) * len(combined_rows)
+            - scenario_gap
+        )
+    else:
+        chart_h = legend_h + empty_section_h
+
+    height = max(460, chart_top + chart_h + footer_h)
+
     scale = 4
     image = Image.new("RGB", (width * scale, height * scale), "#0d1117")
     draw = ImageDraw.Draw(image)
-    title_font = _font(26 * scale, bold=True)
-    subtitle_font = _font(11 * scale)
-    header_font = _font(12 * scale, bold=True)
-    section_font = _font(14 * scale, bold=True)
-    row_font = _font(12 * scale)
-    row_bold_font = _font(12 * scale, bold=True)
-    scenario_font = _font(13 * scale, bold=True)
-    delta_font = _font(12 * scale)
-    delta_bold_font = _font(14 * scale, bold=True)
-    small_font = _font(10 * scale)
+
+    title_font = _font(32 * scale, bold=True)
+    subtitle_font = _font(14 * scale)
+    scenario_font = _font(20 * scale, bold=True)
+    series_font = _font(17 * scale, bold=True)
+    value_font = _font(15 * scale, bold=True)
+    legend_font = _font(14 * scale, bold=True)
+    small_font = _font(13 * scale)
 
     def box(values: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
-        return tuple(value * scale for value in values)
+        return (
+            values[0] * scale,
+            values[1] * scale,
+            values[2] * scale,
+            values[3] * scale,
+        )
 
     def point(x: int, y: int) -> tuple[int, int]:
         return x * scale, y * scale
@@ -840,19 +1033,10 @@ def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> N
             fill=fill,
         )
 
-    def draw_delta(x: int, y: int, value: str, ratio: float | None, max_width: int) -> None:
-        color = ratio_color(ratio)
-        if value == "n/a":
-            draw_fit(x, y + 19, value, delta_bold_font, color, max_width)
-            return
-        amount, _, direction = value.partition(" ")
-        draw_fit(x, y + 12, amount, delta_bold_font, color, max_width)
-        if direction:
-            draw_fit(x, y + 38, direction, delta_font, color, max_width)
-
+    # Header band ------------------------------------------------------------
     draw.rectangle(box((0, 0, width, height)), fill="#0d1117")
-    draw.rectangle(box((0, 0, width, 84)), fill="#161b22")
-    draw.text(point(margin, 20), title, font=title_font, fill="#f0f6fc")
+    draw.rectangle(box((0, 0, width, header_band_h)), fill="#161b22")
+    draw.text(point(margin, 22), title, font=title_font, fill="#f0f6fc")
     metadata = payload["metadata"]
     sha = (metadata.get("git_sha") or "n/a")[:12]
     runner = metadata.get("runner", {}).get("platform") or "n/a"
@@ -860,137 +1044,252 @@ def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> N
         f"Generated {metadata['generated_at']} | ref {metadata.get('git_ref') or 'n/a'} | "
         f"sha {sha} | runner {runner}"
     )
-    draw.text(
-        point(margin, 60),
-        _truncate_to_width(draw, metadata_line, subtitle_font, (width - margin * 2) * scale),
-        font=subtitle_font,
-        fill="#8b949e",
+    draw_fit(
+        margin,
+        70,
+        metadata_line,
+        subtitle_font,
+        "#8b949e",
+        width - margin * 2,
+    )
+    draw_fit(
+        margin,
+        92,
+        "Per-scenario bars normalized to the cold maximum (100%); warm overlays on top.",
+        subtitle_font,
+        "#8b949e",
+        width - margin * 2,
     )
 
-    x0, y0 = margin, table_y
-    table_w = width - margin * 2
-    headers = ["Scenario", "Times", "vs sccache", "vs bare"]
-    widths = [250, 280, 160, 160]
-    padding_x = 10
+    # Chart geometry ---------------------------------------------------------
+    x0 = margin
+    chart_w = width - margin * 2
+    series_label_w = 160
+    value_label_w = 200
+    inner_padding = 16
+    bar_area_x0 = x0 + inner_padding + series_label_w
+    bar_area_x1 = x0 + chart_w - inner_padding - value_label_w
+    bar_area_w = max(1, bar_area_x1 - bar_area_x0)
 
-    draw.rounded_rectangle(
-        box((x0, y0, x0 + table_w, y0 + header_h)),
-        radius=8 * scale,
-        fill="#21262d",
-        outline="#30363d",
-        width=scale,
-    )
-    x = x0 + padding_x
-    for header, col_w in zip(headers, widths):
-        draw.text(point(x, y0 + 10), header, font=header_font, fill="#c9d1d9")
-        x += col_w
-
-    y = y0 + header_h
-    if not rows:
-        draw.rectangle(box((x0, y, x0 + table_w, y + row_h)), fill="#161b22")
-        draw_fit(
-            x0 + padding_x,
-            y + 28,
-            "Benchmark data is not available yet.",
-            row_font,
-            "#f0f6fc",
-            table_w - padding_x * 2,
+    # Legend at the top of the chart area --------------------------------------
+    def draw_legend(y: int) -> int:
+        legend_top = y + 8
+        # Sample swatches: cold (back, full height) + warm (front, narrower)
+        swatch_x = x0 + inner_padding
+        swatch_w = 60
+        cold_top = legend_top
+        cold_bottom = legend_top + 20
+        warm_top = legend_top + 5
+        warm_bottom = legend_top + 15
+        # cold sample (uses zccache-cold to telegraph "this is the protagonist")
+        draw.rectangle(
+            box((swatch_x, cold_top, swatch_x + swatch_w, cold_bottom)),
+            fill=SERIES_COLOR_PAIRS["zccache"]["cold"],
         )
-        y += row_h
-    else:
-        section_styles = {
-            "cold": {
-                "title": "Cold",
-                "section": "#10233a",
-                "row": "#0f1b2d",
-                "row_alt": "#11243a",
-                "accent": "#79c0ff",
-            },
-            "warm": {
-                "title": "Warm",
-                "section": "#2f2110",
-                "row": "#241a0f",
-                "row_alt": "#2b1f12",
-                "accent": "#ffa657",
-            },
-        }
-        for mode in ("cold", "warm"):
-            style = section_styles[mode]
-            draw.rectangle(box((x0, y, x0 + table_w, y + section_h)), fill=style["section"])
-            draw.text(
-                point(x0 + padding_x, y + 7),
-                style["title"],
-                font=section_font,
-                fill=style["accent"],
+        draw.rectangle(
+            box((swatch_x, warm_top, swatch_x + int(swatch_w * 0.42), warm_bottom)),
+            fill=SERIES_COLOR_PAIRS["zccache"]["warm"],
+        )
+        draw_fit(
+            swatch_x + swatch_w + 12,
+            legend_top + 2,
+            "cold (back)  +  warm (front, overlays cold)",
+            legend_font,
+            "#c9d1d9",
+            chart_w - swatch_w - 40,
+        )
+        # Violation swatch on the right side of the legend row
+        violation_x = x0 + chart_w - inner_padding - 220
+        draw.rectangle(
+            box((violation_x, warm_top, violation_x + 30, warm_bottom)),
+            fill=SERIES_COLOR_PAIRS["zccache"]["warm"],
+            outline=WARM_VIOLATION_OUTLINE,
+            width=2 * scale,
+        )
+        draw_fit(
+            violation_x + 38,
+            legend_top + 2,
+            "warm > cold = cache regression",
+            legend_font,
+            WARM_VIOLATION_OUTLINE,
+            220 - 40,
+        )
+        return y + legend_h
+
+    def draw_scenario_block(y: int, combined_row: dict[str, Any], index: int) -> int:
+        block_h = scenario_block_height()
+        # Subtle alternating background per scenario
+        fill = "#0f1620" if index % 2 == 0 else "#11202d"
+        draw.rectangle(box((x0, y, x0 + chart_w, y + block_h)), fill=fill)
+
+        # Per-scenario normalization
+        scale_max, source = _normalization_reference(combined_row)
+        violations = _warm_violations(combined_row)
+
+        # Scenario heading
+        heading = (
+            f"{combined_row['compact_label']} - {combined_row['compact_scenario']}"
+        )
+        draw_fit(
+            x0 + inner_padding,
+            y + scenario_padding_top,
+            heading,
+            scenario_font,
+            "#f0f6fc",
+            chart_w - inner_padding * 2 - 260,
+        )
+        # Per-scenario scale note (right-aligned in the heading row)
+        if source == "cold":
+            scale_note = f"100% = cold max {scale_max:.3f}s"
+        elif source == "warm":
+            scale_note = f"100% = warm max {scale_max:.3f}s (no cold data)"
+        else:
+            scale_note = "no data"
+        scale_note_px = _text_width(draw, scale_note, subtitle_font)
+        draw.text(
+            point(
+                x0 + chart_w - inner_padding - scale_note_px // scale,
+                y + scenario_padding_top + 8,
+            ),
+            scale_note,
+            font=subtitle_font,
+            fill="#8b949e",
+        )
+
+        bars_y = y + scenario_padding_top + scenario_label_h
+        cold_bar_thickness = 28
+        warm_bar_thickness = 16
+
+        for series_index, series in enumerate(SERIES_ORDER):
+            row_top = bars_y + series_index * bar_row_h
+            cold_top = row_top + (bar_row_h - cold_bar_thickness) // 2
+            cold_bottom = cold_top + cold_bar_thickness
+            warm_top = row_top + (bar_row_h - warm_bar_thickness) // 2
+            warm_bottom = warm_top + warm_bar_thickness
+
+            cold_seconds = combined_row["cold"].get(series)
+            warm_seconds = combined_row["warm"].get(series)
+            pair = SERIES_COLOR_PAIRS[series]
+
+            # Series label (use bare_label for the "bare" row)
+            if series == "bare":
+                series_label = str(combined_row.get("bare_label") or "bare").lower()
+            else:
+                series_label = series
+            draw_fit(
+                x0 + inner_padding,
+                row_top + (bar_row_h - 19) // 2,
+                series_label,
+                series_font,
+                pair["warm"],
+                series_label_w - 8,
             )
-            y += section_h
-            for index, row in enumerate(_section_rows(rows, mode)):
-                fill = style["row"] if index % 2 == 0 else style["row_alt"]
-                draw.rectangle(box((x0, y, x0 + table_w, y + row_h)), fill=fill)
-                draw.line(
-                    box((x0, y + row_h, x0 + table_w, y + row_h)),
-                    fill="#30363d",
-                    width=scale,
-                )
-                x = x0 + padding_x
-                draw_fit(
-                    x,
-                    y + 14,
-                    row["compact_label"],
-                    row_font,
-                    "#8b949e",
-                    widths[0] - 16,
-                )
-                draw_fit(
-                    x,
-                    y + 38,
-                    row["compact_scenario"],
-                    scenario_font,
-                    "#f0f6fc",
-                    widths[0] - 16,
+
+            # Background track
+            track_top = row_top + bar_row_h // 2 - 2
+            draw.rectangle(
+                box((bar_area_x0, track_top, bar_area_x1, track_top + 4)),
+                fill="#21262d",
+            )
+
+            # Cold bar (back)
+            if isinstance(cold_seconds, (int, float)) and cold_seconds > 0:
+                fraction = max(0.0, min(1.0, cold_seconds / scale_max))
+                bar_end = bar_area_x0 + max(3, int(round(bar_area_w * fraction)))
+                draw.rectangle(
+                    box((bar_area_x0, cold_top, bar_end, cold_bottom)),
+                    fill=pair["cold"],
                 )
 
-                x += widths[0]
-                time_lines = [
-                    ("bare", row["bare"], row_font, "#c9d1d9"),
-                    ("sccache", row["sccache"], row_font, "#c9d1d9"),
-                    ("zccache", row["zccache"], row_bold_font, "#f0f6fc"),
-                ]
-                for line_index, (label, value, font, color) in enumerate(time_lines):
-                    draw_fit(
-                        x,
-                        y + 8 + line_index * 21,
-                        f"{label}: {value}",
-                        font,
-                        color,
-                        widths[1] - 18,
+            # Warm bar (front, overlay)
+            if isinstance(warm_seconds, (int, float)) and warm_seconds > 0:
+                fraction = max(0.0, min(1.0, warm_seconds / scale_max))
+                bar_end = bar_area_x0 + max(3, int(round(bar_area_w * fraction)))
+                if series in violations:
+                    draw.rectangle(
+                        box((bar_area_x0, warm_top, bar_end, warm_bottom)),
+                        fill=pair["warm"],
+                        outline=WARM_VIOLATION_OUTLINE,
+                        width=2 * scale,
+                    )
+                else:
+                    draw.rectangle(
+                        box((bar_area_x0, warm_top, bar_end, warm_bottom)),
+                        fill=pair["warm"],
                     )
 
-                x += widths[1]
-                draw_delta(
-                    x,
-                    y,
-                    row["vs_sccache_percent"],
-                    row["zccache_vs_sccache_ratio"],
-                    widths[2] - 18,
-                )
-                x += widths[2]
-                draw_delta(
-                    x,
-                    y,
-                    row["vs_bare_percent"],
-                    row["zccache_vs_bare_ratio"],
-                    widths[3] - 18,
-                )
-                y += row_h
+            # Value labels: two compact lines (cold / warm)
+            value_x = bar_area_x1 + 12
+            draw_fit(
+                value_x,
+                row_top + 4,
+                f"cold {_format_seconds_label(cold_seconds)}",
+                value_font,
+                pair["cold"] if isinstance(cold_seconds, (int, float)) and cold_seconds > 0 else "#6e7681",
+                value_label_w - 12,
+            )
+            warm_color = WARM_VIOLATION_OUTLINE if series in violations else (
+                pair["warm"] if isinstance(warm_seconds, (int, float)) and warm_seconds > 0 else "#6e7681"
+            )
+            draw_fit(
+                value_x,
+                row_top + bar_row_h // 2 + 2,
+                f"warm {_format_seconds_label(warm_seconds)}",
+                value_font,
+                warm_color,
+                value_label_w - 12,
+            )
 
-    draw.rectangle(box((margin, height - 34, width - margin, height - 32)), fill="#30363d")
-    footer = "Artifacts: latest.json, benchmark-c.jpg, benchmark-cpp.jpg, benchmark-rust.jpg"
-    draw.text(
-        point(margin, height - 24),
-        _truncate_to_width(draw, footer, small_font, (width - margin * 2) * scale),
-        font=small_font,
-        fill="#8b949e",
+        # Subtle separator under the block
+        draw.line(
+            box(
+                (
+                    x0 + inner_padding,
+                    y + block_h - 1,
+                    x0 + chart_w - inner_padding,
+                    y + block_h - 1,
+                )
+            ),
+            fill="#30363d",
+            width=scale,
+        )
+        return y + block_h
+
+    # Chart body -------------------------------------------------------------
+    y = chart_top
+    y = draw_legend(y)
+    if not combined_rows:
+        draw.rectangle(box((x0, y, x0 + chart_w, y + empty_section_h)), fill="#161b22")
+        draw_fit(
+            x0 + inner_padding,
+            y + 28,
+            "Benchmark data is not available yet.",
+            scenario_font,
+            "#f0f6fc",
+            chart_w - inner_padding * 2,
+        )
+        y += empty_section_h
+    else:
+        for index, combined_row in enumerate(combined_rows):
+            y = draw_scenario_block(y, combined_row, index)
+            if index != len(combined_rows) - 1:
+                y += scenario_gap
+
+    # Footer -----------------------------------------------------------------
+    draw.rectangle(
+        box((margin, height - 36, width - margin, height - 34)), fill="#30363d"
+    )
+    footer = (
+        "Artifacts: latest.json, benchmark-c.jpg, benchmark-cpp.jpg, "
+        "benchmark-emscripten.jpg, benchmark-rust.jpg"
+    )
+    draw_fit(
+        margin,
+        height - 26,
+        footer,
+        small_font,
+        "#8b949e",
+        width - margin * 2,
     )
 
     path.parent.mkdir(parents=True, exist_ok=True)
