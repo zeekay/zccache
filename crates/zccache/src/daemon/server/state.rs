@@ -174,4 +174,34 @@ pub(super) struct SharedState {
     /// on the same `Notify` and re-attempt the cache lookup once it fires,
     /// guaranteeing the tool runs exactly once for the herd.
     pub(super) in_flight_exec: DashMap<String, Arc<Notify>>,
+    /// Pending cache-write registry (issue #610, DD-025 condition 1).
+    ///
+    /// Keyed by `artifact_key_hex` — every cold-miss path that defers its
+    /// `state.artifacts` insert into a `tokio::spawn` task **must** register
+    /// an entry here *before* spawning and notify+remove after the spawned
+    /// work completes. Concurrent lookups for the same key check the
+    /// registry first: they may wait briefly on the `Notify` (~5 ms ceiling
+    /// per condition 3's blast-radius bound) and then either re-attempt the
+    /// in-memory lookup or fall through to "miss → recompile". The failure
+    /// mode (DD-025 condition 2) is always a miss, never a wrong-hit — the
+    /// artifact's content identity stays bound by `blake3` (DD-005); only
+    /// the *publication* is deferred.
+    ///
+    /// At rest the map is empty. Entries live ≤ 100 ms (30× p99 of
+    /// `depgraph_update_ns + persist_enqueue` from #605 iter T2). At most
+    /// `persist_semaphore.available_permits()` entries may exist
+    /// concurrently — the same semaphore that bounds existing C/C++ persist
+    /// spawns provides the backpressure.
+    ///
+    /// On daemon restart the registry is empty: recovered state comes from
+    /// the WAL + on-disk artifacts (DD-008 / DD-017). Crash-mid-flight
+    /// safety is verified by the adversarial test
+    /// `crash_mid_flight_recovery_never_surfaces_wrong_content` in
+    /// `daemon/server/tests/deferred_cold_path.rs` (PR #618).
+    ///
+    /// `dead_code` allowed today: scaffolding for #610's deferred-write
+    /// wiring landing in a follow-up PR. Exercised by the
+    /// `pending_cache_writes` integration tests in the same crate.
+    #[allow(dead_code)]
+    pub(super) pending_cache_writes: DashMap<String, Arc<Notify>>,
 }

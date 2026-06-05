@@ -92,6 +92,7 @@ mod keys;
 mod lifecycle;
 mod link_helpers;
 mod pch;
+mod pending_writes;
 mod persist;
 mod private_daemon;
 mod request_cache;

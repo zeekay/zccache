@@ -15,6 +15,7 @@ mod link_cache;
 mod pack;
 mod path_remap;
 mod pch;
+mod pending_cache_writes;
 mod post_link_hook;
 mod server_ipc;
 mod write_cached;

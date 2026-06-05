@@ -22,9 +22,13 @@
 //! code paths (selectable via env var during the optimization rollout).
 //!
 //! Future iterations will add:
-//! - Notify-timeout fall-through to miss (gated on the PendingCacheWrite
-//!   registry existing — see #610 condition 4)
 //! - Loom + thread-sanitizer harness (separate test target)
+//!
+//! Notify-timeout fall-through (the prior item on this list) landed
+//! once the `PendingCacheWrite` registry scaffold went in — see
+//! `daemon/server/pending_writes.rs` for the unit-level test and
+//! `tests/pending_cache_writes.rs` for the `SharedState`-integration
+//! variant.
 
 #![cfg(unix)] // Test fixtures shell out to /bin/sh; Windows variant deferred.
 
