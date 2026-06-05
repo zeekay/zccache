@@ -370,12 +370,18 @@ def test_write_outputs_creates_timestamped_benchmark_image(tmp_path):
     assert not stale_combined_image.exists()
 
 
-def test_render_language_jpg_draws_cold_warm_sections_and_no_ratio_text(tmp_path, monkeypatch):
-    """Issue #667: per-language JPG renders Cold + Warm grouped bar charts.
+def test_render_language_jpg_draws_combined_cold_warm_overlay(tmp_path, monkeypatch):
+    """Issue #667 (revised): cold and warm collapse into one chart per scenario.
 
-    The image must contain the section headers and the bare/sccache/zccache
-    series labels per scenario, and must NOT contain "% faster" / "% slower"
-    delta strings (those belong only to `index.html` and `latest.json`).
+    The image must:
+    - draw per-series rows that name the actual compiler ("bare clang",
+      "bare clang++") rather than just "bare"
+    - emit value labels prefixed with both "cold" and "warm"
+    - tell the reader the cold maximum is the 100% reference
+    - NOT contain the legacy section-header style ("Cold"/"Warm" as standalone
+      titles); we only allow the lowercase value-label form
+    - NOT contain "% faster" / "% slower" delta strings (those belong only to
+      `index.html` and `latest.json`)
     """
     pytest.importorskip("PIL")
 
@@ -396,12 +402,150 @@ def test_render_language_jpg_draws_cold_warm_sections_and_no_ratio_text(tmp_path
 
     assert out_path.stat().st_size > 0
     joined = "\n".join(captured_text)
-    assert "Cold" in joined
-    assert "Warm" in joined
-    for series in benchmark_stats.SERIES_ORDER:
-        assert series in joined
+    assert "bare clang" in joined
+    assert "sccache" in joined
+    assert "zccache" in joined
+    assert any(t.startswith("cold ") for t in captured_text)
+    assert any(t.startswith("warm ") for t in captured_text)
+    assert any("100% = cold max" in t for t in captured_text)
+    # No standalone section headers from the old layout.
+    assert "Cold" not in captured_text
+    assert "Warm" not in captured_text
     assert "% faster" not in joined
     assert "% slower" not in joined
+
+
+def test_strip_mode_suffix_handles_cold_warm_and_canonical_forms():
+    f = benchmark_stats._strip_mode_suffix
+    assert f("Single-file, Cold") == "Single-file"
+    assert f("Single-file, Warm") == "Single-file"
+    assert f("Build, Cold") == "Build"
+    # Mixed case still strips.
+    assert f("Build, cold") == "Build"
+    # Names that embed __FILE__ should keep their internals.
+    assert (
+        f("Sibling-workspace no __FILE__, Warm") == "Sibling-workspace no __FILE__"
+    )
+    # No marker -> unchanged.
+    assert f("Already-canonical scenario") == "Already-canonical scenario"
+    # Empty -> empty.
+    assert f("") == ""
+
+
+def test_build_combined_image_rows_merges_cold_and_warm_into_one_entry():
+    rows = benchmark_stats.parse_benchmark_log(SAMPLE_LOG)
+    combined = benchmark_stats.build_combined_image_rows(rows)
+
+    by_key = {(c["benchmark"], c["scenario_root"]): c for c in combined}
+
+    # rustc Build merges its Cold and Warm rows into a single entry.
+    rustc_build = by_key[("rust", "Build")]
+    assert rustc_build["cold"]["bare"] == 8.165
+    assert rustc_build["cold"]["sccache"] == 9.634
+    assert rustc_build["cold"]["zccache"] == 41.624
+    assert rustc_build["warm"]["bare"] == 7.018
+    assert rustc_build["warm"]["sccache"] == 8.236
+    assert rustc_build["warm"]["zccache"] == 0.123
+    # Warm-only scenario should have None for all cold series.
+    sibling = by_key[("rust-sibling-remap", "Sibling-workspace")]
+    assert set(sibling["cold"].values()) == {None}
+    assert sibling["warm"]["zccache"] == 0.127
+    # bare_label propagates so the per-row label renders the actual compiler.
+    assert rustc_build["bare_label"] == "Bare rustc"
+    # No duplicate keys per (benchmark, scenario root).
+    keys = [(c["benchmark"], c["scenario_root"]) for c in combined]
+    assert len(keys) == len(set(keys))
+
+
+def test_normalization_reference_prefers_cold_max_then_warm_then_fallback():
+    combined = {
+        "cold": {"bare": 2.0, "sccache": 3.0, "zccache": 1.0},
+        "warm": {"bare": 0.5, "sccache": 0.4, "zccache": 0.01},
+    }
+    assert benchmark_stats._normalization_reference(combined) == (3.0, "cold")
+
+    warm_only = {
+        "cold": {"bare": None, "sccache": None, "zccache": None},
+        "warm": {"bare": 1.0, "sccache": 1.5, "zccache": 0.05},
+    }
+    assert benchmark_stats._normalization_reference(warm_only) == (1.5, "warm")
+
+    empty = {
+        "cold": {"bare": None, "sccache": None, "zccache": None},
+        "warm": {"bare": None, "sccache": None, "zccache": None},
+    }
+    assert benchmark_stats._normalization_reference(empty) == (1.0, "none")
+
+    # Zero/negative cold values are filtered out, not used as a divisor.
+    only_zero_cold = {
+        "cold": {"bare": 0.0, "sccache": -1.0, "zccache": None},
+        "warm": {"bare": 0.5, "sccache": None, "zccache": None},
+    }
+    assert benchmark_stats._normalization_reference(only_zero_cold) == (0.5, "warm")
+
+
+def test_warm_violations_flags_cache_regression_beyond_margin():
+    combined = {
+        "cold": {"bare": 1.000, "sccache": 1.000, "zccache": 1.000},
+        # bare: under 10% slower -> NOT flagged (noise floor).
+        # sccache: 50% slower -> flagged.
+        # zccache: faster -> NOT flagged.
+        "warm": {"bare": 1.050, "sccache": 1.500, "zccache": 0.050},
+    }
+    flags = benchmark_stats._warm_violations(combined)
+    assert "sccache" in flags
+    assert "bare" not in flags
+    assert "zccache" not in flags
+    assert "1.500s" in flags["sccache"]
+    assert "1.000s" in flags["sccache"]
+
+
+def test_warm_violations_skips_missing_or_zero_values():
+    combined = {
+        "cold": {"bare": None, "sccache": 1.0, "zccache": 1.0},
+        "warm": {"bare": 5.0, "sccache": None, "zccache": 0.0},
+    }
+    # No pair has both cold > 0 and warm > 0, so no violations.
+    assert benchmark_stats._warm_violations(combined) == {}
+
+
+def test_render_language_jpg_survives_pathological_inputs(tmp_path):
+    """A scenario row missing every duration must still draw without crashing."""
+    pytest.importorskip("PIL")
+
+    payload = sample_payload()
+    payload["results"].append(
+        {
+            "benchmark": "c-degenerate",
+            "benchmark_label": "C degenerate",
+            "language": "c",
+            "scenario": "All-missing, Warm",
+            "mode": "warm",
+            "bare_label": "Bare clang",
+            "bare_seconds": None,
+            "sccache_seconds": None,
+            "zccache_seconds": None,
+            "zccache_vs_sccache_ratio": None,
+            "zccache_vs_bare_ratio": None,
+            "vs_sccache_text": "n/a",
+            "vs_bare_text": "n/a",
+        }
+    )
+    out_path = tmp_path / "benchmark-c.jpg"
+    benchmark_stats.render_language_jpg(payload, "c", out_path)
+    assert out_path.stat().st_size > 0
+
+
+def test_render_language_jpg_handles_no_data_for_language(tmp_path):
+    """Empty language slice draws the placeholder, not a crash."""
+    pytest.importorskip("PIL")
+
+    payload = sample_payload()
+    payload["results"] = [row for row in payload["results"] if row["language"] != "c"]
+
+    out_path = tmp_path / "benchmark-c-empty.jpg"
+    benchmark_stats.render_language_jpg(payload, "c", out_path)
+    assert out_path.stat().st_size > 0
 
 
 def test_readme_benchmark_images_link_to_results_branch():
