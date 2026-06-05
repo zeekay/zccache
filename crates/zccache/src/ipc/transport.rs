@@ -299,31 +299,148 @@ impl IpcListener {
         }
         #[cfg(windows)]
         {
-            use tokio::net::windows::named_pipe::ServerOptions;
+            self.accept_windows().await
+        }
+    }
 
-            // Pop the front pipe and wait for a client to connect.
-            let pipe = self
-                .inner
-                .pool
-                .pop_front()
-                .expect("pipe pool must not be empty");
-            pipe.connect().await?;
+    /// Windows named-pipe accept with pool-depletion recovery (issue #666).
+    ///
+    /// The pre-#666 implementation had two depletion paths:
+    /// 1. `pool.pop_front().expect(...)` panicked if the pool ever emptied.
+    /// 2. `ServerOptions::create(...)?` on the replacement leaked the popped
+    ///    pipe slot on every failure, silently shrinking the pool.
+    ///
+    /// Combined, a sustained period of transient `create` errors (handle
+    /// exhaustion under a 673-TU ninja burst, antivirus reentrancy, etc.)
+    /// would shrink the pool toward zero and eventually wedge the daemon
+    /// without crashing — every new client would queue on the dwindling
+    /// number of remaining `pipe.connect().await` calls and see the
+    /// CLI-side 300 s recv timeout.
+    ///
+    /// This implementation:
+    /// - Replaces the `pop_front().expect()` panic with an emergency create.
+    /// - Retries replacement creation with bounded backoff so a transient
+    ///   OS hiccup does not consume a pool slot.
+    /// - Treats a `connect()` failure as a normal accept retry rather than
+    ///   propagating it to the daemon's main loop (which would drop the
+    ///   slot the same way the old code did).
+    #[cfg(windows)]
+    async fn accept_windows(&mut self) -> Result<IpcConnection, IpcError> {
+        loop {
+            let pipe = match self.inner.pool.pop_front() {
+                Some(p) => p,
+                None => {
+                    // Pool depleted — every prior `create` retry failed and
+                    // the popped slot was never replaced. Try once more
+                    // synchronously; failure here is a real OS problem and
+                    // is propagated to the caller.
+                    tracing::warn!(
+                        endpoint = %self.inner.endpoint,
+                        "named-pipe pool exhausted — attempting emergency create (issue #666)"
+                    );
+                    create_replacement_pipe(&self.inner.endpoint)?
+                }
+            };
 
-            // Create a replacement instance and push to the back.
-            let replacement = ServerOptions::new()
-                .first_pipe_instance(false)
-                .create(&self.inner.endpoint)?;
-            self.inner.pool.push_back(replacement);
+            if let Err(e) = pipe.connect().await {
+                // The popped pipe is now dropped. Replenish the pool with a
+                // fresh instance (best-effort) and retry the accept so the
+                // daemon's main loop never sees a transient connect glitch.
+                tracing::warn!(
+                    endpoint = %self.inner.endpoint,
+                    error = %e,
+                    "named-pipe connect failed — replenishing and retrying"
+                );
+                if let Ok(replacement) = create_replacement_pipe(&self.inner.endpoint) {
+                    self.inner.pool.push_back(replacement);
+                }
+                continue;
+            }
+
+            // Connect succeeded. Try hard to create a replacement before we
+            // return so the pool stays full. If replacement creation fails
+            // even after retries, log loudly and proceed anyway — the next
+            // accept will hit the pool-depleted branch above instead of
+            // panicking.
+            match create_replacement_pipe_with_retry(&self.inner.endpoint).await {
+                Some(replacement) => self.inner.pool.push_back(replacement),
+                None => tracing::error!(
+                    endpoint = %self.inner.endpoint,
+                    "named-pipe replacement create failed after retries — \
+                     pool slot temporarily unfilled; next accept will recreate (issue #666)"
+                ),
+            }
 
             let (reader, writer) = tokio::io::split(pipe);
-            Ok(IpcConnection {
+            return Ok(IpcConnection {
                 reader,
                 writer,
                 read_buf: BytesMut::with_capacity(4096),
                 recv_timeout: None,
-            })
+            });
         }
     }
+
+    /// Test-only: pop every pipe out of the pool to simulate a deeply
+    /// depleted state. Used by `pool_recovers_from_full_depletion` to
+    /// exercise the issue #666 emergency-create path.
+    #[cfg(all(windows, test))]
+    pub(crate) fn test_drain_pool(&mut self) -> usize {
+        let drained = self.inner.pool.len();
+        self.inner.pool.clear();
+        drained
+    }
+}
+
+/// Issue #666: synchronous replacement pipe creation. Used by the emergency
+/// path when the pool is fully depleted.
+#[cfg(windows)]
+fn create_replacement_pipe(
+    endpoint: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, IpcError> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    Ok(ServerOptions::new()
+        .first_pipe_instance(false)
+        .create(endpoint)?)
+}
+
+/// Issue #666: bounded-backoff retry around replacement creation. Returns
+/// `None` only after the full retry budget is exhausted; in that case the
+/// caller logs and proceeds without push-back so the pool slot is filled
+/// lazily on the next accept.
+///
+/// The backoff is deliberately short (5 ms → 80 ms over 5 attempts, ~155 ms
+/// total worst case) because we are blocking the daemon's accept loop while
+/// retrying — long enough to ride out a brief OS handle spike, short enough
+/// that the daemon doesn't appear wedged.
+#[cfg(windows)]
+async fn create_replacement_pipe_with_retry(
+    endpoint: &str,
+) -> Option<tokio::net::windows::named_pipe::NamedPipeServer> {
+    const ATTEMPTS: u32 = 5;
+    const INITIAL_DELAY_MS: u64 = 5;
+    const MAX_DELAY_MS: u64 = 80;
+
+    let mut delay_ms = INITIAL_DELAY_MS;
+    for attempt in 0..ATTEMPTS {
+        match create_replacement_pipe(endpoint) {
+            Ok(p) => return Some(p),
+            Err(e) => {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    max_attempts = ATTEMPTS,
+                    error = %e,
+                    endpoint = %endpoint,
+                    "named-pipe replacement create retry"
+                );
+                if attempt + 1 < ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+                }
+            }
+        }
+    }
+    None
 }
 
 // ── Client connect ──────────────────────────────────────────────────
@@ -487,6 +604,42 @@ mod tests {
             Err(IpcError::Io(_)) => {}
             other => panic!("unexpected result: {other:?}"),
         }
+
+        server.await.unwrap();
+    }
+
+    /// Regression test for <https://github.com/zackees/zccache/issues/666>.
+    ///
+    /// The pre-#666 Windows accept path would `pop_front().expect(...)`-panic
+    /// the moment the pool ever depleted. After the fix, a fully drained pool
+    /// must recover via the emergency-create path on the next accept.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pool_recovers_from_full_depletion() {
+        let endpoint = unique_test_endpoint();
+        let mut listener = IpcListener::bind(&endpoint).unwrap();
+
+        // Simulate the issue #666 wedge: pool is fully drained by repeated
+        // replacement-create failures (modelled here by an explicit drain).
+        let drained = listener.test_drain_pool();
+        assert!(drained > 0, "fresh listener should have pre-created pipes");
+
+        let server = tokio::spawn(async move {
+            // accept() on a drained pool must NOT panic — it must take the
+            // emergency-create path and serve the client.
+            let mut conn = listener.accept().await.expect("accept after drain");
+            let msg: Option<Request> = conn.recv().await.unwrap();
+            assert_eq!(msg, Some(Request::Ping));
+            conn.send(&Response::Pong).await.unwrap();
+        });
+
+        // The emergency create + connect handshake adds a few ms — give the
+        // server room to set up before the client connects.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut client = connect(&endpoint).await.unwrap();
+        client.send(&Request::Ping).await.unwrap();
+        let resp: Option<Response> = client.recv().await.unwrap();
+        assert_eq!(resp, Some(Response::Pong));
 
         server.await.unwrap();
     }

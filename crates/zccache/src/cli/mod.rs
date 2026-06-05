@@ -25,6 +25,39 @@ pub(crate) fn status_probe_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Default per-call timeout for Compile/Link recv before treating the daemon
+/// as wedged and triggering recovery (issue #666). Ninety seconds covers any
+/// reasonable single-TU compile (FastLED's heaviest unity-ish TU finishes
+/// well under 60 s on the slowest supported Windows runner) while bounding
+/// the per-worker wait when the daemon stops servicing the IPC. The pre-#666
+/// behavior was the 300 s global `DEFAULT_CLIENT_RECV_TIMEOUT`; under a wedge,
+/// every parallel ninja job paid the full window.
+///
+/// On timeout the wrapper force-kills the wedged daemon via
+/// `stop_stale_daemon`, ensures a fresh one is spawned, and retries the
+/// request exactly once on the fresh daemon. Subsequent ninja workers that
+/// queue up while the kill is in flight see no daemon at connect time and
+/// take the normal spawn path — so only one worker pays the recovery cost,
+/// not all 673.
+///
+/// Overridable via `ZCCACHE_WEDGE_RECV_TIMEOUT_SECS`; set to `0` to disable
+/// the wedge detection entirely and keep the historical 300 s behavior.
+const WEDGE_RECV_DEFAULT_SECS: u64 = 90;
+
+/// Returns the wedge-detection recv timeout for Compile/Link calls. `None`
+/// means "disabled" (the env var was set to `0`). See [`WEDGE_RECV_DEFAULT_SECS`].
+pub(crate) fn wedge_recv_timeout() -> Option<std::time::Duration> {
+    let secs = std::env::var("ZCCACHE_WEDGE_RECV_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(WEDGE_RECV_DEFAULT_SECS);
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
 // Re-export daemon-lifecycle helpers moved to `runtime.rs` (issue #365 wave 6)
 // so the public API path is unchanged.
 #[allow(deprecated)]
