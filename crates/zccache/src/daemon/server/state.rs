@@ -199,9 +199,5 @@ pub(super) struct SharedState {
     /// `crash_mid_flight_recovery_never_surfaces_wrong_content` in
     /// `daemon/server/tests/deferred_cold_path.rs` (PR #618).
     ///
-    /// `dead_code` allowed today: scaffolding for #610's deferred-write
-    /// wiring landing in a follow-up PR. Exercised by the
-    /// `pending_cache_writes` integration tests in the same crate.
-    #[allow(dead_code)]
     pub(super) pending_cache_writes: DashMap<String, Arc<Notify>>,
 }

@@ -147,7 +147,7 @@ pub(super) struct FastHitProbe<'a> {
     pub(super) build_context_ns: u64,
 }
 
-pub(super) fn try_fast_hit(probe: FastHitProbe<'_>) -> Option<Response> {
+pub(super) async fn try_fast_hit(probe: FastHitProbe<'_>) -> Option<Response> {
     let FastHitProbe {
         state,
         sid,
@@ -180,12 +180,33 @@ pub(super) fn try_fast_hit(probe: FastHitProbe<'_>) -> Option<Response> {
         // depgraph path instead of the zero-hash fast-hit cache.
         return None;
     }
-    let entry = state.fast_hit_cache.get(&context_key)?;
-    if !cache_entry_fresh_at(compile_start, entry.cached_at, FAST_HIT_MAX_AGE)
-        || !context_files_fresh(state, &context_key, source_path, entry.clock)
+    // Snap a clone of the fast-hit entry's fields BEFORE awaiting on the
+    // pending registry — DashMap's `get` returns a shard guard, and holding
+    // it across `.await` risks a cross-shard deadlock when concurrent
+    // tasks contend for the same shard.
+    let (entry_artifact_key_hex, entry_clock, entry_cached_at) = {
+        let entry = state.fast_hit_cache.get(&context_key)?;
+        (entry.artifact_key_hex.clone(), entry.clock, entry.cached_at)
+    };
+    if !cache_entry_fresh_at(compile_start, entry_cached_at, FAST_HIT_MAX_AGE)
+        || !context_files_fresh(state, &context_key, source_path, entry_clock)
     {
         return None;
     }
+
+    // Issue #610, DD-025: if a cold-miss for this artifact key is still
+    // publishing to the in-memory cache, briefly wait so the materialize
+    // step below hits instead of falling through to a recompile-on-race.
+    // Capped at PENDING_WAIT_TIMEOUT (5 ms) inside the helper; common case
+    // (no pending entry) returns immediately. `await_pending` clones the
+    // inner `Arc<Notify>` before yielding so no DashMap shard lock
+    // straddles the await.
+    pending_writes::await_pending(
+        &state.pending_cache_writes,
+        &entry_artifact_key_hex,
+        pending_writes::PENDING_WAIT_TIMEOUT,
+    )
+    .await;
 
     let secondary_output_dir = if is_rustc {
         output_path.parent().unwrap_or(cwd_path).into()
@@ -203,7 +224,7 @@ pub(super) fn try_fast_hit(probe: FastHitProbe<'_>) -> Option<Response> {
     let response = materialize_cached_compile_hit(CachedHitMaterializeRequest {
         state,
         sid,
-        artifact_key_hex: &entry.artifact_key_hex,
+        artifact_key_hex: &entry_artifact_key_hex,
         source_path,
         output_path,
         secondary_output_dir,
