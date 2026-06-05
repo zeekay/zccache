@@ -766,6 +766,9 @@ def build_image_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "bare": _format_seconds(row["bare_seconds"]),
             "sccache": _format_seconds(row["sccache_seconds"]),
             "zccache": _format_seconds(row["zccache_seconds"]),
+            "bare_seconds": row["bare_seconds"],
+            "sccache_seconds": row["sccache_seconds"],
+            "zccache_seconds": row["zccache_seconds"],
             "vs_sccache": _format_ratio(row["zccache_vs_sccache_ratio"]),
             "vs_bare": _format_ratio(row["zccache_vs_bare_ratio"]),
             "vs_sccache_percent": _format_percent_delta(row["zccache_vs_sccache_ratio"]),
@@ -777,11 +780,59 @@ def build_image_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+SECTION_STYLES: dict[str, dict[str, str]] = {
+    "cold": {
+        "title": "Cold",
+        "section": "#10233a",
+        "row": "#0f1b2d",
+        "row_alt": "#11243a",
+        "accent": "#79c0ff",
+    },
+    "warm": {
+        "title": "Warm",
+        "section": "#2f2110",
+        "row": "#241a0f",
+        "row_alt": "#2b1f12",
+        "accent": "#ffa657",
+    },
+}
+
+# bare/sccache/zccache bar colors — match the README dark theme. Issue #667.
+SERIES_COLORS: dict[str, str] = {
+    "bare": "#8b949e",
+    "sccache": "#79c0ff",
+    "zccache": "#3fb950",
+}
+SERIES_ORDER: tuple[str, ...] = ("bare", "sccache", "zccache")
+
+
+def _section_max_seconds(rows: list[dict[str, Any]]) -> float:
+    """Largest finite duration across bare/sccache/zccache for the section.
+
+    Per-section scale keeps warm (sub-ms zccache) readable instead of being
+    crushed by cold's multi-second bars.
+    """
+    candidates = [
+        value
+        for row in rows
+        for value in (row["bare_seconds"], row["sccache_seconds"], row["zccache_seconds"])
+        if isinstance(value, (int, float)) and value > 0
+    ]
+    if not candidates:
+        return 1.0
+    return float(max(candidates))
+
+
 def _section_rows(rows: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
     return [row for row in rows if row["mode"] == mode]
 
 
 def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> None:
+    """Render a per-language benchmark image as cold/warm grouped bar charts.
+
+    Issue #667 — the previous ratio table broke down when zccache approached
+    zero. Grouped bars over absolute seconds stay honest at any magnitude.
+    """
     try:
         from PIL import Image, ImageDraw
     except ImportError as exc:
@@ -792,31 +843,52 @@ def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> N
 
     rows = build_image_rows(group_results_by_language(payload["results"])[language])
     title = f"zccache {LANGUAGE_LABELS[language]} benchmarks"
+
     width = 900
     margin = 20
-    row_h = 76
-    section_h = 28
-    header_h = 34
-    table_y = 106
+    header_band_h = 84
+    chart_top = 106
     footer_h = 44
-    section_count = 2
-    rendered_row_count = max(1, len(rows))
-    height = max(
-        390,
-        table_y + header_h + section_h * section_count + row_h * rendered_row_count + footer_h,
-    )
+
+    bar_row_h = 22
+    scenario_label_h = 22
+    scenario_gap = 10
+    section_title_h = 32
+    section_gap = 12
+    empty_section_h = 60
+
+    sections: list[tuple[str, list[dict[str, Any]]]] = []
+    for mode in ("cold", "warm"):
+        section_rows = _section_rows(rows, mode)
+        if section_rows:
+            sections.append((mode, section_rows))
+
+    def section_height(section_rows: list[dict[str, Any]]) -> int:
+        if not section_rows:
+            return empty_section_h
+        per_scenario = scenario_label_h + bar_row_h * len(SERIES_ORDER) + scenario_gap
+        return per_scenario * len(section_rows) + scenario_gap
+
+    if sections:
+        chart_h = (
+            sum(section_title_h + section_height(section_rows) for _, section_rows in sections)
+            + section_gap * (len(sections) - 1)
+        )
+    else:
+        chart_h = section_title_h + empty_section_h
+
+    height = max(420, chart_top + chart_h + footer_h)
+
     scale = 4
     image = Image.new("RGB", (width * scale, height * scale), "#0d1117")
     draw = ImageDraw.Draw(image)
+
     title_font = _font(26 * scale, bold=True)
     subtitle_font = _font(11 * scale)
-    header_font = _font(12 * scale, bold=True)
-    section_font = _font(14 * scale, bold=True)
-    row_font = _font(12 * scale)
-    row_bold_font = _font(12 * scale, bold=True)
+    section_font = _font(15 * scale, bold=True)
     scenario_font = _font(13 * scale, bold=True)
-    delta_font = _font(12 * scale)
-    delta_bold_font = _font(14 * scale, bold=True)
+    series_font = _font(11 * scale, bold=True)
+    value_font = _font(12 * scale, bold=True)
     small_font = _font(10 * scale)
 
     def box(values: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
@@ -840,18 +912,9 @@ def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> N
             fill=fill,
         )
 
-    def draw_delta(x: int, y: int, value: str, ratio: float | None, max_width: int) -> None:
-        color = ratio_color(ratio)
-        if value == "n/a":
-            draw_fit(x, y + 19, value, delta_bold_font, color, max_width)
-            return
-        amount, _, direction = value.partition(" ")
-        draw_fit(x, y + 12, amount, delta_bold_font, color, max_width)
-        if direction:
-            draw_fit(x, y + 38, direction, delta_font, color, max_width)
-
+    # Header band ------------------------------------------------------------
     draw.rectangle(box((0, 0, width, height)), fill="#0d1117")
-    draw.rectangle(box((0, 0, width, 84)), fill="#161b22")
+    draw.rectangle(box((0, 0, width, header_band_h)), fill="#161b22")
     draw.text(point(margin, 20), title, font=title_font, fill="#f0f6fc")
     metadata = payload["metadata"]
     sha = (metadata.get("git_sha") or "n/a")[:12]
@@ -860,137 +923,165 @@ def render_language_jpg(payload: dict[str, Any], language: str, path: Path) -> N
         f"Generated {metadata['generated_at']} | ref {metadata.get('git_ref') or 'n/a'} | "
         f"sha {sha} | runner {runner}"
     )
-    draw.text(
-        point(margin, 60),
-        _truncate_to_width(draw, metadata_line, subtitle_font, (width - margin * 2) * scale),
-        font=subtitle_font,
-        fill="#8b949e",
+    draw_fit(
+        margin,
+        60,
+        metadata_line,
+        subtitle_font,
+        "#8b949e",
+        width - margin * 2,
     )
 
-    x0, y0 = margin, table_y
-    table_w = width - margin * 2
-    headers = ["Scenario", "Times", "vs sccache", "vs bare"]
-    widths = [250, 280, 160, 160]
-    padding_x = 10
+    # Chart geometry ---------------------------------------------------------
+    x0 = margin
+    chart_w = width - margin * 2
+    series_label_w = 70
+    value_label_w = 90
+    inner_padding = 12
+    bar_area_x0 = x0 + inner_padding + series_label_w
+    bar_area_x1 = x0 + chart_w - inner_padding - value_label_w
+    bar_area_w = max(1, bar_area_x1 - bar_area_x0)
 
-    draw.rounded_rectangle(
-        box((x0, y0, x0 + table_w, y0 + header_h)),
-        radius=8 * scale,
-        fill="#21262d",
-        outline="#30363d",
-        width=scale,
-    )
-    x = x0 + padding_x
-    for header, col_w in zip(headers, widths):
-        draw.text(point(x, y0 + 10), header, font=header_font, fill="#c9d1d9")
-        x += col_w
+    def draw_scenario_block(
+        y: int,
+        section_rows: list[dict[str, Any]],
+        scale_max: float,
+        accent: str,
+        row_fill: str,
+        row_alt_fill: str,
+    ) -> int:
+        for index, row in enumerate(section_rows):
+            block_h = scenario_label_h + bar_row_h * len(SERIES_ORDER) + scenario_gap
+            fill = row_fill if index % 2 == 0 else row_alt_fill
+            draw.rectangle(box((x0, y, x0 + chart_w, y + block_h)), fill=fill)
+            # Scenario heading: compact label (muted) + compact scenario (bright)
+            heading = f"{row['compact_label']} - {row['compact_scenario']}"
+            draw_fit(
+                x0 + inner_padding,
+                y + 4,
+                heading,
+                scenario_font,
+                "#f0f6fc",
+                chart_w - inner_padding * 2,
+            )
+            bars_y = y + scenario_label_h
+            for series_index, series in enumerate(SERIES_ORDER):
+                bar_top = bars_y + series_index * bar_row_h + 4
+                bar_bottom = bar_top + 14
+                seconds = row.get(f"{series}_seconds")
+                # Series label (left)
+                draw_fit(
+                    x0 + inner_padding,
+                    bar_top - 1,
+                    series,
+                    series_font,
+                    SERIES_COLORS[series],
+                    series_label_w - 6,
+                )
+                # Bar track
+                draw.rectangle(
+                    box((bar_area_x0, bar_top + 5, bar_area_x1, bar_top + 9)),
+                    fill="#21262d",
+                )
+                if isinstance(seconds, (int, float)) and seconds > 0:
+                    fraction = max(0.0, min(1.0, seconds / scale_max))
+                    bar_end = bar_area_x0 + max(2, int(round(bar_area_w * fraction)))
+                    draw.rectangle(
+                        box((bar_area_x0, bar_top, bar_end, bar_bottom)),
+                        fill=SERIES_COLORS[series],
+                    )
+                    label = row[series]
+                else:
+                    label = row[series]  # "n/a" or already-rendered string
+                draw_fit(
+                    bar_area_x1 + 8,
+                    bar_top - 1,
+                    label,
+                    value_font,
+                    "#f0f6fc",
+                    value_label_w - 8,
+                )
+            # Subtle separator under the block
+            draw.line(
+                box((x0 + inner_padding, y + block_h - 1, x0 + chart_w - inner_padding, y + block_h - 1)),
+                fill="#30363d",
+                width=scale,
+            )
+            y += block_h
+        _ = accent  # accent is only used in the section title; silence linters.
+        return y
 
-    y = y0 + header_h
-    if not rows:
-        draw.rectangle(box((x0, y, x0 + table_w, y + row_h)), fill="#161b22")
-        draw_fit(
-            x0 + padding_x,
-            y + 28,
-            "Benchmark data is not available yet.",
-            row_font,
-            "#f0f6fc",
-            table_w - padding_x * 2,
+    # Sections ---------------------------------------------------------------
+    y = chart_top
+    if not sections:
+        style = SECTION_STYLES["cold"]
+        draw.rectangle(box((x0, y, x0 + chart_w, y + section_title_h)), fill=style["section"])
+        draw.text(
+            point(x0 + inner_padding, y + 7),
+            "Benchmark data",
+            font=section_font,
+            fill=style["accent"],
         )
-        y += row_h
+        y += section_title_h
+        draw.rectangle(box((x0, y, x0 + chart_w, y + empty_section_h)), fill="#161b22")
+        draw_fit(
+            x0 + inner_padding,
+            y + 20,
+            "Benchmark data is not available yet.",
+            scenario_font,
+            "#f0f6fc",
+            chart_w - inner_padding * 2,
+        )
+        y += empty_section_h
     else:
-        section_styles = {
-            "cold": {
-                "title": "Cold",
-                "section": "#10233a",
-                "row": "#0f1b2d",
-                "row_alt": "#11243a",
-                "accent": "#79c0ff",
-            },
-            "warm": {
-                "title": "Warm",
-                "section": "#2f2110",
-                "row": "#241a0f",
-                "row_alt": "#2b1f12",
-                "accent": "#ffa657",
-            },
-        }
-        for mode in ("cold", "warm"):
-            style = section_styles[mode]
-            draw.rectangle(box((x0, y, x0 + table_w, y + section_h)), fill=style["section"])
+        for section_index, (mode, section_rows) in enumerate(sections):
+            style = SECTION_STYLES[mode]
+            # Section title bar
+            draw.rectangle(box((x0, y, x0 + chart_w, y + section_title_h)), fill=style["section"])
             draw.text(
-                point(x0 + padding_x, y + 7),
+                point(x0 + inner_padding, y + 7),
                 style["title"],
                 font=section_font,
                 fill=style["accent"],
             )
-            y += section_h
-            for index, row in enumerate(_section_rows(rows, mode)):
-                fill = style["row"] if index % 2 == 0 else style["row_alt"]
-                draw.rectangle(box((x0, y, x0 + table_w, y + row_h)), fill=fill)
-                draw.line(
-                    box((x0, y + row_h, x0 + table_w, y + row_h)),
-                    fill="#30363d",
-                    width=scale,
-                )
-                x = x0 + padding_x
-                draw_fit(
-                    x,
-                    y + 14,
-                    row["compact_label"],
-                    row_font,
-                    "#8b949e",
-                    widths[0] - 16,
-                )
-                draw_fit(
-                    x,
-                    y + 38,
-                    row["compact_scenario"],
-                    scenario_font,
-                    "#f0f6fc",
-                    widths[0] - 16,
-                )
+            # Per-section scale annotation
+            scale_max = _section_max_seconds(section_rows)
+            scale_label = f"scale: 0 - {scale_max:.3f}s"
+            scale_label_w = _text_width(draw, scale_label, subtitle_font)
+            draw.text(
+                point(
+                    x0 + chart_w - inner_padding - scale_label_w // scale,
+                    y + 10,
+                ),
+                scale_label,
+                font=subtitle_font,
+                fill="#8b949e",
+            )
+            y += section_title_h
+            y = draw_scenario_block(
+                y,
+                section_rows,
+                scale_max,
+                style["accent"],
+                style["row"],
+                style["row_alt"],
+            )
+            if section_index != len(sections) - 1:
+                y += section_gap
 
-                x += widths[0]
-                time_lines = [
-                    ("bare", row["bare"], row_font, "#c9d1d9"),
-                    ("sccache", row["sccache"], row_font, "#c9d1d9"),
-                    ("zccache", row["zccache"], row_bold_font, "#f0f6fc"),
-                ]
-                for line_index, (label, value, font, color) in enumerate(time_lines):
-                    draw_fit(
-                        x,
-                        y + 8 + line_index * 21,
-                        f"{label}: {value}",
-                        font,
-                        color,
-                        widths[1] - 18,
-                    )
-
-                x += widths[1]
-                draw_delta(
-                    x,
-                    y,
-                    row["vs_sccache_percent"],
-                    row["zccache_vs_sccache_ratio"],
-                    widths[2] - 18,
-                )
-                x += widths[2]
-                draw_delta(
-                    x,
-                    y,
-                    row["vs_bare_percent"],
-                    row["zccache_vs_bare_ratio"],
-                    widths[3] - 18,
-                )
-                y += row_h
-
+    # Footer ----------------------------------------------------------------
     draw.rectangle(box((margin, height - 34, width - margin, height - 32)), fill="#30363d")
-    footer = "Artifacts: latest.json, benchmark-c.jpg, benchmark-cpp.jpg, benchmark-rust.jpg"
-    draw.text(
-        point(margin, height - 24),
-        _truncate_to_width(draw, footer, small_font, (width - margin * 2) * scale),
-        font=small_font,
-        fill="#8b949e",
+    footer = (
+        "Artifacts: latest.json, benchmark-c.jpg, benchmark-cpp.jpg, "
+        "benchmark-emscripten.jpg, benchmark-rust.jpg"
+    )
+    draw_fit(
+        margin,
+        height - 24,
+        footer,
+        small_font,
+        "#8b949e",
+        width - margin * 2,
     )
 
     path.parent.mkdir(parents=True, exist_ok=True)

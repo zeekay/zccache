@@ -370,6 +370,40 @@ def test_write_outputs_creates_timestamped_benchmark_image(tmp_path):
     assert not stale_combined_image.exists()
 
 
+def test_render_language_jpg_draws_cold_warm_sections_and_no_ratio_text(tmp_path, monkeypatch):
+    """Issue #667: per-language JPG renders Cold + Warm grouped bar charts.
+
+    The image must contain the section headers and the bare/sccache/zccache
+    series labels per scenario, and must NOT contain "% faster" / "% slower"
+    delta strings (those belong only to `index.html` and `latest.json`).
+    """
+    pytest.importorskip("PIL")
+
+    from PIL import ImageDraw
+
+    captured_text: list[str] = []
+    original_text = ImageDraw.ImageDraw.text
+
+    def recording_text(self, xy, text, *args, **kwargs):
+        captured_text.append(text)
+        return original_text(self, xy, text, *args, **kwargs)
+
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", recording_text)
+
+    payload = sample_payload()
+    out_path = tmp_path / "benchmark-cpp.jpg"
+    benchmark_stats.render_language_jpg(payload, "c++", out_path)
+
+    assert out_path.stat().st_size > 0
+    joined = "\n".join(captured_text)
+    assert "Cold" in joined
+    assert "Warm" in joined
+    for series in benchmark_stats.SERIES_ORDER:
+        assert series in joined
+    assert "% faster" not in joined
+    assert "% slower" not in joined
+
+
 def test_readme_benchmark_images_link_to_results_branch():
     readme = (benchmark_stats.REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
