@@ -229,11 +229,17 @@ impl DaemonServer {
                 {
                     let dir = state.artifact_dir.clone();
                     let artifacts = state.artifacts.clone();
+                    // Issue #680: pass the current depgraph snapshot so
+                    // contexts pointing at evicted artifacts are invalidated
+                    // synchronously. Pre-fix the depgraph kept stale Hit
+                    // pointers and the next compile reported `artifact_not_found`.
+                    let dg = state.dep_graph.load_full();
                     let result = tokio::task::spawn_blocking(move || {
                         super::super::eviction::evict_disk_artifacts(
                             &dir,
                             &artifacts,
                             max_cache_size,
+                            Some(&dg),
                         )
                     })
                     .await;
@@ -251,11 +257,13 @@ impl DaemonServer {
                     tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
                     let dir = state.artifact_dir.clone();
                     let artifacts = state.artifacts.clone();
+                    let dg = state.dep_graph.load_full();
                     let result = tokio::task::spawn_blocking(move || {
                         super::super::eviction::evict_disk_artifacts(
                             &dir,
                             &artifacts,
                             max_cache_size,
+                            Some(&dg),
                         )
                     })
                     .await;

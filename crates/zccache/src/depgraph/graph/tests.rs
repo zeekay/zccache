@@ -73,6 +73,89 @@ fn warm_context_all_fresh_returns_hit() {
     assert!(matches!(verdict, CacheVerdict::Hit { .. }));
 }
 
+/// Regression test for <https://github.com/zackees/zccache/issues/680>.
+///
+/// `invalidate_artifact_keys` must clear `artifact_key` on every context whose
+/// currently-recorded key is in the evicted set, and leave every other
+/// context untouched. Without this, the disk-GC fix's bridge from eviction →
+/// depgraph has no payload — the symptom (depgraph `Hit` followed by
+/// artifact-store `not_found`) returns the moment the disk fills again.
+#[test]
+fn invalidate_artifact_keys_clears_only_matching() {
+    let graph = DepGraph::new();
+
+    // Two warm contexts with distinct artifact keys.
+    let key_a = graph.register(make_ctx("/src/a.c"));
+    let key_b = graph.register(make_ctx("/src/b.c"));
+    let scan_a = ScanResult {
+        resolved: vec![NormalizedPath::from("/inc/a.h")],
+        unresolved: Vec::new(),
+        has_computed: false,
+    };
+    let scan_b = ScanResult {
+        resolved: vec![NormalizedPath::from("/inc/b.h")],
+        unresolved: Vec::new(),
+        has_computed: false,
+    };
+    let art_a = graph
+        .update(&key_a, scan_a, dummy_hash)
+        .expect("a artifact");
+    let art_b = graph
+        .update(&key_b, scan_b, dummy_hash)
+        .expect("b artifact");
+    let hex_a = art_a.hash().to_hex().to_string();
+    let hex_b = art_b.hash().to_hex().to_string();
+
+    // Pre-condition: both contexts have artifact_key populated.
+    assert!(
+        graph.contexts.get(&key_a).unwrap().artifact_key.is_some(),
+        "fixture: A must start with artifact_key set"
+    );
+    assert!(
+        graph.contexts.get(&key_b).unwrap().artifact_key.is_some(),
+        "fixture: B must start with artifact_key set"
+    );
+
+    // Evict only artifact A.
+    let mut evicted = std::collections::HashSet::new();
+    evicted.insert(hex_a.clone());
+    let cleared = graph.invalidate_artifact_keys(&evicted);
+    assert_eq!(cleared, 1, "exactly one context should have been cleared");
+
+    // Post-condition: A's artifact_key is None; B's is intact (and still
+    // equals its original hex).
+    assert!(
+        graph.contexts.get(&key_a).unwrap().artifact_key.is_none(),
+        "issue #680: A's artifact_key must be cleared — pre-fix this stayed \
+         populated and surfaced as a wasted hit"
+    );
+    let surviving = graph.contexts.get(&key_b).unwrap();
+    assert_eq!(
+        surviving
+            .artifact_key
+            .as_ref()
+            .map(|k| k.hash().to_hex().to_string()),
+        Some(hex_b),
+        "B must keep its artifact_key — invalidation must be precise, \
+         not a blanket wipe"
+    );
+
+    // Empty-set call is a no-op.
+    assert_eq!(
+        graph.invalidate_artifact_keys(&std::collections::HashSet::new()),
+        0,
+        "empty evicted set must be a no-op (no spurious clears)"
+    );
+
+    // Calling again with the same key after it's already cleared is also
+    // a no-op (no double-counting).
+    assert_eq!(
+        graph.invalidate_artifact_keys(&evicted),
+        0,
+        "re-invalidating already-cleared contexts must report zero clears"
+    );
+}
+
 #[test]
 fn rustc_extern_artifact_key_ignores_target_dir_path_shape() {
     let graph = DepGraph::new();

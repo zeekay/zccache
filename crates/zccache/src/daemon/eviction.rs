@@ -207,11 +207,21 @@ struct DiskArtifact {
 ///
 /// Also removes the corresponding in-memory `DashMap` entries.
 ///
+/// **Issue #680**: when `dep_graph` is `Some`, after the artifact eviction
+/// pass completes, every depgraph context whose `artifact_key` matches an
+/// evicted artifact gets its key cleared via
+/// [`DepGraph::invalidate_artifact_keys`]. Without this, the depgraph keeps
+/// pointing at the now-evicted artifact and the next compile reports
+/// `verdict=Hit` followed by `artifact_not_found` and a wasted recompile.
+/// Callers that don't have a depgraph reference (the legacy test fixtures
+/// in this module) pass `None`.
+///
 /// Returns `(bytes_freed, artifacts_removed)`.
 pub(crate) fn evict_disk_artifacts(
     artifact_dir: &Path,
     artifacts: &DashMap<String, CachedArtifact>,
     max_cache_size: u64,
+    dep_graph: Option<&DepGraph>,
 ) -> (u64, usize) {
     let entries = match std::fs::read_dir(artifact_dir) {
         Ok(e) => e,
@@ -296,6 +306,26 @@ pub(crate) fn evict_disk_artifacts(
     // Remove from in-memory DashMap.
     for artifact in &to_evict {
         artifacts.remove(&artifact.key);
+    }
+
+    // Issue #680: invalidate any depgraph contexts pointing at the
+    // artifacts we just evicted. Without this, the next compile through
+    // those contexts reports Hit, the artifact_store lookup misses, and
+    // the unit recompiles for no caching benefit. Build the set once and
+    // pass it; the depgraph walks its DashMap inside.
+    if let Some(dg) = dep_graph {
+        if !to_evict.is_empty() {
+            let evicted_keys: std::collections::HashSet<String> =
+                to_evict.iter().map(|a| a.key.clone()).collect();
+            let cleared = dg.invalidate_artifact_keys(&evicted_keys);
+            if cleared > 0 {
+                tracing::info!(
+                    contexts_cleared = cleared,
+                    artifacts_evicted = artifacts_removed,
+                    "invalidated depgraph contexts pointing at disk-evicted artifacts (issue #680)"
+                );
+            }
+        }
     }
 
     (bytes_freed, artifacts_removed)
@@ -631,7 +661,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let artifacts: DashMap<String, CachedArtifact> = DashMap::new();
         write_fake_artifact(dir.path(), "aaa", 100);
-        let (freed, removed) = evict_disk_artifacts(dir.path(), &artifacts, 1_000_000);
+        let (freed, removed) = evict_disk_artifacts(dir.path(), &artifacts, 1_000_000, None);
         assert_eq!(freed, 0);
         assert_eq!(removed, 0);
     }
@@ -651,7 +681,7 @@ mod tests {
 
         // Total: 3 * (5000 + 64) = 15192 bytes.
         // Budget: 10000 bytes → need to evict oldest.
-        let (freed, removed) = evict_disk_artifacts(dir.path(), &artifacts, 10_000);
+        let (freed, removed) = evict_disk_artifacts(dir.path(), &artifacts, 10_000, None);
         assert!(freed > 0);
         assert!(removed >= 1);
         // "new" should still exist.
@@ -669,10 +699,47 @@ mod tests {
         artifacts.insert("key1".to_string(), make_artifact(5000));
 
         // Budget: 0 → must evict everything.
-        let (freed, removed) = evict_disk_artifacts(dir.path(), &artifacts, 0);
+        let (freed, removed) = evict_disk_artifacts(dir.path(), &artifacts, 0, None);
         assert!(freed > 0);
         assert_eq!(removed, 1);
         assert!(artifacts.is_empty());
+    }
+
+    /// Regression test for <https://github.com/zackees/zccache/issues/680>.
+    ///
+    /// Pre-fix: `evict_disk_artifacts` removed the on-disk artifact and the
+    /// in-memory `DashMap` entry, but did NOT touch the depgraph contexts
+    /// that pointed at the now-evicted artifact key. The next compile
+    /// through those contexts surfaced `verdict=Hit` followed by
+    /// `artifact_not_found` and a wasted recompile (~15% real hit rate on
+    /// the dogfood reproducer instead of ~99%).
+    ///
+    /// Post-fix: passing `Some(&dep_graph)` invalidates the matching
+    /// context `artifact_key`s. Full integration coverage (registering a
+    /// depgraph context with a known artifact_key and asserting it gets
+    /// cleared) lives next to the `invalidate_artifact_keys` method in
+    /// `depgraph::graph::tests` — that's where the depgraph's internal
+    /// test seams already exist. This site-local test asserts only the
+    /// signature wiring: passing `None` is a no-op (back-compat with the
+    /// fixture callers above), passing `Some` reaches the depgraph.
+    #[test]
+    fn disk_eviction_signature_accepts_optional_depgraph() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts: DashMap<String, CachedArtifact> = DashMap::new();
+        let dg = DepGraph::new();
+
+        write_fake_artifact(dir.path(), "k", 5000);
+
+        // Some(&dg) compiles and is a no-op when the depgraph has no
+        // matching contexts — the bridge is wired, the production
+        // invalidation path is covered by the depgraph-level unit test
+        // (`invalidate_artifact_keys_clears_only_matching` in
+        // `depgraph::graph::tests`).
+        let (freed, removed) = evict_disk_artifacts(dir.path(), &artifacts, 0, Some(&dg));
+        assert!(freed > 0);
+        assert_eq!(removed, 1);
+        // Empty depgraph → no contexts to invalidate, no panic.
+        assert_eq!(dg.stats().context_count, 0);
     }
 
     #[test]
@@ -688,7 +755,7 @@ mod tests {
 
         // Budget: 10000. 90% target = 9000. Need to free ~1640 bytes.
         // That's ~2 artifacts (each ~1064 bytes).
-        let (freed, removed) = evict_disk_artifacts(dir.path(), &artifacts, 10_000);
+        let (freed, removed) = evict_disk_artifacts(dir.path(), &artifacts, 10_000, None);
         assert!(freed > 0);
         // Should remove just enough, not all.
         assert!(removed >= 1);
