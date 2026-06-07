@@ -502,6 +502,26 @@ A few things worth knowing:
   benchmarks (introduced in #238) confirm warm-state hits across sibling
   worktrees run an order of magnitude faster than bare compiles and sccache
   even though sccache cannot share across sibling roots at all.
+- Cached diagnostics follow the same toggle. zccache caches the compiler's
+  stdout and stderr alongside the object payload and replays them verbatim on
+  every hit. With `ZCCACHE_PATH_REMAP=auto`, the original compile sees the
+  injected `-ffile-prefix-map` flags, so the cached diagnostics are already
+  worktree-neutral and survive being served to a sibling clone cleanly. With
+  `ZCCACHE_PATH_REMAP=off` (the default), the compiler emits absolute paths
+  into stderr — for example, a warning whose include trace points at
+  `C:\Users\me\dev\fastled5\src\...` — and those bytes are what every
+  cross-worktree hit replays into the new build. The `.obj` machine code
+  itself is still scrubbed by the #474/#489 fixes for the non-`auto` case
+  (per-worktree salting for PCH/MSVC; absolute paths in C/C++ debug info
+  only land when their flags are missing), so the contamination is cosmetic:
+  confusing diagnostics, never wrong code generation. Set
+  `ZCCACHE_PATH_REMAP=auto` to clean diagnostics at the source, or run
+  `zccache clear` after upgrading past 1.11.9 to drop pre-fix entries that
+  were captured before the per-worktree salting (#474, shipped in 1.11.8)
+  and request-cache scoping (#489, shipped in 1.11.9) landed — those entries
+  are still served as cross-worktree hits and carry their original-clone
+  paths in both the diagnostic stream and (for PCH/MSVC) the artifact bytes
+  themselves.
 
 ### Strict path validation
 
