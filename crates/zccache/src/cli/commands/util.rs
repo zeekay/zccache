@@ -169,6 +169,17 @@ pub(crate) fn init_tracing() {
         .init();
 }
 
+/// User-facing message for the `Ok(None)` recv path — daemon closed the
+/// pipe cleanly without sending a Response frame.
+///
+/// The legacy text led with "daemon-CLI protocol version mismatch", which
+/// was misleading: the thundering-herd window that produced this symptom
+/// for FastLED's `clud-pr` parallel builds was fixed in 1.11.16 (#674)
+/// and the pipe-pool wedge in 1.11.15 (#669). With those gone, the
+/// remaining causes are an external `zccache stop`/kill mid-request or a
+/// genuine daemon crash — point users at `zccache status` first.
+pub(crate) const LOST_CONNECTION_MSG: &str = "zccache[err][R]: lost connection to daemon (no response). The daemon may have crashed or been killed mid-request — run `zccache status` to check, or `zccache stop` then retry to restart it.";
+
 pub(crate) fn print_json_value(value: &serde_json::Value) {
     match serde_json::to_string_pretty(value) {
         Ok(s) => println!("{s}"),

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use super::super::snapshot_fp;
-use super::util::{connect, format_bytes};
+use super::util::{connect, format_bytes, LOST_CONNECTION_MSG};
 
 pub(crate) async fn cmd_clear(endpoint: &str) -> ExitCode {
     let mut conn = match connect(endpoint).await {
@@ -46,7 +46,7 @@ pub(crate) async fn cmd_clear(endpoint: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         None => {
-            eprintln!("zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`");
+            eprintln!("{LOST_CONNECTION_MSG}");
             ExitCode::FAILURE
         }
         Some(other) => {

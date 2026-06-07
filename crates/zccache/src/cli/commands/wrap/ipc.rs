@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use super::super::super::wedge_recv_timeout;
 use super::super::daemon::{ensure_daemon, stop_stale_daemon};
-use super::super::util::{connect, exit_code_from_i32, slurp_stdin_if_piped};
+use super::super::util::{connect, exit_code_from_i32, slurp_stdin_if_piped, LOST_CONNECTION_MSG};
 
 pub(super) async fn cmd_compile(
     endpoint: &str,
@@ -284,10 +284,7 @@ fn relay_compile_response<W: Write, E: Write>(
             ExitCode::FAILURE
         }
         None => {
-            let _ = writeln!(
-                stderr,
-                "zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch - try `zccache stop`"
-            );
+            let _ = writeln!(stderr, "{LOST_CONNECTION_MSG}");
             ExitCode::FAILURE
         }
         Some(other) => {
@@ -325,10 +322,7 @@ fn relay_link_response<W: Write, E: Write>(
             ExitCode::FAILURE
         }
         None => {
-            let _ = writeln!(
-                stderr,
-                "zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch - try `zccache stop`"
-            );
+            let _ = writeln!(stderr, "{LOST_CONNECTION_MSG}");
             ExitCode::FAILURE
         }
         Some(other) => {
