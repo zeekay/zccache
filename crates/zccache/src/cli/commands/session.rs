@@ -7,7 +7,9 @@ use std::process::ExitCode;
 
 use super::super::session_end_idempotent;
 use super::daemon::ensure_daemon;
-use super::util::{connect, format_duration_ms, print_json_value, resolve_endpoint};
+use super::util::{
+    connect, format_duration_ms, print_json_value, resolve_endpoint, LOST_CONNECTION_MSG,
+};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SessionStartPrivateOptions {
@@ -203,7 +205,7 @@ pub(crate) async fn cmd_session_start(
             ExitCode::FAILURE
         }
         None => {
-            eprintln!("zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`");
+            eprintln!("{LOST_CONNECTION_MSG}");
             ExitCode::FAILURE
         }
         Some(other) => {
@@ -313,7 +315,7 @@ pub(crate) async fn cmd_session_stats(endpoint: &str, session_id: String, json: 
             ExitCode::FAILURE
         }
         None => {
-            let message = "zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`";
+            let message = LOST_CONNECTION_MSG;
             if json {
                 print_session_stats_error_json(&session_id, message);
             } else {
@@ -498,6 +500,6 @@ pub(crate) async fn query_session_stats(
         Some(crate::protocol::Response::SessionStatsResult { stats }) => Ok(stats),
         Some(crate::protocol::Response::Error { message }) => Err(message),
         Some(other) => Err(format!("unexpected daemon response: {other:?}")),
-        None => Err("lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`".to_string()),
+        None => Err(LOST_CONNECTION_MSG.to_string()),
     }
 }

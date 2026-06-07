@@ -4,7 +4,7 @@ use crate::core::NormalizedPath;
 use std::process::ExitCode;
 
 use super::super::status_probe_timeout;
-use super::util::{connect, resolve_endpoint, run_async};
+use super::util::{connect, resolve_endpoint, run_async, LOST_CONNECTION_MSG};
 
 pub(crate) enum VersionCheck {
     Ok,
@@ -339,7 +339,7 @@ pub(crate) async fn cmd_stop(endpoint: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         None => {
-            eprintln!("zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`");
+            eprintln!("{LOST_CONNECTION_MSG}");
             ExitCode::FAILURE
         }
         Some(other) => {

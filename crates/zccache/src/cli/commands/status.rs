@@ -2,7 +2,9 @@
 
 use std::process::ExitCode;
 
-use super::util::{connect, format_bytes, format_duration_ms, format_uptime, print_json_value};
+use super::util::{
+    connect, format_bytes, format_duration_ms, format_uptime, print_json_value, LOST_CONNECTION_MSG,
+};
 
 pub(crate) async fn cmd_status(endpoint: &str, json: bool) -> ExitCode {
     let mut conn = match connect(endpoint).await {
@@ -151,7 +153,7 @@ pub(crate) async fn cmd_status(endpoint: &str, json: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         None => {
-            let message = "zccache[err][R]: lost connection to daemon (no response). Often a daemon-CLI protocol version mismatch — try `zccache stop`";
+            let message = LOST_CONNECTION_MSG;
             if json {
                 print_status_error_json(endpoint, message);
             } else {
