@@ -1062,6 +1062,64 @@ impl DepGraph {
         Some(artifact_key)
     }
 
+    /// Clear `artifact_key` on every context whose currently-recorded
+    /// artifact key is in `evicted_hex`. Returns the number of contexts
+    /// whose key was cleared.
+    ///
+    /// **Issue #680 — eviction-divergence fix.** When the disk artifact
+    /// GC (`evict_disk_artifacts`) removes an artifact, the depgraph
+    /// contexts that point at the now-evicted key still report
+    /// `CacheVerdict::Hit { artifact_key }` on their next check, which
+    /// then surfaces in the daemon log as `artifact_not_found` and a
+    /// wasted recompile (the user observed a 15.7% real hit rate on a
+    /// soldr dogfood rebuild that should have been ~99%). Wiring the
+    /// disk GC to call this method after each eviction batch keeps the
+    /// two stores in agreement: the next check on an evicted context
+    /// returns `Cold` (forcing a clean miss + re-store) instead of a
+    /// stale `Hit`.
+    ///
+    /// Key comparison uses the hex form (`ArtifactKey::hash().to_hex()`)
+    /// so callers — which already have the evicted artifacts' string
+    /// keys from the disk eviction pass — do not have to round-trip
+    /// through `ArtifactKey` construction.
+    ///
+    /// `last_accessed` is intentionally NOT bumped — this is a passive
+    /// invalidation, and resetting access time would extend the
+    /// context's `trim()` lifetime past its disk-evicted artifact.
+    pub fn invalidate_artifact_keys(
+        &self,
+        evicted_hex: &std::collections::HashSet<String>,
+    ) -> usize {
+        if evicted_hex.is_empty() {
+            return 0;
+        }
+        // Two-phase to avoid holding DashMap shard locks across the
+        // `evicted_hex.contains(...)` allocation: read-only scan collects
+        // the context keys whose artifact_key needs clearing, then a
+        // bounded set of `get_mut` writes does the clear. Each `get_mut`
+        // takes only the matching shard's lock briefly. This pattern is
+        // what `trim()` and the existing artifact retention loops use to
+        // stay deadlock-free under concurrent compile traffic.
+        let mut to_clear: Vec<ContextKey> = Vec::new();
+        for entry in self.contexts.iter() {
+            if let Some(ref ak) = entry.value().artifact_key {
+                if evicted_hex.contains(ak.hash().to_hex().as_str()) {
+                    to_clear.push(*entry.key());
+                }
+            }
+        }
+        let mut cleared = 0;
+        for ctx_key in &to_clear {
+            if let Some(mut entry) = self.contexts.get_mut(ctx_key) {
+                if entry.artifact_key.is_some() {
+                    entry.artifact_key = None;
+                    cleared += 1;
+                }
+            }
+        }
+        cleared
+    }
+
     /// Trim entries not accessed within the given duration.
     /// Returns the number of entries removed.
     pub fn trim(&self, max_age: Duration) -> usize {
