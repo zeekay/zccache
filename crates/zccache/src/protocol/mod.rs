@@ -53,6 +53,27 @@ pub const PROST_PROTOCOL_VERSION: u32 = 16;
 pub const PROTOCOL_VERSION: u32 = BINCODE_PROTOCOL_VERSION;
 
 use bytes::{Buf, BufMut, BytesMut};
+use prost::Message as ProstMessage;
+
+/// Message decoded from a version-dispatched daemon frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedWireMessage<Bincode, Prost> {
+    /// v15 bincode payload, kept for old clients during the migration.
+    BincodeV15(Bincode),
+    /// v16 prost payload.
+    ProstV16(Prost),
+}
+
+impl<Bincode, Prost> DecodedWireMessage<Bincode, Prost> {
+    /// Wire family selected by the frame protocol-version header.
+    #[must_use]
+    pub const fn wire_format(&self) -> wire_prost::WireFormat {
+        match self {
+            Self::BincodeV15(_) => wire_prost::WireFormat::BincodeV15,
+            Self::ProstV16(_) => wire_prost::WireFormat::ProstV16,
+        }
+    }
+}
 
 /// Serialize a message to a length-prefixed byte buffer with protocol version.
 ///
@@ -64,6 +85,15 @@ use bytes::{Buf, BufMut, BytesMut};
 ///
 /// Returns an error if serialization fails.
 pub fn encode_message<T: serde::Serialize>(msg: &T) -> Result<BytesMut, ProtocolError> {
+    encode_bincode_message(msg)
+}
+
+/// Serialize a message to the v15 bincode compatibility frame.
+///
+/// # Errors
+///
+/// Returns an error if serialization fails.
+pub fn encode_bincode_message<T: serde::Serialize>(msg: &T) -> Result<BytesMut, ProtocolError> {
     let payload =
         bincode::serialize(msg).map_err(|e| ProtocolError::Serialization(e.to_string()))?;
     let frame_len: u32 = (4 + payload.len())
@@ -72,7 +102,7 @@ pub fn encode_message<T: serde::Serialize>(msg: &T) -> Result<BytesMut, Protocol
 
     let mut buf = BytesMut::with_capacity(4 + 4 + payload.len());
     buf.put_u32_le(frame_len);
-    buf.put_u32_le(PROTOCOL_VERSION);
+    buf.put_u32_le(BINCODE_PROTOCOL_VERSION);
     buf.extend_from_slice(&payload);
     Ok(buf)
 }
@@ -89,6 +119,82 @@ pub fn encode_message<T: serde::Serialize>(msg: &T) -> Result<BytesMut, Protocol
 pub fn decode_message<T: serde::de::DeserializeOwned>(
     buf: &mut BytesMut,
 ) -> Result<Option<T>, ProtocolError> {
+    decode_bincode_message(buf)
+}
+
+/// Try to decode a v15 bincode compatibility frame from a byte buffer.
+///
+/// Returns `None` if the buffer does not contain a complete message.
+/// Advances the buffer past the consumed message on success.
+///
+/// # Errors
+///
+/// Returns `VersionMismatch` if the sender is not using v15 bincode.
+/// Returns a deserialization error if the payload is malformed.
+pub fn decode_bincode_message<T: serde::de::DeserializeOwned>(
+    buf: &mut BytesMut,
+) -> Result<Option<T>, ProtocolError> {
+    let Some((remote_ver, payload)) = take_complete_frame(buf)? else {
+        return Ok(None);
+    };
+
+    if remote_ver != BINCODE_PROTOCOL_VERSION {
+        return Err(ProtocolError::VersionMismatch {
+            expected: BINCODE_PROTOCOL_VERSION,
+            received: remote_ver,
+        });
+    }
+
+    let msg = bincode::deserialize(&payload[..])
+        .map_err(|e| ProtocolError::Deserialization(e.to_string()))?;
+    Ok(Some(msg))
+}
+
+/// Try to decode either a v15 bincode or v16 prost frame from a byte buffer.
+///
+/// The live transport still calls [`decode_message`], which keeps today's v15
+/// behavior. This helper is the migration hook for the daemon dispatcher: it
+/// peeks the existing protocol-version header and routes to the compatible
+/// decoder without consuming incomplete or unsupported frames.
+///
+/// # Errors
+///
+/// Returns a protocol error if the frame version is unsupported, too large, or
+/// if the selected decoder cannot deserialize the payload.
+pub fn decode_wire_message<Bincode, Prost>(
+    buf: &mut BytesMut,
+) -> Result<Option<DecodedWireMessage<Bincode, Prost>>, ProtocolError>
+where
+    Bincode: serde::de::DeserializeOwned,
+    Prost: ProstMessage + Default,
+{
+    let Some(version) = peek_frame_protocol_version(buf)? else {
+        return Ok(None);
+    };
+
+    match wire_prost::wire_format_for_protocol_version(version) {
+        Some(wire_prost::WireFormat::BincodeV15) => {
+            decode_bincode_message(buf).map(|msg| msg.map(DecodedWireMessage::BincodeV15))
+        }
+        Some(wire_prost::WireFormat::ProstV16) => {
+            wire_prost::decode_prost_message(buf).map(|msg| msg.map(DecodedWireMessage::ProstV16))
+        }
+        None => Err(ProtocolError::VersionMismatch {
+            expected: PROST_PROTOCOL_VERSION,
+            received: version,
+        }),
+    }
+}
+
+/// Read the protocol-version header without consuming the buffer.
+///
+/// Returns `None` until a complete frame is buffered.
+///
+/// # Errors
+///
+/// Returns an error when the announced frame length is impossible or exceeds
+/// the maximum message size.
+pub fn peek_frame_protocol_version(buf: &BytesMut) -> Result<Option<u32>, ProtocolError> {
     if buf.len() < 4 {
         return Ok(None);
     }
@@ -99,8 +205,28 @@ pub fn decode_message<T: serde::de::DeserializeOwned>(
         return Err(ProtocolError::MessageTooLarge(len));
     }
 
+    if len < 4 {
+        return Err(ProtocolError::Deserialization(
+            "frame too small for protocol version".into(),
+        ));
+    }
+
     if buf.len() < 4 + len {
         return Ok(None);
+    }
+
+    Ok(Some(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]])))
+}
+
+fn take_complete_frame(buf: &mut BytesMut) -> Result<Option<(u32, BytesMut)>, ProtocolError> {
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+
+    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+
+    if len > MAX_MESSAGE_SIZE {
+        return Err(ProtocolError::MessageTooLarge(len));
     }
 
     if len < 4 {
@@ -109,20 +235,14 @@ pub fn decode_message<T: serde::de::DeserializeOwned>(
         ));
     }
 
-    buf.advance(4);
-    let frame = buf.split_to(len);
-
-    let remote_ver = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]);
-    if remote_ver != PROTOCOL_VERSION {
-        return Err(ProtocolError::VersionMismatch {
-            expected: PROTOCOL_VERSION,
-            received: remote_ver,
-        });
+    if buf.len() < 4 + len {
+        return Ok(None);
     }
 
-    let msg = bincode::deserialize(&frame[4..])
-        .map_err(|e| ProtocolError::Deserialization(e.to_string()))?;
-    Ok(Some(msg))
+    buf.advance(4);
+    let mut frame = buf.split_to(len);
+    let remote_ver = frame.get_u32_le();
+    Ok(Some((remote_ver, frame)))
 }
 
 /// Maximum message size (16 MB).

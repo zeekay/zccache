@@ -11,11 +11,11 @@ fn current_protocol_version_remains_v15_bincode() {
 fn wire_env_accepts_current_and_planned_modes() {
     assert_eq!(
         wire_format_from_env_value(None).unwrap(),
-        WireFormat::BincodeV15
+        WireFormat::ProstV16
     );
     assert_eq!(
         wire_format_from_env_value(Some("auto")).unwrap(),
-        WireFormat::BincodeV15
+        WireFormat::ProstV16
     );
     assert_eq!(
         wire_format_from_env_value(Some("bincode")).unwrap(),

@@ -16,6 +16,8 @@ Domain payloads live next to it:
 - `messages/compat.rs`: bincode roundtrip and variant-index guards.
 - `wire_prost.rs`: generated protobuf module, v16 frame helpers, and
   `ZCCACHE_DAEMON_WIRE` parsing.
+- `decode_wire_message`: migration dispatcher hook that peeks the frame
+  protocol-version header and selects v15 bincode or v16 prost decoding.
 
 New protocol payload structs should land in the closest domain module. New
 enum variants must still be appended in `messages/mod.rs` and require a
@@ -25,9 +27,11 @@ enum variants must still be appended in `messages/mod.rs` and require a
 
 `PROTOCOL_VERSION` remains `15` while the public `encode_message` and
 `decode_message` helpers emit and accept bincode bodies. `PROST_PROTOCOL_VERSION`
-is `16` for the planned prost path. `ZCCACHE_DAEMON_WIRE=prost` is reserved for
-the future v16 client default, and `ZCCACHE_DAEMON_WIRE=bincode` is the fallback
-spelling that will keep old v15 behavior available during the transition.
+is `16` for the planned prost path. `decode_wire_message` now models the daemon
+dispatcher that accepts both frame versions, but the live IPC transport has not
+switched to it yet. `ZCCACHE_DAEMON_WIRE` parsing models the intended client
+selection: unset or `auto` prefers prost, and `bincode` keeps the old v15
+fallback available during the transition.
 
 ## Request Variants
 
