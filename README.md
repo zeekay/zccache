@@ -156,7 +156,7 @@ See [`docs/FEATURE-MATRIX.md`](docs/FEATURE-MATRIX.md) for the long-form view wi
 | Feature | zccache | sccache |
 |---|:---:|:---:|
 | Persistent daemon with sub-ms IPC | yes | partial |
-| Single-roundtrip IPC (length-prefixed daemon frame) | yes | no |
+| Single-roundtrip IPC (length-prefixed bincode) | yes | no |
 | Hardlink delivery on hit | yes | no |
 | In-memory metadata cache (DashMap) | yes | no |
 | Filesystem watcher (notify-backed) | yes | no |
