@@ -38,6 +38,9 @@ impl WireFormat {
     }
 }
 
+/// Planned default for new clients once the live transport uses the dispatcher.
+pub const DEFAULT_CLIENT_WIRE_FORMAT: WireFormat = WireFormat::ProstV16;
+
 /// Return the wire family for a protocol-version header.
 #[must_use]
 pub const fn wire_format_for_protocol_version(version: u32) -> Option<WireFormat> {
@@ -50,20 +53,21 @@ pub const fn wire_format_for_protocol_version(version: u32) -> Option<WireFormat
 
 /// Parse a `ZCCACHE_DAEMON_WIRE` value.
 ///
-/// `None` keeps the current v15 bincode path active. The value is modeled now
-/// so callers and docs can agree on accepted spellings before the live
-/// dispatcher flips the default to prost.
+/// `None` and `auto` model the migration target: new clients prefer v16 prost,
+/// while `bincode` remains the explicit v15 fallback spelling. The live
+/// transport still calls the bincode helpers directly until the daemon
+/// dispatcher is wired into IPC.
 ///
 /// # Errors
 ///
 /// Returns a message suitable for diagnostics when the value is not recognized.
 pub fn wire_format_from_env_value(value: Option<&str>) -> Result<WireFormat, String> {
     let Some(value) = value else {
-        return Ok(WireFormat::BincodeV15);
+        return Ok(DEFAULT_CLIENT_WIRE_FORMAT);
     };
 
     match value.trim().to_ascii_lowercase().as_str() {
-        "" | "auto" => Ok(WireFormat::BincodeV15),
+        "" | "auto" => Ok(DEFAULT_CLIENT_WIRE_FORMAT),
         "bincode" | "bincode-v15" | "v15" => Ok(WireFormat::BincodeV15),
         "prost" | "prost-v16" | "v16" => Ok(WireFormat::ProstV16),
         other => Err(format!(
