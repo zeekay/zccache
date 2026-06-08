@@ -115,6 +115,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # test_support module without needing a separate workspace member.
 zccache = { path = ".", features = ["test-support"] }
 
+[build-dependencies]
+prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }
+
 [[bench]]
 name = "hashing"
 harness = false
