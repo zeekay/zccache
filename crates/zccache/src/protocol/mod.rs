@@ -1,17 +1,34 @@
 //! IPC protocol types and serialization for zccache.
 //!
 //! Defines the message types exchanged between CLI/wrapper and daemon,
-//! and provides serialization/deserialization using bincode.
+//! and provides serialization/deserialization using the active daemon wire.
 
 pub mod messages;
+pub mod wire_prost;
 
 pub use messages::*;
+
+/// Current bincode daemon wire version.
+///
+/// This remains the active compatibility version until the v16 prost dispatcher
+/// is wired through the IPC transport. Do not change `PROTOCOL_VERSION` to v16
+/// while `encode_message` and `decode_message` still serialize bincode bodies.
+pub const BINCODE_PROTOCOL_VERSION: u32 = 15;
+
+/// Planned prost daemon wire version.
+///
+/// The prost schema and frame helpers use this value. A future change will make
+/// the daemon dispatch v15 bincode and v16 prost frames concurrently.
+pub const PROST_PROTOCOL_VERSION: u32 = 16;
 
 /// Protocol version number. Bump this when the wire format changes:
 /// new/removed/reordered enum variants or struct field changes.
 /// Patch releases that don't change the protocol keep the same version.
 ///
-/// v15 (current): added `Request::ReleaseWorktreeHandles` /
+/// v16 (planned): prost-encoded protobuf body. The v16 schema lives in
+///                  `proto/zccache_v1.proto`; v15 bincode remains accepted
+///                  during the transition.
+/// v15 (current bincode): added `Request::ReleaseWorktreeHandles` /
 ///                  `Response::ReleaseWorktreeHandlesResult` so callers
 ///                  (soldr Tier 3 worktree teardown, issue #690) can ask
 ///                  the daemon to drop sessions and close per-session
@@ -33,7 +50,7 @@ pub use messages::*;
 ///     so per-session aggregate phase timing reaches clients.
 /// v8: `Compile` / `CompileEphemeral` gained `stdin: Vec<u8>` and
 ///     `ArtifactPayload` replaced `ArtifactOutput.data: Arc<Vec<u8>>`.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = BINCODE_PROTOCOL_VERSION;
 
 use bytes::{Buf, BufMut, BytesMut};
 

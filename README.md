@@ -87,7 +87,7 @@ The difference comes from **architecture**, not better caching:
 
 - **Filesystem watcher** — a background `notify` watcher tracks file changes in real time, so the daemon already knows whether inputs are dirty before you even invoke a compile. No redundant stat/hash work on hit.
 - **In-memory metadata cache** — file sizes, mtimes, and content hashes live in a lock-free `DashMap`. Cache key computation is a memory lookup, not disk I/O.
-- **Single-roundtrip IPC** — each compile is one length-prefixed bincode message over a Unix socket (or named pipe on Windows). No subprocess spawning, no repeated handshakes.
+- **Single-roundtrip IPC** — each compile is one length-prefixed daemon message over a Unix socket (or named pipe on Windows). No subprocess spawning, no repeated handshakes. The active wire is v15 bincode; a v16 prost wire is staged behind the migration tracked by zackees/running-process#234.
 - **Hardlink delivery** — cache hits are served by hardlinking the cached artifact to the output path — a single syscall instead of reading + writing the file contents.
 - **Multi-file fast path** — when a build system passes N source files in one invocation, zccache checks all N against the cache in parallel, serves hits immediately, and batches only the misses into a single compiler process.
 
@@ -436,6 +436,13 @@ soldr development, use `ZCCACHE_DAEMON_NAMESPACE=dev` or a more specific value
 such as `soldr-dev`. `zccache-daemon-dev` is not a separate shipped binary; it
 is represented by the documented namespace mode so the `zccache` CLI, wrapper
 mode, and direct daemon entrypoint all resolve the same daemon identity.
+
+### Daemon wire migration
+
+The active daemon wire remains v15 bincode while the v16 prost schema and
+dispatcher foundation land. `ZCCACHE_DAEMON_WIRE=prost` is reserved for the
+future prost default, and `ZCCACHE_DAEMON_WIRE=bincode` is the documented
+fallback spelling for keeping v15 behavior during the migration.
 
 ### Worktree cache sharing
 
