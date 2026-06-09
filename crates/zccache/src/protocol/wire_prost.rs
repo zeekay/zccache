@@ -85,6 +85,35 @@ pub fn wire_format_from_env() -> Result<WireFormat, String> {
     wire_format_from_env_value(std::env::var(WIRE_FORMAT_ENV).ok().as_deref())
 }
 
+/// Convert the narrow set of v16 prost daemon-control requests that the live
+/// dispatcher can handle before the full enum conversion lands.
+///
+/// # Errors
+///
+/// Returns a clear diagnostic for missing or unsupported request bodies. The
+/// caller should surface this as a daemon response instead of dropping the
+/// connection.
+pub fn supported_control_request_from_prost(
+    request: zccache_v1::Request,
+) -> Result<super::Request, String> {
+    use zccache_v1::request::Body;
+
+    match request.body {
+        Some(Body::Ping(_)) => Ok(super::Request::Ping),
+        Some(Body::Status(_)) => Ok(super::Request::Status),
+        Some(Body::Shutdown(_)) => Ok(super::Request::Shutdown),
+        Some(other) => Err(format!(
+            "unsupported v16 prost request body {other:?}; only Ping, Status, and Shutdown are \
+             supported before the full zccache prost conversion lands"
+        )),
+        None => Err(
+            "unsupported v16 prost request: missing request body; only Ping, Status, and Shutdown \
+             are supported before the full zccache prost conversion lands"
+                .to_string(),
+        ),
+    }
+}
+
 /// Serialize a prost message to the planned v16 length-prefixed frame.
 ///
 /// Format: `[4-byte LE length][4-byte LE protocol version][prost payload]`.
