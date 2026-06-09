@@ -160,12 +160,12 @@ fn print_status(args: &Args) {
 async fn query_daemon_status(
     endpoint: &str,
 ) -> Result<zccache::protocol::DaemonStatus, Box<dyn std::error::Error>> {
-    let mut conn = zccache::ipc::connect(endpoint).await?;
-    // Client-style round trip: opt into the 5-minute default so a hung
-    // daemon surfaces as a Timeout rather than blocking forever.
-    conn.set_recv_timeout(zccache::ipc::DEFAULT_CLIENT_RECV_TIMEOUT);
-    conn.send(&zccache::protocol::Request::Status).await?;
-    let resp: Option<zccache::protocol::Response> = conn.recv().await?;
+    let resp = zccache::ipc::daemon_control_roundtrip(
+        endpoint,
+        zccache::ipc::DaemonControlRequest::Status,
+        None,
+    )
+    .await?;
     match resp {
         Some(zccache::protocol::Response::Status(s)) => Ok(s),
         Some(other) => Err(format!("unexpected response: {other:?}").into()),
