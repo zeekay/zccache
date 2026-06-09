@@ -1,6 +1,10 @@
 //! Per-client IPC connection dispatch loop.
 
 use super::*;
+use crate::protocol::{
+    wire_prost::{self, zccache_v1 as pb},
+    DecodedWireMessage,
+};
 
 /// Handle a single client connection.
 pub(super) async fn handle_connection(
@@ -8,7 +12,7 @@ pub(super) async fn handle_connection(
     state: Arc<SharedState>,
 ) -> Result<(), crate::ipc::IpcError> {
     loop {
-        let request: Option<Request> = match conn.recv().await {
+        let request = match conn.recv_wire::<Request, pb::Request>().await {
             Ok(req) => req,
             Err(crate::ipc::IpcError::Protocol(
                 crate::protocol::ProtocolError::VersionMismatch { expected, received },
@@ -62,6 +66,21 @@ pub(super) async fn handle_connection(
             tracing::debug!("client disconnected");
             return Ok(());
         };
+        state.last_activity.store(now_secs(), Ordering::Relaxed);
+
+        let request = match request {
+            DecodedWireMessage::BincodeV15(request) => request,
+            DecodedWireMessage::ProstV16(request) => {
+                match wire_prost::supported_control_request_from_prost(request) {
+                    Ok(request) => request,
+                    Err(message) => {
+                        tracing::warn!("{message}");
+                        conn.send(&Response::Error { message }).await?;
+                        continue;
+                    }
+                }
+            }
+        };
 
         match &request {
             Request::SessionStart {
@@ -80,7 +99,6 @@ pub(super) async fn handle_connection(
             }
             _ => tracing::debug!(?request, "received request"),
         }
-        state.last_activity.store(now_secs(), Ordering::Relaxed);
 
         // Dispatch request and capture journal metadata in the same match
         // to move args/session_id into JournalContext without cloning.
@@ -596,6 +614,104 @@ fn derive_approx_spans(outcome: &str, total_ns: u128) -> Option<SelfProfileSpans
         _ => return None,
     }
     Some(spans)
+}
+
+#[cfg(test)]
+mod live_ipc_prost_tests {
+    use super::*;
+    use crate::protocol::wire_prost::zccache_v1 as pb;
+
+    fn prost_request(request_id: &str, body: pb::request::Body) -> pb::Request {
+        pb::Request {
+            body: Some(body),
+            request_id: request_id.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_connection_accepts_v15_and_v16_control_requests() {
+        crate::test_support::test_timeout(async {
+            let endpoint = crate::ipc::unique_test_endpoint();
+            let temp = tempfile::tempdir().unwrap();
+            let cache_dir: crate::core::NormalizedPath = temp.path().into();
+            let DaemonServer {
+                mut listener,
+                state,
+                ..
+            } = DaemonServer::bind_with_cache_dir(&endpoint, &cache_dir).unwrap();
+
+            let server_task = tokio::spawn(async move {
+                let conn = listener.accept().await.unwrap();
+                handle_connection(conn, state).await.unwrap();
+            });
+
+            let mut client = crate::ipc::connect(&endpoint).await.unwrap();
+
+            client.send(&Request::Ping).await.unwrap();
+            let response: Option<Response> = client.recv().await.unwrap();
+            assert_eq!(response, Some(Response::Pong));
+
+            client
+                .send_prost(&prost_request(
+                    "prost-status",
+                    pb::request::Body::Status(pb::Empty {}),
+                ))
+                .await
+                .unwrap();
+            let response: Option<Response> = client.recv().await.unwrap();
+            match response {
+                Some(Response::Status(status)) => {
+                    assert_eq!(status.endpoint, endpoint);
+                }
+                other => panic!("expected Status response, got {other:?}"),
+            }
+
+            client
+                .send_prost(&prost_request(
+                    "prost-clear",
+                    pb::request::Body::Clear(pb::Empty {}),
+                ))
+                .await
+                .unwrap();
+            let response: Option<Response> = client.recv().await.unwrap();
+            match response {
+                Some(Response::Error { message }) => {
+                    assert!(
+                        message.contains("unsupported v16 prost request"),
+                        "unexpected error message: {message}"
+                    );
+                    assert!(
+                        message.contains("Ping, Status, and Shutdown"),
+                        "unsupported diagnostic should name the supported slice: {message}"
+                    );
+                }
+                other => panic!("expected Error response, got {other:?}"),
+            }
+
+            client
+                .send_prost(&prost_request(
+                    "prost-ping",
+                    pb::request::Body::Ping(pb::Empty {}),
+                ))
+                .await
+                .unwrap();
+            let response: Option<Response> = client.recv().await.unwrap();
+            assert_eq!(response, Some(Response::Pong));
+
+            client
+                .send_prost(&prost_request(
+                    "prost-shutdown",
+                    pb::request::Body::Shutdown(pb::Empty {}),
+                ))
+                .await
+                .unwrap();
+            let response: Option<Response> = client.recv().await.unwrap();
+            assert_eq!(response, Some(Response::ShuttingDown));
+
+            server_task.await.unwrap();
+        })
+        .await;
+    }
 }
 
 #[cfg(test)]
