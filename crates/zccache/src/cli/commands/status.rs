@@ -3,13 +3,19 @@
 use std::process::ExitCode;
 
 use super::util::{
-    connect, format_bytes, format_duration_ms, format_uptime, print_json_value, LOST_CONNECTION_MSG,
+    format_bytes, format_duration_ms, format_uptime, print_json_value, LOST_CONNECTION_MSG,
 };
 
 pub(crate) async fn cmd_status(endpoint: &str, json: bool) -> ExitCode {
-    let mut conn = match connect(endpoint).await {
-        Ok(c) => c,
-        Err(e) => {
+    let recv_result = match crate::ipc::daemon_control_roundtrip(
+        endpoint,
+        crate::ipc::DaemonControlRequest::Status,
+        None,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(e) if crate::cli::client::is_daemon_unreachable_err(&e) => {
             let message = format!("daemon not running at {endpoint}: {e}");
             if json {
                 print_status_error_json(endpoint, &message);
@@ -18,19 +24,6 @@ pub(crate) async fn cmd_status(endpoint: &str, json: bool) -> ExitCode {
             }
             return ExitCode::FAILURE;
         }
-    };
-
-    if let Err(e) = conn.send(&crate::protocol::Request::Status).await {
-        let message = format!("zccache: failed to send to daemon: {e}");
-        if json {
-            print_status_error_json(endpoint, &message);
-        } else {
-            eprintln!("{message}");
-        }
-        return ExitCode::FAILURE;
-    }
-    let recv_result = match conn.recv().await {
-        Ok(r) => r,
         Err(e) => {
             let message = format!("zccache: broken connection to daemon: {e}");
             if json {

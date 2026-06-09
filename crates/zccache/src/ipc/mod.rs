@@ -17,9 +17,153 @@ pub use transport::{
 };
 
 use crate::core::NormalizedPath;
+use crate::protocol::{self, wire_prost, Response};
 
 #[cfg(unix)]
 const MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES: usize = 100;
+
+#[cfg(unix)]
+type ClientConnection = IpcConnection;
+#[cfg(windows)]
+type ClientConnection = IpcClientConnection;
+
+/// Daemon control requests that may opt into the v16 prost migration slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonControlRequest {
+    /// Health check.
+    Ping,
+    /// Request daemon status/statistics.
+    Status,
+    /// Request daemon shutdown.
+    Shutdown,
+}
+
+impl DaemonControlRequest {
+    #[must_use]
+    fn to_protocol_request(self) -> protocol::Request {
+        match self {
+            Self::Ping => protocol::Request::Ping,
+            Self::Status => protocol::Request::Status,
+            Self::Shutdown => protocol::Request::Shutdown,
+        }
+    }
+}
+
+/// Send a daemon control request and receive the bincode response.
+///
+/// Only `Ping`, `Status`, and `Shutdown` are eligible for the v16 prost client
+/// path. Unset/`auto` `ZCCACHE_DAEMON_WIRE` prefers prost, then retries the
+/// same control request as v15 bincode if an older daemon clearly rejects the
+/// v16 frame or closes the connection after the mismatch. Compile, session,
+/// cache, fingerprint, and download-daemon requests do not route through this
+/// helper and remain v15 bincode.
+///
+/// # Errors
+///
+/// Returns the IPC error from the selected send/receive path, or an endpoint
+/// error when `ZCCACHE_DAEMON_WIRE` is invalid.
+pub async fn daemon_control_roundtrip(
+    endpoint: &str,
+    request: DaemonControlRequest,
+    recv_timeout: Option<std::time::Duration>,
+) -> Result<Option<Response>, IpcError> {
+    let selection = wire_prost::client_wire_selection_from_env().map_err(IpcError::Endpoint)?;
+    daemon_control_roundtrip_with_selection(endpoint, request, recv_timeout, selection).await
+}
+
+async fn daemon_control_roundtrip_with_selection(
+    endpoint: &str,
+    request: DaemonControlRequest,
+    recv_timeout: Option<std::time::Duration>,
+    selection: wire_prost::ClientWireSelection,
+) -> Result<Option<Response>, IpcError> {
+    match selection.preferred_format() {
+        wire_prost::WireFormat::BincodeV15 => {
+            send_bincode_control(endpoint, request, recv_timeout).await
+        }
+        wire_prost::WireFormat::ProstV16 => {
+            match send_prost_control(endpoint, request, recv_timeout).await {
+                Ok(Some(Response::Error { message }))
+                    if selection.allows_bincode_fallback()
+                        && control_wire_mismatch_message(&message) =>
+                {
+                    send_bincode_control(endpoint, request, recv_timeout).await
+                }
+                Ok(None) if selection.allows_bincode_fallback() => {
+                    send_bincode_control(endpoint, request, recv_timeout).await
+                }
+                Ok(response) => Ok(response),
+                Err(err)
+                    if selection.allows_bincode_fallback() && control_wire_mismatch_error(&err) =>
+                {
+                    send_bincode_control(endpoint, request, recv_timeout).await
+                }
+                Err(err) => Err(err),
+            }
+        }
+    }
+}
+
+async fn connect_control_client(endpoint: &str) -> Result<ClientConnection, IpcError> {
+    let mut conn = connect(endpoint).await?;
+    conn.set_recv_timeout(DEFAULT_CLIENT_RECV_TIMEOUT);
+    Ok(conn)
+}
+
+async fn send_bincode_control(
+    endpoint: &str,
+    request: DaemonControlRequest,
+    recv_timeout: Option<std::time::Duration>,
+) -> Result<Option<Response>, IpcError> {
+    let mut conn = connect_control_client(endpoint).await?;
+    let request = request.to_protocol_request();
+    conn.send(&request).await?;
+    recv_control_response(&mut conn, recv_timeout).await
+}
+
+async fn send_prost_control(
+    endpoint: &str,
+    request: DaemonControlRequest,
+    recv_timeout: Option<std::time::Duration>,
+) -> Result<Option<Response>, IpcError> {
+    let mut conn = connect_control_client(endpoint).await?;
+    let request = request.to_protocol_request();
+    let request =
+        wire_prost::supported_control_request_to_prost(&request).map_err(IpcError::Endpoint)?;
+    conn.send_prost(&request).await?;
+    recv_control_response(&mut conn, recv_timeout).await
+}
+
+async fn recv_control_response(
+    conn: &mut ClientConnection,
+    recv_timeout: Option<std::time::Duration>,
+) -> Result<Option<Response>, IpcError> {
+    match recv_timeout {
+        Some(timeout) => conn.recv_with_timeout(timeout).await,
+        None => conn.recv().await,
+    }
+}
+
+fn control_wire_mismatch_error(err: &IpcError) -> bool {
+    match err {
+        IpcError::Protocol(protocol::ProtocolError::VersionMismatch { .. })
+        | IpcError::ConnectionClosed => true,
+        IpcError::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        IpcError::Protocol(_) | IpcError::Endpoint(_) | IpcError::Timeout(_) => false,
+    }
+}
+
+fn control_wire_mismatch_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("protocol version mismatch")
+        || message.contains("protocol_version")
+        || (message.contains("expected v15") && message.contains("received v16"))
+}
 
 /// Returns the platform-specific default IPC endpoint path.
 ///
@@ -523,6 +667,136 @@ mod tests {
                 None => std::env::remove_var(crate::core::config::DAEMON_NAMESPACE_ENV),
             }
         }
+    }
+
+    fn test_daemon_status(endpoint: &str) -> crate::protocol::DaemonStatus {
+        crate::protocol::DaemonStatus {
+            version: crate::core::VERSION.to_string(),
+            daemon_namespace: "test".to_string(),
+            endpoint: endpoint.to_string(),
+            private_daemon: crate::protocol::PrivateDaemonStatus::shared(),
+            artifact_count: 0,
+            cache_size_bytes: 0,
+            metadata_entries: 0,
+            uptime_secs: 1,
+            cache_hits: 0,
+            cache_misses: 0,
+            total_compilations: 0,
+            non_cacheable: 0,
+            compile_errors: 0,
+            compile_errors_cached: 0,
+            time_saved_ms: 0,
+            total_links: 0,
+            link_hits: 0,
+            link_misses: 0,
+            link_non_cacheable: 0,
+            dep_graph_contexts: 0,
+            dep_graph_files: 0,
+            sessions_total: 0,
+            sessions_active: 0,
+            cache_dir: std::env::temp_dir().into(),
+            dep_graph_version: crate::depgraph::DEPGRAPH_VERSION,
+            dep_graph_disk_size: 0,
+            dep_graph_persisted: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_control_roundtrip_auto_prefers_prost_for_status() {
+        let endpoint = unique_test_endpoint();
+        let mut listener = IpcListener::bind(&endpoint).unwrap();
+        let expected_endpoint = endpoint.clone();
+
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let msg: Option<
+                crate::protocol::DecodedWireMessage<
+                    crate::protocol::Request,
+                    crate::protocol::wire_prost::zccache_v1::Request,
+                >,
+            > = conn.recv_wire().await.unwrap();
+            match msg {
+                Some(crate::protocol::DecodedWireMessage::ProstV16(request)) => {
+                    assert_eq!(request.request_id, "control-status");
+                    assert!(matches!(
+                        request.body,
+                        Some(crate::protocol::wire_prost::zccache_v1::request::Body::Status(_))
+                    ));
+                }
+                other => panic!("expected prost status request, got {other:?}"),
+            }
+            conn.send(&Response::Status(test_daemon_status(&expected_endpoint)))
+                .await
+                .unwrap();
+        });
+
+        let response = daemon_control_roundtrip_with_selection(
+            &endpoint,
+            DaemonControlRequest::Status,
+            None,
+            wire_prost::ClientWireSelection::Auto,
+        )
+        .await
+        .unwrap();
+
+        match response {
+            Some(Response::Status(status)) => assert_eq!(status.endpoint, endpoint),
+            other => panic!("expected Status response, got {other:?}"),
+        }
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_control_roundtrip_auto_falls_back_to_bincode_for_old_daemon() {
+        let endpoint = unique_test_endpoint();
+        let mut listener = IpcListener::bind(&endpoint).unwrap();
+        let expected_endpoint = endpoint.clone();
+
+        let server = tokio::spawn(async move {
+            let mut first = listener.accept().await.unwrap();
+            let err = first
+                .recv::<crate::protocol::Request>()
+                .await
+                .expect_err("v16 prost request must not decode as v15 bincode");
+            assert!(matches!(
+                err,
+                IpcError::Protocol(crate::protocol::ProtocolError::VersionMismatch {
+                    expected: crate::protocol::BINCODE_PROTOCOL_VERSION,
+                    received: crate::protocol::PROST_PROTOCOL_VERSION,
+                })
+            ));
+            first
+                .send(&Response::Error {
+                    message: "protocol version mismatch: expected v15, received v16".to_string(),
+                })
+                .await
+                .unwrap();
+
+            let mut second = listener.accept().await.unwrap();
+            let request: Option<crate::protocol::Request> = second.recv().await.unwrap();
+            assert_eq!(request, Some(crate::protocol::Request::Status));
+            second
+                .send(&Response::Status(test_daemon_status(&expected_endpoint)))
+                .await
+                .unwrap();
+        });
+
+        let response = daemon_control_roundtrip_with_selection(
+            &endpoint,
+            DaemonControlRequest::Status,
+            None,
+            wire_prost::ClientWireSelection::Auto,
+        )
+        .await
+        .unwrap();
+
+        match response {
+            Some(Response::Status(status)) => assert_eq!(status.endpoint, endpoint),
+            other => panic!("expected fallback Status response, got {other:?}"),
+        }
+
+        server.await.unwrap();
     }
 
     #[test]

@@ -24,18 +24,18 @@ pub fn client_start(endpoint: Option<&str>) -> Result<(), String> {
 pub fn client_stop(endpoint: Option<&str>) -> Result<bool, String> {
     let endpoint = resolve_endpoint(endpoint);
     run_async(async move {
-        let mut conn = match connect_client(&endpoint).await {
-            Ok(c) => c,
-            Err(_) => return Ok(false),
-        };
-        conn.send(&crate::protocol::Request::Shutdown)
-            .await
-            .map_err(|e| format!("failed to send to daemon: {e}"))?;
-        match conn.recv::<crate::protocol::Response>().await {
+        match crate::ipc::daemon_control_roundtrip(
+            &endpoint,
+            crate::ipc::DaemonControlRequest::Shutdown,
+            None,
+        )
+        .await
+        {
             Ok(Some(crate::protocol::Response::ShuttingDown)) => Ok(true),
             Ok(Some(crate::protocol::Response::Error { message })) => Err(message),
             Ok(None) => Err("lost connection to daemon (no response received)".to_string()),
             Ok(Some(other)) => Err(format!("unexpected response from daemon: {other:?}")),
+            Err(e) if is_daemon_unreachable_err(&e) => Ok(false),
             Err(e) => Err(format!("broken connection to daemon: {e}")),
         }
     })
@@ -44,17 +44,20 @@ pub fn client_stop(endpoint: Option<&str>) -> Result<bool, String> {
 pub fn client_status(endpoint: Option<&str>) -> Result<crate::protocol::DaemonStatus, String> {
     let endpoint = resolve_endpoint(endpoint);
     run_async(async move {
-        let mut conn = connect_client(&endpoint)
-            .await
-            .map_err(|e| format!("daemon not running at {endpoint}: {e}"))?;
-        conn.send(&crate::protocol::Request::Status)
-            .await
-            .map_err(|e| format!("failed to send to daemon: {e}"))?;
-        match conn.recv::<crate::protocol::Response>().await {
+        match crate::ipc::daemon_control_roundtrip(
+            &endpoint,
+            crate::ipc::DaemonControlRequest::Status,
+            None,
+        )
+        .await
+        {
             Ok(Some(crate::protocol::Response::Status(status))) => Ok(status),
             Ok(Some(crate::protocol::Response::Error { message })) => Err(message),
             Ok(None) => Err("lost connection to daemon (no response received)".to_string()),
             Ok(Some(other)) => Err(format!("unexpected response from daemon: {other:?}")),
+            Err(e) if is_daemon_unreachable_err(&e) => {
+                Err(format!("daemon not running at {endpoint}: {e}"))
+            }
             Err(e) => Err(format!("broken connection to daemon: {e}")),
         }
     })

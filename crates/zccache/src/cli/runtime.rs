@@ -26,6 +26,7 @@ enum VersionCheck {
     DaemonOlder { daemon_ver: String },
     DaemonNewer,
     CommError,
+    ClientConfigError(String),
 }
 
 #[cfg(unix)]
@@ -47,16 +48,12 @@ pub async fn connect_client(
 }
 
 async fn check_daemon_version(endpoint: &str) -> VersionCheck {
-    let mut conn = match connect_client(endpoint).await {
-        Ok(c) => c,
-        Err(_) => return VersionCheck::Unreachable,
-    };
-    if conn.send(&crate::protocol::Request::Status).await.is_err() {
-        return VersionCheck::CommError;
-    }
-    match conn
-        .recv_with_timeout::<crate::protocol::Response>(super::status_probe_timeout())
-        .await
+    match crate::ipc::daemon_control_roundtrip(
+        endpoint,
+        crate::ipc::DaemonControlRequest::Status,
+        Some(super::status_probe_timeout()),
+    )
+    .await
     {
         Ok(Some(crate::protocol::Response::Status(s))) => {
             if s.version == crate::core::VERSION {
@@ -75,6 +72,14 @@ async fn check_daemon_version(endpoint: &str) -> VersionCheck {
                     daemon_ver: s.version,
                 },
             }
+        }
+        Err(crate::ipc::IpcError::Endpoint(message))
+            if message.contains(crate::protocol::wire_prost::WIRE_FORMAT_ENV) =>
+        {
+            VersionCheck::ClientConfigError(message)
+        }
+        Err(err) if crate::cli::client::is_daemon_unreachable_err(&err) => {
+            VersionCheck::Unreachable
         }
         _ => VersionCheck::CommError,
     }
@@ -241,10 +246,13 @@ pub(crate) async fn wait_for_daemon_ready_with(
 
 /// Stop a stale daemon that is unreachable or version-incompatible.
 async fn stop_stale_daemon(endpoint: &str) {
-    if let Ok(mut conn) = connect_client(endpoint).await {
-        let _ = conn.send(&crate::protocol::Request::Shutdown).await;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
+    let _ = crate::ipc::daemon_control_roundtrip(
+        endpoint,
+        crate::ipc::DaemonControlRequest::Shutdown,
+        None,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     if let Some(pid) = crate::ipc::check_running_daemon() {
         if crate::ipc::force_kill_process(pid).is_ok() {
@@ -283,6 +291,7 @@ pub async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
             return spawn_and_wait(endpoint, crate::core::lifecycle::REASON_REPLACED_COMM_ERROR)
                 .await;
         }
+        VersionCheck::ClientConfigError(message) => return Err(message),
         VersionCheck::Unreachable => {}
     }
 
@@ -314,6 +323,7 @@ pub async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
                     )
                     .await;
                 }
+                VersionCheck::ClientConfigError(message) => return Err(message),
                 VersionCheck::Unreachable => continue,
             }
         }

@@ -20,6 +20,8 @@ pub(crate) enum VersionCheck {
     Unreachable,
     /// Connected but could not complete the version exchange (protocol mismatch, etc.).
     CommError,
+    /// Client-side daemon wire configuration is invalid.
+    ClientConfigError(String),
 }
 
 /// Connect to the daemon and compare its version to ours.
@@ -30,16 +32,12 @@ pub(crate) enum VersionCheck {
 /// (`ensure_daemon` → `stop_stale_daemon` → `spawn_and_wait`) then runs
 /// promptly. See issue #554.
 pub(crate) async fn check_daemon_version(endpoint: &str) -> VersionCheck {
-    let mut conn = match connect(endpoint).await {
-        Ok(c) => c,
-        Err(_) => return VersionCheck::Unreachable,
-    };
-    if conn.send(&crate::protocol::Request::Status).await.is_err() {
-        return VersionCheck::CommError;
-    }
-    match conn
-        .recv_with_timeout::<crate::protocol::Response>(status_probe_timeout())
-        .await
+    match crate::ipc::daemon_control_roundtrip(
+        endpoint,
+        crate::ipc::DaemonControlRequest::Status,
+        Some(status_probe_timeout()),
+    )
+    .await
     {
         Ok(Some(crate::protocol::Response::Status(s))) => {
             if s.version == crate::core::VERSION {
@@ -61,6 +59,14 @@ pub(crate) async fn check_daemon_version(endpoint: &str) -> VersionCheck {
                     daemon_ver: s.version,
                 },
             }
+        }
+        Err(crate::ipc::IpcError::Endpoint(message))
+            if message.contains(crate::protocol::wire_prost::WIRE_FORMAT_ENV) =>
+        {
+            VersionCheck::ClientConfigError(message)
+        }
+        Err(err) if crate::cli::client::is_daemon_unreachable_err(&err) => {
+            VersionCheck::Unreachable
         }
         _ => VersionCheck::CommError,
     }
@@ -97,12 +103,14 @@ pub(crate) async fn spawn_and_wait(endpoint: &str, reason: &str) -> Result<(), S
 /// Attempts graceful shutdown via IPC first, then falls back to force-killing
 /// the process via the lock file PID. Waits for the endpoint to be released.
 pub(crate) async fn stop_stale_daemon(endpoint: &str) {
-    // Try graceful shutdown via IPC
-    if let Ok(mut conn) = connect(endpoint).await {
-        let _ = conn.send(&crate::protocol::Request::Shutdown).await;
-        // Give it a moment to process the shutdown
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
+    // Try graceful shutdown via IPC.
+    let _ = crate::ipc::daemon_control_roundtrip(
+        endpoint,
+        crate::ipc::DaemonControlRequest::Shutdown,
+        None,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Force-kill via lock file PID if the daemon is still alive
     if let Some(pid) = crate::ipc::check_running_daemon() {
@@ -162,6 +170,7 @@ pub(crate) async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
             return spawn_and_wait(endpoint, crate::core::lifecycle::REASON_REPLACED_COMM_ERROR)
                 .await;
         }
+        VersionCheck::ClientConfigError(message) => return Err(message),
         VersionCheck::Unreachable => {
             // Fall through to lock-file check / spawn
         }
@@ -205,6 +214,7 @@ pub(crate) async fn ensure_daemon(endpoint: &str) -> Result<(), String> {
                     )
                     .await;
                 }
+                VersionCheck::ClientConfigError(message) => return Err(message),
                 VersionCheck::Unreachable => continue,
             }
         }
@@ -274,9 +284,15 @@ pub(crate) async fn cmd_start(endpoint: &str) -> ExitCode {
 }
 
 pub(crate) async fn cmd_stop(endpoint: &str) -> ExitCode {
-    let mut conn = match connect(endpoint).await {
-        Ok(c) => c,
-        Err(_) => {
+    let recv_result = match crate::ipc::daemon_control_roundtrip(
+        endpoint,
+        crate::ipc::DaemonControlRequest::Shutdown,
+        None,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(e) if crate::cli::client::is_daemon_unreachable_err(&e) => {
             let Some(pid) = crate::ipc::check_running_daemon() else {
                 eprintln!("daemon not running at {endpoint}");
                 // No daemon — but the index file might still be there from a
@@ -313,14 +329,6 @@ pub(crate) async fn cmd_stop(endpoint: &str) -> ExitCode {
                 }
             }
         }
-    };
-
-    if let Err(e) = conn.send(&crate::protocol::Request::Shutdown).await {
-        eprintln!("zccache[err][S]: failed to send to daemon: {e}");
-        return ExitCode::FAILURE;
-    }
-    let recv_result = match conn.recv().await {
-        Ok(r) => r,
         Err(e) => {
             eprintln!("zccache[err][R]: broken connection to daemon: {e}");
             return ExitCode::FAILURE;

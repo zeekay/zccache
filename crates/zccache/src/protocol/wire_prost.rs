@@ -1,9 +1,9 @@
 //! Prost wire helpers and v16 dispatcher scaffolding.
 //!
-//! The live daemon wire remains v15 bincode today. This module intentionally
-//! models the v16 prost path without changing `encode_message` /
-//! `decode_message`, so old clients keep working while the generated protobuf
-//! types and compatibility tests land first.
+//! The public `encode_message` / `decode_message` helpers remain v15 bincode
+//! so hot-path requests keep their old wire shape. The live daemon dispatcher
+//! can accept v16 prost control requests through the explicit helpers in this
+//! module while the full enum conversion lands incrementally.
 
 use bytes::{Buf, BufMut, BytesMut};
 use prost::Message;
@@ -41,6 +41,37 @@ impl WireFormat {
 /// Planned default for new clients once the live transport uses the dispatcher.
 pub const DEFAULT_CLIENT_WIRE_FORMAT: WireFormat = WireFormat::ProstV16;
 
+/// Client-side wire selection policy from `ZCCACHE_DAEMON_WIRE`.
+///
+/// `Auto` preserves the user's unset/auto intent so control-request callers
+/// can prefer prost while still retrying v15 bincode against older daemons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientWireSelection {
+    /// Prefer prost and allow a bincode retry on a clear protocol mismatch.
+    Auto,
+    /// Force the v15 bincode compatibility path.
+    BincodeV15,
+    /// Force the v16 prost path.
+    ProstV16,
+}
+
+impl ClientWireSelection {
+    /// Wire family to try first for this selection.
+    #[must_use]
+    pub const fn preferred_format(self) -> WireFormat {
+        match self {
+            Self::Auto | Self::ProstV16 => WireFormat::ProstV16,
+            Self::BincodeV15 => WireFormat::BincodeV15,
+        }
+    }
+
+    /// Whether a failed prost control request may be retried as bincode.
+    #[must_use]
+    pub const fn allows_bincode_fallback(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
 /// Return the wire family for a protocol-version header.
 #[must_use]
 pub const fn wire_format_for_protocol_version(version: u32) -> Option<WireFormat> {
@@ -54,26 +85,15 @@ pub const fn wire_format_for_protocol_version(version: u32) -> Option<WireFormat
 /// Parse a `ZCCACHE_DAEMON_WIRE` value.
 ///
 /// `None` and `auto` model the migration target: new clients prefer v16 prost,
-/// while `bincode` remains the explicit v15 fallback spelling. The live
-/// transport still calls the bincode helpers directly until the daemon
-/// dispatcher is wired into IPC.
+/// while `bincode` remains the explicit v15 fallback spelling. Use
+/// [`client_wire_selection_from_env_value`] when callers need to distinguish
+/// auto from forced prost.
 ///
 /// # Errors
 ///
 /// Returns a message suitable for diagnostics when the value is not recognized.
 pub fn wire_format_from_env_value(value: Option<&str>) -> Result<WireFormat, String> {
-    let Some(value) = value else {
-        return Ok(DEFAULT_CLIENT_WIRE_FORMAT);
-    };
-
-    match value.trim().to_ascii_lowercase().as_str() {
-        "" | "auto" => Ok(DEFAULT_CLIENT_WIRE_FORMAT),
-        "bincode" | "bincode-v15" | "v15" => Ok(WireFormat::BincodeV15),
-        "prost" | "prost-v16" | "v16" => Ok(WireFormat::ProstV16),
-        other => Err(format!(
-            "invalid {WIRE_FORMAT_ENV}={other:?}; expected auto, bincode, or prost"
-        )),
-    }
+    client_wire_selection_from_env_value(value).map(ClientWireSelection::preferred_format)
 }
 
 /// Read `ZCCACHE_DAEMON_WIRE` from the process environment.
@@ -83,6 +103,38 @@ pub fn wire_format_from_env_value(value: Option<&str>) -> Result<WireFormat, Str
 /// Returns a message suitable for diagnostics when the value is not recognized.
 pub fn wire_format_from_env() -> Result<WireFormat, String> {
     wire_format_from_env_value(std::env::var(WIRE_FORMAT_ENV).ok().as_deref())
+}
+
+/// Parse `ZCCACHE_DAEMON_WIRE` while preserving unset/auto as a distinct
+/// selection for compatibility fallbacks.
+///
+/// # Errors
+///
+/// Returns a message suitable for diagnostics when the value is not recognized.
+pub fn client_wire_selection_from_env_value(
+    value: Option<&str>,
+) -> Result<ClientWireSelection, String> {
+    let Some(value) = value else {
+        return Ok(ClientWireSelection::Auto);
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(ClientWireSelection::Auto),
+        "bincode" | "bincode-v15" | "v15" => Ok(ClientWireSelection::BincodeV15),
+        "prost" | "prost-v16" | "v16" => Ok(ClientWireSelection::ProstV16),
+        other => Err(format!(
+            "invalid {WIRE_FORMAT_ENV}={other:?}; expected auto, bincode, or prost"
+        )),
+    }
+}
+
+/// Read `ZCCACHE_DAEMON_WIRE` as a client selection policy.
+///
+/// # Errors
+///
+/// Returns a message suitable for diagnostics when the value is not recognized.
+pub fn client_wire_selection_from_env() -> Result<ClientWireSelection, String> {
+    client_wire_selection_from_env_value(std::env::var(WIRE_FORMAT_ENV).ok().as_deref())
 }
 
 /// Convert the narrow set of v16 prost daemon-control requests that the live
@@ -112,6 +164,35 @@ pub fn supported_control_request_from_prost(
                 .to_string(),
         ),
     }
+}
+
+/// Convert the narrow daemon-control request slice to the v16 prost schema.
+///
+/// # Errors
+///
+/// Returns a clear diagnostic when a caller tries to route an unsupported
+/// request through the prost control path.
+pub fn supported_control_request_to_prost(
+    request: &super::Request,
+) -> Result<zccache_v1::Request, String> {
+    use zccache_v1::request::Body;
+
+    let (request_id, body) = match request {
+        super::Request::Ping => ("control-ping", Body::Ping(zccache_v1::Empty {})),
+        super::Request::Status => ("control-status", Body::Status(zccache_v1::Empty {})),
+        super::Request::Shutdown => ("control-shutdown", Body::Shutdown(zccache_v1::Empty {})),
+        other => {
+            return Err(format!(
+                "unsupported v16 prost control request {other:?}; only Ping, Status, and Shutdown \
+                 may select {WIRE_FORMAT_ENV} before the full zccache prost conversion lands"
+            ));
+        }
+    };
+
+    Ok(zccache_v1::Request {
+        body: Some(body),
+        request_id: request_id.to_string(),
+    })
 }
 
 /// Serialize a prost message to the planned v16 length-prefixed frame.
