@@ -2,12 +2,14 @@
 //!
 //! Provides platform-abstracted IPC using named pipes on Windows
 //! and Unix domain sockets on Unix. Messages are length-prefixed
-//! bincode via `zccache-protocol`.
+//! bincode via `zccache-protocol`. Explicit migration hooks can send v16 prost
+//! frames and receive either v15 bincode or v16 prost frames without changing
+//! the default v15 client/server path.
 
 use std::time::Duration;
 
 use bytes::BytesMut;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use super::error::IpcError;
 
@@ -79,6 +81,18 @@ impl IpcConnection {
         Ok(())
     }
 
+    /// Send a prost message over the v16 daemon wire.
+    ///
+    /// This is an explicit migration hook. The default [`Self::send`] method
+    /// remains v15 bincode so existing clients keep working until the daemon
+    /// flips its live protocol policy.
+    pub async fn send_prost<M: prost::Message>(&mut self, msg: &M) -> Result<(), IpcError> {
+        let buf = crate::protocol::wire_prost::encode_prost_message(msg)?;
+        self.writer.write_all(&buf).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
     /// Configure the default timeout applied to subsequent `recv` calls.
     ///
     /// Until called, `recv` is unbounded (today's behavior). After this
@@ -126,24 +140,53 @@ impl IpcConnection {
         }
     }
 
+    /// Receive a message using the version-dispatching daemon wire decoder.
+    ///
+    /// This accepts both v15 bincode and v16 prost frames while preserving
+    /// [`Self::recv`] as the compatibility-only bincode receive path.
+    pub async fn recv_wire<Bincode, Prost>(
+        &mut self,
+    ) -> Result<Option<crate::protocol::DecodedWireMessage<Bincode, Prost>>, IpcError>
+    where
+        Bincode: serde::de::DeserializeOwned,
+        Prost: prost::Message + Default,
+    {
+        match self.recv_timeout {
+            Some(t) => self.recv_wire_with_timeout(t).await,
+            None => self.recv_wire_loop().await,
+        }
+    }
+
+    /// Receive a version-dispatched daemon wire message with a timeout.
+    pub async fn recv_wire_with_timeout<Bincode, Prost>(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<crate::protocol::DecodedWireMessage<Bincode, Prost>>, IpcError>
+    where
+        Bincode: serde::de::DeserializeOwned,
+        Prost: prost::Message + Default,
+    {
+        match tokio::time::timeout(timeout, self.recv_wire_loop()).await {
+            Ok(result) => result,
+            Err(_) => Err(IpcError::Timeout(timeout)),
+        }
+    }
+
     /// The recv read loop, factored out so both `recv` and
     /// `recv_with_timeout` share the same implementation. Always
     /// unbounded — the wrapping methods add the deadline.
     async fn recv_loop<T: serde::de::DeserializeOwned>(&mut self) -> Result<Option<T>, IpcError> {
-        loop {
-            if let Some(msg) = crate::protocol::decode_message::<T>(&mut self.read_buf)? {
-                return Ok(Some(msg));
-            }
-            let mut tmp = [0u8; 4096];
-            let n = self.reader.read(&mut tmp).await?;
-            if n == 0 {
-                if self.read_buf.is_empty() {
-                    return Ok(None);
-                }
-                return Err(IpcError::ConnectionClosed);
-            }
-            self.read_buf.extend_from_slice(&tmp[..n]);
-        }
+        recv_bincode_loop(&mut self.reader, &mut self.read_buf).await
+    }
+
+    async fn recv_wire_loop<Bincode, Prost>(
+        &mut self,
+    ) -> Result<Option<crate::protocol::DecodedWireMessage<Bincode, Prost>>, IpcError>
+    where
+        Bincode: serde::de::DeserializeOwned,
+        Prost: prost::Message + Default,
+    {
+        recv_wire_loop(&mut self.reader, &mut self.read_buf).await
     }
 }
 
@@ -154,6 +197,18 @@ impl IpcClientConnection {
     /// Send a serializable message over the connection.
     pub async fn send<T: serde::Serialize>(&mut self, msg: &T) -> Result<(), IpcError> {
         let buf = crate::protocol::encode_message(msg)?;
+        self.writer.write_all(&buf).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    /// Send a prost message over the v16 daemon wire.
+    ///
+    /// This is an explicit migration hook. The default [`Self::send`] method
+    /// remains v15 bincode so existing clients keep working until the daemon
+    /// flips its live protocol policy.
+    pub async fn send_prost<M: prost::Message>(&mut self, msg: &M) -> Result<(), IpcError> {
+        let buf = crate::protocol::wire_prost::encode_prost_message(msg)?;
         self.writer.write_all(&buf).await?;
         self.writer.flush().await?;
         Ok(())
@@ -200,22 +255,104 @@ impl IpcClientConnection {
         }
     }
 
-    async fn recv_loop<T: serde::de::DeserializeOwned>(&mut self) -> Result<Option<T>, IpcError> {
-        loop {
-            if let Some(msg) = crate::protocol::decode_message::<T>(&mut self.read_buf)? {
-                return Ok(Some(msg));
-            }
-            let mut tmp = [0u8; 4096];
-            let n = self.reader.read(&mut tmp).await?;
-            if n == 0 {
-                if self.read_buf.is_empty() {
-                    return Ok(None);
-                }
-                return Err(IpcError::ConnectionClosed);
-            }
-            self.read_buf.extend_from_slice(&tmp[..n]);
+    /// Receive a message using the version-dispatching daemon wire decoder.
+    ///
+    /// This accepts both v15 bincode and v16 prost frames while preserving
+    /// [`Self::recv`] as the compatibility-only bincode receive path.
+    pub async fn recv_wire<Bincode, Prost>(
+        &mut self,
+    ) -> Result<Option<crate::protocol::DecodedWireMessage<Bincode, Prost>>, IpcError>
+    where
+        Bincode: serde::de::DeserializeOwned,
+        Prost: prost::Message + Default,
+    {
+        match self.recv_timeout {
+            Some(t) => self.recv_wire_with_timeout(t).await,
+            None => self.recv_wire_loop().await,
         }
     }
+
+    /// Receive a version-dispatched daemon wire message with a timeout.
+    pub async fn recv_wire_with_timeout<Bincode, Prost>(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<crate::protocol::DecodedWireMessage<Bincode, Prost>>, IpcError>
+    where
+        Bincode: serde::de::DeserializeOwned,
+        Prost: prost::Message + Default,
+    {
+        match tokio::time::timeout(timeout, self.recv_wire_loop()).await {
+            Ok(result) => result,
+            Err(_) => Err(IpcError::Timeout(timeout)),
+        }
+    }
+
+    async fn recv_loop<T: serde::de::DeserializeOwned>(&mut self) -> Result<Option<T>, IpcError> {
+        recv_bincode_loop(&mut self.reader, &mut self.read_buf).await
+    }
+
+    async fn recv_wire_loop<Bincode, Prost>(
+        &mut self,
+    ) -> Result<Option<crate::protocol::DecodedWireMessage<Bincode, Prost>>, IpcError>
+    where
+        Bincode: serde::de::DeserializeOwned,
+        Prost: prost::Message + Default,
+    {
+        recv_wire_loop(&mut self.reader, &mut self.read_buf).await
+    }
+}
+
+async fn recv_bincode_loop<R, T>(
+    reader: &mut R,
+    read_buf: &mut BytesMut,
+) -> Result<Option<T>, IpcError>
+where
+    R: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    loop {
+        if let Some(msg) = crate::protocol::decode_message::<T>(read_buf)? {
+            return Ok(Some(msg));
+        }
+        if !read_next_chunk(reader, read_buf).await? {
+            return Ok(None);
+        }
+    }
+}
+
+async fn recv_wire_loop<R, Bincode, Prost>(
+    reader: &mut R,
+    read_buf: &mut BytesMut,
+) -> Result<Option<crate::protocol::DecodedWireMessage<Bincode, Prost>>, IpcError>
+where
+    R: AsyncRead + Unpin,
+    Bincode: serde::de::DeserializeOwned,
+    Prost: prost::Message + Default,
+{
+    loop {
+        if let Some(msg) = crate::protocol::decode_wire_message::<Bincode, Prost>(read_buf)? {
+            return Ok(Some(msg));
+        }
+        if !read_next_chunk(reader, read_buf).await? {
+            return Ok(None);
+        }
+    }
+}
+
+async fn read_next_chunk<R>(reader: &mut R, read_buf: &mut BytesMut) -> Result<bool, IpcError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut tmp = [0u8; 4096];
+    let n = reader.read(&mut tmp).await?;
+    if n == 0 {
+        if read_buf.is_empty() {
+            return Ok(false);
+        }
+        return Err(IpcError::ConnectionClosed);
+    }
+    read_buf.extend_from_slice(&tmp[..n]);
+    Ok(true)
 }
 
 // ── IpcListener ─────────────────────────────────────────────────────
@@ -549,7 +686,7 @@ pub fn unique_test_endpoint() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Request, Response};
+    use crate::protocol::{wire_prost::zccache_v1 as pb, DecodedWireMessage, Request, Response};
 
     #[tokio::test]
     async fn test_ping_pong() {
@@ -591,6 +728,58 @@ mod tests {
             let resp: Option<Response> = client.recv().await.unwrap();
             assert_eq!(resp, Some(Response::Pong));
         }
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recv_wire_accepts_bincode_request_on_live_ipc() {
+        let endpoint = unique_test_endpoint();
+        let mut listener = IpcListener::bind(&endpoint).unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let msg: Option<DecodedWireMessage<Request, pb::Request>> =
+                conn.recv_wire().await.unwrap();
+            assert_eq!(msg, Some(DecodedWireMessage::BincodeV15(Request::Ping)));
+            conn.send(&Response::Pong).await.unwrap();
+        });
+
+        let mut client = connect(&endpoint).await.unwrap();
+        client.send(&Request::Ping).await.unwrap();
+        let resp: Option<Response> = client.recv().await.unwrap();
+        assert_eq!(resp, Some(Response::Pong));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recv_wire_accepts_prost_request_on_live_ipc() {
+        let endpoint = unique_test_endpoint();
+        let mut listener = IpcListener::bind(&endpoint).unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let msg: Option<DecodedWireMessage<Request, pb::Request>> =
+                conn.recv_wire().await.unwrap();
+            match msg {
+                Some(DecodedWireMessage::ProstV16(request)) => {
+                    assert_eq!(request.request_id, "live-prost");
+                    assert!(matches!(request.body, Some(pb::request::Body::Ping(_))));
+                }
+                other => panic!("expected prost request, got {other:?}"),
+            }
+            conn.send(&Response::Pong).await.unwrap();
+        });
+
+        let mut client = connect(&endpoint).await.unwrap();
+        let request = pb::Request {
+            body: Some(pb::request::Body::Ping(pb::Empty {})),
+            request_id: "live-prost".to_string(),
+        };
+        client.send_prost(&request).await.unwrap();
+        let resp: Option<Response> = client.recv().await.unwrap();
+        assert_eq!(resp, Some(Response::Pong));
 
         server.await.unwrap();
     }
