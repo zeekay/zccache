@@ -27,6 +27,18 @@ struct TrackedFile {
     hash_hex: String,
 }
 
+/// Pre-computed metadata for a single changed path in an `on_batch` call.
+///
+/// Built once per watcher batch *outside* the watch-map lock so the per-watch
+/// update loop never holds a DashMap shard lock across filesystem I/O (issue #724).
+struct ChangedMeta {
+    /// Canonicalized absolute path of the changed file.
+    canon: NormalizedPath,
+    mtime_ns: u64,
+    size: u64,
+    hash_hex: String,
+}
+
 /// State of a single fingerprint watch.
 #[allow(dead_code)]
 struct WatchState {
@@ -315,27 +327,50 @@ impl FingerprintManager {
             return;
         }
 
+        // Pre-compute canonical path + stat + content hash for each changed path
+        // ONCE, before touching the watch map. The previous implementation did this
+        // canonicalize()/hash_file() I/O *inside* `watches.iter_mut()`, holding a
+        // DashMap write-shard lock across blocking filesystem reads and repeating
+        // the same hash once per watch. Large ESP32/LPC builds register hundreds of
+        // watch roots, so a single watcher batch starved every RPC handler waiting
+        // on those shards and wedged the daemon (issue #724). Hoisting the I/O out
+        // of the lock keeps shard hold-times to in-memory map updates only, and
+        // hashes each changed file exactly once instead of once per watch.
+        let changed_meta: Vec<ChangedMeta> = changed
+            .iter()
+            .map(|path| {
+                let canon_path = canon(path);
+                let mtime_ns = crate::fingerprint::persist::mtime_ns(&canon_path).unwrap_or(0);
+                let size = crate::fingerprint::persist::file_size(&canon_path).unwrap_or(0);
+                let hash_hex = match crate::hash::hash_file(&canon_path) {
+                    Ok(h) => h.to_hex(),
+                    Err(_) => String::new(),
+                };
+                ChangedMeta {
+                    canon: canon_path,
+                    mtime_ns,
+                    size,
+                    hash_hex,
+                }
+            })
+            .collect();
+        let removed_canon: Vec<NormalizedPath> = removed
+            .iter()
+            .map(|path| canon_maybe_missing(path))
+            .collect();
+
         for mut entry in self.watches.iter_mut() {
             let watch = entry.value_mut();
             let root = &watch.root;
 
-            for path in changed {
-                let path = canon(path);
-                if let Ok(rel) = path.strip_prefix(root) {
+            for cm in &changed_meta {
+                if let Ok(rel) = cm.canon.strip_prefix(root) {
                     let rel_str = rel.to_string_lossy().replace('\\', "/");
-                    // Re-hash the changed file.
-                    let mtime = crate::fingerprint::persist::mtime_ns(&path).unwrap_or(0);
-                    let size = crate::fingerprint::persist::file_size(&path).unwrap_or(0);
-                    let hash_hex = match crate::hash::hash_file(&path) {
-                        Ok(h) => h.to_hex(),
-                        Err(_) => String::new(),
-                    };
 
-                    // Check if content actually changed.
-                    let content_changed = if let Some(existing) = watch.files.get(&rel_str) {
-                        existing.hash_hex != hash_hex
-                    } else {
-                        true // new file
+                    // Check if content actually changed (using the pre-hashed value).
+                    let content_changed = match watch.files.get(&rel_str) {
+                        Some(existing) => existing.hash_hex != cm.hash_hex,
+                        None => true, // new file
                     };
 
                     if content_changed {
@@ -345,24 +380,21 @@ impl FingerprintManager {
                         watch.files.insert(
                             rel_str,
                             TrackedFile {
-                                mtime_ns: mtime,
-                                size,
-                                hash_hex,
+                                mtime_ns: cm.mtime_ns,
+                                size: cm.size,
+                                hash_hex: cm.hash_hex.clone(),
                             },
                         );
-                    } else {
+                    } else if let Some(tracked) = watch.files.get_mut(&rel_str) {
                         // Just update mtime/size, content unchanged (smart touch).
-                        if let Some(entry) = watch.files.get_mut(&rel_str) {
-                            entry.mtime_ns = mtime;
-                            entry.size = size;
-                        }
+                        tracked.mtime_ns = cm.mtime_ns;
+                        tracked.size = cm.size;
                     }
                 }
             }
 
-            for path in removed {
-                let path = canon_maybe_missing(path);
-                if let Ok(rel) = path.strip_prefix(root) {
+            for canon_path in &removed_canon {
+                if let Ok(rel) = canon_path.strip_prefix(root) {
                     let rel_str = rel.to_string_lossy().replace('\\', "/");
                     if watch.files.remove(&rel_str).is_some() {
                         watch.dirty = true;
@@ -858,5 +890,59 @@ mod tests {
         // cache1 should need a fresh scan.
         let r1 = mgr.check(&cache1, "two-layer", src.path(), &[], &[], &[]);
         assert_eq!(r1.decision, "run");
+    }
+
+    #[test]
+    fn on_batch_many_watches_completes_quickly() {
+        // Regression test for issue #724: on_batch must not hold the watch-map lock
+        // across per-file canonicalize/hash I/O. With hundreds of watch roots the
+        // old implementation canonicalized every changed path once *per watch*
+        // (O(n^2) syscalls) and hashed under a DashMap write-shard lock, starving
+        // RPC handlers and wedging the daemon. The fix pre-computes path metadata
+        // once per batch, so this large batch must finish well within budget.
+        const ROOTS: usize = 200;
+
+        let cache_dir = TempDir::new().unwrap();
+        let mgr = FingerprintManager::new();
+        let mut roots = Vec::with_capacity(ROOTS);
+        let mut cache_files = Vec::with_capacity(ROOTS);
+
+        for i in 0..ROOTS {
+            let root = TempDir::new().unwrap();
+            create_file(root.path(), "src.cpp", "original");
+            let cache_file = cache_dir.path().join(format!("fp{i}.json"));
+            mgr.check(&cache_file, "two-layer", root.path(), &[], &[], &[]);
+            mgr.mark_success(&cache_file);
+            cache_files.push(cache_file);
+            roots.push(root);
+        }
+
+        // Modify every tracked file, then deliver one big watcher batch.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut changed = Vec::with_capacity(ROOTS);
+        for root in &roots {
+            create_file(root.path(), "src.cpp", "modified");
+            changed.push(canon(&root.path().join("src.cpp")));
+        }
+
+        let start = std::time::Instant::now();
+        mgr.on_batch(&changed, &[]);
+        let elapsed = start.elapsed();
+
+        // Generous budget: the wedge made this effectively unbounded under lock
+        // contention. The lock-free variant is orders of magnitude faster.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "on_batch over {ROOTS} watches took {elapsed:?}, expected < 10s (issue #724 regression)"
+        );
+
+        // Correctness: every watch must now be dirty.
+        for (i, cache_file) in cache_files.iter().enumerate() {
+            let result = mgr.check(cache_file, "two-layer", roots[i].path(), &[], &[], &[]);
+            assert_eq!(
+                result.decision, "run",
+                "watch {i} should be dirty after on_batch"
+            );
+        }
     }
 }
