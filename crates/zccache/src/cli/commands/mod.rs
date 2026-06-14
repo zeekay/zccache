@@ -18,6 +18,7 @@ pub(crate) mod exec;
 pub(crate) mod fp;
 pub(crate) mod gha;
 pub(crate) mod meson_cache;
+pub(crate) mod release_handles;
 pub(crate) mod rust_plan;
 pub(crate) mod service_definition;
 pub(crate) mod session;
@@ -387,6 +388,10 @@ fn dispatch(command: Commands, global_strict_paths: Option<&str>) -> ExitCode {
                 }
             };
             wrap::run_wrap(&wrap_args, strict_paths)
+        }
+        Commands::ReleaseHandles { path, json } => {
+            let endpoint = resolve_endpoint(None);
+            run_async(release_handles::cmd_release_handles(&endpoint, &path, json))
         }
         Commands::Meson { command } => match command {
             args::MesonCommands::Configure {

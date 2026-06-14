@@ -502,6 +502,24 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: MesonCommands,
     },
+    /// Ask the daemon to release any handles it owns under `--path`.
+    ///
+    /// Wraps `Request::ReleaseWorktreeHandles` (issue #690) so callers who
+    /// don't go through soldr — FastLED CI cleanup, sysadmin scripts,
+    /// manual debugging — can break daemon-held file handles before
+    /// `rm -rf` / `git worktree remove` on Windows. The daemon refuses
+    /// to release handles whose target path contains the cache root.
+    /// See zccache#694 Phase 2.
+    #[command(name = "release-handles")]
+    ReleaseHandles {
+        /// Path prefix under which daemon-held handles should be released.
+        /// Resolved to an absolute path before the request is sent.
+        #[arg(long, value_name = "PATH")]
+        path: String,
+        /// Emit a machine-readable JSON document on stdout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `zccache meson` subcommands.
@@ -930,6 +948,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "defender-exclusions",
     "exec",
     "cc",
+    "release-handles",
     "help",
     "--help",
     "-h",
