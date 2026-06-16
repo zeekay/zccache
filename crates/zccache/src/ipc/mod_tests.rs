@@ -704,3 +704,57 @@ async fn probe_returns_false_when_lock_file_pid_is_not_a_daemon() {
              not waited for the connect timeout — elapsed {elapsed:?}"
     );
 }
+
+/// Issue #774 regression. On Windows the kernel keeps a process object
+/// alive as long as **any** handle references it — Task Manager, Process
+/// Explorer, a sibling tool monitoring the daemon, the running-process
+/// broker, etc. Plain `OpenProcess` on the dead PID still returns a
+/// valid handle in that state, so the previous `is_process_alive`
+/// implementation reported the dead daemon as alive and the CLI looped
+/// against an orphaned pipe until the user rebooted.
+///
+/// This test spawns a short-lived process, waits for it to exit, then
+/// pins the kernel process object open via `OpenProcess` and asserts
+/// that `is_process_alive` correctly returns `false` — the
+/// `WaitForSingleObject(handle, 0) == WAIT_TIMEOUT` check added in the
+/// fix is what makes that work.
+#[cfg(windows)]
+#[test]
+fn is_process_alive_returns_false_for_terminated_referenced_process() {
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("cmd")
+        .args(["/c", "exit", "0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cmd /c exit 0");
+    let pid = child.id();
+    let status = child.wait().expect("wait child");
+    assert!(status.success(), "child should have exited cleanly");
+
+    // Pin the kernel process object alive by holding our own OpenProcess
+    // handle — this is exactly what an external monitor (Task Manager,
+    // a parent shell's job table, fbuild's process tracker) does.
+    #[allow(clashing_extern_declarations)]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    let pin = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    assert_ne!(
+        pin, 0,
+        "expected to pin the kernel process object open — without this the OS \
+         may have already reaped the PID and the test would be trivially passing"
+    );
+
+    assert!(
+        !is_process_alive(pid),
+        "PID {pid} terminated cleanly but is_process_alive returned true \
+         (Windows process-object zombie — issue #774)"
+    );
+
+    unsafe { CloseHandle(pin) };
+}

@@ -671,7 +671,23 @@ pub fn force_kill_process(pid: u32) -> Result<(), std::io::Error> {
     }
 }
 
-/// Check if a process with the given PID is alive.
+/// Check if a process with the given PID is actually running.
+///
+/// On Windows this is stricter than "the kernel still has a process object for
+/// this PID": the function returns `false` for a terminated process whose
+/// process object is being kept alive by some other handle holder (Task
+/// Manager, Process Explorer, a sibling tool that called `OpenProcess` for
+/// monitoring, etc.). Plain `OpenProcess` success is *not* sufficient because
+/// the object can outlive the actual process by an arbitrary amount of time;
+/// see issue #774 where this caused `taskkill /F` on `zccache-daemon` to leave
+/// the CLI looping against a dead PID until manual cleanup.
+///
+/// We disambiguate with `WaitForSingleObject(handle, 0)`: the process object
+/// becomes signaled at termination, so `WAIT_TIMEOUT` (still waiting) is the
+/// unambiguous "actually running" signal. Using `WaitForSingleObject` rather
+/// than `GetExitCodeProcess` also sidesteps the documented Windows wart where
+/// a process that genuinely exited with code 259 is indistinguishable from
+/// one that is still running.
 #[must_use]
 pub fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
@@ -690,16 +706,24 @@ pub fn is_process_alive(pid: u32) -> bool {
         extern "system" {
             fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
             fn CloseHandle(handle: isize) -> i32;
+            fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32;
         }
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const WAIT_TIMEOUT: u32 = 0x0000_0102;
         unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle != 0 {
-                CloseHandle(handle);
-                true
-            } else {
-                false
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
+            if handle == 0 {
+                return false;
             }
+            // WAIT_TIMEOUT means the process object has not yet been signaled
+            // — i.e. the process really is still running. Any other return
+            // value (WAIT_OBJECT_0 = signaled = exited, WAIT_FAILED, WAIT_ABANDONED)
+            // means the process is not running, even if a zombie process
+            // object keeps the PID nominally addressable.
+            let status = WaitForSingleObject(handle, 0);
+            CloseHandle(handle);
+            status == WAIT_TIMEOUT
         }
     }
 }
