@@ -361,10 +361,53 @@ impl IpcListener {
                         .clamp(16, 128)
                 });
 
+            // Issue #774: the first pipe instance asserts namespace ownership
+            // via `first_pipe_instance(true)`. After a hard-killed daemon
+            // (`taskkill /F`), the pipe name can linger briefly in the OS
+            // namespace while the kernel reaps the dead process's handles.
+            // Retry the first bind with backoff to ride out that GC window
+            // before declaring the namespace contested — the alternative is
+            // the daemon failing to start and forcing a reboot. The
+            // companion fix in `is_process_alive` (also #774) stops the CLI
+            // from spinning against a still-referenced-but-terminated PID,
+            // which is what allowed the orphan pipe to outlive the daemon
+            // long enough to matter here.
+            const FIRST_BIND_ATTEMPTS: u32 = 8;
+            const FIRST_BIND_INITIAL_DELAY_MS: u64 = 20;
+            const FIRST_BIND_MAX_DELAY_MS: u64 = 160;
+
             let mut pool = VecDeque::with_capacity(pool_size);
-            for i in 0..pool_size {
+            let first_pipe = {
+                let mut attempt = 0u32;
+                let mut delay_ms = FIRST_BIND_INITIAL_DELAY_MS;
+                loop {
+                    match ServerOptions::new()
+                        .first_pipe_instance(true)
+                        .create(endpoint)
+                    {
+                        Ok(p) => break p,
+                        Err(e) => {
+                            attempt += 1;
+                            if attempt >= FIRST_BIND_ATTEMPTS {
+                                return Err(e.into());
+                            }
+                            tracing::warn!(
+                                attempt,
+                                max_attempts = FIRST_BIND_ATTEMPTS,
+                                error = %e,
+                                endpoint = %endpoint,
+                                "first pipe instance bind failed; retrying after backoff (issue #774)"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            delay_ms = (delay_ms * 2).min(FIRST_BIND_MAX_DELAY_MS);
+                        }
+                    }
+                }
+            };
+            pool.push_back(first_pipe);
+            for _ in 1..pool_size {
                 let pipe = ServerOptions::new()
-                    .first_pipe_instance(i == 0)
+                    .first_pipe_instance(false)
                     .create(endpoint)?;
                 pool.push_back(pipe);
             }
