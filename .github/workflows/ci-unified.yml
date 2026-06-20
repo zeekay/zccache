@@ -256,6 +256,12 @@ jobs:
         run: |
           set -e
           start=$SECONDS
+          # setup-soldr exports SOLDR_SKIP_CARGO_REGISTRY_SAVE=1
+          # because IT owns the cache layer in the warm-path setup;
+          # if we leave it set our `save` becomes a no-op and the
+          # archive existence check below fires (#272). The smoke
+          # test is the explicit caller — unset so save actually runs.
+          unset SOLDR_SKIP_CARGO_REGISTRY_SAVE
           soldr cargo build -p zccache --bin zccache
           ZCC="$(find target -type f -name 'zccache' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
           if [ -z "$ZCC" ]; then
