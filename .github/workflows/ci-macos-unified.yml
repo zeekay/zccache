@@ -59,7 +59,7 @@ env:
 
 jobs:
   macos:
-    name: macOS validation (fmt + clippy + build + test)
+    name: macOS validation (fmt + clippy + dylint + build + test)
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
@@ -71,7 +71,12 @@ jobs:
       # reuses the same warmed dependency graph — that's where the macOS
       # speedup actually lands compared to N separate runners each doing
       # their own soldr-cook.
-      - uses: zackees/setup-soldr@v0.9.62
+      #
+      # dylint-cache + dylint-toolchain pins are the same the Linux
+      # `Dylint` job in ci.yml uses — keeping them in sync so a future
+      # nightly bump on Linux also lands here in the same PR.
+      - id: setup-soldr
+        uses: zackees/setup-soldr@v0.9.62
         with:
           zccache-seed-strict: true
           toolchain: 1.94.1
@@ -82,6 +87,11 @@ jobs:
           prebuild-deps-flags: ""
           solo-toolchain-cache: true
           verify-compile-cache: warn
+          dylint-cache: true
+          dylint-toolchain: nightly-2026-03-26
+          dylint-driver-rev: 4bd91ce7729b74c7ee5664bbb588f7baf30b4a09
+          cargo-dylint-version: 5.0.0
+          dylint-link-version: 5.0.0
 
       # ── fmt ──────────────────────────────────────────────────────────
       - name: fmt
@@ -100,6 +110,42 @@ jobs:
           soldr cargo clippy --workspace --all-targets -- -D warnings
           dur=$((SECONDS - start))
           echo "- **macOS / clippy**: ${dur}s" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── dylint ──────────────────────────────────────────────────────
+      # Folded into the same runner because the cargo-cook warm cache
+      # from `prebuild-deps: soldr-cook` above pays for the bulk of
+      # dependency compilation; only the dylint-specific nightly
+      # toolchain install + driver build is incremental cost.
+      - name: Install Dylint nightly toolchain
+        run: soldr rustup toolchain install nightly-2026-03-26 --component llvm-tools-preview --component rust-src --component rustc-dev --profile minimal
+      - name: Install Dylint
+        if: steps.setup-soldr.outputs.dylint-cache-hit != 'true'
+        run: |
+          soldr cargo install cargo-dylint --version 5.0.0 --locked
+          soldr cargo install dylint-link --version 5.0.0 --locked
+      - name: Build compatible Dylint driver
+        if: steps.setup-soldr.outputs.dylint-cache-hit != 'true'
+        run: python3 ci/build_dylint_driver.py
+      - name: Check Dylint Library Formatting (ban_std_pathbuf)
+        run: soldr cargo fmt --manifest-path dylints/ban_std_pathbuf/Cargo.toml --all -- --check
+      - name: Check Dylint Library Formatting (ban_unrooted_tempdir)
+        run: soldr cargo fmt --manifest-path dylints/ban_unrooted_tempdir/Cargo.toml --all -- --check
+      - name: Test Dylint Library (ban_std_pathbuf)
+        run: |
+          export PATH="${CARGO_HOME}/bin:${PATH}"
+          soldr rustup run nightly-2026-03-26 cargo test --manifest-path dylints/ban_std_pathbuf/Cargo.toml
+      - name: Test Dylint Library (ban_unrooted_tempdir)
+        run: |
+          export PATH="${CARGO_HOME}/bin:${PATH}"
+          soldr rustup run nightly-2026-03-26 cargo test --manifest-path dylints/ban_unrooted_tempdir/Cargo.toml
+      - name: dylint
+        shell: bash
+        run: |
+          export PATH="${CARGO_HOME}/bin:${PATH}"
+          start=$SECONDS
+          python3 -m ci.lint --dylint-only
+          dur=$((SECONDS - start))
+          echo "- **macOS / dylint**: ${dur}s" >> "$GITHUB_STEP_SUMMARY"
 
       # ── build (cargo check is the standard "does it compile" gate;
       #     covers what the old Check job ran) ─────────────────────────
