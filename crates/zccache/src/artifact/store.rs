@@ -106,13 +106,58 @@ impl ArtifactStore {
     /// "started empty" was the symptom that hid the cold-tar-untar-warm
     /// 0-hit-rate bug across two perf-cluster runs.
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let entries = DashMap::new();
+        let store = Self::open_empty(path);
+        store.load_from_disk()?;
+        Ok(store)
+    }
+
+    /// Construct an empty store rooted at `path` without touching disk.
+    ///
+    /// Issue #784 phase 2d: lets `DaemonServer::bind_with_cache_dir`
+    /// build the store in microseconds (no `std::fs::read` of the
+    /// index blob), with the actual entry-loading deferred to a
+    /// background `spawn_blocking` that calls
+    /// [`Self::load_from_disk`] AFTER the readiness lockfile is
+    /// written. Until the load runs, `get` returns `None` for every
+    /// key and the request handlers fall through to the cold path —
+    /// no incorrect "warm hit" can fire because no entries exist.
+    pub fn open_empty(path: &Path) -> Self {
+        Self {
+            path: NormalizedPath::new(path),
+            entries: DashMap::new(),
+        }
+    }
+
+    /// Read the on-disk index blob (if any) and insert every entry
+    /// into the live `DashMap`. Idempotent re-keys overwrite existing
+    /// entries.
+    ///
+    /// Issue #784 phase 2d. Runs in a `spawn_blocking` after the
+    /// daemon's readiness lockfile is written. Inserts during the load
+    /// window race against request-handler inserts on the same
+    /// DashMap; both paths use `&self` insert and the eventual state
+    /// converges to whatever the most-recent write was. A request
+    /// arriving during the load window for a key that was on disk but
+    /// not yet inserted returns `None` (cold-path miss → recompile);
+    /// once inserted, subsequent requests hit. No correctness risk
+    /// because the on-disk artifact bytes themselves are content-
+    /// addressed by `blake3` (DD-005), independent of when the index
+    /// entry lands.
+    ///
+    /// # Errors
+    ///
+    /// Surface any `std::fs::read` error other than `NotFound` to the
+    /// caller. A missing file and a corrupt blob are both logged and
+    /// treated as "empty" — same shape as the inline path in
+    /// [`Self::open`].
+    pub fn load_from_disk(&self) -> std::io::Result<()> {
+        let path = self.path.as_path();
         match std::fs::read(path) {
             Ok(bytes) => match bincode::deserialize::<Vec<(String, ArtifactIndex)>>(&bytes) {
                 Ok(rows) => {
                     let count = rows.len();
                     for (k, v) in rows {
-                        entries.insert(k, v);
+                        self.entries.insert(k, v);
                     }
                     if count > 0 {
                         tracing::info!(
@@ -142,10 +187,7 @@ impl ArtifactStore {
             }
             Err(e) => return Err(e),
         };
-        Ok(Self {
-            path: NormalizedPath::new(path),
-            entries,
-        })
+        Ok(())
     }
 
     /// Insert or update an artifact entry. In-memory only.

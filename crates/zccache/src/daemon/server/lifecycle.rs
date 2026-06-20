@@ -42,15 +42,19 @@ impl DaemonServer {
         // daemon starts accepting connections immediately (Bug 6 fix).
         let artifacts: DashMap<String, CachedArtifact> = DashMap::new();
 
-        // Open the bincode-backed artifact index for fast startup + persistence.
+        // Issue #784 phase 2d: open the artifact-index store EMPTY here
+        // so the readiness lockfile is not gated on reading + decoding
+        // the bincode blob (which scales with cached-artifact count and
+        // dominated the spawn→lockfile window on FastLED-scale caches).
+        // The on-disk entries are merged into the live DashMap by
+        // `artifact_store_loader()`'s `load_and_install()` in a
+        // `spawn_blocking` AFTER the lockfile fires. Requests during
+        // the load window see a cold-path miss on any not-yet-merged
+        // key and recompile — correctness is guaranteed by the content-
+        // addressed blake3 artifact bytes (DD-005), independent of
+        // when the index entry lands.
         let index_path = crate::core::config::index_path_from_cache_dir(cache_dir);
-        let artifact_store = ArtifactStore::open(&index_path).map_err(|e| {
-            crate::ipc::IpcError::Io(std::io::Error::other(format!(
-                "failed to open artifact index at {}: {e}",
-                index_path.display()
-            )))
-        })?;
-        let artifact_store = Arc::new(artifact_store);
+        let artifact_store = Arc::new(ArtifactStore::open_empty(&index_path));
 
         let (index_writer_tx, index_writer_rx) =
             tokio::sync::mpsc::unbounded_channel::<(String, ArtifactIndex)>();
@@ -169,6 +173,7 @@ impl DaemonServer {
                 index_writer_shutdown,
                 artifacts_loaded: AtomicBool::new(false),
                 compiler_hash_cache_loaded: AtomicBool::new(false),
+                artifact_store_loaded: AtomicBool::new(false),
                 shutdown_event_logged: AtomicBool::new(false),
                 fingerprint: FingerprintManager::new(),
                 dep_graph_persisted: AtomicBool::new(false),
@@ -250,6 +255,21 @@ impl DaemonServer {
         CompilerHashCacheLoader {
             state: Arc::clone(&self.state),
             path: self.state.compiler_hash_cache_path.clone(),
+        }
+    }
+
+    /// Hand out a loader that reads the on-disk artifact index blob
+    /// and merges its entries into the live `ArtifactStore`. Issue
+    /// #784 phase 2d — the last of the four #784 deferrals.
+    ///
+    /// Designed to be called once, immediately after `write_lock_file`,
+    /// inside a `tokio::task::spawn_blocking`. The loader holds an
+    /// `Arc<ArtifactStore>` clone so the merge writes go directly to
+    /// the same `DashMap` that the request handlers read.
+    pub fn artifact_store_loader(&self) -> ArtifactStoreLoader {
+        ArtifactStoreLoader {
+            state: Arc::clone(&self.state),
+            store: Arc::clone(&self.state.artifact_store),
         }
     }
 
@@ -382,6 +402,39 @@ impl DepGraphSetter {
 pub struct CompilerHashCacheLoader {
     state: Arc<SharedState>,
     path: crate::core::NormalizedPath,
+}
+
+/// Owned handle that reads the on-disk artifact-index blob and merges
+/// its entries into the running daemon's `ArtifactStore`.
+///
+/// Issue #784 phase 2d. Same shape as the earlier #784 loaders, but
+/// holds an `Arc<ArtifactStore>` directly so the merge writes hit the
+/// same `DashMap` instance the request handlers read (no swap needed —
+/// the store was constructed empty at bind time).
+pub struct ArtifactStoreLoader {
+    state: Arc<SharedState>,
+    store: Arc<ArtifactStore>,
+}
+
+impl ArtifactStoreLoader {
+    /// Read the on-disk index blob (if any) and insert its entries
+    /// into the live store via [`ArtifactStore::load_from_disk`].
+    ///
+    /// I/O errors (file present but unreadable) are logged at WARN
+    /// and treated as "empty" — the daemon stays running with an
+    /// empty in-memory index and the next `flush()` will rewrite the
+    /// file from whatever request-handler inserts have landed since.
+    /// After the load — successful or empty — `artifact_store_loaded`
+    /// is set so `run.rs`'s shutdown path knows the in-memory state is
+    /// canonical.
+    pub fn load_and_install(self) {
+        if let Err(e) = self.store.load_from_disk() {
+            tracing::warn!("artifact index load failed, continuing with empty store: {e}");
+        }
+        self.state
+            .artifact_store_loaded
+            .store(true, Ordering::Release);
+    }
 }
 
 impl CompilerHashCacheLoader {

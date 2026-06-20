@@ -411,6 +411,19 @@ fn run_server(args: Args) {
             compiler_hash_loader.load_and_install();
         });
 
+        // Issue #784 phase 2d: same shape for the on-disk
+        // `index.bin` artifact-store blob. The store itself was
+        // constructed empty in `bind_with_cache_dir`; the loader holds
+        // an `Arc<ArtifactStore>` clone and inserts the on-disk entries
+        // directly into the live `DashMap` that request handlers read.
+        // Requests during the load window for a not-yet-merged key
+        // see `None` and take the cold-path miss (content-addressed
+        // blake3 artifacts make that correctness-safe per DD-005).
+        let artifact_store_loader = server.artifact_store_loader();
+        tokio::task::spawn_blocking(move || {
+            artifact_store_loader.load_and_install();
+        });
+
         // Wire up Ctrl+C to trigger graceful shutdown
         let shutdown = server.shutdown_handle();
         tokio::spawn(async move {

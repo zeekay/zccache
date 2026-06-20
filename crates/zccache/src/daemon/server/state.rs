@@ -161,6 +161,16 @@ pub(super) struct SharedState {
     /// until the loader's `install()` runs; once true the in-memory
     /// DashMap is considered canonical for save.
     pub(super) compiler_hash_cache_loaded: AtomicBool,
+    /// Whether the background artifact-index load has completed.
+    ///
+    /// Issue #784 phase 2d: the on-disk `index.bin` blob is read
+    /// post-lockfile from a `spawn_blocking` task. Mirrors
+    /// `compiler_hash_cache_loaded` above. No shutdown-save gate is
+    /// needed for this field — `ArtifactStore` persistence runs
+    /// through the periodic WAL/flush path (`index_writer_tx`), not
+    /// at shutdown — so this flag is informational, observable via
+    /// `test_artifact_store_loaded()` for the deferred-load test.
+    pub(super) artifact_store_loaded: AtomicBool,
     /// Whether the `died-shutdown` lifecycle event has been written for this
     /// daemon. Under burst load (issue #726), many wedge-detecting clients
     /// race to send `Request::Shutdown` within a few milliseconds and each
