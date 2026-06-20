@@ -461,6 +461,7 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
                 &sid,
                 &format!("[DIAG] artifact_not_found: key={artifact_key_hex}"),
             );
+            invalidate_missing_depgraph_artifact(state, &sid, &artifact_key_hex);
         }
         crate::depgraph::CacheVerdict::SourceChanged { artifact_key } => {
             let artifact_key_hex = artifact_key.hash().to_hex();
@@ -654,6 +655,21 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
         stderr,
         cached: false,
     }
+}
+
+fn invalidate_missing_depgraph_artifact(
+    state: &SharedState,
+    sid: &SessionId,
+    artifact_key_hex: &str,
+) {
+    let mut stale_keys = std::collections::HashSet::with_capacity(1);
+    stale_keys.insert(artifact_key_hex.to_string());
+    let cleared = state.dep_graph.load().invalidate_artifact_keys(&stale_keys);
+    write_session_log(
+        &state.sessions,
+        sid,
+        &format!("[DIAG] depgraph_invalidate_artifact: key={artifact_key_hex} cleared={cleared}"),
+    );
 }
 
 async fn wait_for_startup_depgraph_load(state: &SharedState, sid: &SessionId) {
