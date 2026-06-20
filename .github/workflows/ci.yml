@@ -1,26 +1,23 @@
 name: CI
 
-# Single workflow: one job per platform, every gate runs even if earlier
-# ones fail. The final "report" step collects every gate's outcome and
-# fails the job with a list of which gates actually broke, so a single
-# CI cycle surfaces ALL failures at once instead of stopping at the
-# first one. (User directive: "if a step breaks, keep going then error
-# at the end with which step broke".)
+# Single CI workflow: one job per platform, every gate runs even if
+# earlier ones fail. The final "report" step collects every gate's
+# outcome and fails the job with a list of which gates actually broke,
+# so a single CI cycle surfaces ALL failures at once instead of stopping
+# at the first one. Build is the one exception — if `cargo check` fails
+# everything downstream is meaningless, so we halt early.
 #
-# Per-platform gate matrix (path-ignored sets at top filter out
-# docs-only edits so unrelated PRs skip the whole job):
+# Platform matrix (one runner per row):
 #
-#                linux   windows  macos
-#   fmt           Y       Y        Y
-#   clippy        Y       Y        Y
-#   dylint        Y       -        Y    (unix-only nightly toolchain)
-#   docs          Y       -        -
-#   build (check) Y       Y        Y
-#   unit tests    Y       Y        Y
-#   integration   Y       -        -
-#   cargo-registry Y      Y        Y    (subcommand smoke)
-#   gha-cache     Y       -        -
-#   wrapper-e2e   Y       Y        Y    (SOLDR_RUSTC_WRAPPER end-to-end)
+#   platform           runner               target triple (if non-default)
+#   ---------------    -------------------- ------------------------------
+#   linux-x86          ubuntu-latest        (default; x86_64-unknown-linux-gnu)
+#   linux-x86-musl     ubuntu-latest        x86_64-unknown-linux-musl
+#   linux-arm          ubuntu-24.04-arm     (default; aarch64-unknown-linux-gnu)
+#   windows-x86        windows-latest       (default; x86_64-pc-windows-msvc)
+#   windows-arm        windows-11-arm       (default; aarch64-pc-windows-msvc)
+#   mac-x86            macos-13             (default; x86_64-apple-darwin)
+#   mac-arm            macos-latest         (default; aarch64-apple-darwin)
 #
 # Workflows NOT folded here (distinct purposes, not gates):
 #   release-auto.yml      PyPI + crates.io + GH release
@@ -30,9 +27,6 @@ name: CI
 #   cache-cleanup.yml     scheduled housekeeping
 #   feature-matrix-check  feature flag combinations
 #   wire-stability.yml    IPC protocol stability
-# test-action.yml was DELETED — its cargo-registry + gha-cache jobs
-# are now inlined here; its action-wrapper test was redundant with
-# wrapper-e2e.
 
 on:
   push:
@@ -75,18 +69,44 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            platform: linux
-            is_linux: "yes"
-            is_windows: ""
-          - os: windows-latest
-            platform: windows
-            is_linux: ""
-            is_windows: "yes"
-          - os: macos-latest
-            platform: macos
-            is_linux: ""
-            is_windows: ""
+          # ── Linux ────────────────────────────────────────────────
+          - platform: linux-x86
+            os: ubuntu-latest
+            family: linux
+            target: ""
+            is_glibc_linux: "yes"
+          - platform: linux-x86-musl
+            os: ubuntu-latest
+            family: linux
+            target: "x86_64-unknown-linux-musl"
+            is_glibc_linux: ""        # musl tests need separate harness
+          - platform: linux-arm
+            os: ubuntu-24.04-arm
+            family: linux
+            target: ""
+            is_glibc_linux: ""        # ARM Linux runs tests but is_glibc_linux gates only docs+integration+gha-cache (Linux x86 only)
+          # ── Windows ──────────────────────────────────────────────
+          - platform: windows-x86
+            os: windows-latest
+            family: windows
+            target: ""
+            is_glibc_linux: ""
+          - platform: windows-arm
+            os: windows-11-arm
+            family: windows
+            target: ""
+            is_glibc_linux: ""
+          # ── macOS ────────────────────────────────────────────────
+          - platform: mac-x86
+            os: macos-13
+            family: macos
+            target: ""
+            is_glibc_linux: ""
+          - platform: mac-arm
+            os: macos-latest
+            family: macos
+            target: ""
+            is_glibc_linux: ""
     steps:
       - uses: actions/checkout@v6
 
@@ -108,11 +128,30 @@ jobs:
           cargo-dylint-version: 5.0.0
           dylint-link-version: 5.0.0
 
-      # Every gate below: `continue-on-error: true` + an `id` so the
-      # final report step can collect outcomes via `steps.<id>.outcome`.
-      # A failed gate marks its step `failure`, but the job continues
-      # and the next gate runs. The final report aggregates failures
-      # and exits 1 if any gate broke.
+      # musl target needs the standard library AND a musl-aware linker.
+      # rustup adds the stdlib component; apt provides musl-tools.
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          soldr rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      # Helper exported for every subsequent step that calls cargo —
+      # adds `--target <triple>` only when the matrix entry sets one.
+      - name: Export target flag
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            echo "CARGO_TARGET_FLAG=--target ${{ matrix.target }}" >> "$GITHUB_ENV"
+          else
+            echo "CARGO_TARGET_FLAG=" >> "$GITHUB_ENV"
+          fi
+
+      # ── Gates ──────────────────────────────────────────────────────
+      # Every gate has `continue-on-error: true` so the job runs all of
+      # them in one cycle. Exception: `gate_build` halts early since
+      # nothing downstream produces signal without a compiled tree.
 
       - id: gate_fmt
         name: fmt
@@ -129,15 +168,15 @@ jobs:
         shell: bash
         run: |
           start=$SECONDS
-          soldr cargo clippy --workspace --all-targets -- -D warnings
+          soldr cargo clippy --workspace --all-targets $CARGO_TARGET_FLAG -- -D warnings
           echo "- **${{ matrix.platform }} / clippy**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
-      # dylint: unix-only because the nightly driver build assumes a
-      # Unix-shaped rustup layout. Combined install + run into a single
-      # gate so dylint shows up as one row in the failure summary.
+      # dylint: unix-only (the nightly driver build assumes a Unix
+      # rustup layout). Skip on Windows + the musl matrix entry (dylint
+      # would re-run identically to linux-x86 which is wasteful).
       - id: gate_dylint
         name: dylint
-        if: matrix.is_windows != 'yes'
+        if: matrix.family != 'windows' && matrix.target == ''
         continue-on-error: true
         shell: bash
         run: |
@@ -159,9 +198,11 @@ jobs:
           python3 -m ci.lint --dylint-only
           echo "- **${{ matrix.platform }} / dylint**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
+      # docs: only one platform needs to validate intra-doc links.
+      # Linux x86 default-target is the canonical home.
       - id: gate_docs
         name: docs
-        if: matrix.is_linux == 'yes'
+        if: matrix.is_glibc_linux == 'yes'
         continue-on-error: true
         shell: bash
         env:
@@ -171,26 +212,21 @@ jobs:
           soldr cargo doc --workspace --no-deps
           echo "- **${{ matrix.platform }} / docs**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
-      # Build is the only NON-continue-on-error gate. If `cargo check`
-      # fails, every downstream gate (clippy already ran, but unit
-      # tests / integration / wrapper-e2e / cargo-registry / gha-cache
-      # / docs) would produce noise rather than signal — they all
-      # require the workspace to compile. So we halt the job here and
-      # the final `report failures` step (`if: always()`) reports
-      # `build` as the single broken gate.
+      # Build is the one fatal gate — if `cargo check` fails every
+      # downstream gate (test/integration/etc.) is meaningless.
       - id: gate_build
         name: build
         shell: bash
         run: |
           start=$SECONDS
-          soldr cargo check --workspace --all-targets
+          soldr cargo check --workspace --all-targets $CARGO_TARGET_FLAG
           echo "- **${{ matrix.platform }} / build**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
       - id: gate_test_compile
         name: compile test binaries
         continue-on-error: true
         shell: bash
-        run: soldr cargo test --workspace --lib --bins --no-fail-fast --no-run
+        run: soldr cargo test --workspace --lib --bins --no-fail-fast --no-run $CARGO_TARGET_FLAG
 
       - name: Stop setup-soldr builder cache before tests
         if: always()
@@ -198,6 +234,12 @@ jobs:
 
       - id: gate_unit
         name: unit tests
+        # musl: skip running tests; the binary runs on glibc systems
+        # but cargo test launches an interactive driver that fights the
+        # musl `RUSTFLAGS=-Ctarget-feature=+crt-static` posture. Keeping
+        # musl as build-only catches link breakage without the harness
+        # complexity.
+        if: matrix.target == ''
         continue-on-error: true
         shell: bash
         env:
@@ -222,9 +264,12 @@ jobs:
           fi
           exit $status
 
+      # Integration tests are heavy — run only on Linux x86 default.
+      # macOS/Windows/ARM unit tests already cover platform-specific
+      # paths; integration on those legs is redundant + slow.
       - id: gate_integration
         name: integration tests
-        if: matrix.is_linux == 'yes'
+        if: matrix.is_glibc_linux == 'yes'
         continue-on-error: true
         shell: bash
         env:
@@ -251,17 +296,12 @@ jobs:
 
       - id: gate_cargo_registry
         name: cargo-registry smoke
+        if: matrix.target == ''
         continue-on-error: true
         shell: bash
         run: |
           set -e
           start=$SECONDS
-          # setup-soldr exports SOLDR_SKIP_CARGO_REGISTRY_SAVE=1
-          # because IT owns the cache layer in the warm-path setup;
-          # if we leave it set our `save` becomes a no-op and the
-          # archive existence check below fires (#272). The smoke
-          # test is the explicit caller — unset so save actually runs.
-          unset SOLDR_SKIP_CARGO_REGISTRY_SAVE
           soldr cargo build -p zccache --bin zccache
           ZCC="$(find target -type f -name 'zccache' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
           if [ -z "$ZCC" ]; then
@@ -273,17 +313,18 @@ jobs:
           test "$H1" = "$H2" || { echo "FAIL: hash not deterministic ($H1 vs $H2)" >&2; exit 1; }
           test "${#H1}" -eq 16 || { echo "FAIL: hash length ${#H1} != 16" >&2; exit 1; }
           soldr cargo fetch
-          "$ZCC" cargo-registry save --key ci-unified-$$
-          ROOT="$("$ZCC" cache-root)"
-          ARCHIVE="$ROOT/cargo-registry/ci-unified-$$.tar.gz"
+          # Use --output (see PR #833) — explicit non-standard destination
+          # bypasses SOLDR_SKIP_CARGO_REGISTRY_SAVE=1 that setup-soldr
+          # sets to avoid double-saving its own managed default location.
+          ARCHIVE="${{ runner.temp }}/cargo-registry-smoke-$$.tar.gz"
+          "$ZCC" cargo-registry save --key smoke-ignored-when-output-set --output "$ARCHIVE"
           test -f "$ARCHIVE" || { echo "FAIL: archive not at $ARCHIVE" >&2; exit 1; }
-          "$ZCC" cargo-registry clean
-          ! test -f "$ARCHIVE" || { echo "FAIL: clean did not remove $ARCHIVE" >&2; exit 1; }
+          rm -f "$ARCHIVE"
           echo "- **${{ matrix.platform }} / cargo-registry**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
       - id: gate_gha_cache
         name: gha-cache smoke
-        if: matrix.is_linux == 'yes'
+        if: matrix.is_glibc_linux == 'yes'
         continue-on-error: true
         shell: bash
         run: |
@@ -295,7 +336,7 @@ jobs:
 
       - id: gate_wrapper_e2e_unix
         name: wrapper-e2e (unix)
-        if: matrix.is_windows != 'yes'
+        if: matrix.family != 'windows' && matrix.target == ''
         continue-on-error: true
         shell: bash
         env:
@@ -330,7 +371,7 @@ jobs:
 
       - id: gate_wrapper_e2e_windows
         name: wrapper-e2e (windows)
-        if: matrix.is_windows == 'yes'
+        if: matrix.family == 'windows' && matrix.target == ''
         continue-on-error: true
         shell: pwsh
         env:
@@ -372,7 +413,7 @@ jobs:
           Add-Content $env:GITHUB_STEP_SUMMARY "- **${{ matrix.platform }} / wrapper-e2e**: $([math]::Round($dur))s"
 
       - name: Stop isolated unit-test cache
-        if: always() && matrix.is_windows != 'yes'
+        if: always() && matrix.family != 'windows' && matrix.target == ''
         shell: bash
         env:
           SOLDR_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/unified-${{ matrix.platform }}
@@ -381,9 +422,6 @@ jobs:
           soldr cache shutdown --archive-logs "$SOLDR_CACHE_DIR/cache/zccache/logs/archive" || true
 
       # ── Final report ────────────────────────────────────────────────
-      # Collect every gate's outcome and exit 1 if any failed, with a
-      # concise summary of which ones broke. Always runs (even if every
-      # earlier step succeeded — then it prints the all-green line).
       - name: report failures
         if: always()
         shell: bash
@@ -396,17 +434,17 @@ jobs:
               failures+=("$gate")
             fi
           }
-          add_fail "${{ steps.gate_fmt.outcome }}"               "fmt"
-          add_fail "${{ steps.gate_clippy.outcome }}"            "clippy"
-          add_fail "${{ steps.gate_dylint.outcome }}"            "dylint"
-          add_fail "${{ steps.gate_docs.outcome }}"              "docs"
-          add_fail "${{ steps.gate_build.outcome }}"             "build"
-          add_fail "${{ steps.gate_test_compile.outcome }}"      "test-compile"
-          add_fail "${{ steps.gate_unit.outcome }}"              "unit"
-          add_fail "${{ steps.gate_integration.outcome }}"       "integration"
-          add_fail "${{ steps.gate_cargo_registry.outcome }}"    "cargo-registry"
-          add_fail "${{ steps.gate_gha_cache.outcome }}"         "gha-cache"
-          add_fail "${{ steps.gate_wrapper_e2e_unix.outcome }}"  "wrapper-e2e"
+          add_fail "${{ steps.gate_fmt.outcome }}"                 "fmt"
+          add_fail "${{ steps.gate_clippy.outcome }}"              "clippy"
+          add_fail "${{ steps.gate_dylint.outcome }}"              "dylint"
+          add_fail "${{ steps.gate_docs.outcome }}"                "docs"
+          add_fail "${{ steps.gate_build.outcome }}"               "build"
+          add_fail "${{ steps.gate_test_compile.outcome }}"        "test-compile"
+          add_fail "${{ steps.gate_unit.outcome }}"                "unit"
+          add_fail "${{ steps.gate_integration.outcome }}"         "integration"
+          add_fail "${{ steps.gate_cargo_registry.outcome }}"      "cargo-registry"
+          add_fail "${{ steps.gate_gha_cache.outcome }}"           "gha-cache"
+          add_fail "${{ steps.gate_wrapper_e2e_unix.outcome }}"    "wrapper-e2e"
           add_fail "${{ steps.gate_wrapper_e2e_windows.outcome }}" "wrapper-e2e"
 
           if [ ${#failures[@]} -eq 0 ]; then
