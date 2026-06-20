@@ -171,9 +171,15 @@ jobs:
           soldr cargo doc --workspace --no-deps
           echo "- **${{ matrix.platform }} / docs**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
+      # Build is the only NON-continue-on-error gate. If `cargo check`
+      # fails, every downstream gate (clippy already ran, but unit
+      # tests / integration / wrapper-e2e / cargo-registry / gha-cache
+      # / docs) would produce noise rather than signal — they all
+      # require the workspace to compile. So we halt the job here and
+      # the final `report failures` step (`if: always()`) reports
+      # `build` as the single broken gate.
       - id: gate_build
         name: build
-        continue-on-error: true
         shell: bash
         run: |
           start=$SECONDS
