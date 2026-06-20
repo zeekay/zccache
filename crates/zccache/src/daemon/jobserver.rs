@@ -32,7 +32,7 @@
 //!   a follow-up sub-task. The Windows form of the protocol is
 //!   `--jobserver-auth=fifo:<name>` per GNU make 4.4+; the
 //!   implementation requires a server-side message loop that's its own
-//!   focused review. Until that lands, [`JobserverPool::create`]
+//!   focused review. Until that lands, `JobserverPool::create`
 //!   returns an error on Windows; callers fall back to today's
 //!   uncapped behavior.
 
