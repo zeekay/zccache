@@ -57,7 +57,15 @@ ONEOF_OPEN_RE = re.compile(r"^\s*oneof\s+([A-Za-z_]\w*)\s*\{\s*$")
 FIELD_RE = re.compile(
     r"""^\s*
         (?:(?P<label>optional|repeated)\s+)?
-        (?P<type>[A-Za-z_][\w.]*)\s+
+        # `map<K, V>` must come first so the identifier branch does
+        # not eat the bare keyword. Both K and V are restricted to the
+        # protobuf scalar types we use today (uint{32,64}, int{32,64},
+        # string, bool); extend if a future proto needs more.
+        (?P<type>
+            map<\s*[A-Za-z_]\w*\s*,\s*[A-Za-z_][\w.]*\s*>
+            |
+            [A-Za-z_][\w.]*
+        )\s+
         (?P<name>[A-Za-z_]\w*)\s*=\s*
         (?P<number>\d+)
         \s*(?:\[[^]]*\])?

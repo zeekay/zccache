@@ -129,12 +129,24 @@ struct PosixPipe {
 #[cfg(unix)]
 impl PosixPipe {
     fn create(capacity: usize) -> std::io::Result<Self> {
-        // `pipe2(O_CLOEXEC)` keeps these FDs out of unrelated forks.
-        // The daemon explicitly clears CLOEXEC at spawn time for the
-        // children that should inherit (sub-task #816's responsibility);
-        // by default, descendants are isolated.
+        // Create a pipe with both ends marked CLOEXEC so the FDs do not
+        // leak into unrelated forks. The daemon explicitly clears
+        // CLOEXEC at spawn time for children that should inherit
+        // (sub-task #816's responsibility); by default, descendants are
+        // isolated.
+        //
+        // On Linux/BSD/Solarish we use `pipe2(O_CLOEXEC)` — atomic.
+        // On macOS the libc crate exposes no `pipe2`, so we fall back
+        // to the two-call `pipe()` + per-FD `fcntl(F_SETFD, FD_CLOEXEC)`
+        // dance. There is a tiny race between the `pipe()` return and
+        // the two `fcntl` calls during which a concurrent `fork()`
+        // could inherit either FD; the daemon's process model does not
+        // spawn worker forks before this pool is constructed, so the
+        // race is closed in practice. If that invariant changes,
+        // switch to a guarded spawn lock or use the `nix` crate's
+        // `pipe2` wrapper.
         let mut fds = [0_i32; 2];
-        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        let rc = unsafe { Self::sys_pipe(&mut fds) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -154,17 +166,58 @@ impl PosixPipe {
             return Err(std::io::Error::last_os_error());
         }
         if (written as usize) != bytes.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "jobserver pipe priming wrote {} of {} bytes",
-                    written,
-                    bytes.len()
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "jobserver pipe priming wrote {} of {} bytes",
+                written,
+                bytes.len()
+            )));
         }
 
         Ok(Self { read, write })
+    }
+
+    /// Platform-shimmed pipe creation. Returns 0 on success and -1 on
+    /// failure (setting errno via the underlying syscalls).
+    ///
+    /// SAFETY: `fds` must point at a writable `[i32; 2]`.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "illumos",
+        target_os = "solaris",
+        target_os = "redox",
+        target_os = "emscripten",
+    ))]
+    unsafe fn sys_pipe(fds: &mut [i32; 2]) -> libc::c_int {
+        libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC)
+    }
+
+    /// macOS + iOS fallback: `pipe()` + per-FD `fcntl(F_SETFD, FD_CLOEXEC)`.
+    /// See the doc comment on `create` for the race-window rationale.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    unsafe fn sys_pipe(fds: &mut [i32; 2]) -> libc::c_int {
+        let rc = libc::pipe(fds.as_mut_ptr());
+        if rc != 0 {
+            return rc;
+        }
+        for &fd in fds.iter() {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags == -1 {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+                return -1;
+            }
+            if libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1 {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+                return -1;
+            }
+        }
+        0
     }
 
     fn read_fd(&self) -> RawFd {
