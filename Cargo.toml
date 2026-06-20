@@ -59,7 +59,7 @@ sevenz-rust = "0.6"
 rkyv = { version = "0.7", features = ["validation"] }
 tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 mimalloc = "0.1"
-running-process = { version = "4.4.0", default-features = false, features = ["client-async"] }
+running-process = { version = "4.5.5", default-features = false, features = ["client-async"] }
 zccache = { path = "crates/zccache" }
 zccache-watcher = { path = "crates/zccache-watcher" }
 zccache-cli = { path = "crates/zccache-cli" }
@@ -70,13 +70,17 @@ zccache-fingerprint = { path = "crates/zccache-fingerprint" }
 # 2. Report start_read failure (watcher silently dying) as error
 [patch.crates-io]
 notify = { path = "vendor/notify" }
-# Spike for #777: pin to the running-process commit that landed the
-# broker-v2 proto types (zackees/running-process PR #484, slice 1 of
-# zackees/running-process#483). Reproducible for any contributor —
-# no local path required and no dependency on a published crates.io
-# release of that revision. Remove this patch once running-process
-# publishes a version that exposes `broker::protocol_v2`.
-running-process = { git = "https://github.com/zackees/running-process", rev = "e64f6ff5de860499dc66f2e6fbf3536859ff4d1a" }
+# Cross-repo dev pin per zccache#842 (broker-v2 burn-down): the
+# upstream issues running-process#517 / #518 / #519 are being fixed
+# locally in `.extern-repos/running-process` so zccache can compile +
+# test against the patched copy before upstream cuts a new release.
+# Uses a file:// git URL so running-process keeps its own workspace
+# context (a path-dep would collapse it into zccache's workspace and
+# miss inherited deps like `rusqlite`). Iteration cycle: edit in
+# `.extern-repos/running-process`, commit there, then
+# `soldr cargo update -p running-process` in zccache. Revert to the
+# published version (4.5.6+) once the fixes ship upstream.
+running-process = { git = "file:///C:/Users/niteris/dev/zccache/.extern-repos/running-process" }
 
 [workspace.metadata.dylint]
 libraries = [{ path = "dylints/*" }]
