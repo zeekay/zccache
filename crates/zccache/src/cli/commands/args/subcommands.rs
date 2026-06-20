@@ -165,12 +165,21 @@ pub(crate) enum DefenderExclusionsCommands {
 pub(crate) enum CargoRegistryCommands {
     /// Save cargo registry to a compressed archive.
     Save {
-        /// Cache key (used as filename).
+        /// Cache key (used as filename when `--output` is not set).
         #[arg(long)]
         key: String,
         /// Cargo home directory (default: ~/.cargo or $CARGO_HOME).
         #[arg(long)]
         cargo_home: Option<String>,
+        /// Explicit output archive path. When supplied, the archive is
+        /// written exactly here instead of the default
+        /// `<cache-root>/cargo-registry/<key>.tar.gz`, AND the
+        /// `SOLDR_SKIP_CARGO_REGISTRY_SAVE=1` no-op is bypassed —
+        /// the caller has chosen a non-standard destination, so the
+        /// setup-soldr coordination flag (which exists to avoid
+        /// double-saving the standard location) does not apply.
+        #[arg(long)]
+        output: Option<String>,
     },
     /// Restore cargo registry from a compressed archive.
     Restore {

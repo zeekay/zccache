@@ -310,9 +310,15 @@ fn dispatch(command: Commands, global_strict_paths: Option<&str>) -> ExitCode {
             }
         }
         Commands::CargoRegistry { action } => match action {
-            CargoRegistryCommands::Save { key, cargo_home } => {
-                cargo_registry::cmd_cargo_registry_save(&key, cargo_home.as_deref())
-            }
+            CargoRegistryCommands::Save {
+                key,
+                cargo_home,
+                output,
+            } => cargo_registry::cmd_cargo_registry_save(
+                &key,
+                cargo_home.as_deref(),
+                output.as_deref(),
+            ),
             CargoRegistryCommands::Restore { key, cargo_home } => {
                 cargo_registry::cmd_cargo_registry_restore(&key, cargo_home.as_deref())
             }
