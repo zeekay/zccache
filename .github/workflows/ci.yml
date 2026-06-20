@@ -14,6 +14,7 @@ name: CI
 #   linux-x86          ubuntu-latest        (default; x86_64-unknown-linux-gnu)
 #   linux-x86-musl     ubuntu-latest        x86_64-unknown-linux-musl
 #   linux-arm          ubuntu-24.04-arm     (default; aarch64-unknown-linux-gnu)
+#   linux-arm-musl     ubuntu-24.04-arm     aarch64-unknown-linux-musl
 #   windows-x86        windows-latest       (default; x86_64-pc-windows-msvc)
 #   windows-arm        windows-11-arm       (default; aarch64-pc-windows-msvc)
 #   mac-x86            macos-13             (default; x86_64-apple-darwin)
@@ -85,6 +86,11 @@ jobs:
             family: linux
             target: ""
             is_glibc_linux: ""        # ARM Linux runs tests but is_glibc_linux gates only docs+integration+gha-cache (Linux x86 only)
+          - platform: linux-arm-musl
+            os: ubuntu-24.04-arm
+            family: linux
+            target: "aarch64-unknown-linux-musl"
+            is_glibc_linux: ""        # build-only on musl (same posture as linux-x86-musl)
           # ── Windows ──────────────────────────────────────────────
           - platform: windows-x86
             os: windows-latest
@@ -128,12 +134,14 @@ jobs:
           cargo-dylint-version: 5.0.0
           dylint-link-version: 5.0.0
 
-      # musl target needs the standard library AND a musl-aware linker.
-      # rustup adds the stdlib component; apt provides musl-tools.
+      # musl targets need the standard library AND a musl-aware linker.
+      # rustup adds the stdlib component; apt provides musl-tools (x86)
+      # or cross-compile-aware tools (aarch64). The `if` covers both
+      # x86_64-unknown-linux-musl and aarch64-unknown-linux-musl.
       - name: Install musl toolchain
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: endsWith(matrix.target, '-unknown-linux-musl')
         run: |
-          soldr rustup target add x86_64-unknown-linux-musl
+          soldr rustup target add ${{ matrix.target }}
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
 
