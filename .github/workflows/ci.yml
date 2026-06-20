@@ -1,33 +1,28 @@
 name: CI
 
-# Single CI workflow: one job per platform, every gate runs even if
-# earlier ones fail. The final "report" step collects every gate's
-# outcome and fails the job with a list of which gates actually broke,
-# so a single CI cycle surfaces ALL failures at once instead of stopping
-# at the first one. Build is the one exception — if `cargo check` fails
-# everything downstream is meaningless, so we halt early.
+# One job per platform; every gate is a step that delegates to
+# `ci.py <gate>`. Logic lives in Python (`ci/gates/*.py`); YAML is the
+# thin orchestration layer it should always have been.
 #
-# Platform matrix (one runner per row):
+# Gates inherit continue-past-failures semantics from the action's
+# `continue-on-error`. The final `ci.py all` step is NOT used here —
+# we expand to one step per gate so step-level UI in the GHA web view
+# still tells the developer which gate fired. For local repro
+# (laptop, fix-it loop), `uv run --script ci.py all` runs everything
+# with the same continue-past-failures accumulator.
+#
+# Platform matrix:
 #
 #   platform           runner               target triple (if non-default)
 #   ---------------    -------------------- ------------------------------
-#   linux-x86          ubuntu-latest        (default; x86_64-unknown-linux-gnu)
+#   linux-x86          ubuntu-latest        default
 #   linux-x86-musl     ubuntu-latest        x86_64-unknown-linux-musl
-#   linux-arm          ubuntu-24.04-arm     (default; aarch64-unknown-linux-gnu)
+#   linux-arm          ubuntu-24.04-arm     default
 #   linux-arm-musl     ubuntu-24.04-arm     aarch64-unknown-linux-musl
-#   windows-x86        windows-latest       (default; x86_64-pc-windows-msvc)
-#   windows-arm        windows-11-arm       (default; aarch64-pc-windows-msvc)
-#   mac-x86            macos-13             (default; x86_64-apple-darwin)
-#   mac-arm            macos-latest         (default; aarch64-apple-darwin)
-#
-# Workflows NOT folded here (distinct purposes, not gates):
-#   release-auto.yml      PyPI + crates.io + GH release
-#   perf-*.yml, bench-*   perf regression cluster
-#   build.yml             distribution binaries (workflow_dispatch)
-#   coverage.yml          coverage builds (separate RUSTFLAGS)
-#   cache-cleanup.yml     scheduled housekeeping
-#   feature-matrix-check  feature flag combinations
-#   wire-stability.yml    IPC protocol stability
+#   windows-x86        windows-latest       default
+#   windows-arm        windows-11-arm       default
+#   mac-x86            macos-13             default
+#   mac-arm            macos-latest         default
 
 on:
   push:
@@ -70,51 +65,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Linux ────────────────────────────────────────────────
           - platform: linux-x86
             os: ubuntu-latest
-            family: linux
             target: ""
-            is_glibc_linux: "yes"
           - platform: linux-x86-musl
             os: ubuntu-latest
-            family: linux
             target: "x86_64-unknown-linux-musl"
-            is_glibc_linux: ""        # musl tests need separate harness
           - platform: linux-arm
             os: ubuntu-24.04-arm
-            family: linux
             target: ""
-            is_glibc_linux: ""        # ARM Linux runs tests but is_glibc_linux gates only docs+integration+gha-cache (Linux x86 only)
           - platform: linux-arm-musl
             os: ubuntu-24.04-arm
-            family: linux
             target: "aarch64-unknown-linux-musl"
-            is_glibc_linux: ""        # build-only on musl (same posture as linux-x86-musl)
-          # ── Windows ──────────────────────────────────────────────
           - platform: windows-x86
             os: windows-latest
-            family: windows
             target: ""
-            is_glibc_linux: ""
           - platform: windows-arm
             os: windows-11-arm
-            family: windows
             target: ""
-            is_glibc_linux: ""
-          # ── macOS ────────────────────────────────────────────────
           - platform: mac-x86
             os: macos-13
-            family: macos
             target: ""
-            is_glibc_linux: ""
           - platform: mac-arm
             os: macos-latest
-            family: macos
             target: ""
-            is_glibc_linux: ""
     steps:
       - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "latest"
 
       - id: setup-soldr
         uses: zackees/setup-soldr@v0.9.62
@@ -134,10 +114,6 @@ jobs:
           cargo-dylint-version: 5.0.0
           dylint-link-version: 5.0.0
 
-      # musl targets need the standard library AND a musl-aware linker.
-      # rustup adds the stdlib component; apt provides musl-tools (x86)
-      # or cross-compile-aware tools (aarch64). The `if` covers both
-      # x86_64-unknown-linux-musl and aarch64-unknown-linux-musl.
       - name: Install musl toolchain
         if: endsWith(matrix.target, '-unknown-linux-musl')
         run: |
@@ -145,9 +121,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
 
-      # Helper exported for every subsequent step that calls cargo —
-      # adds `--target <triple>` only when the matrix entry sets one.
-      - name: Export target flag
+      - name: Export gate env
         shell: bash
         run: |
           if [ -n "${{ matrix.target }}" ]; then
@@ -155,86 +129,45 @@ jobs:
           else
             echo "CARGO_TARGET_FLAG=" >> "$GITHUB_ENV"
           fi
+          # Pass the dylint-cache-hit through to the dylint gate so it
+          # can skip the install steps when setup-soldr already restored
+          # the driver.
+          echo "SETUP_SOLDR_DYLINT_CACHE_HIT=${{ steps.setup-soldr.outputs.dylint-cache-hit }}" >> "$GITHUB_ENV"
 
       # ── Gates ──────────────────────────────────────────────────────
-      # Every gate has `continue-on-error: true` so the job runs all of
-      # them in one cycle. Exception: `gate_build` halts early since
-      # nothing downstream produces signal without a compiled tree.
+      # Each gate is `uv run --script ci.py <gate>` so the actual logic
+      # lives in `ci/gates/*.py`. `continue-on-error: true` on every
+      # gate except build; the final `report failures` step aggregates.
 
       - id: gate_fmt
         name: fmt
         continue-on-error: true
-        shell: bash
-        run: |
-          start=$SECONDS
-          soldr cargo fmt --all -- --check
-          echo "- **${{ matrix.platform }} / fmt**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+        run: uv run --script ci.py fmt
 
       - id: gate_clippy
         name: clippy
         continue-on-error: true
-        shell: bash
-        run: |
-          start=$SECONDS
-          soldr cargo clippy --workspace --all-targets $CARGO_TARGET_FLAG -- -D warnings
-          echo "- **${{ matrix.platform }} / clippy**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+        run: uv run --script ci.py clippy
 
-      # dylint: unix-only (the nightly driver build assumes a Unix
-      # rustup layout). Skip on Windows + the musl matrix entry (dylint
-      # would re-run identically to linux-x86 which is wasteful).
       - id: gate_dylint
         name: dylint
-        if: matrix.family != 'windows' && matrix.target == ''
         continue-on-error: true
-        shell: bash
-        run: |
-          start=$SECONDS
-          set -e
-          soldr rustup toolchain install nightly-2026-03-26 \
-            --component llvm-tools-preview --component rust-src \
-            --component rustc-dev --profile minimal
-          if [ "${{ steps.setup-soldr.outputs.dylint-cache-hit }}" != "true" ]; then
-            soldr cargo install cargo-dylint --version 5.0.0 --locked
-            soldr cargo install dylint-link  --version 5.0.0 --locked
-            python3 ci/build_dylint_driver.py
-          fi
-          export PATH="${CARGO_HOME}/bin:${PATH}"
-          soldr cargo fmt --manifest-path dylints/ban_std_pathbuf/Cargo.toml --all -- --check
-          soldr cargo fmt --manifest-path dylints/ban_unrooted_tempdir/Cargo.toml --all -- --check
-          soldr rustup run nightly-2026-03-26 cargo test --manifest-path dylints/ban_std_pathbuf/Cargo.toml
-          soldr rustup run nightly-2026-03-26 cargo test --manifest-path dylints/ban_unrooted_tempdir/Cargo.toml
-          python3 -m ci.lint --dylint-only
-          echo "- **${{ matrix.platform }} / dylint**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+        run: uv run --script ci.py dylint
 
-      # docs: only one platform needs to validate intra-doc links.
-      # Linux x86 default-target is the canonical home.
       - id: gate_docs
         name: docs
-        if: matrix.is_glibc_linux == 'yes'
         continue-on-error: true
-        shell: bash
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-        run: |
-          start=$SECONDS
-          soldr cargo doc --workspace --no-deps
-          echo "- **${{ matrix.platform }} / docs**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+        run: uv run --script ci.py docs
 
-      # Build is the one fatal gate — if `cargo check` fails every
-      # downstream gate (test/integration/etc.) is meaningless.
+      # Build is the one fatal gate — see `FATAL_GATES` in ci.gates.
       - id: gate_build
         name: build
-        shell: bash
-        run: |
-          start=$SECONDS
-          soldr cargo check --workspace --all-targets $CARGO_TARGET_FLAG
-          echo "- **${{ matrix.platform }} / build**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+        run: uv run --script ci.py build
 
       - id: gate_test_compile
         name: compile test binaries
         continue-on-error: true
-        shell: bash
-        run: soldr cargo test --workspace --lib --bins --no-fail-fast --no-run $CARGO_TARGET_FLAG
+        run: uv run --script ci.py test-compile
 
       - name: Stop setup-soldr builder cache before tests
         if: always()
@@ -242,268 +175,38 @@ jobs:
 
       - id: gate_unit
         name: unit tests
-        # musl: skip running tests; the binary runs on glibc systems
-        # but cargo test launches an interactive driver that fights the
-        # musl `RUSTFLAGS=-Ctarget-feature=+crt-static` posture. Keeping
-        # musl as build-only catches link breakage without the harness
-        # complexity.
-        if: matrix.target == ''
         continue-on-error: true
-        shell: bash
-        env:
-          SOLDR_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/unified-${{ matrix.platform }}
-          SOLDR_CACHE_LIFECYCLE: command
-          SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
-        run: |
-          set +e
-          unset ZCCACHE_CACHE_DIR
-          mkdir -p "$SOLDR_CACHE_DIR"
-          start=$SECONDS
-          soldr cargo test --workspace --lib --bins --no-fail-fast 2>&1 | tee unit-output.txt
-          status=${PIPESTATUS[0]}
-          echo "- **${{ matrix.platform }} / unit**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
-          if [ $status -ne 0 ]; then
-            {
-              echo '## Unit test failures (${{ matrix.platform }})'
-              echo '```'
-              awk '/^failures:$/,/^test result:/' unit-output.txt
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-          exit $status
+        run: uv run --script ci.py unit
 
-      # Integration tests are heavy — run only on Linux x86 default.
-      # macOS/Windows/ARM unit tests already cover platform-specific
-      # paths; integration on those legs is redundant + slow.
       - id: gate_integration
         name: integration tests
-        if: matrix.is_glibc_linux == 'yes'
         continue-on-error: true
-        shell: bash
-        env:
-          SOLDR_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/integration-unified
-          SOLDR_CACHE_LIFECYCLE: command
-          SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
-        run: |
-          set +e
-          unset ZCCACHE_CACHE_DIR
-          mkdir -p "$SOLDR_CACHE_DIR"
-          start=$SECONDS
-          soldr cargo test --workspace --no-fail-fast 2>&1 | tee integration-output.txt
-          status=${PIPESTATUS[0]}
-          echo "- **${{ matrix.platform }} / integration**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
-          if [ $status -ne 0 ]; then
-            {
-              echo '## Integration test failures'
-              echo '```'
-              awk '/^failures:$/,/^test result:/' integration-output.txt
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-          exit $status
+        run: uv run --script ci.py integration
 
       - id: gate_cargo_registry
         name: cargo-registry smoke
-        if: matrix.target == ''
         continue-on-error: true
-        shell: bash
-        run: |
-          set -e
-          start=$SECONDS
-          soldr cargo build -p zccache --bin zccache
-          ZCC="$(find target -type f -name 'zccache' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
-          if [ -z "$ZCC" ]; then
-            ZCC="$(find target -type f -name 'zccache.exe' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
-          fi
-          test -x "$ZCC" || { echo "FAIL: zccache binary not found under target/" >&2; exit 1; }
-          H1=$("$ZCC" cargo-registry hash --lockfile Cargo.lock)
-          H2=$("$ZCC" cargo-registry hash --lockfile Cargo.lock)
-          test "$H1" = "$H2" || { echo "FAIL: hash not deterministic ($H1 vs $H2)" >&2; exit 1; }
-          test "${#H1}" -eq 16 || { echo "FAIL: hash length ${#H1} != 16" >&2; exit 1; }
-          soldr cargo fetch
-          # Use --output (see PR #833) — explicit non-standard destination
-          # bypasses SOLDR_SKIP_CARGO_REGISTRY_SAVE=1 that setup-soldr
-          # sets to avoid double-saving its own managed default location.
-          ARCHIVE="${{ runner.temp }}/cargo-registry-smoke-$$.tar.gz"
-          "$ZCC" cargo-registry save --key smoke-ignored-when-output-set --output "$ARCHIVE"
-          test -f "$ARCHIVE" || { echo "FAIL: archive not at $ARCHIVE" >&2; exit 1; }
-          rm -f "$ARCHIVE"
-          echo "- **${{ matrix.platform }} / cargo-registry**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+        run: uv run --script ci.py cargo-registry
 
       - id: gate_gha_cache
         name: gha-cache smoke
-        if: matrix.is_glibc_linux == 'yes'
         continue-on-error: true
-        shell: bash
-        run: |
-          start=$SECONDS
-          ZCC="$(find target -type f -name 'zccache' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
-          OUTPUT=$("$ZCC" gha-cache status 2>&1 || true)
-          echo "gha-cache status: $OUTPUT"
-          echo "- **${{ matrix.platform }} / gha-cache**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+        run: uv run --script ci.py gha-cache
 
-      # ── action.yml self-test (cheap, replaces test-action.yml) ──────
-      # `action.yml` (the composite GitHub Action at zackees/zccache@v1)
-      # invokes the zccache binary via a fixed CLI surface: `--version`,
-      # `start`, `stop`, `cache-root`, plus the `cargo-registry` and
-      # `gha-cache` subcommand families. If that surface drifts, every
-      # downstream consumer of the published action breaks at runtime.
-      #
-      # The deleted test-action.yml ran the action end-to-end (uses: ./)
-      # which re-built zccache from source — wasted minutes per platform.
-      # We already built the binary in earlier gates, so the meaningful
-      # contract here is "does action.yml's shell call against an API
-      # this binary actually exposes?" Assert against `--help` text +
-      # action.yml's structural shape; if either drifts the gate fires.
       - id: gate_action_yaml
-        name: action.yml structural validity
-        if: matrix.is_glibc_linux == 'yes'
+        name: action.yml structural
         continue-on-error: true
-        shell: bash
-        run: |
-          start=$SECONDS
-          python3 - <<'PY'
-          import sys
-          import yaml
-          with open('action.yml') as f:
-              a = yaml.safe_load(f)
-          assert a.get('runs', {}).get('using') == 'composite', \
-              "action.yml must declare `using: composite`"
-          ins = a.get('inputs', {})
-          for required in ('cache-cargo-registry', 'cache-compilation',
-                           'cache-target', 'zccache-version', 'shared-key'):
-              assert required in ins, f"action.yml missing input `{required}`"
-          # action/cleanup must also be a valid composite action.
-          with open('action/cleanup/action.yml') as f:
-              c = yaml.safe_load(f)
-          assert c.get('runs', {}).get('using') == 'composite', \
-              "action/cleanup must declare `using: composite`"
-          print("action.yml + action/cleanup/action.yml structurally valid")
-          PY
-          echo "- **${{ matrix.platform }} / action-yaml**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+        run: uv run --script ci.py action-yaml
 
       - id: gate_action_surface
-        name: action.yml CLI surface contract
-        if: matrix.target == ''
+        name: action surface contract
         continue-on-error: true
-        shell: bash
-        run: |
-          start=$SECONDS
-          set -e
-          ZCC="$(find target -type f -name 'zccache' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
-          if [ -z "$ZCC" ]; then
-            ZCC="$(find target -type f -name 'zccache.exe' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
-          fi
-          test -x "$ZCC" || { echo "FAIL: no zccache binary"; exit 1; }
+        run: uv run --script ci.py action-surface
 
-          # The action.yml install-validation does:
-          #   zccache --version | grep -Eq '^zccache [0-9]'
-          # Lock that contract.
-          "$ZCC" --version 2>&1 | grep -Eq '^zccache [0-9]' || {
-            echo "FAIL: --version output drifted from action.yml's regex"; exit 1; }
-
-          # Subcommands the action's setup/cleanup shell snippets call:
-          for sub in start stop cache-root cargo-registry gha-cache; do
-            "$ZCC" --help 2>&1 | grep -qE "^[[:space:]]+$sub" || {
-              echo "FAIL: subcommand '$sub' missing from --help — action.yml's"
-              echo "  shell scripts reference it; downstream consumers would break."
-              exit 1; }
-          done
-
-          # action.yml also calls `zccache start --foreground=false` style
-          # daemon spawn in some paths — make sure `start` exits cleanly
-          # so a consumer's first job doesn't hang.
-          ZCCACHE_CACHE_DIR="$(mktemp -d)" "$ZCC" start && \
-            ZCCACHE_CACHE_DIR="$(mktemp -d)" "$ZCC" stop || true
-
-          echo "- **${{ matrix.platform }} / action-surface**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
-
-      - id: gate_wrapper_e2e_unix
-        name: wrapper-e2e (unix)
-        if: matrix.family != 'windows' && matrix.target == ''
+      - id: gate_wrapper_e2e
+        name: wrapper-e2e
         continue-on-error: true
-        shell: bash
-        env:
-          SOLDR_CACHE_LIFECYCLE: command
-          SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
-          ZCCACHE_CACHE_DIR: ${{ runner.temp }}/wrapper-e2e-zccache
-        run: |
-          set -e
-          start=$SECONDS
-          install_dir="$HOME/.local/bin"
-          mkdir -p "$install_dir"
-          ZCC="$(find target -type f -name 'zccache' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
-          ZCCD="$(find target -type f -name 'zccache-daemon' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
-          if [ -z "$ZCCD" ]; then
-            soldr cargo build -p zccache --bin zccache-daemon
-            ZCCD="$(find target -type f -name 'zccache-daemon' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
-          fi
-          install -m755 "$ZCC"  "$install_dir/zccache"
-          install -m755 "$ZCCD" "$install_dir/zccache-daemon"
-          export PATH="$install_dir:$PATH"
-          export SOLDR_RUSTC_WRAPPER="$install_dir/zccache"
-          cd "$(mktemp -d)"
-          soldr cargo new --lib hello
-          cd hello
-          soldr cargo add serde --features derive
-          soldr cargo build --verbose 2>&1 | tee build.log
-          grep -F 'zccache ' build.log
-          effective_root="$(zccache cache-root)"
-          test -d "$effective_root/logs"
-          zccache stop || true
-          echo "- **${{ matrix.platform }} / wrapper-e2e**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
-
-      - id: gate_wrapper_e2e_windows
-        name: wrapper-e2e (windows)
-        if: matrix.family == 'windows' && matrix.target == ''
-        continue-on-error: true
-        shell: pwsh
-        env:
-          SOLDR_CACHE_LIFECYCLE: command
-          SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
-          ZCCACHE_CACHE_DIR: ${{ runner.temp }}/wrapper-e2e-zccache
-        run: |
-          $start = Get-Date
-          $installDir = "$env:USERPROFILE\.local\bin"
-          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-          $zcc = Get-ChildItem -Recurse target -Filter zccache.exe -ErrorAction SilentlyContinue |
-                 Where-Object { $_.FullName -match '\\debug\\' -and $_.FullName -notmatch '\\deps\\' -and $_.FullName -notmatch '\\build\\' } |
-                 Select-Object -First 1
-          if (-not $zcc) {
-            soldr cargo build -p zccache --bin zccache
-            $zcc = Get-ChildItem -Recurse target -Filter zccache.exe -ErrorAction SilentlyContinue |
-                   Where-Object { $_.FullName -match '\\debug\\' -and $_.FullName -notmatch '\\deps\\' -and $_.FullName -notmatch '\\build\\' } |
-                   Select-Object -First 1
-          }
-          soldr cargo build -p zccache --bin zccache-daemon
-          $zccd = Get-ChildItem -Recurse target -Filter zccache-daemon.exe -ErrorAction SilentlyContinue |
-                  Where-Object { $_.FullName -match '\\debug\\' -and $_.FullName -notmatch '\\deps\\' -and $_.FullName -notmatch '\\build\\' } |
-                  Select-Object -First 1
-          Copy-Item $zcc.FullName  "$installDir\zccache.exe"        -Force
-          Copy-Item $zccd.FullName "$installDir\zccache-daemon.exe" -Force
-          $env:PATH = "$installDir;$env:PATH"
-          $env:SOLDR_RUSTC_WRAPPER = "$installDir\zccache.exe"
-          $tmp = New-Item -ItemType Directory -Path "$env:TEMP/zc-e2e-$(Get-Random)" -Force
-          Set-Location $tmp
-          soldr cargo new --lib hello
-          Set-Location hello
-          soldr cargo add serde --features derive
-          soldr cargo build --verbose 2>&1 | Tee-Object -FilePath build.log
-          if (-not (Select-String -Path build.log -SimpleMatch 'zccache')) { exit 1 }
-          $effectiveRoot = (& zccache cache-root).Trim()
-          if (-not (Test-Path "$effectiveRoot/logs")) { exit 1 }
-          zccache stop 2>$null
-          $dur = ((Get-Date) - $start).TotalSeconds
-          Add-Content $env:GITHUB_STEP_SUMMARY "- **${{ matrix.platform }} / wrapper-e2e**: $([math]::Round($dur))s"
-
-      - name: Stop isolated unit-test cache
-        if: always() && matrix.family != 'windows' && matrix.target == ''
-        shell: bash
-        env:
-          SOLDR_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/unified-${{ matrix.platform }}
-        run: |
-          unset ZCCACHE_CACHE_DIR
-          soldr cache shutdown --archive-logs "$SOLDR_CACHE_DIR/cache/zccache/logs/archive" || true
+        run: uv run --script ci.py wrapper-e2e
 
       # ── Final report ────────────────────────────────────────────────
       - name: report failures
@@ -518,20 +221,19 @@ jobs:
               failures+=("$gate")
             fi
           }
-          add_fail "${{ steps.gate_fmt.outcome }}"                 "fmt"
-          add_fail "${{ steps.gate_clippy.outcome }}"              "clippy"
-          add_fail "${{ steps.gate_dylint.outcome }}"              "dylint"
-          add_fail "${{ steps.gate_docs.outcome }}"                "docs"
-          add_fail "${{ steps.gate_build.outcome }}"               "build"
-          add_fail "${{ steps.gate_test_compile.outcome }}"        "test-compile"
-          add_fail "${{ steps.gate_unit.outcome }}"                "unit"
-          add_fail "${{ steps.gate_integration.outcome }}"         "integration"
-          add_fail "${{ steps.gate_cargo_registry.outcome }}"      "cargo-registry"
-          add_fail "${{ steps.gate_gha_cache.outcome }}"           "gha-cache"
-          add_fail "${{ steps.gate_action_yaml.outcome }}"         "action-yaml"
-          add_fail "${{ steps.gate_action_surface.outcome }}"      "action-surface"
-          add_fail "${{ steps.gate_wrapper_e2e_unix.outcome }}"    "wrapper-e2e"
-          add_fail "${{ steps.gate_wrapper_e2e_windows.outcome }}" "wrapper-e2e"
+          add_fail "${{ steps.gate_fmt.outcome }}"            "fmt"
+          add_fail "${{ steps.gate_clippy.outcome }}"         "clippy"
+          add_fail "${{ steps.gate_dylint.outcome }}"         "dylint"
+          add_fail "${{ steps.gate_docs.outcome }}"           "docs"
+          add_fail "${{ steps.gate_build.outcome }}"          "build"
+          add_fail "${{ steps.gate_test_compile.outcome }}"   "test-compile"
+          add_fail "${{ steps.gate_unit.outcome }}"           "unit"
+          add_fail "${{ steps.gate_integration.outcome }}"    "integration"
+          add_fail "${{ steps.gate_cargo_registry.outcome }}" "cargo-registry"
+          add_fail "${{ steps.gate_gha_cache.outcome }}"      "gha-cache"
+          add_fail "${{ steps.gate_action_yaml.outcome }}"    "action-yaml"
+          add_fail "${{ steps.gate_action_surface.outcome }}" "action-surface"
+          add_fail "${{ steps.gate_wrapper_e2e.outcome }}"    "wrapper-e2e"
 
           if [ ${#failures[@]} -eq 0 ]; then
             echo "## ${{ matrix.platform }}: all gates passed" >> "$GITHUB_STEP_SUMMARY"
