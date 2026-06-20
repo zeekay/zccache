@@ -6,8 +6,8 @@
 """ci.py — single-file dispatcher for every CI gate.
 
 Usage:
-    uv run --script ci.py <gate>
-    uv run --script ci.py all
+    ./ci.sh <gate>
+    ./ci.sh all
 
 Gates (each maps 1:1 to a step in .github/workflows/ci.yml):
     fmt, clippy, dylint, docs, build, test-compile, unit,
@@ -37,7 +37,7 @@ from ci.gates import FATAL_GATES, GATES
 
 
 USAGE = f"""\
-usage: uv run --script ci.py <gate>|all
+usage: ./ci.sh <gate>|all
 
 gates: {' '.join(GATES)}
 """

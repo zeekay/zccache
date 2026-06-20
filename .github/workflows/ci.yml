@@ -8,7 +8,7 @@ name: CI
 # `continue-on-error`. The final `ci.py all` step is NOT used here —
 # we expand to one step per gate so step-level UI in the GHA web view
 # still tells the developer which gate fired. For local repro
-# (laptop, fix-it loop), `uv run --script ci.py all` runs everything
+# (laptop, fix-it loop), `./ci.sh all` runs everything
 # with the same continue-past-failures accumulator.
 #
 # Platform matrix:
@@ -135,39 +135,39 @@ jobs:
           echo "SETUP_SOLDR_DYLINT_CACHE_HIT=${{ steps.setup-soldr.outputs.dylint-cache-hit }}" >> "$GITHUB_ENV"
 
       # ── Gates ──────────────────────────────────────────────────────
-      # Each gate is `uv run --script ci.py <gate>` so the actual logic
+      # Each gate is `./ci.sh <gate>` so the actual logic
       # lives in `ci/gates/*.py`. `continue-on-error: true` on every
       # gate except build; the final `report failures` step aggregates.
 
       - id: gate_fmt
         name: fmt
         continue-on-error: true
-        run: uv run --script ci.py fmt
+        run: ./ci.sh fmt
 
       - id: gate_clippy
         name: clippy
         continue-on-error: true
-        run: uv run --script ci.py clippy
+        run: ./ci.sh clippy
 
       - id: gate_dylint
         name: dylint
         continue-on-error: true
-        run: uv run --script ci.py dylint
+        run: ./ci.sh dylint
 
       - id: gate_docs
         name: docs
         continue-on-error: true
-        run: uv run --script ci.py docs
+        run: ./ci.sh docs
 
       # Build is the one fatal gate — see `FATAL_GATES` in ci.gates.
       - id: gate_build
         name: build
-        run: uv run --script ci.py build
+        run: ./ci.sh build
 
       - id: gate_test_compile
         name: compile test binaries
         continue-on-error: true
-        run: uv run --script ci.py test-compile
+        run: ./ci.sh test-compile
 
       - name: Stop setup-soldr builder cache before tests
         if: always()
@@ -176,37 +176,37 @@ jobs:
       - id: gate_unit
         name: unit tests
         continue-on-error: true
-        run: uv run --script ci.py unit
+        run: ./ci.sh unit
 
       - id: gate_integration
         name: integration tests
         continue-on-error: true
-        run: uv run --script ci.py integration
+        run: ./ci.sh integration
 
       - id: gate_cargo_registry
         name: cargo-registry smoke
         continue-on-error: true
-        run: uv run --script ci.py cargo-registry
+        run: ./ci.sh cargo-registry
 
       - id: gate_gha_cache
         name: gha-cache smoke
         continue-on-error: true
-        run: uv run --script ci.py gha-cache
+        run: ./ci.sh gha-cache
 
       - id: gate_action_yaml
         name: action.yml structural
         continue-on-error: true
-        run: uv run --script ci.py action-yaml
+        run: ./ci.sh action-yaml
 
       - id: gate_action_surface
         name: action surface contract
         continue-on-error: true
-        run: uv run --script ci.py action-surface
+        run: ./ci.sh action-surface
 
       - id: gate_wrapper_e2e
         name: wrapper-e2e
         continue-on-error: true
-        run: uv run --script ci.py wrapper-e2e
+        run: ./ci.sh wrapper-e2e
 
       # ── Final report ────────────────────────────────────────────────
       - name: report failures
