@@ -144,6 +144,11 @@ jobs:
         continue-on-error: true
         run: ./ci.sh fmt
 
+      - id: gate_loc
+        name: loc budget
+        continue-on-error: true
+        run: ./ci.sh loc
+
       - id: gate_clippy
         name: clippy
         continue-on-error: true
@@ -222,6 +227,7 @@ jobs:
             fi
           }
           add_fail "${{ steps.gate_fmt.outcome }}"            "fmt"
+          add_fail "${{ steps.gate_loc.outcome }}"            "loc"
           add_fail "${{ steps.gate_clippy.outcome }}"         "clippy"
           add_fail "${{ steps.gate_dylint.outcome }}"         "dylint"
           add_fail "${{ steps.gate_docs.outcome }}"           "docs"

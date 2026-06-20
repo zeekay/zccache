@@ -29,6 +29,7 @@ from . import (
     fmt,
     gha_cache,
     integration,
+    loc,
     test_compile,
     unit,
     wrapper_e2e,
@@ -40,6 +41,7 @@ from . import (
 # `ci.py`.
 GATES: Dict[str, Callable[[], int]] = {
     "fmt": fmt.run,
+    "loc": loc.run,
     "clippy": clippy.run,
     "dylint": dylint.run,
     "docs": docs.run,
