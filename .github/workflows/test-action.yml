@@ -1,15 +1,14 @@
 name: Test zccache-action
 
 on:
+  # Push-to-main + workflow_dispatch only. PR-time coverage of the
+  # `cargo-registry` and `gha-cache` subcommands moved to ci-unified.yml's
+  # per-platform job to consolidate to one-runner-per-platform; the
+  # remaining `test-zccache-action` job here exercises the published
+  # GitHub Action wiring (setup-zccache@v0 → action.yml glue) which is
+  # only worth re-validating on main pushes, not every PR.
   push:
     branches: [main]
-    paths:
-      - "action.yml"
-      - "action/**"
-      - "crates/zccache-cli/**"
-      - "crates/zccache/**"
-      - ".github/workflows/test-action.yml"
-  pull_request:
     paths:
       - "action.yml"
       - "action/**"
