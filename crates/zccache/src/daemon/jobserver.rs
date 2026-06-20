@@ -154,14 +154,11 @@ impl PosixPipe {
             return Err(std::io::Error::last_os_error());
         }
         if (written as usize) != bytes.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "jobserver pipe priming wrote {} of {} bytes",
-                    written,
-                    bytes.len()
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "jobserver pipe priming wrote {} of {} bytes",
+                written,
+                bytes.len()
+            )));
         }
 
         Ok(Self { read, write })
