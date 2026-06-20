@@ -453,14 +453,19 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
             record_session_stat(&state.sessions, &sid, |t| {
                 t.record_depgraph_hit_artifact_miss();
             });
-            let evicted: std::collections::HashSet<String> =
-                std::iter::once(artifact_key_hex.clone()).collect();
-            state.dep_graph.load().invalidate_artifact_keys(&evicted);
             write_session_log(
                 &state.sessions,
                 &sid,
                 &format!("[DIAG] artifact_not_found: key={artifact_key_hex}"),
             );
+            // Drop the stale depgraph entry pointing at the missing
+            // payload so the next lookup for this source does not
+            // re-fire the same wasted-hit dance. `invalidate_missing_
+            // depgraph_artifact` logs `cleared=N` so the
+            // regression test in `daemon_rustc_restore_test.rs` can
+            // assert the expected cleared count of 1; an earlier
+            // version of this branch invalidated inline too, racing
+            // the helper to `cleared=0` and breaking the test.
             invalidate_missing_depgraph_artifact(state, &sid, &artifact_key_hex);
         }
         crate::depgraph::CacheVerdict::SourceChanged { artifact_key } => {
