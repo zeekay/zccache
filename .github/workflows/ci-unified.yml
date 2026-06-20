@@ -1,32 +1,38 @@
 name: CI
 
-# Single CI workflow: one job per platform, each job runs every gate
-# (fmt + clippy + dylint + docs + MSRV + build + unit tests + integration
-# + wrapper-e2e + cargo-registry + gha-cache) inline against the SAME
-# warmed cargo-cook + zccache cache from the surrounding setup-soldr.
+# Single workflow: one job per platform, every gate runs even if earlier
+# ones fail. The final "report" step collects every gate's outcome and
+# fails the job with a list of which gates actually broke, so a single
+# CI cycle surfaces ALL failures at once instead of stopping at the
+# first one. (User directive: "if a step breaks, keep going then error
+# at the end with which step broke".)
 #
-# Why one job instead of N: the macOS runner pool is the wall-clock
-# bottleneck on every PR. Splitting fmt/clippy/dylint/build/test into
-# separate matrix entries means each one pays the soldr-cook cold cost
-# AND queues for its own runner slot. Running them in sequence inside
-# one job amortizes both. Trade-off accepted: lose per-step status
-# badges; gain ~5-7x macOS wall-clock reduction.
+# Per-platform gate matrix (path-ignored sets at top filter out
+# docs-only edits so unrelated PRs skip the whole job):
 #
-# Platform-specific gates:
-#   linux  : fmt + clippy + dylint + docs + msrv + build + unit + integration
-#            + wrapper-e2e + cargo-registry + gha-cache + no-save mode
-#   windows: fmt + clippy + build + unit + wrapper-e2e + cargo-registry
-#   macos  : fmt + clippy + dylint + build + unit + wrapper-e2e + cargo-registry
+#                linux   windows  macos
+#   fmt           Y       Y        Y
+#   clippy        Y       Y        Y
+#   dylint        Y       -        Y    (unix-only nightly toolchain)
+#   docs          Y       -        -
+#   build (check) Y       Y        Y
+#   unit tests    Y       Y        Y
+#   integration   Y       -        -
+#   cargo-registry Y      Y        Y    (subcommand smoke)
+#   gha-cache     Y       -        -
+#   wrapper-e2e   Y       Y        Y    (SOLDR_RUSTC_WRAPPER end-to-end)
 #
-# Workflows NOT folded here (separate concerns, kept):
-#   - release-auto.yml      : ships PyPI + crates.io + GH release
-#   - perf-*.yml, bench-*   : perf regression cluster
-#   - build.yml             : per-platform distribution binaries
-#   - coverage.yml          : per-platform coverage
-#   - cache-cleanup.yml     : housekeeping
-#   - feature-matrix-check  : feature flag combinations
-#   - wire-stability.yml    : IPC protocol stability
-#   - test-action.yml       : tests the published zackees/zccache-action
+# Workflows NOT folded here (distinct purposes, not gates):
+#   release-auto.yml      PyPI + crates.io + GH release
+#   perf-*.yml, bench-*   perf regression cluster
+#   build.yml             distribution binaries (workflow_dispatch)
+#   coverage.yml          coverage builds (separate RUSTFLAGS)
+#   cache-cleanup.yml     scheduled housekeeping
+#   feature-matrix-check  feature flag combinations
+#   wire-stability.yml    IPC protocol stability
+# test-action.yml was DELETED — its cargo-registry + gha-cache jobs
+# are now inlined here; its action-wrapper test was redundant with
+# wrapper-e2e.
 
 on:
   push:
@@ -84,8 +90,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # setup-soldr default-good settings — one cook per runner, reused
-      # by every step below.
       - id: setup-soldr
         uses: zackees/setup-soldr@v0.9.62
         with:
@@ -104,40 +108,50 @@ jobs:
           cargo-dylint-version: 5.0.0
           dylint-link-version: 5.0.0
 
-      # ── fmt ─────────────────────────────────────────────────────────
-      - name: fmt
+      # Every gate below: `continue-on-error: true` + an `id` so the
+      # final report step can collect outcomes via `steps.<id>.outcome`.
+      # A failed gate marks its step `failure`, but the job continues
+      # and the next gate runs. The final report aggregates failures
+      # and exits 1 if any gate broke.
+
+      - id: gate_fmt
+        name: fmt
+        continue-on-error: true
         shell: bash
         run: |
           start=$SECONDS
           soldr cargo fmt --all -- --check
           echo "- **${{ matrix.platform }} / fmt**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
-      # ── clippy ──────────────────────────────────────────────────────
-      - name: clippy
+      - id: gate_clippy
+        name: clippy
+        continue-on-error: true
         shell: bash
         run: |
           start=$SECONDS
           soldr cargo clippy --workspace --all-targets -- -D warnings
           echo "- **${{ matrix.platform }} / clippy**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
-      # ── dylint (unix only; nightly toolchain + driver) ──────────────
-      - name: Install Dylint nightly toolchain (unix)
+      # dylint: unix-only because the nightly driver build assumes a
+      # Unix-shaped rustup layout. Combined install + run into a single
+      # gate so dylint shows up as one row in the failure summary.
+      - id: gate_dylint
+        name: dylint
         if: matrix.is_windows != 'yes'
-        run: soldr rustup toolchain install nightly-2026-03-26 --component llvm-tools-preview --component rust-src --component rustc-dev --profile minimal
-      - name: Install Dylint (unix)
-        if: matrix.is_windows != 'yes' && steps.setup-soldr.outputs.dylint-cache-hit != 'true'
-        run: |
-          soldr cargo install cargo-dylint --version 5.0.0 --locked
-          soldr cargo install dylint-link --version 5.0.0 --locked
-      - name: Build Dylint driver (unix)
-        if: matrix.is_windows != 'yes' && steps.setup-soldr.outputs.dylint-cache-hit != 'true'
-        run: python3 ci/build_dylint_driver.py
-      - name: dylint
-        if: matrix.is_windows != 'yes'
+        continue-on-error: true
         shell: bash
         run: |
-          export PATH="${CARGO_HOME}/bin:${PATH}"
           start=$SECONDS
+          set -e
+          soldr rustup toolchain install nightly-2026-03-26 \
+            --component llvm-tools-preview --component rust-src \
+            --component rustc-dev --profile minimal
+          if [ "${{ steps.setup-soldr.outputs.dylint-cache-hit }}" != "true" ]; then
+            soldr cargo install cargo-dylint --version 5.0.0 --locked
+            soldr cargo install dylint-link  --version 5.0.0 --locked
+            python3 ci/build_dylint_driver.py
+          fi
+          export PATH="${CARGO_HOME}/bin:${PATH}"
           soldr cargo fmt --manifest-path dylints/ban_std_pathbuf/Cargo.toml --all -- --check
           soldr cargo fmt --manifest-path dylints/ban_unrooted_tempdir/Cargo.toml --all -- --check
           soldr rustup run nightly-2026-03-26 cargo test --manifest-path dylints/ban_std_pathbuf/Cargo.toml
@@ -145,9 +159,10 @@ jobs:
           python3 -m ci.lint --dylint-only
           echo "- **${{ matrix.platform }} / dylint**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
-      # ── docs (linux only; cheap and deterministic) ──────────────────
-      - name: docs
+      - id: gate_docs
+        name: docs
         if: matrix.is_linux == 'yes'
+        continue-on-error: true
         shell: bash
         env:
           RUSTDOCFLAGS: "-D warnings"
@@ -156,23 +171,28 @@ jobs:
           soldr cargo doc --workspace --no-deps
           echo "- **${{ matrix.platform }} / docs**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
-      # ── build (cargo check) ─────────────────────────────────────────
-      - name: build
+      - id: gate_build
+        name: build
+        continue-on-error: true
         shell: bash
         run: |
           start=$SECONDS
           soldr cargo check --workspace --all-targets
           echo "- **${{ matrix.platform }} / build**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
-      # ── unit tests (lib + bins; isolated cache dir per #240) ────────
-      - name: Build test binaries
+      - id: gate_test_compile
+        name: compile test binaries
+        continue-on-error: true
         shell: bash
         run: soldr cargo test --workspace --lib --bins --no-fail-fast --no-run
 
       - name: Stop setup-soldr builder cache before tests
+        if: always()
         uses: zackees/setup-soldr/cleanup@v0.9.62
 
-      - name: unit tests
+      - id: gate_unit
+        name: unit tests
+        continue-on-error: true
         shell: bash
         env:
           SOLDR_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/unified-${{ matrix.platform }}
@@ -196,9 +216,10 @@ jobs:
           fi
           exit $status
 
-      # ── integration tests (linux only; full workspace) ──────────────
-      - name: integration tests
+      - id: gate_integration
+        name: integration tests
         if: matrix.is_linux == 'yes'
+        continue-on-error: true
         shell: bash
         env:
           SOLDR_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/integration-unified
@@ -222,28 +243,23 @@ jobs:
           fi
           exit $status
 
-      # ── cargo-registry subcommand smoke ─────────────────────────────
-      # Folded from test-action.yml. Tests the `zccache cargo-registry
-      # hash/save/restore/clean` surface end-to-end.
-      - name: cargo-registry smoke
+      - id: gate_cargo_registry
+        name: cargo-registry smoke
+        continue-on-error: true
         shell: bash
         run: |
+          set -e
           start=$SECONDS
-          # Build the CLI if `cargo check` didn't already produce a
-          # debug binary the test can call. Use the same `soldr cargo
-          # build` so the cache hits warm.
           soldr cargo build -p zccache --bin zccache
           ZCC="$(find target -type f -name 'zccache' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
           if [ -z "$ZCC" ]; then
             ZCC="$(find target -type f -name 'zccache.exe' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
           fi
           test -x "$ZCC" || { echo "FAIL: zccache binary not found under target/" >&2; exit 1; }
-          # hash deterministic
           H1=$("$ZCC" cargo-registry hash --lockfile Cargo.lock)
           H2=$("$ZCC" cargo-registry hash --lockfile Cargo.lock)
           test "$H1" = "$H2" || { echo "FAIL: hash not deterministic ($H1 vs $H2)" >&2; exit 1; }
           test "${#H1}" -eq 16 || { echo "FAIL: hash length ${#H1} != 16" >&2; exit 1; }
-          # save/restore round trip
           soldr cargo fetch
           "$ZCC" cargo-registry save --key ci-unified-$$
           ROOT="$("$ZCC" cache-root)"
@@ -253,36 +269,34 @@ jobs:
           ! test -f "$ARCHIVE" || { echo "FAIL: clean did not remove $ARCHIVE" >&2; exit 1; }
           echo "- **${{ matrix.platform }} / cargo-registry**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
-      # ── gha-cache smoke (linux only — uses the GHA cache API) ───────
-      - name: gha-cache smoke
+      - id: gate_gha_cache
+        name: gha-cache smoke
         if: matrix.is_linux == 'yes'
+        continue-on-error: true
         shell: bash
         run: |
           start=$SECONDS
           ZCC="$(find target -type f -name 'zccache' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
           OUTPUT=$("$ZCC" gha-cache status 2>&1 || true)
-          # Non-fatal: just confirms the subcommand parses and reports
-          # status without crashing. PR-level coverage; release-auto
-          # exercises the real save/restore path.
           echo "gha-cache status: $OUTPUT"
           echo "- **${{ matrix.platform }} / gha-cache**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
-      # ── wrapper-e2e: SOLDR_RUSTC_WRAPPER end-to-end smoke ───────────
-      - name: wrapper-e2e (unix)
+      - id: gate_wrapper_e2e_unix
+        name: wrapper-e2e (unix)
         if: matrix.is_windows != 'yes'
+        continue-on-error: true
         shell: bash
         env:
           SOLDR_CACHE_LIFECYCLE: command
           SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
           ZCCACHE_CACHE_DIR: ${{ runner.temp }}/wrapper-e2e-zccache
         run: |
+          set -e
           start=$SECONDS
-          # Install the just-built binaries on PATH.
           install_dir="$HOME/.local/bin"
           mkdir -p "$install_dir"
           ZCC="$(find target -type f -name 'zccache' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
           ZCCD="$(find target -type f -name 'zccache-daemon' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
-          # `cargo build -p zccache --bin zccache` already ran; build the daemon now if needed.
           if [ -z "$ZCCD" ]; then
             soldr cargo build -p zccache --bin zccache-daemon
             ZCCD="$(find target -type f -name 'zccache-daemon' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
@@ -302,8 +316,10 @@ jobs:
           zccache stop || true
           echo "- **${{ matrix.platform }} / wrapper-e2e**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: wrapper-e2e (windows)
+      - id: gate_wrapper_e2e_windows
+        name: wrapper-e2e (windows)
         if: matrix.is_windows == 'yes'
+        continue-on-error: true
         shell: pwsh
         env:
           SOLDR_CACHE_LIFECYCLE: command
@@ -351,3 +367,46 @@ jobs:
         run: |
           unset ZCCACHE_CACHE_DIR
           soldr cache shutdown --archive-logs "$SOLDR_CACHE_DIR/cache/zccache/logs/archive" || true
+
+      # ── Final report ────────────────────────────────────────────────
+      # Collect every gate's outcome and exit 1 if any failed, with a
+      # concise summary of which ones broke. Always runs (even if every
+      # earlier step succeeded — then it prints the all-green line).
+      - name: report failures
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          declare -a failures=()
+          add_fail() {
+            local outcome="$1" gate="$2"
+            if [ "$outcome" = "failure" ]; then
+              failures+=("$gate")
+            fi
+          }
+          add_fail "${{ steps.gate_fmt.outcome }}"               "fmt"
+          add_fail "${{ steps.gate_clippy.outcome }}"            "clippy"
+          add_fail "${{ steps.gate_dylint.outcome }}"            "dylint"
+          add_fail "${{ steps.gate_docs.outcome }}"              "docs"
+          add_fail "${{ steps.gate_build.outcome }}"             "build"
+          add_fail "${{ steps.gate_test_compile.outcome }}"      "test-compile"
+          add_fail "${{ steps.gate_unit.outcome }}"              "unit"
+          add_fail "${{ steps.gate_integration.outcome }}"       "integration"
+          add_fail "${{ steps.gate_cargo_registry.outcome }}"    "cargo-registry"
+          add_fail "${{ steps.gate_gha_cache.outcome }}"         "gha-cache"
+          add_fail "${{ steps.gate_wrapper_e2e_unix.outcome }}"  "wrapper-e2e"
+          add_fail "${{ steps.gate_wrapper_e2e_windows.outcome }}" "wrapper-e2e"
+
+          if [ ${#failures[@]} -eq 0 ]; then
+            echo "## ${{ matrix.platform }}: all gates passed" >> "$GITHUB_STEP_SUMMARY"
+            echo "all gates passed"
+            exit 0
+          fi
+
+          {
+            echo "## ${{ matrix.platform }}: FAILED gates"
+            for g in "${failures[@]}"; do echo "- $g"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "FAILED: ${failures[*]}"
+          exit 1
