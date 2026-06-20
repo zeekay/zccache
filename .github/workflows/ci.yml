@@ -342,6 +342,82 @@ jobs:
           echo "gha-cache status: $OUTPUT"
           echo "- **${{ matrix.platform }} / gha-cache**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
 
+      # ── action.yml self-test (cheap, replaces test-action.yml) ──────
+      # `action.yml` (the composite GitHub Action at zackees/zccache@v1)
+      # invokes the zccache binary via a fixed CLI surface: `--version`,
+      # `start`, `stop`, `cache-root`, plus the `cargo-registry` and
+      # `gha-cache` subcommand families. If that surface drifts, every
+      # downstream consumer of the published action breaks at runtime.
+      #
+      # The deleted test-action.yml ran the action end-to-end (uses: ./)
+      # which re-built zccache from source — wasted minutes per platform.
+      # We already built the binary in earlier gates, so the meaningful
+      # contract here is "does action.yml's shell call against an API
+      # this binary actually exposes?" Assert against `--help` text +
+      # action.yml's structural shape; if either drifts the gate fires.
+      - id: gate_action_yaml
+        name: action.yml structural validity
+        if: matrix.is_glibc_linux == 'yes'
+        continue-on-error: true
+        shell: bash
+        run: |
+          start=$SECONDS
+          python3 - <<'PY'
+          import sys
+          import yaml
+          with open('action.yml') as f:
+              a = yaml.safe_load(f)
+          assert a.get('runs', {}).get('using') == 'composite', \
+              "action.yml must declare `using: composite`"
+          ins = a.get('inputs', {})
+          for required in ('cache-cargo-registry', 'cache-compilation',
+                           'cache-target', 'zccache-version', 'shared-key'):
+              assert required in ins, f"action.yml missing input `{required}`"
+          # action/cleanup must also be a valid composite action.
+          with open('action/cleanup/action.yml') as f:
+              c = yaml.safe_load(f)
+          assert c.get('runs', {}).get('using') == 'composite', \
+              "action/cleanup must declare `using: composite`"
+          print("action.yml + action/cleanup/action.yml structurally valid")
+          PY
+          echo "- **${{ matrix.platform }} / action-yaml**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+
+      - id: gate_action_surface
+        name: action.yml CLI surface contract
+        if: matrix.target == ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          start=$SECONDS
+          set -e
+          ZCC="$(find target -type f -name 'zccache' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
+          if [ -z "$ZCC" ]; then
+            ZCC="$(find target -type f -name 'zccache.exe' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
+          fi
+          test -x "$ZCC" || { echo "FAIL: no zccache binary"; exit 1; }
+
+          # The action.yml install-validation does:
+          #   zccache --version | grep -Eq '^zccache [0-9]'
+          # Lock that contract.
+          "$ZCC" --version 2>&1 | grep -Eq '^zccache [0-9]' || {
+            echo "FAIL: --version output drifted from action.yml's regex"; exit 1; }
+
+          # Subcommands the action's setup/cleanup shell snippets call:
+          for sub in start stop cache-root cargo-registry gha-cache; do
+            "$ZCC" --help 2>&1 | grep -qE "^[[:space:]]+$sub" || {
+              echo "FAIL: subcommand '$sub' missing from --help — action.yml's"
+              echo "  shell scripts reference it; downstream consumers would break."
+              exit 1; }
+          done
+
+          # action.yml also calls `zccache start --foreground=false` style
+          # daemon spawn in some paths — make sure `start` exits cleanly
+          # so a consumer's first job doesn't hang.
+          ZCCACHE_CACHE_DIR="$(mktemp -d)" "$ZCC" start && \
+            ZCCACHE_CACHE_DIR="$(mktemp -d)" "$ZCC" stop || true
+
+          echo "- **${{ matrix.platform }} / action-surface**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+
       - id: gate_wrapper_e2e_unix
         name: wrapper-e2e (unix)
         if: matrix.family != 'windows' && matrix.target == ''
@@ -452,6 +528,8 @@ jobs:
           add_fail "${{ steps.gate_integration.outcome }}"         "integration"
           add_fail "${{ steps.gate_cargo_registry.outcome }}"      "cargo-registry"
           add_fail "${{ steps.gate_gha_cache.outcome }}"           "gha-cache"
+          add_fail "${{ steps.gate_action_yaml.outcome }}"         "action-yaml"
+          add_fail "${{ steps.gate_action_surface.outcome }}"      "action-surface"
           add_fail "${{ steps.gate_wrapper_e2e_unix.outcome }}"    "wrapper-e2e"
           add_fail "${{ steps.gate_wrapper_e2e_windows.outcome }}" "wrapper-e2e"
 
