@@ -1,0 +1,353 @@
+name: CI
+
+# Single CI workflow: one job per platform, each job runs every gate
+# (fmt + clippy + dylint + docs + MSRV + build + unit tests + integration
+# + wrapper-e2e + cargo-registry + gha-cache) inline against the SAME
+# warmed cargo-cook + zccache cache from the surrounding setup-soldr.
+#
+# Why one job instead of N: the macOS runner pool is the wall-clock
+# bottleneck on every PR. Splitting fmt/clippy/dylint/build/test into
+# separate matrix entries means each one pays the soldr-cook cold cost
+# AND queues for its own runner slot. Running them in sequence inside
+# one job amortizes both. Trade-off accepted: lose per-step status
+# badges; gain ~5-7x macOS wall-clock reduction.
+#
+# Platform-specific gates:
+#   linux  : fmt + clippy + dylint + docs + msrv + build + unit + integration
+#            + wrapper-e2e + cargo-registry + gha-cache + no-save mode
+#   windows: fmt + clippy + build + unit + wrapper-e2e + cargo-registry
+#   macos  : fmt + clippy + dylint + build + unit + wrapper-e2e + cargo-registry
+#
+# Workflows NOT folded here (separate concerns, kept):
+#   - release-auto.yml      : ships PyPI + crates.io + GH release
+#   - perf-*.yml, bench-*   : perf regression cluster
+#   - build.yml             : per-platform distribution binaries
+#   - coverage.yml          : per-platform coverage
+#   - cache-cleanup.yml     : housekeeping
+#   - feature-matrix-check  : feature flag combinations
+#   - wire-stability.yml    : IPC protocol stability
+#   - test-action.yml       : tests the published zackees/zccache-action
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "NOTICE*"
+      - "AUTHORS*"
+      - "CODEOWNERS"
+      - "CONTRIBUTING*"
+      - ".gitignore"
+      - ".gitattributes"
+      - ".editorconfig"
+      - "tasks/**"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - "NOTICE*"
+      - "AUTHORS*"
+      - "CODEOWNERS"
+      - "CONTRIBUTING*"
+      - ".gitignore"
+      - ".gitattributes"
+      - ".editorconfig"
+      - "tasks/**"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  ci:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            is_linux: "yes"
+            is_windows: ""
+          - os: windows-latest
+            platform: windows
+            is_linux: ""
+            is_windows: "yes"
+          - os: macos-latest
+            platform: macos
+            is_linux: ""
+            is_windows: ""
+    steps:
+      - uses: actions/checkout@v6
+
+      # setup-soldr default-good settings — one cook per runner, reused
+      # by every step below.
+      - id: setup-soldr
+        uses: zackees/setup-soldr@v0.9.62
+        with:
+          zccache-seed-strict: true
+          toolchain: 1.94.1
+          cache: true
+          cache-key-suffix: unified-${{ matrix.platform }}
+          linker: fast
+          prebuild-deps: soldr-cook
+          prebuild-deps-flags: ""
+          solo-toolchain-cache: true
+          verify-compile-cache: warn
+          dylint-cache: true
+          dylint-toolchain: nightly-2026-03-26
+          dylint-driver-rev: 4bd91ce7729b74c7ee5664bbb588f7baf30b4a09
+          cargo-dylint-version: 5.0.0
+          dylint-link-version: 5.0.0
+
+      # ── fmt ─────────────────────────────────────────────────────────
+      - name: fmt
+        shell: bash
+        run: |
+          start=$SECONDS
+          soldr cargo fmt --all -- --check
+          echo "- **${{ matrix.platform }} / fmt**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── clippy ──────────────────────────────────────────────────────
+      - name: clippy
+        shell: bash
+        run: |
+          start=$SECONDS
+          soldr cargo clippy --workspace --all-targets -- -D warnings
+          echo "- **${{ matrix.platform }} / clippy**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── dylint (unix only; nightly toolchain + driver) ──────────────
+      - name: Install Dylint nightly toolchain (unix)
+        if: matrix.is_windows != 'yes'
+        run: soldr rustup toolchain install nightly-2026-03-26 --component llvm-tools-preview --component rust-src --component rustc-dev --profile minimal
+      - name: Install Dylint (unix)
+        if: matrix.is_windows != 'yes' && steps.setup-soldr.outputs.dylint-cache-hit != 'true'
+        run: |
+          soldr cargo install cargo-dylint --version 5.0.0 --locked
+          soldr cargo install dylint-link --version 5.0.0 --locked
+      - name: Build Dylint driver (unix)
+        if: matrix.is_windows != 'yes' && steps.setup-soldr.outputs.dylint-cache-hit != 'true'
+        run: python3 ci/build_dylint_driver.py
+      - name: dylint
+        if: matrix.is_windows != 'yes'
+        shell: bash
+        run: |
+          export PATH="${CARGO_HOME}/bin:${PATH}"
+          start=$SECONDS
+          soldr cargo fmt --manifest-path dylints/ban_std_pathbuf/Cargo.toml --all -- --check
+          soldr cargo fmt --manifest-path dylints/ban_unrooted_tempdir/Cargo.toml --all -- --check
+          soldr rustup run nightly-2026-03-26 cargo test --manifest-path dylints/ban_std_pathbuf/Cargo.toml
+          soldr rustup run nightly-2026-03-26 cargo test --manifest-path dylints/ban_unrooted_tempdir/Cargo.toml
+          python3 -m ci.lint --dylint-only
+          echo "- **${{ matrix.platform }} / dylint**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── docs (linux only; cheap and deterministic) ──────────────────
+      - name: docs
+        if: matrix.is_linux == 'yes'
+        shell: bash
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          start=$SECONDS
+          soldr cargo doc --workspace --no-deps
+          echo "- **${{ matrix.platform }} / docs**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── build (cargo check) ─────────────────────────────────────────
+      - name: build
+        shell: bash
+        run: |
+          start=$SECONDS
+          soldr cargo check --workspace --all-targets
+          echo "- **${{ matrix.platform }} / build**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── unit tests (lib + bins; isolated cache dir per #240) ────────
+      - name: Build test binaries
+        shell: bash
+        run: soldr cargo test --workspace --lib --bins --no-fail-fast --no-run
+
+      - name: Stop setup-soldr builder cache before tests
+        uses: zackees/setup-soldr/cleanup@v0.9.62
+
+      - name: unit tests
+        shell: bash
+        env:
+          SOLDR_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/unified-${{ matrix.platform }}
+          SOLDR_CACHE_LIFECYCLE: command
+          SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
+        run: |
+          set +e
+          unset ZCCACHE_CACHE_DIR
+          mkdir -p "$SOLDR_CACHE_DIR"
+          start=$SECONDS
+          soldr cargo test --workspace --lib --bins --no-fail-fast 2>&1 | tee unit-output.txt
+          status=${PIPESTATUS[0]}
+          echo "- **${{ matrix.platform }} / unit**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+          if [ $status -ne 0 ]; then
+            {
+              echo '## Unit test failures (${{ matrix.platform }})'
+              echo '```'
+              awk '/^failures:$/,/^test result:/' unit-output.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $status
+
+      # ── integration tests (linux only; full workspace) ──────────────
+      - name: integration tests
+        if: matrix.is_linux == 'yes'
+        shell: bash
+        env:
+          SOLDR_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/integration-unified
+          SOLDR_CACHE_LIFECYCLE: command
+          SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
+        run: |
+          set +e
+          unset ZCCACHE_CACHE_DIR
+          mkdir -p "$SOLDR_CACHE_DIR"
+          start=$SECONDS
+          soldr cargo test --workspace --no-fail-fast 2>&1 | tee integration-output.txt
+          status=${PIPESTATUS[0]}
+          echo "- **${{ matrix.platform }} / integration**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+          if [ $status -ne 0 ]; then
+            {
+              echo '## Integration test failures'
+              echo '```'
+              awk '/^failures:$/,/^test result:/' integration-output.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $status
+
+      # ── cargo-registry subcommand smoke ─────────────────────────────
+      # Folded from test-action.yml. Tests the `zccache cargo-registry
+      # hash/save/restore/clean` surface end-to-end.
+      - name: cargo-registry smoke
+        shell: bash
+        run: |
+          start=$SECONDS
+          # Build the CLI if `cargo check` didn't already produce a
+          # debug binary the test can call. Use the same `soldr cargo
+          # build` so the cache hits warm.
+          soldr cargo build -p zccache --bin zccache
+          ZCC="$(find target -type f -name 'zccache' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
+          if [ -z "$ZCC" ]; then
+            ZCC="$(find target -type f -name 'zccache.exe' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
+          fi
+          test -x "$ZCC" || { echo "FAIL: zccache binary not found under target/" >&2; exit 1; }
+          # hash deterministic
+          H1=$("$ZCC" cargo-registry hash --lockfile Cargo.lock)
+          H2=$("$ZCC" cargo-registry hash --lockfile Cargo.lock)
+          test "$H1" = "$H2" || { echo "FAIL: hash not deterministic ($H1 vs $H2)" >&2; exit 1; }
+          test "${#H1}" -eq 16 || { echo "FAIL: hash length ${#H1} != 16" >&2; exit 1; }
+          # save/restore round trip
+          soldr cargo fetch
+          "$ZCC" cargo-registry save --key ci-unified-$$
+          ROOT="$("$ZCC" cache-root)"
+          ARCHIVE="$ROOT/cargo-registry/ci-unified-$$.tar.gz"
+          test -f "$ARCHIVE" || { echo "FAIL: archive not at $ARCHIVE" >&2; exit 1; }
+          "$ZCC" cargo-registry clean
+          ! test -f "$ARCHIVE" || { echo "FAIL: clean did not remove $ARCHIVE" >&2; exit 1; }
+          echo "- **${{ matrix.platform }} / cargo-registry**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── gha-cache smoke (linux only — uses the GHA cache API) ───────
+      - name: gha-cache smoke
+        if: matrix.is_linux == 'yes'
+        shell: bash
+        run: |
+          start=$SECONDS
+          ZCC="$(find target -type f -name 'zccache' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
+          OUTPUT=$("$ZCC" gha-cache status 2>&1 || true)
+          # Non-fatal: just confirms the subcommand parses and reports
+          # status without crashing. PR-level coverage; release-auto
+          # exercises the real save/restore path.
+          echo "gha-cache status: $OUTPUT"
+          echo "- **${{ matrix.platform }} / gha-cache**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── wrapper-e2e: SOLDR_RUSTC_WRAPPER end-to-end smoke ───────────
+      - name: wrapper-e2e (unix)
+        if: matrix.is_windows != 'yes'
+        shell: bash
+        env:
+          SOLDR_CACHE_LIFECYCLE: command
+          SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
+          ZCCACHE_CACHE_DIR: ${{ runner.temp }}/wrapper-e2e-zccache
+        run: |
+          start=$SECONDS
+          # Install the just-built binaries on PATH.
+          install_dir="$HOME/.local/bin"
+          mkdir -p "$install_dir"
+          ZCC="$(find target -type f -name 'zccache' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
+          ZCCD="$(find target -type f -name 'zccache-daemon' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
+          # `cargo build -p zccache --bin zccache` already ran; build the daemon now if needed.
+          if [ -z "$ZCCD" ]; then
+            soldr cargo build -p zccache --bin zccache-daemon
+            ZCCD="$(find target -type f -name 'zccache-daemon' -not -path '*/deps/*' -not -path '*/build/*' | head -1)"
+          fi
+          install -m755 "$ZCC"  "$install_dir/zccache"
+          install -m755 "$ZCCD" "$install_dir/zccache-daemon"
+          export PATH="$install_dir:$PATH"
+          export SOLDR_RUSTC_WRAPPER="$install_dir/zccache"
+          cd "$(mktemp -d)"
+          soldr cargo new --lib hello
+          cd hello
+          soldr cargo add serde --features derive
+          soldr cargo build --verbose 2>&1 | tee build.log
+          grep -F 'zccache ' build.log
+          effective_root="$(zccache cache-root)"
+          test -d "$effective_root/logs"
+          zccache stop || true
+          echo "- **${{ matrix.platform }} / wrapper-e2e**: $((SECONDS - start))s" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: wrapper-e2e (windows)
+        if: matrix.is_windows == 'yes'
+        shell: pwsh
+        env:
+          SOLDR_CACHE_LIFECYCLE: command
+          SOLDR_CACHE_SHUTDOWN_TIMEOUT_SECS: "30"
+          ZCCACHE_CACHE_DIR: ${{ runner.temp }}/wrapper-e2e-zccache
+        run: |
+          $start = Get-Date
+          $installDir = "$env:USERPROFILE\.local\bin"
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+          $zcc = Get-ChildItem -Recurse target -Filter zccache.exe -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match '\\debug\\' -and $_.FullName -notmatch '\\deps\\' -and $_.FullName -notmatch '\\build\\' } |
+                 Select-Object -First 1
+          if (-not $zcc) {
+            soldr cargo build -p zccache --bin zccache
+            $zcc = Get-ChildItem -Recurse target -Filter zccache.exe -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -match '\\debug\\' -and $_.FullName -notmatch '\\deps\\' -and $_.FullName -notmatch '\\build\\' } |
+                   Select-Object -First 1
+          }
+          soldr cargo build -p zccache --bin zccache-daemon
+          $zccd = Get-ChildItem -Recurse target -Filter zccache-daemon.exe -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match '\\debug\\' -and $_.FullName -notmatch '\\deps\\' -and $_.FullName -notmatch '\\build\\' } |
+                  Select-Object -First 1
+          Copy-Item $zcc.FullName  "$installDir\zccache.exe"        -Force
+          Copy-Item $zccd.FullName "$installDir\zccache-daemon.exe" -Force
+          $env:PATH = "$installDir;$env:PATH"
+          $env:SOLDR_RUSTC_WRAPPER = "$installDir\zccache.exe"
+          $tmp = New-Item -ItemType Directory -Path "$env:TEMP/zc-e2e-$(Get-Random)" -Force
+          Set-Location $tmp
+          soldr cargo new --lib hello
+          Set-Location hello
+          soldr cargo add serde --features derive
+          soldr cargo build --verbose 2>&1 | Tee-Object -FilePath build.log
+          if (-not (Select-String -Path build.log -SimpleMatch 'zccache')) { exit 1 }
+          $effectiveRoot = (& zccache cache-root).Trim()
+          if (-not (Test-Path "$effectiveRoot/logs")) { exit 1 }
+          zccache stop 2>$null
+          $dur = ((Get-Date) - $start).TotalSeconds
+          Add-Content $env:GITHUB_STEP_SUMMARY "- **${{ matrix.platform }} / wrapper-e2e**: $([math]::Round($dur))s"
+
+      - name: Stop isolated unit-test cache
+        if: always() && matrix.is_windows != 'yes'
+        shell: bash
+        env:
+          SOLDR_CACHE_DIR: ${{ runner.temp }}/zccache-self-tests/unified-${{ matrix.platform }}
+        run: |
+          unset ZCCACHE_CACHE_DIR
+          soldr cache shutdown --archive-logs "$SOLDR_CACHE_DIR/cache/zccache/logs/archive" || true
