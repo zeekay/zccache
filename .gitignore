@@ -58,3 +58,6 @@ uv.lock
 POST_HOOK_FAILURE_*.txt
 
 local-notes.md
+
+# Dependent-repo checkouts managed via clud-extern-repos workflow
+.extern-repos/
