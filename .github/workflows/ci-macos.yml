@@ -29,7 +29,12 @@ on:
       - "tasks/**"
 
 jobs:
-  macos:
+  x86:
     uses: ./.github/workflows/ci-check.yml
     with:
-      os: macos-latest
+      os: macos-13
+
+  arm:
+    uses: ./.github/workflows/ci-check.yml
+    with:
+      os: macos-14

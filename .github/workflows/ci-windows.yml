@@ -29,7 +29,12 @@ on:
       - "tasks/**"
 
 jobs:
-  windows:
+  x86:
     uses: ./.github/workflows/ci-check.yml
     with:
       os: windows-latest
+
+  arm:
+    uses: ./.github/workflows/ci-check.yml
+    with:
+      os: windows-11-arm
