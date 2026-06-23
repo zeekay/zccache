@@ -8,6 +8,8 @@
 
 use super::*;
 
+const ACCEPT_STALL_WATCHDOG_INTERVAL: Duration = Duration::from_secs(600);
+
 impl DaemonServer {
     /// Run the server, accepting connections until shutdown is signaled.
     ///
@@ -94,7 +96,7 @@ impl DaemonServer {
                                 "idle_timeout_secs": timeout,
                             }),
                         );
-                        state.shutdown.notify_one();
+                        state.shutdown.notify_waiters();
                         break;
                     }
                 }
@@ -132,7 +134,7 @@ impl DaemonServer {
                                 "removed_pids": prune.removed_pids,
                             }),
                         );
-                        state.shutdown.notify_one();
+                        state.shutdown.notify_waiters();
                         break;
                     }
                 }
@@ -226,54 +228,12 @@ impl DaemonServer {
             let interval_secs = crate::core::config::Config::default().disk_gc_interval_secs;
             tokio::spawn(async move {
                 // Run once immediately at startup to reclaim excess disk from Bug 5.
-                {
-                    let dir = state.artifact_dir.clone();
-                    let artifacts = state.artifacts.clone();
-                    // Issue #680: pass the current depgraph snapshot so
-                    // contexts pointing at evicted artifacts are invalidated
-                    // synchronously. Pre-fix the depgraph kept stale Hit
-                    // pointers and the next compile reported `artifact_not_found`.
-                    let dg = state.dep_graph.load_full();
-                    let result = tokio::task::spawn_blocking(move || {
-                        super::super::eviction::evict_disk_artifacts(
-                            &dir,
-                            &artifacts,
-                            max_cache_size,
-                            Some(&dg),
-                        )
-                    })
-                    .await;
-                    if let Ok((freed, removed)) = result {
-                        if removed > 0 {
-                            tracing::info!(
-                                freed_bytes = freed,
-                                artifacts_removed = removed,
-                                "initial disk GC"
-                            );
-                        }
-                    }
-                }
+                run_disk_gc_pass(Arc::clone(&state), max_cache_size, "initial").await;
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-                    let dir = state.artifact_dir.clone();
-                    let artifacts = state.artifacts.clone();
-                    let dg = state.dep_graph.load_full();
-                    let result = tokio::task::spawn_blocking(move || {
-                        super::super::eviction::evict_disk_artifacts(
-                            &dir,
-                            &artifacts,
-                            max_cache_size,
-                            Some(&dg),
-                        )
-                    })
-                    .await;
-                    if let Ok((freed, removed)) = result {
-                        if removed > 0 {
-                            tracing::info!(
-                                freed_bytes = freed,
-                                artifacts_removed = removed,
-                                "disk GC"
-                            );
+                    tokio::select! {
+                        () = state.shutdown.notified() => break,
+                        () = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {
+                            run_disk_gc_pass(Arc::clone(&state), max_cache_size, "periodic").await;
                         }
                     }
                 }
@@ -319,12 +279,33 @@ impl DaemonServer {
                         }
                     });
                 }
+                () = tokio::time::sleep(ACCEPT_STALL_WATCHDOG_INTERVAL) => {
+                    tracing::warn!(
+                        stall_secs = ACCEPT_STALL_WATCHDOG_INTERVAL.as_secs(),
+                        "daemon accept loop has not accepted a connection within watchdog interval"
+                    );
+                }
                 () = self.shutdown.notified() => {
                     tracing::info!("daemon server shutting down");
                     // Drop the watcher to stop the OS thread and close channels.
                     // The settle buffer and consumer tasks will exit when their
                     // input channels close.
-                    *self.state.watcher.lock().await = None;
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        self.state.watcher.lock(),
+                    )
+                    .await
+                    {
+                        Ok(mut watcher) => {
+                            *watcher = None;
+                            self.state.watcher_active.store(false, Ordering::Release);
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "timed out acquiring watcher lock during shutdown; proceeding"
+                            );
+                        }
+                    }
 
                     // Deferred rustc/C++ persist tasks publish their durable
                     // `ArtifactIndex` rows only after the cache files land on
@@ -375,34 +356,37 @@ impl DaemonServer {
                     let store = Arc::clone(&self.state.artifact_store);
                     let entries = store.len();
                     let flush_start = std::time::Instant::now();
-                    let res = tokio::task::spawn_blocking(move || store.flush()).await;
+                    let res = store.flush_blocking().await;
                     match res {
-                        Ok(Ok(())) => tracing::info!(
+                        Ok(()) => tracing::info!(
                             entries,
                             elapsed_ms = flush_start.elapsed().as_millis() as u64,
                             "artifact store final flush complete"
                         ),
-                        Ok(Err(e)) => tracing::warn!(
+                        Err(e) => tracing::warn!(
                             entries,
                             "artifact store final flush failed: {e}"
                         ),
-                        Err(e) => tracing::warn!(
-                            entries,
-                            "artifact store final flush task join error: {e}"
-                        ),
                     }
 
-                    // Save depgraph to disk before exiting.
+                    // Save depgraph to disk before exiting. The serializer and
+                    // atomic write path are synchronous, so run them off the
+                    // Tokio runtime thread.
                     let start = std::time::Instant::now();
                     let path = crate::depgraph::depgraph_file_path();
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent).ok();
-                    }
-                    let dg = self.state.dep_graph.load();
-                    let (cold_ctxs, warm_ctxs, stale_ctxs) = dg.state_breakdown();
-                    let ctxs_with_key = dg.contexts_with_artifact_key();
-                    match crate::depgraph::save_to_file(&dg, &path) {
-                        Ok(()) => {
+                    let dg = self.state.dep_graph.load_full();
+                    let depgraph_save = tokio::task::spawn_blocking(move || {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        let (cold_ctxs, warm_ctxs, stale_ctxs) = dg.state_breakdown();
+                        let ctxs_with_key = dg.contexts_with_artifact_key();
+                        let result = crate::depgraph::save_to_file(&dg, &path);
+                        (result, cold_ctxs, warm_ctxs, stale_ctxs, ctxs_with_key)
+                    })
+                    .await;
+                    match depgraph_save {
+                        Ok((Ok(()), cold_ctxs, warm_ctxs, stale_ctxs, ctxs_with_key)) => {
                             self.state
                                 .dep_graph_persisted
                                 .store(true, Ordering::Release);
@@ -420,7 +404,8 @@ impl DaemonServer {
                                 "depgraph saved"
                             );
                         }
-                        Err(e) => tracing::warn!("depgraph save failed: {e}"),
+                        Ok((Err(e), _, _, _, _)) => tracing::warn!("depgraph save failed: {e}"),
+                        Err(e) => tracing::warn!("depgraph save task join error: {e}"),
                     }
 
                     // Persist the in-memory MetadataCache so the next
@@ -447,13 +432,17 @@ impl DaemonServer {
                     {
                         let meta_start = std::time::Instant::now();
                         let metadata_entries = self.state.cache_system.metadata().len();
-                        match self
-                            .state
-                            .cache_system
-                            .metadata()
-                            .save_to_disk(self.state.metadata_path.as_path())
-                        {
-                            Ok(()) => {
+                        let state = Arc::clone(&self.state);
+                        let metadata_path = self.state.metadata_path.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            state
+                                .cache_system
+                                .metadata()
+                                .save_to_disk(metadata_path.as_path())
+                        })
+                        .await;
+                        match res {
+                            Ok(Ok(())) => {
                                 if metadata_entries > 0 {
                                     tracing::info!(
                                         entries = metadata_entries,
@@ -462,9 +451,13 @@ impl DaemonServer {
                                     );
                                 }
                             }
-                            Err(e) => tracing::warn!(
+                            Ok(Err(e)) => tracing::warn!(
                                 path = %self.state.metadata_path.display(),
                                 "metadata cache save failed: {e}"
+                            ),
+                            Err(e) => tracing::warn!(
+                                path = %self.state.metadata_path.display(),
+                                "metadata cache save task join error: {e}"
                             ),
                         }
                     } else {
@@ -492,15 +485,28 @@ impl DaemonServer {
                         .compiler_hash_cache_loaded
                         .load(Ordering::Acquire)
                     {
-                        if let Err(e) = self
-                            .state
-                            .compiler_hash_cache
-                            .save_to_disk(self.state.compiler_hash_cache_path.as_path())
-                        {
-                            tracing::warn!(
-                                path = %self.state.compiler_hash_cache_path.display(),
-                                "compiler hash cache save failed: {e}"
-                            );
+                        let state = Arc::clone(&self.state);
+                        let compiler_hash_cache_path = self.state.compiler_hash_cache_path.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            state
+                                .compiler_hash_cache
+                                .save_to_disk(compiler_hash_cache_path.as_path())
+                        })
+                        .await;
+                        match res {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    path = %self.state.compiler_hash_cache_path.display(),
+                                    "compiler hash cache save failed: {e}"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %self.state.compiler_hash_cache_path.display(),
+                                    "compiler hash cache save task join error: {e}"
+                                );
+                            }
                         }
                     } else {
                         tracing::debug!(
@@ -527,14 +533,30 @@ impl DaemonServer {
                         .system_includes_loaded
                         .load(Ordering::Acquire)
                     {
-                        let includes = self.state.system_includes.lock().await;
-                        if let Err(e) = includes
-                            .save_to_disk(self.state.system_includes_cache_path.as_path())
-                        {
-                            tracing::warn!(
-                                path = %self.state.system_includes_cache_path.display(),
-                                "system include cache save failed: {e}"
-                            );
+                        let includes = {
+                            let includes = self.state.system_includes.lock().await;
+                            includes.clone()
+                        };
+                        let system_includes_cache_path =
+                            self.state.system_includes_cache_path.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            includes.save_to_disk(system_includes_cache_path.as_path())
+                        })
+                        .await;
+                        match res {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    path = %self.state.system_includes_cache_path.display(),
+                                    "system include cache save failed: {e}"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %self.state.system_includes_cache_path.display(),
+                                    "system include cache save task join error: {e}"
+                                );
+                            }
                         }
                     } else {
                         tracing::debug!(
@@ -563,7 +585,17 @@ impl DaemonServer {
             }
         };
 
-        *self.state.watcher.lock().await = Some(watcher);
+        match tokio::time::timeout(Duration::from_secs(5), self.state.watcher.lock()).await {
+            Ok(mut watcher_guard) => {
+                *watcher_guard = Some(watcher);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "timed out acquiring watcher lock during startup; running without watcher"
+                );
+                return;
+            }
+        }
         self.state.watcher_active.store(true, Ordering::Release);
 
         // Settle buffer: coalesces raw events into batches after a quiet period.
@@ -576,7 +608,12 @@ impl DaemonServer {
         // Consumer: feeds settled events into CacheSystem for metadata invalidation.
         let state = Arc::clone(&self.state);
         tokio::spawn(async move {
-            while let Some(event) = settled_rx.recv().await {
+            loop {
+                let event = tokio::select! {
+                    event = settled_rx.recv() => event,
+                    () = state.shutdown.notified() => break,
+                };
+                let Some(event) = event else { break };
                 match event {
                     SettledEvent::Batch { changed, removed } => {
                         let count = changed.len() + removed.len();
@@ -631,5 +668,28 @@ impl DaemonServer {
         });
 
         tracing::info!("file watcher pipeline started");
+    }
+}
+
+async fn run_disk_gc_pass(state: Arc<SharedState>, max_cache_size: u64, pass: &'static str) {
+    let dir = state.artifact_dir.clone();
+    let artifacts = state.artifacts.clone();
+    // Issue #680: pass the current depgraph snapshot so contexts pointing at
+    // evicted artifacts are invalidated synchronously. Pre-fix the depgraph
+    // kept stale Hit pointers and the next compile reported `artifact_not_found`.
+    let dg = state.dep_graph.load_full();
+    let result = tokio::task::spawn_blocking(move || {
+        super::super::eviction::evict_disk_artifacts(&dir, &artifacts, max_cache_size, Some(&dg))
+    })
+    .await;
+    if let Ok((freed, removed)) = result {
+        if removed > 0 {
+            tracing::info!(
+                freed_bytes = freed,
+                artifacts_removed = removed,
+                gc_pass = pass,
+                "disk GC"
+            );
+        }
     }
 }
