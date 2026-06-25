@@ -6,6 +6,7 @@ mod analyze;
 mod args_parsing;
 mod cache_ops;
 mod daemon;
+mod engine_profile;
 mod exit_code;
 mod session_warnings;
 mod snapshot;

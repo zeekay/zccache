@@ -83,6 +83,20 @@ reads only the documented fields; it tolerates malformed lines
 (emits a stderr warning and skips the row) and missing journals
 (exits zero with a `(no journal)` message).
 
+## Engine phase profiling
+
+`session-stats --json` and `session-end --json` include `phase_profile` when
+the daemon can report aggregate cache-engine phase totals. Use
+`zccache engine-profile <stats-json>` to render the hit/miss phase breakdown
+from `last-session-stats.json` or captured session-stats JSON. Add `--json`
+for the stable machine-readable form.
+
+This is separate from Tokio Console. `engine-profile` attributes cache-engine
+work such as hashing, depgraph checks, artifact lookup, output writes, compiler
+execution, include scanning, and artifact storage. Tokio Console is for live
+Tokio runtime symptoms such as blocked tasks, long polls, wakeups, timers, and
+resource contention.
+
 ## Stability & versioning
 
 The journal is **additive-by-default**: new optional fields may appear in

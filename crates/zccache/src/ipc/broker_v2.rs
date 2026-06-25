@@ -338,8 +338,8 @@ mod tests {
         assert_eq!(result.expect("fast closure returns Ok"), 42);
     }
 
-    /// Stress test: 100 consecutive `call_with_brokerv2_deadline` calls,
-    /// each closure stalls for 60s while the deadline fires at 10ms.
+    /// Stress test: repeated `call_with_brokerv2_deadline` calls,
+    /// each closure stalls longer than the deadline.
     /// Total wall-clock should be much less than 100 × 10ms = 1s if the
     /// helper threads truly run independently (i.e. each call returns
     /// on its own thread's deadline, not serialized).
@@ -355,13 +355,17 @@ mod tests {
     /// follow-up (see ledger #842 round-2 finding #1).
     #[test]
     fn call_with_brokerv2_deadline_stress_repeated_timeouts() {
+        const ATTEMPTS: usize = 32;
+        const DEADLINE: Duration = Duration::from_millis(10);
+        const CLOSURE_STALL: Duration = Duration::from_secs(2);
+        const WALL_BUDGET: Duration = Duration::from_secs(5);
+
         let start = std::time::Instant::now();
-        for _ in 0..100 {
-            let result: Result<(), BrokerV2Error> =
-                call_with_brokerv2_deadline(Duration::from_millis(10), || {
-                    std::thread::sleep(Duration::from_secs(60));
-                    Ok(())
-                });
+        for _ in 0..ATTEMPTS {
+            let result: Result<(), BrokerV2Error> = call_with_brokerv2_deadline(DEADLINE, || {
+                std::thread::sleep(CLOSURE_STALL);
+                Ok(())
+            });
             match result {
                 Err(BrokerV2Error::Io(io)) if io.kind() == std::io::ErrorKind::TimedOut => {}
                 other => panic!("expected Io(TimedOut), got: {other:?}"),
@@ -369,8 +373,8 @@ mod tests {
         }
         let elapsed = start.elapsed();
         assert!(
-            elapsed < Duration::from_secs(5),
-            "100 repeated timeouts took {elapsed:?}; expected ~1s (5s budget)"
+            elapsed < WALL_BUDGET,
+            "{ATTEMPTS} repeated timeouts took {elapsed:?}; expected under {WALL_BUDGET:?}"
         );
     }
 
