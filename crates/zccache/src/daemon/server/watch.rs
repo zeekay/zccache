@@ -94,38 +94,46 @@ pub(super) async fn watch_directories(state: &SharedState, dirs: &[NormalizedPat
         return;
     }
 
-    for dir in new_dirs {
-        match watch_one_directory(state, dir.clone()).await {
-            Ok(true) => {
-                tracing::info!("watching directory: {}", dir.display());
+    // Batch the per-dir watcher-mutex acquisition: acquire the watcher
+    // lock once and register every directory under a single guard. Each
+    // `w.watch(dir)` is a synchronous syscall (~50us inotify_add_watch on
+    // Linux); holding the tokio Mutex across N back-to-back syscalls
+    // costs far less futex traffic than N separate acquire/release pairs,
+    // and serialises 50 concurrent cold-miss handlers through one
+    // futex-wait instead of 50 per request.
+    //
+    // Also batch the rollback for the "watcher unavailable" / "watch
+    // failed" cases under a single `watched_dirs` lock acquisition,
+    // preserving the prior behaviour of removing the entry so a future
+    // call may retry.
+    let mut to_unmark: Vec<NormalizedPath> = Vec::new();
+    {
+        let mut watcher_guard = state.watcher.lock().await;
+        match *watcher_guard {
+            Some(ref mut w) => {
+                for dir in &new_dirs {
+                    match w.watch(dir) {
+                        Ok(()) => {
+                            tracing::info!("watching directory: {}", dir.display());
+                        }
+                        Err(e) => {
+                            tracing::warn!("failed to watch {}: {e}", dir.display());
+                            to_unmark.push(dir.clone());
+                        }
+                    }
+                }
             }
-            Ok(false) => {
-                state.watched_dirs.lock().await.remove(&dir);
-            }
-            Err(e) => {
-                state.watched_dirs.lock().await.remove(&dir);
-                tracing::warn!("failed to watch {}: {e}", dir.display());
+            None => {
+                // No watcher available — roll back every reservation.
+                to_unmark.extend(new_dirs.iter().cloned());
             }
         }
     }
-}
 
-async fn watch_one_directory(
-    state: &SharedState,
-    dir: NormalizedPath,
-) -> crate::core::Result<bool> {
-    register_notify_watch(state, &dir).await
-}
-
-async fn register_notify_watch(
-    state: &SharedState,
-    dir: &NormalizedPath,
-) -> crate::core::Result<bool> {
-    let mut watcher_guard = state.watcher.lock().await;
-    if let Some(ref mut w) = *watcher_guard {
-        w.watch(dir)?;
-        Ok(true)
-    } else {
-        Ok(false)
+    if !to_unmark.is_empty() {
+        let mut watched = state.watched_dirs.lock().await;
+        for dir in &to_unmark {
+            watched.remove(dir);
+        }
     }
 }

@@ -3,6 +3,23 @@
 //! Discovery is per-compiler-path memoized in `state.system_includes`. This
 //! module is the only caller of the discovery helper plus the post-discovery
 //! `watch_directories` for the include roots.
+//!
+//! ## Two-level cache (L1 in-RAM, L2 on-disk — ISSUE-201)
+//!
+//! The in-memory `Mutex<SystemIncludeCache>` on `SharedState` is the L1
+//! fast path. The on-disk snapshot at `state.system_includes_cache_path`
+//! is the L2 — loaded once at startup via `SystemIncludesLoader`
+//! (issue #784 phase 2c) and previously persisted only at graceful
+//! shutdown. ISSUE-201 closes the SIGKILL gap: on every actual L1
+//! insert (not on hits), we clone the cache under the lock, drop the
+//! lock, and spawn a `tokio::task::spawn_blocking` to call
+//! `SystemIncludeCache::save_to_disk` so the L2 stays in lock-step with
+//! the L1 without blocking the request thread on disk I/O. The
+//! `state.system_includes_loaded` gate prevents write-through from
+//! racing the background loader and clobbering the loaded-from-disk
+//! superset with a fresh-daemon subset. Stat-verify on every L1 / L2
+//! lookup keeps the cache invalidating itself if the compiler binary
+//! changes mtime or size in-place (apt upgrade, brew upgrade, etc.).
 
 use super::super::super::*;
 
@@ -59,18 +76,56 @@ pub(super) async fn discover_system_includes(
         } else {
             let discovered =
                 discover_system_include_paths(compiler, lineage, compiler_priority, use_fast).await;
-            let mut cache = state.system_includes.lock().await;
-            if let Some(paths) = cache.get(compiler) {
-                paths.to_vec()
-            } else if let Some(discovered) = discovered {
-                cache.insert(compiler.clone(), discovered);
-                cache
-                    .get(compiler)
-                    .map(|paths| paths.to_vec())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
+            // Inserted-this-call flag drives a single async write-through
+            // snapshot after we drop the cache lock. We never block the
+            // request thread on disk I/O — the snapshot runs in a
+            // `tokio::task::spawn_blocking` and any failure is logged but
+            // does not surface to the compile request (the in-memory L1
+            // entry is still authoritative for this daemon's lifetime).
+            let (resolved, inserted_snapshot) = {
+                let mut cache = state.system_includes.lock().await;
+                if let Some(paths) = cache.get(compiler) {
+                    (paths.to_vec(), None)
+                } else if let Some(discovered) = discovered {
+                    cache.insert(compiler.clone(), discovered);
+                    let paths = cache
+                        .get(compiler)
+                        .map(|paths| paths.to_vec())
+                        .unwrap_or_default();
+                    // Snapshot the full cache under the lock. We only do
+                    // this on an actual insert (not a hit), so the cost
+                    // is paid once per (compiler binary, mtime) — the
+                    // same denominator as the spawn cost we're trying to
+                    // amortize. Cloning the `SystemIncludeCache` is a
+                    // shallow `HashMap` clone (≤ a few dozen entries in
+                    // practice) — orders of magnitude cheaper than the
+                    // `<compiler> -###` / `-v -E` spawn we just paid for.
+                    let snapshot = cache.clone();
+                    (paths, Some(snapshot))
+                } else {
+                    (Vec::new(), None)
+                }
+            };
+            // Issue #784 phase 2c invariant: don't write-through until
+            // the on-disk snapshot has been merged into the live cache.
+            // Saving a subset over the loaded-from-disk superset would
+            // silently lose entries on the next restart. Once the
+            // background loader sets `system_includes_loaded`, the
+            // in-memory cache is canonical and write-through is safe.
+            if let Some(snapshot) = inserted_snapshot {
+                if state.system_includes_loaded.load(Ordering::Acquire) {
+                    let path = state.system_includes_cache_path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = snapshot.save_to_disk(path.as_path()) {
+                            tracing::warn!(
+                                path = %path.display(),
+                                "system include cache write-through failed: {e}"
+                            );
+                        }
+                    });
+                }
             }
+            resolved
         }
     };
     let system_includes_ns = t_system_includes

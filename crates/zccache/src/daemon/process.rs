@@ -3,7 +3,7 @@
 use std::io;
 use std::process::Output;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     OnceLock,
 };
 
@@ -181,20 +181,43 @@ impl CompilePriority {
         }
     }
 
+    /// Observation variant — samples the in-flight counter without
+    /// incrementing it. Spawn sites must call [`Self::resolve_and_track`]
+    /// instead so the decision is race-free against concurrent spawns.
     pub(crate) fn resolve_for_current_load(self) -> CompilePriorityDecision {
         let cpu_usage_percent = matches!(self, Self::Auto)
             .then(current_cpu_usage_percent)
             .flatten();
-        self.resolve_with_cpu_usage_and_ci(cpu_usage_percent, is_ci_host().is_some())
+        let in_flight = current_in_flight_compiles();
+        self.resolve_with_cpu_usage_and_ci(cpu_usage_percent, is_ci_host().is_some(), in_flight)
+    }
+
+    /// Spawn-site resolution. Acquires an [`InFlightCompileTicket`] so the
+    /// `Auto` decision uses the pre-increment count (race-free under
+    /// parallel spawns) and the counter accurately reflects in-flight work
+    /// for the next caller. The ticket **must** be held by the caller for
+    /// the lifetime of the spawned process.
+    pub(crate) fn resolve_and_track(self) -> (CompilePriorityDecision, InFlightCompileTicket) {
+        let ticket = InFlightCompileTicket::acquire();
+        let cpu_usage_percent = matches!(self, Self::Auto)
+            .then(current_cpu_usage_percent)
+            .flatten();
+        let decision = self.resolve_with_cpu_usage_and_ci(
+            cpu_usage_percent,
+            is_ci_host().is_some(),
+            ticket.in_flight_before(),
+        );
+        (decision, ticket)
     }
 
     fn resolve_with_cpu_usage_and_ci(
         self,
         cpu_usage_percent: Option<f32>,
         is_ci: bool,
+        in_flight_before: usize,
     ) -> CompilePriorityDecision {
         let effective = match self {
-            Self::Auto => Self::auto_effective_priority(cpu_usage_percent, is_ci),
+            Self::Auto => Self::auto_effective_priority(cpu_usage_percent, is_ci, in_flight_before),
             priority => priority,
         };
         CompilePriorityDecision {
@@ -205,20 +228,35 @@ impl CompilePriority {
     }
 
     /// Resolves what `Auto` actually means for a given CPU sample + host
-    /// kind. Issue #813 / #810 changed the interactive default from
-    /// `Normal` to `Low` — see the meta for the design discussion.
+    /// kind + in-flight count. Issue #813 / #810 changed the interactive
+    /// default from `Normal` to `Low`; this refinement (master-profile
+    /// 2026-06-25 ISSUE-001) restores `Normal` for the case the original
+    /// patch overshot — single/idle compiles — while keeping the wave
+    /// case at `Low`.
     ///
     /// - **CI host** (any env in [`CI_DETECT_ENV_VARS`] truthy): the
     ///   historical behavior — `Normal` until system CPU is ≥ 95%, then
     ///   `Low`. CI runners are dedicated to compilation; no foreground
     ///   workload to yield to.
-    /// - **Interactive host** (no CI env): always `Low`. The previous
-    ///   "Normal until 95%" heuristic fired too late to deliver the UI
-    ///   responsiveness the env-var was created to enable — the first
-    ///   wave of rustcs (the ones that hurt UI most) all spawned at
-    ///   `Normal` and pushed CPU to 100% before the demotion kicked in.
-    fn auto_effective_priority(cpu_usage_percent: Option<f32>, is_ci: bool) -> Self {
+    /// - **Interactive host** (no CI env): `Normal` when no other compile
+    ///   is in flight (`in_flight_before == 0`), `Low` otherwise. A
+    ///   parallel cargo wave of N rustcs all calling `fetch_add(1)` sees
+    ///   counts `0, 1, …, N-1` deterministically — one `Normal` leader
+    ///   plus `N-1` `Low` followers. The leader at `Normal` runs at
+    ///   bare-rustc speed (the cold-bench win); the `N-1` followers stay
+    ///   `Low`, bounding the CPU spike #813 was protecting against. When
+    ///   the wave finishes and a single rustc returns (e.g. last compile
+    ///   in a cargo dep tree, or a one-off check), the counter drops back
+    ///   to 0 and the next spawn is again `Normal`.
+    fn auto_effective_priority(
+        cpu_usage_percent: Option<f32>,
+        is_ci: bool,
+        in_flight_before: usize,
+    ) -> Self {
         if !is_ci {
+            if in_flight_before == 0 {
+                return Self::Normal;
+            }
             return Self::Low;
         }
         match cpu_usage_percent {
@@ -350,6 +388,51 @@ fn current_cpu_usage_percent() -> Option<f32> {
     CPU_USAGE_MONITOR.get_or_init(CpuUsageMonitor::new).sample()
 }
 
+/// Global counter of daemon-owned compiler children currently spawned and
+/// not yet reaped. Used by `Auto` priority to decide whether a new spawn
+/// is the first/only one (use `Normal`, restoring near-bare-rustc speed)
+/// or part of an in-flight wave (demote to `Low` to preserve UI
+/// responsiveness per issues #813 / #810).
+static IN_FLIGHT_COMPILES: AtomicUsize = AtomicUsize::new(0);
+
+/// Observation-only sampler. `Auto` resolution at *spawn sites* must use
+/// the pre-increment value returned by [`InFlightCompileTicket::acquire`]
+/// instead, so concurrent decisions are race-free (fetch-add ordering).
+pub(crate) fn current_in_flight_compiles() -> usize {
+    IN_FLIGHT_COMPILES.load(Ordering::Acquire)
+}
+
+/// RAII ticket representing one in-flight compile spawn. Acquire **before**
+/// resolving `Auto` priority; the pre-increment count is exposed via
+/// [`Self::in_flight_before`] and is the deterministic input for the
+/// priority decision (a wave of N simultaneous fetch-adds yields counts
+/// `0, 1, 2, …, N-1` — one `Normal` followed by `N-1` `Low`, bounding the
+/// CPU spike #813 was protecting against).
+///
+/// Drop decrements the counter; the ticket must be held until the spawned
+/// process is fully waited on.
+#[must_use = "the ticket decrements on drop — hold it until the child is reaped"]
+pub(crate) struct InFlightCompileTicket {
+    in_flight_before: usize,
+}
+
+impl InFlightCompileTicket {
+    pub(crate) fn acquire() -> Self {
+        let in_flight_before = IN_FLIGHT_COMPILES.fetch_add(1, Ordering::AcqRel);
+        Self { in_flight_before }
+    }
+
+    pub(crate) fn in_flight_before(&self) -> usize {
+        self.in_flight_before
+    }
+}
+
+impl Drop for InFlightCompileTicket {
+    fn drop(&mut self) {
+        IN_FLIGHT_COMPILES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompilePriorityParseError {
     value: String,
@@ -402,7 +485,7 @@ pub(crate) fn command_output_with_priority_stdin(
     priority: CompilePriority,
     stdin_bytes: Option<&[u8]>,
 ) -> io::Result<Output> {
-    let decision = priority.resolve_for_current_load();
+    let (decision, _ticket) = priority.resolve_and_track();
     let priority = decision.effective;
     let pipe_stdin = matches!(stdin_bytes, Some(b) if !b.is_empty());
 
@@ -505,7 +588,7 @@ pub(crate) async fn tokio_command_output_with_priority_stdin(
     priority: CompilePriority,
     stdin_bytes: Option<&[u8]>,
 ) -> io::Result<Output> {
-    let decision = priority.resolve_for_current_load();
+    let (decision, _ticket) = priority.resolve_and_track();
     let priority = decision.effective;
     let pipe_stdin = matches!(stdin_bytes, Some(b) if !b.is_empty());
 
@@ -752,64 +835,97 @@ mod tests {
     fn ci_auto_priority_uses_normal_until_cpu_is_saturated() {
         // CI host (is_ci=true) preserves the historical heuristic:
         // Normal until 95% CPU, then Low. CI runners are dedicated to
-        // compilation; no foreground workload to yield to.
+        // compilation; no foreground workload to yield to. In-flight
+        // count is ignored on CI — the CPU gate is sufficient.
         let is_ci = true;
         assert_eq!(
-            CompilePriority::auto_effective_priority(None, is_ci),
+            CompilePriority::auto_effective_priority(None, is_ci, 0),
             CompilePriority::Normal
         );
         assert_eq!(
-            CompilePriority::auto_effective_priority(Some(94.9), is_ci),
+            CompilePriority::auto_effective_priority(Some(94.9), is_ci, 32),
             CompilePriority::Normal
         );
         assert_eq!(
-            CompilePriority::auto_effective_priority(Some(95.0), is_ci),
+            CompilePriority::auto_effective_priority(Some(95.0), is_ci, 0),
             CompilePriority::Low
         );
         assert_eq!(
-            CompilePriority::auto_effective_priority(Some(100.0), is_ci),
+            CompilePriority::auto_effective_priority(Some(100.0), is_ci, 32),
             CompilePriority::Low
         );
     }
 
     #[test]
-    fn interactive_auto_priority_always_resolves_to_low() {
-        // Issue #813 / #810: interactive hosts default to Low regardless
-        // of current CPU usage — the historical 95% gate fired too late
-        // to deliver the responsiveness the env-var ostensibly enables.
+    fn interactive_auto_priority_adapts_to_in_flight_count() {
+        // Master-profile 2026-06-25 ISSUE-001: interactive hosts get
+        // Normal when no other compile is in flight (single/idle case —
+        // bare-rustc speed), Low once a wave is detected. Preserves
+        // #813's UI-win on parallel waves while restoring near-bare-rustc
+        // speed on the single-compile cases that the unconditional Low
+        // was overshooting.
         let is_ci = false;
+        // No others in flight → Normal regardless of CPU.
         assert_eq!(
-            CompilePriority::auto_effective_priority(None, is_ci),
+            CompilePriority::auto_effective_priority(None, is_ci, 0),
+            CompilePriority::Normal
+        );
+        assert_eq!(
+            CompilePriority::auto_effective_priority(Some(0.0), is_ci, 0),
+            CompilePriority::Normal
+        );
+        assert_eq!(
+            CompilePriority::auto_effective_priority(Some(100.0), is_ci, 0),
+            CompilePriority::Normal
+        );
+        // One or more others in flight → Low (yield to UI).
+        assert_eq!(
+            CompilePriority::auto_effective_priority(None, is_ci, 1),
             CompilePriority::Low
         );
         assert_eq!(
-            CompilePriority::auto_effective_priority(Some(0.0), is_ci),
-            CompilePriority::Low
-        );
-        assert_eq!(
-            CompilePriority::auto_effective_priority(Some(50.0), is_ci),
-            CompilePriority::Low
-        );
-        assert_eq!(
-            CompilePriority::auto_effective_priority(Some(100.0), is_ci),
+            CompilePriority::auto_effective_priority(Some(50.0), is_ci, 7),
             CompilePriority::Low
         );
     }
 
     #[test]
     fn auto_priority_decision_records_effective_priority_on_ci() {
-        let decision = CompilePriority::Auto.resolve_with_cpu_usage_and_ci(Some(96.0), true);
+        let decision = CompilePriority::Auto.resolve_with_cpu_usage_and_ci(Some(96.0), true, 0);
         assert_eq!(decision.requested, CompilePriority::Auto);
         assert_eq!(decision.effective, CompilePriority::Low);
         assert_eq!(decision.cpu_usage_percent, Some(96.0));
     }
 
     #[test]
-    fn auto_priority_decision_low_on_interactive_regardless_of_cpu() {
-        let decision = CompilePriority::Auto.resolve_with_cpu_usage_and_ci(Some(10.0), false);
+    fn auto_priority_decision_low_on_interactive_when_wave_in_flight() {
+        let decision = CompilePriority::Auto.resolve_with_cpu_usage_and_ci(Some(10.0), false, 3);
         assert_eq!(decision.requested, CompilePriority::Auto);
         assert_eq!(decision.effective, CompilePriority::Low);
         assert_eq!(decision.cpu_usage_percent, Some(10.0));
+    }
+
+    #[test]
+    fn auto_priority_decision_normal_on_interactive_when_idle() {
+        let decision = CompilePriority::Auto.resolve_with_cpu_usage_and_ci(Some(10.0), false, 0);
+        assert_eq!(decision.requested, CompilePriority::Auto);
+        assert_eq!(decision.effective, CompilePriority::Normal);
+        assert_eq!(decision.cpu_usage_percent, Some(10.0));
+    }
+
+    #[test]
+    fn in_flight_ticket_returns_pre_increment_count_atomically() {
+        let baseline = current_in_flight_compiles();
+        let t1 = InFlightCompileTicket::acquire();
+        assert_eq!(t1.in_flight_before(), baseline);
+        assert_eq!(current_in_flight_compiles(), baseline + 1);
+        let t2 = InFlightCompileTicket::acquire();
+        assert_eq!(t2.in_flight_before(), baseline + 1);
+        assert_eq!(current_in_flight_compiles(), baseline + 2);
+        drop(t2);
+        assert_eq!(current_in_flight_compiles(), baseline + 1);
+        drop(t1);
+        assert_eq!(current_in_flight_compiles(), baseline);
     }
 
     #[test]
