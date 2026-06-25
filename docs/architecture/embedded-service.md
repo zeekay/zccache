@@ -120,7 +120,7 @@ pub struct ZccacheService {
 
 pub struct ZccacheConfig {
     pub host: HostIdentity,
-    pub cache_root: PathBuf,
+    pub cache_root: NormalizedPath,
     pub audit: AuditConfig,
     pub limits: ServiceLimits,
     pub runtime: RuntimeHooks,
@@ -142,9 +142,9 @@ pub struct AuditContext {
 
 pub struct CompileRequest {
     pub audit: AuditContext,
-    pub compiler: PathBuf,
+    pub compiler: NormalizedPath,
     pub args: Vec<String>,
-    pub cwd: PathBuf,
+    pub cwd: NormalizedPath,
     pub env: Vec<(String, String)>,
 }
 

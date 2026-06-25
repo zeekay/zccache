@@ -267,6 +267,22 @@ fn session_stats_accepts_json_flag() {
     ));
 }
 
+#[test]
+fn engine_profile_accepts_json_flag() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from([
+        "zccache",
+        "engine-profile",
+        "last-session-stats.json",
+        "--json",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Commands::EngineProfile { json: true, .. })
+    ));
+}
+
 // Issue #256 -- CLI flag parsing for session-start --profile
 // and the new zccache analyze filter/sort flags.
 

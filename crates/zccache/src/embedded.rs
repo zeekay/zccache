@@ -4,10 +4,10 @@
 //! already own a Tokio runtime. The service reuses the daemon compile/session
 //! machinery directly and does not bind or listen on zccache IPC endpoints.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::core::NormalizedPath;
 use crate::daemon::server::{
     EmbeddedCompileRequest, EmbeddedDaemon, EmbeddedFlushReport, EmbeddedStatsSnapshot,
 };
@@ -39,7 +39,7 @@ pub struct ZccacheService {
 #[derive(Debug, Clone)]
 pub struct ZccacheConfig {
     pub host: HostIdentity,
-    pub cache_root: PathBuf,
+    pub cache_root: NormalizedPath,
     pub audit: AuditConfig,
     pub limits: ServiceLimits,
     pub runtime: RuntimeHooks,
@@ -69,9 +69,9 @@ pub struct ServiceLimits {
 #[derive(Debug, Clone)]
 pub struct CompileRequest {
     pub audit: AuditContext,
-    pub compiler: PathBuf,
+    pub compiler: NormalizedPath,
     pub args: Vec<String>,
-    pub cwd: PathBuf,
+    pub cwd: NormalizedPath,
     pub env: Vec<(String, String)>,
     pub stdin: Vec<u8>,
 }
@@ -120,7 +120,7 @@ pub struct FlushReport {
 /// Current service statistics.
 #[derive(Debug, Clone)]
 pub struct ServiceStats {
-    pub cache_root: PathBuf,
+    pub cache_root: NormalizedPath,
     pub uptime_secs: u64,
     pub total_compilations: u64,
     pub cache_hits: u64,
@@ -143,9 +143,8 @@ impl ZccacheService {
     /// Start an in-process zccache service on the caller's Tokio runtime.
     pub async fn start(config: ZccacheConfig) -> Result<Self> {
         let endpoint = embedded_endpoint(&config.host);
-        let cache_root = crate::core::config::effective_cache_root_from_top_level(
-            &crate::core::NormalizedPath::new(config.cache_root),
-        );
+        let cache_root =
+            crate::core::config::effective_cache_root_from_top_level(&config.cache_root);
         let daemon = EmbeddedDaemon::start(endpoint, cache_root)
             .await
             .map_err(|err| EmbeddedError::Start(err.to_string()))?;
@@ -170,9 +169,9 @@ impl ZccacheService {
         let response = self
             .daemon
             .compile(EmbeddedCompileRequest {
-                compiler: request.compiler,
+                compiler: request.compiler.into_path_buf(),
                 args: request.args,
-                cwd: request.cwd,
+                cwd: request.cwd.into_path_buf(),
                 env: Some(request.env),
                 stdin: request.stdin,
             })
@@ -228,7 +227,7 @@ impl ServiceStats {
     fn from_snapshot(snapshot: EmbeddedStatsSnapshot) -> Self {
         let status = snapshot.status;
         Self {
-            cache_root: status.cache_dir.into_path_buf(),
+            cache_root: status.cache_dir,
             uptime_secs: status.uptime_secs,
             total_compilations: status.total_compilations,
             cache_hits: status.cache_hits,

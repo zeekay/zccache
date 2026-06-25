@@ -14,6 +14,7 @@ pub(crate) mod cache_ops;
 pub(crate) mod cargo_registry;
 pub(crate) mod daemon;
 pub(crate) mod download;
+pub(crate) mod engine_profile;
 pub(crate) mod exec;
 pub(crate) mod fp;
 pub(crate) mod gha;
@@ -144,6 +145,9 @@ fn dispatch(command: Commands, global_strict_paths: Option<&str>) -> ExitCode {
                 top,
             },
         ),
+        Commands::EngineProfile { stats_json, json } => {
+            engine_profile::cmd_engine_profile(&stats_json, json)
+        }
         Commands::Clear => {
             let endpoint = resolve_endpoint(None);
             run_async(cache_ops::cmd_clear(&endpoint))

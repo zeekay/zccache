@@ -1033,6 +1033,19 @@ zccache session-stats $ZCCACHE_SESSION_ID   # query mid-build
 zccache session-end $ZCCACHE_SESSION_ID     # final stats
 ```
 
+Render the always-on engine phase profiler from a saved stats JSON file:
+
+```bash
+zccache session-end $ZCCACHE_SESSION_ID --json > last-session-stats.json
+zccache engine-profile last-session-stats.json
+zccache engine-profile last-session-stats.json --json
+```
+
+This reports aggregate hit/miss phase totals, averages, and dominant phases
+from `phase_profile`. It is the cache-engine regression view; Tokio Console is
+for live async runtime symptoms such as blocked tasks, long polls, and resource
+contention.
+
 **Persistent cache:** Artifacts are stored in `~/.zccache/artifacts/`
 and survive daemon restarts. No need to re-warm the cache after a reboot.
 

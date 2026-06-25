@@ -115,6 +115,15 @@ pub(crate) enum Commands {
         #[arg(long)]
         top: Option<usize>,
     },
+    /// Render engine phase profiling from a session-stats JSON file.
+    #[command(name = "engine-profile")]
+    EngineProfile {
+        /// Path to last-session-stats.json or `session-stats --json` output.
+        stats_json: String,
+        /// Print a stable machine-readable JSON report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Clear the artifact cache.
     Clear,
     /// Install the running-process `zccache.servicedef` so the shared
@@ -567,6 +576,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "daemon",
     "status",
     "analyze",
+    "engine-profile",
     "clear",
     "install-servicedef",
     "wrap",
