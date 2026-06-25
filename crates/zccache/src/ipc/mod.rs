@@ -575,16 +575,42 @@ fn running_process_endpoint_path(endpoint: &str) -> String {
 ///
 /// Slice 24 of zccache#782: migrated to the `protocol_v2::backend_handle`
 /// namespace.
+///
+/// ISSUE-601 / Linux Docker profile 2026-06-25: the underlying
+/// `DaemonProcess::current_process` SHA-256-hashes the daemon binary (via
+/// `running_process::broker::backend_lifecycle::identity::sha256_file`). The
+/// flame chart showed that single chain owning **43.06% of on-CPU** because
+/// `DaemonServer::bind` / `bind_with_cache_dir` / `EmbeddedDaemon::start`
+/// were repeatedly recomputing it. The daemon exe is immutable inside a
+/// running process, so the hash is keyed-by-endpoint cached for the process
+/// lifetime here. First-call errors still bubble up; only success values
+/// are inserted into the cache, so a transient failure (e.g. the exe was
+/// briefly unreadable) will retry on the next call.
 pub fn current_backend_identity(
     endpoint: &str,
 ) -> Result<
     running_process::broker::protocol_v2::backend_handle::DaemonProcess,
     running_process::broker::protocol_v2::backend_handle::IdentityError,
 > {
-    running_process::broker::protocol_v2::backend_handle::DaemonProcess::current_process(
-        running_process_endpoint(endpoint),
-        None,
-    )
+    use std::sync::LazyLock;
+    static IDENTITY_CACHE: LazyLock<
+        dashmap::DashMap<
+            String,
+            std::sync::Arc<running_process::broker::protocol_v2::backend_handle::DaemonProcess>,
+        >,
+    > = LazyLock::new(dashmap::DashMap::new);
+
+    if let Some(cached) = IDENTITY_CACHE.get(endpoint) {
+        return Ok((**cached).clone());
+    }
+
+    let identity =
+        running_process::broker::protocol_v2::backend_handle::DaemonProcess::current_process(
+            running_process_endpoint(endpoint),
+            None,
+        )?;
+    IDENTITY_CACHE.insert(endpoint.to_string(), std::sync::Arc::new(identity.clone()));
+    Ok(identity)
 }
 
 /// Persist the daemon identity used by future `BackendHandle` probes.

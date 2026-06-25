@@ -5,13 +5,24 @@ use super::*;
 /// How many artifact-persist tasks may be in flight concurrently.
 ///
 /// The daemon's persist path writes each cached artifact to disk via
-/// `std::fs::write` inside `tokio::task::spawn_blocking`. On Windows with
-/// Defender real-time protection, every write blocks until Defender finishes
-/// scanning the file. The hardcoded default of 8 was retained because raising
-/// it without other changes regressed wall-clock on this machine
-/// (see `tests/persist_pool_bench.rs`). The env var gives operators a lever
-/// when their workload differs — e.g. cache on a network mount, or a slow
-/// AV setup that benefits from more in-flight writes.
+/// `std::fs::write` inside `tokio::task::spawn_blocking`.
+///
+/// **Platform split (ISSUE-501, Linux Docker 2026-06-25):**
+///
+/// - **Windows:** Defender real-time protection serializes file writes —
+///   every `std::fs::write` blocks until Defender finishes scanning the
+///   file. The hardcoded default of 8 was retained because raising it
+///   without other changes regressed wall-clock on this machine (see
+///   `tests/persist_pool_bench.rs`).
+/// - **Non-Windows (Linux/macOS):** No AV serialization. The previous
+///   `8` cap throttled cold-miss waves on Linux to Windows-Defender
+///   width — a 50-file fan-out only got 8 concurrent persists. The
+///   non-Windows default is now `max(16, available_parallelism())` so
+///   the persist pool scales with the host's CPU count.
+///
+/// The env var gives operators a lever when their workload differs —
+/// e.g. cache on a network mount, or a slow AV setup that benefits
+/// from more (or fewer) in-flight writes.
 ///
 /// Override with `ZCCACHE_STORE_WORKERS=<N>` (must be ≥ 1, clamped to 1024).
 pub(super) fn persist_workers_default() -> usize {
@@ -22,7 +33,21 @@ pub(super) fn persist_workers_default() -> usize {
             }
         }
     }
-    8
+    #[cfg(windows)]
+    {
+        // Windows Defender serializes write-scan; raising this above 8
+        // regressed wall-clock in `tests/persist_pool_bench.rs`.
+        8
+    }
+    #[cfg(not(windows))]
+    {
+        // ISSUE-501 (Linux Docker 2026-06-25): cap the persist pool at
+        // host parallelism rather than the Windows Defender floor.
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        parallelism.max(16)
+    }
 }
 
 /// Hash a file using the metadata cache (with watcher-assisted confidence).

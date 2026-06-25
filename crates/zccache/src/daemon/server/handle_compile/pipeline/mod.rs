@@ -388,8 +388,16 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
     }
 
     // ── Slow path: hash + depgraph verify ────────────────────────────
+    //
+    // Issue #401 plumbing: the `hash_map` extracted here is fed back
+    // into the cc/cpp miss path's `StoreOutcomeRequest.pre_hashed` so
+    // the post-compile parallel hash skips files we already hashed
+    // here. The rustc miss path uses `pre_hash_task` (a background
+    // join handle) instead and ignores `pre_hashed`. The binding is
+    // marked `mut` so the rustc compat-check branch below can take it
+    // by `mem::take` without forcing a clone.
     let HashVerifyOutcome {
-        hash_map,
+        mut hash_map,
         hash_source_ns,
         hash_headers_ns,
         depgraph_check_ns,
@@ -568,7 +576,12 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
         {
             let check_style_request = !rustc_args.emit_types.iter().any(|emit| emit == "link");
             if check_style_request {
-                let compat_hash_map = std::cell::RefCell::new(hash_map);
+                // Issue #401: take `hash_map` here (rustc compat branch only)
+                // so cc/cpp can still hand the populated map to
+                // `StoreOutcomeRequest.pre_hashed`. For rustc we never
+                // pass `pre_hashed` (the `pre_hash_task` path is used
+                // instead), so leaving an empty map behind is benign.
+                let compat_hash_map = std::cell::RefCell::new(std::mem::take(&mut hash_map));
                 let get_hash = |p: &Path| {
                     let path = NormalizedPath::new(p);
                     if let Some(hash) = compat_hash_map.borrow().get(&path).copied() {
@@ -780,6 +793,18 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
             depfile_strategy,
             show_includes_scan,
             pre_hash_task,
+            // Issue #401: hand the cc/cpp miss path the hashes already
+            // computed in `hash_and_verify` so `store_outcome.rs` skips
+            // re-hashing the same headers in its parallel `t_hash` phase.
+            // For rustc the same hashes arrive via `pre_hash_task` and
+            // `pre_hashed` is left `None`. If we got here via cold context
+            // or fell back to a direct compile, `hash_map` is empty and
+            // the store path will hash everything as before.
+            pre_hashed: if is_rustc || hash_map.is_empty() {
+                None
+            } else {
+                Some(hash_map)
+            },
             compiler_priority_decision,
             compile_start,
             snap_clock,

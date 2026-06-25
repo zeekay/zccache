@@ -18,7 +18,37 @@ static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use clap::Parser;
 use zccache::core::NormalizedPath;
 
-const DAEMON_MAX_BLOCKING_THREADS: usize = 16;
+/// Upper bound for the tokio multi-thread runtime's `spawn_blocking` pool.
+///
+/// **Sizing rationale (ISSUE-502, Linux Docker 2026-06-25):**
+///
+/// The previous hardcoded `16` was undersized for the daemon's actual
+/// blocking-task fan-out. Three sources of `spawn_blocking` traffic share
+/// this pool:
+///
+/// 1. **Cache-check fan-out** (`handle_compile_multi.rs:367-389`): a
+///    50-file wave spawns up to 50 concurrent metadata/hash lookups.
+/// 2. **Persist concurrency** (`persist_workers_default`): on Linux now
+///    scales with host parallelism (ISSUE-501), so a 32-core box may
+///    have 32+ persist tasks in flight.
+/// 3. **Background loaders** (depgraph / compiler-hash / metadata /
+///    system-includes / artifact-store): five concurrent `spawn_blocking`
+///    tasks at daemon startup, plus per-request loader fall-throughs.
+///
+/// A 50-wide fan-out alone exhausted the prior 16-thread budget, leaving
+/// persist + loader tasks queued behind cache lookups.
+///
+/// We compute `max(64, available_parallelism * 4)` capped at `512`
+/// (tokio's stated default for the blocking pool). On a typical
+/// 8-core dev box this lands at 64; on a 32-core CI host at 128; and
+/// the 512 ceiling protects against pathological hosts.
+fn daemon_max_blocking_threads() -> usize {
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    parallelism.saturating_mul(4).clamp(64, 512)
+}
+
 const DAEMON_PROFILE_ENV: &str = "ZCCACHE_DAEMON_PROFILE";
 const TOKIO_CONSOLE_PROFILE: &str = "tokio-console";
 const TOKIO_CONSOLE_BIND_ENV: &str = "TOKIO_CONSOLE_BIND";
@@ -236,7 +266,7 @@ fn run_server(args: Args) {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .max_blocking_threads(DAEMON_MAX_BLOCKING_THREADS)
+        .max_blocking_threads(daemon_max_blocking_threads())
         .build()
         .expect("failed to create tokio runtime");
 

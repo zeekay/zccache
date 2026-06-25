@@ -32,6 +32,14 @@ pub(super) struct StoreOutcomeRequest<'a> {
     pub(super) depfile_strategy: DepfileStrategy,
     pub(super) show_includes_scan: Option<crate::depgraph::ScanResult>,
     pub(super) pre_hash_task: Option<tokio::task::JoinHandle<HashMap<NormalizedPath, ContentHash>>>,
+    /// Issue #401: pre-compile hashes already produced by `hash_and_verify`
+    /// on the cc/cpp miss path. `None` means the pre-compile hash phase did
+    /// not run (e.g. cold context, source-hash fallback) — fall back to
+    /// hashing everything as before. When `Some`, the same `(path, hash)`
+    /// pairs are seeded into the post-compile `hash_map` so the parallel
+    /// rayon hash skips files already covered. The rustc path uses
+    /// `pre_hash_task` (a `JoinHandle`) instead and is unaffected.
+    pub(super) pre_hashed: Option<HashMap<NormalizedPath, ContentHash>>,
     pub(super) compiler_priority_decision: crate::daemon::process::CompilePriorityDecision,
     pub(super) compile_start: std::time::Instant,
     pub(super) snap_clock: Clock,
@@ -215,6 +223,7 @@ pub(super) async fn store_successful_compile(req: StoreOutcomeRequest<'_>) -> Op
         depfile_strategy,
         show_includes_scan,
         pre_hash_task,
+        pre_hashed,
         compiler_priority_decision,
         compile_start,
         snap_clock,
@@ -364,22 +373,29 @@ pub(super) async fn store_successful_compile(req: StoreOutcomeRequest<'_>) -> Op
     // `pre_hash_task`; join here and then only hash the late-arriving
     // includes (scan_result.resolved + force_includes), which are
     // typically empty for workspace link.
+    //
+    // Issue #401: for cc/cpp, the miss path already hashed source +
+    // the depgraph's stored include set in `hash_and_verify`. Seed the
+    // local `hash_map` from `pre_hashed` so the parallel rayon hash
+    // below skips files already present, instead of re-hashing every
+    // header from scratch.
     let t_hash = std::time::Instant::now();
     let mut hash_map: HashMap<NormalizedPath, ContentHash> = match pre_hash_task {
         Some(task) => task.await.unwrap_or_default(),
-        None => HashMap::new(),
+        None => pre_hashed.unwrap_or_default(),
     };
     let pre_hashed_count = hash_map.len();
     {
         use rayon::prelude::*;
-        // Build the post-compile path list. When pre_hash_task ran,
-        // we skip source + externs (already hashed). Otherwise hash
-        // everything as before (C/C++ fallback).
+        // Build the post-compile path list. When the pre-hash phase
+        // populated `hash_map` (either rustc's `pre_hash_task` or the
+        // cc/cpp `pre_hashed` seed from `hash_and_verify`), skip paths
+        // already covered. Otherwise hash everything as before.
         let post_paths: Vec<&NormalizedPath> = if pre_hashed_count > 0 {
-            scan_result
-                .resolved
-                .iter()
+            std::iter::once(source_path)
+                .chain(scan_result.resolved.iter())
                 .chain(ctx.force_includes.iter())
+                .chain(rustc_extern_paths.iter())
                 .filter(|p| !hash_map.contains_key(*p))
                 .collect()
         } else {

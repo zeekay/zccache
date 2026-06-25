@@ -91,10 +91,20 @@ pub(super) fn emit_rust_miss_profile(profile: RustMissProfile<'_>) {
         .saturating_add(hash_headers_ns)
         .saturating_add(depgraph_check_ns);
     let pre_exec_other_ns = pre_exec_ns.saturating_sub(pre_exec_measured_ns);
+    // Issue ISSUE-501: include every named sub-phase printed below so
+    // `artifact_store_other_ns` reflects only the un-named residual
+    // (intra-phase glue, write_session_log, record_pch_source_mapping).
+    // Prior version omitted `rust_snapshot_ns`, double-counting ~1.4 ms
+    // of named persist work as "unaccounted" in cold profiles.
     let artifact_store_measured_ns = depgraph_update_ns
         .saturating_add(artifact_build_ns)
+        .saturating_add(artifact_meta_build_ns)
+        .saturating_add(rust_snapshot_ns)
         .saturating_add(persist_enqueue_ns)
-        .saturating_add(artifact_insert_stats_ns);
+        .saturating_add(artifact_insert_stats_ns)
+        .saturating_add(artifact_index_build_ns)
+        .saturating_add(artifact_index_persist_ns)
+        .saturating_add(artifact_memory_insert_ns);
     let artifact_store_other_ns = artifact_store_ns.saturating_sub(artifact_store_measured_ns);
     let accounted_ns = pre_exec_ns
         .saturating_add(compiler_prep_ns)

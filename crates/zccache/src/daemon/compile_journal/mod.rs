@@ -16,11 +16,11 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::{mpsc, Mutex};
 use std::time::SystemTime;
 
 use crate::core::NormalizedPath;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 
 use super::event_log::{format_timestamp, open_append};
 
@@ -272,9 +272,23 @@ impl SelfProfileSpans {
     }
 }
 
-/// JSONL compile journal backed by a lock-free channel and background writer thread.
+/// JSONL compile journal backed by a sync channel and background writer thread.
+///
+/// The channel is `std::sync::mpsc` (not `tokio::sync::mpsc`) because the
+/// consumer is a plain OS thread doing blocking file I/O — using tokio's
+/// `blocking_recv` here forced the writer through tokio's parking_lot chain
+/// for every message, costing one context switch per entry (ISSUE-101).
+///
+/// The sender is wrapped in `Mutex` so the `CompileJournal` handle remains
+/// `Sync` (callers share it as `Arc<CompileJournal>` across tokio tasks and
+/// real threads — see `tests::test_concurrent_logging` and the daemon's
+/// `ServerState`). `std::sync::mpsc::Sender` is `Send` but not `Sync`, so a
+/// raw field would break those call sites. The lock is uncontended in
+/// practice (sends are O(1) push onto a lock-free internal queue), so the
+/// overhead is a single uncontended futex acquire — still far cheaper than
+/// the tokio runtime detour we replaced.
 pub struct CompileJournal {
-    sender: Option<mpsc::UnboundedSender<JournalMessage>>,
+    sender: Option<Mutex<mpsc::Sender<JournalMessage>>>,
 }
 
 impl CompileJournal {
@@ -296,14 +310,16 @@ impl CompileJournal {
         let path = log_dir.join("compile_journal.jsonl");
         let file = open_append(&path)?;
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel();
 
         std::thread::Builder::new()
             .name("zccache-journal".into())
             .spawn(move || journal_thread(rx, path, file))
             .map_err(std::io::Error::other)?;
 
-        Ok(Self { sender: Some(tx) })
+        Ok(Self {
+            sender: Some(Mutex::new(tx)),
+        })
     }
 
     /// Create a no-op journal that discards all entries.
@@ -322,10 +338,12 @@ impl CompileJournal {
             // Serialize on caller's thread (tokio task).
             match serde_json::to_string(entry) {
                 Ok(line) => {
-                    let _ = tx.send(JournalMessage::Entry {
-                        line,
-                        session_path: session_path.map(Into::into),
-                    });
+                    if let Ok(tx) = tx.lock() {
+                        let _ = tx.send(JournalMessage::Entry {
+                            line,
+                            session_path: session_path.map(Into::into),
+                        });
+                    }
                 }
                 Err(e) => {
                     tracing::debug!("journal serialize error: {e}");
@@ -338,7 +356,9 @@ impl CompileJournal {
     /// so the background thread can release the file.
     pub fn close_session(&self, path: &Path) {
         if let Some(tx) = &self.sender {
-            let _ = tx.send(JournalMessage::CloseSession { path: path.into() });
+            if let Ok(tx) = tx.lock() {
+                let _ = tx.send(JournalMessage::CloseSession { path: path.into() });
+            }
         }
     }
 }
