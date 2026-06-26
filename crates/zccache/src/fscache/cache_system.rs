@@ -10,7 +10,64 @@ use super::metadata::MetadataCache;
 use crate::core::NormalizedPath;
 use crate::core::Result;
 use crate::hash::ContentHash;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Semaphore;
+
+/// Env override for the hashing semaphore. `0` / `unlimited` disables
+/// the gate (a permits=`usize::MAX / 2` semaphore is installed so the
+/// acquire is effectively a no-op). Any positive integer sets an
+/// explicit permit count.
+const HASH_WORKERS_ENV: &str = "ZCCACHE_HASH_WORKERS";
+
+/// Process-wide gate on concurrent blocking hash operations launched
+/// via [`CacheSystem::lookup_since_async`]. Sized generously so it is
+/// **strictly larger** than the daemon's `max_blocking_threads` pool —
+/// the semaphore exists as an upper bound on outstanding `mmap`s
+/// (and therefore VM pressure) under pathological bursts, not as the
+/// effective parallelism limit. The blocking pool, sized at
+/// `clamp(parallelism * 8, 128, 512)` in `bin/zccache-daemon.rs`, is
+/// what actually caps concurrent hash work in practice; this gate only
+/// trips when a million-file `find | xargs hash_file` style burst
+/// would otherwise hold a million mmaps in flight.
+///
+/// Default size: `clamp(parallelism * 16, 128, 1024)`.
+/// Override via `ZCCACHE_HASH_WORKERS=<N>` (`0` or `unlimited` =
+/// effectively no gate).
+fn hash_semaphore() -> &'static Arc<Semaphore> {
+    static HASH_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    HASH_SEMAPHORE.get_or_init(|| {
+        let permits = resolve_hash_workers(std::env::var(HASH_WORKERS_ENV).ok().as_deref());
+        Arc::new(Semaphore::new(permits))
+    })
+}
+
+/// Effective no-op permit count — large enough that `acquire` never
+/// blocks in practice. We don't use `usize::MAX` because Tokio's
+/// `Semaphore` caps at `MAX_PERMITS = usize::MAX >> 3`.
+const HASH_SEMAPHORE_UNLIMITED: usize = usize::MAX >> 4;
+
+fn resolve_hash_workers(env: Option<&str>) -> usize {
+    if let Some(raw) = env {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("unlimited") || trimmed == "0" {
+            return HASH_SEMAPHORE_UNLIMITED;
+        }
+        if let Ok(n) = trimmed.parse::<usize>() {
+            if n >= 1 {
+                return n;
+            }
+        }
+        tracing::warn!(
+            env = HASH_WORKERS_ENV,
+            value = raw,
+            "invalid {HASH_WORKERS_ENV}; falling back to default"
+        );
+    }
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    parallelism.saturating_mul(16).clamp(128, 1024)
+}
 
 /// Result of a clock-aware lookup.
 #[derive(Debug, Clone)]
@@ -113,12 +170,24 @@ impl CacheSystem {
     ///
     /// The slow path can stat and hash files, so async callers use this named
     /// edge instead of running filesystem work on Tokio runtime threads.
+    ///
+    /// Acquires a permit from [`hash_semaphore`] before dispatching to
+    /// `spawn_blocking`. Sized so the gate is a memory-pressure backstop,
+    /// not the effective parallelism limit — see the module-level docs on
+    /// [`hash_semaphore`].
     pub async fn lookup_since_async(
         &self,
         path: NormalizedPath,
         since_clock: Clock,
     ) -> Result<ClockLookup> {
         let cache = self.clone();
+        let _permit = hash_semaphore()
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|err| crate::core::Error::Cache {
+                message: format!("hash semaphore closed: {err}"),
+            })?;
         tokio::task::spawn_blocking(move || cache.lookup_since(&path, since_clock))
             .await
             .map_err(|err| crate::core::Error::Cache {
@@ -280,6 +349,47 @@ mod tests {
         let cache = CacheSystem::new();
         let result = cache.lookup_since(&NormalizedPath::from("/no/such/file.c"), Clock::ZERO);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_hash_workers_unset_uses_default() {
+        let n = resolve_hash_workers(None);
+        assert!(n >= 128, "default must be at least 128 (the floor)");
+        assert!(n <= 1024, "default must be at most 1024 (the ceiling)");
+    }
+
+    #[test]
+    fn resolve_hash_workers_explicit_value() {
+        assert_eq!(resolve_hash_workers(Some("64")), 64);
+        assert_eq!(resolve_hash_workers(Some("256")), 256);
+        assert_eq!(resolve_hash_workers(Some("  16  ")), 16);
+    }
+
+    #[test]
+    fn resolve_hash_workers_zero_is_unlimited() {
+        assert_eq!(resolve_hash_workers(Some("0")), HASH_SEMAPHORE_UNLIMITED);
+    }
+
+    #[test]
+    fn resolve_hash_workers_unlimited_keyword() {
+        assert_eq!(
+            resolve_hash_workers(Some("unlimited")),
+            HASH_SEMAPHORE_UNLIMITED
+        );
+        assert_eq!(
+            resolve_hash_workers(Some("UNLIMITED")),
+            HASH_SEMAPHORE_UNLIMITED
+        );
+        assert_eq!(
+            resolve_hash_workers(Some(" Unlimited ")),
+            HASH_SEMAPHORE_UNLIMITED
+        );
+    }
+
+    #[test]
+    fn resolve_hash_workers_invalid_falls_back_to_default() {
+        let n = resolve_hash_workers(Some("not-a-number"));
+        assert!((128..=1024).contains(&n));
     }
 
     #[test]
