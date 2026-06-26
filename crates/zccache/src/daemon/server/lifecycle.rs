@@ -232,6 +232,7 @@ impl EmbeddedDaemon {
     pub(crate) async fn start(
         endpoint: String,
         cache_dir: crate::core::NormalizedPath,
+        runtime_handle: Option<tokio::runtime::Handle>,
     ) -> Result<Self, crate::ipc::IpcError> {
         let backend_identity = crate::ipc::current_backend_identity(&endpoint)
             .map_err(|err| crate::ipc::IpcError::Endpoint(err.to_string()))?;
@@ -242,16 +243,25 @@ impl EmbeddedDaemon {
             index_writer_rx: Some(index_writer_rx),
             index_writer_handle: Mutex::new(None),
         };
-        daemon.start_background_tasks().await;
+        daemon.start_background_tasks(runtime_handle).await;
         Ok(daemon)
     }
 
-    async fn start_background_tasks(&mut self) {
+    async fn start_background_tasks(&mut self, runtime_handle: Option<tokio::runtime::Handle>) {
         if let Some(rx) = self.index_writer_rx.take() {
             let store = Arc::clone(&self.state.artifact_store);
             let shutdown = Arc::clone(&self.state.index_writer_shutdown);
-            *self.index_writer_handle.lock().await =
-                Some(tokio::spawn(run_index_writer(rx, store, shutdown)));
+            let task = run_index_writer(rx, store, shutdown);
+            // zccache#922: when the embedded host supplied a Tokio Handle,
+            // route the persistent index-writer spawn through it. Otherwise
+            // fall back to the ambient runtime (the calling runtime is the
+            // only one available when `runtime_handle.is_none()`, and the
+            // ambient resolves to it).
+            let handle = match &runtime_handle {
+                Some(h) => h.spawn(task),
+                None => tokio::spawn(task),
+            };
+            *self.index_writer_handle.lock().await = Some(handle);
         }
 
         let state = Arc::clone(&self.state);
