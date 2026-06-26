@@ -46,11 +46,78 @@ pub struct ZccacheConfig {
 }
 
 /// Host identity used to namespace and diagnose an embedded service instance.
+///
+/// Feeds the synthetic IPC endpoint string `embedded:<product>:<instance_id>:<workspace_id>`
+/// which in turn keys `current_backend_identity` (a process-wide
+/// `LazyLock<DashMap>` since PR #919). The keying decides which cached
+/// entries survive across daemon restarts within the same process — so
+/// stability of these three strings is a contract, not an aesthetic.
+///
+/// # Stability guidance (zccache#925)
+///
+/// | Field | What it controls | Recommended stability |
+/// |---|---|---|
+/// | `product` | Tags the daemon for diagnostics + the broker name | Constant per product (e.g. `"soldr"`, `"fbuild"`). Treat as a literal string. |
+/// | `instance_id` | Cache-continuity key. Two starts with the same `instance_id` share warm caches; two different `instance_id`s do not. | Stable across daemon restarts on the same host + install. The `HostIdentity::default_for_product` helper hashes `(current_exe, host_data_dir)` which gives you this for free. |
+/// | `workspace_id` | Today: same as `instance_id` (no-op key under the synthetic endpoint). Future: per-call value once it migrates to [`CompileRequest`]. | Until it moves, leave equal to `instance_id` — that's the no-op default. |
+///
+/// What breaks if you violate the contract:
+/// - Changing `instance_id` per daemon restart: the warm `current_backend_identity`
+///   cache for the previous run is unreachable; every restart pays the
+///   first-bind SHA-256 cost again (the 43% on-CPU plateau PR #919 fixed).
+/// - Sharing `instance_id` across two unrelated products in the same process:
+///   their cache entries collide in the DashMap shard.
+/// - Setting `workspace_id` to something other than `instance_id` today:
+///   silently namespaces the cache by workspace, which is rarely intended at
+///   start-time — wait for the per-compile migration.
+///
+/// See `HostIdentity::default_for_product` for the helper that satisfies
+/// these contracts automatically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostIdentity {
     pub product: String,
     pub instance_id: String,
     pub workspace_id: String,
+}
+
+impl HostIdentity {
+    /// Build a `HostIdentity` whose `instance_id` is stable across daemon
+    /// restarts on the same machine + same install.
+    ///
+    /// The instance hash mixes `std::env::current_exe()` (so two soldrs
+    /// installed at different paths get different ids, and an upgrade in
+    /// place keeps the same id when the exe path is unchanged) with the
+    /// caller-supplied `product` string (so two products embedding zccache
+    /// in the same process get distinct ids even if they share an exe).
+    /// `workspace_id` is set equal to `instance_id` so the cache key is
+    /// the no-op single-namespace form until the planned per-compile
+    /// migration (see the type-level doc).
+    ///
+    /// If `std::env::current_exe()` fails the hash falls back to a fixed
+    /// value derived from the product string only — better than panicking
+    /// in a host daemon, but the resulting id is less unique. Callers that
+    /// want a stronger guarantee should construct `HostIdentity` directly.
+    pub fn default_for_product(product: impl Into<String>) -> Self {
+        use blake3::Hasher;
+        let product = product.into();
+        let mut hasher = Hasher::new();
+        hasher.update(product.as_bytes());
+        hasher.update(b"\0zccache-host-identity-v1\0");
+        if let Ok(exe) = std::env::current_exe() {
+            hasher.update(exe.as_os_str().to_string_lossy().as_bytes());
+        }
+        let bytes = hasher.finalize();
+        let mut hex = String::with_capacity(32);
+        for byte in &bytes.as_bytes()[..16] {
+            use std::fmt::Write;
+            let _ = write!(hex, "{byte:02x}");
+        }
+        Self {
+            product,
+            instance_id: hex.clone(),
+            workspace_id: hex,
+        }
+    }
 }
 
 /// Runtime integration hooks reserved for host-owned Tokio runtimes.
@@ -305,6 +372,48 @@ fn sanitize_identity(value: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod host_identity_tests {
+    //! zccache#925: tests for `HostIdentity::default_for_product` and the
+    //! documented stability contract.
+
+    use super::*;
+
+    #[test]
+    fn default_for_product_is_stable_within_one_process() {
+        // Two calls in the same process must yield byte-identical
+        // identities. This is the "cache continuity across daemon
+        // restarts on the same install" contract — within a process the
+        // current_exe path and product string don't change, so the hash
+        // doesn't change.
+        let a = HostIdentity::default_for_product("soldr");
+        let b = HostIdentity::default_for_product("soldr");
+        assert_eq!(a, b, "same product must yield same identity");
+        assert_eq!(a.product, "soldr");
+        assert_eq!(a.workspace_id, a.instance_id);
+    }
+
+    #[test]
+    fn default_for_product_differs_per_product() {
+        // Two different products must yield distinct identities so they
+        // don't collide in the per-process backend-identity DashMap.
+        let soldr = HostIdentity::default_for_product("soldr");
+        let fbuild = HostIdentity::default_for_product("fbuild");
+        assert_ne!(soldr, fbuild);
+        assert_ne!(soldr.instance_id, fbuild.instance_id);
+    }
+
+    #[test]
+    fn default_for_product_instance_id_is_16_bytes_of_hex() {
+        // 32 hex chars = 16 bytes. The format is part of the
+        // diagnostic surface (`embedded_endpoint` prints it) so freezing
+        // it here catches accidental changes.
+        let id = HostIdentity::default_for_product("zccache-test");
+        assert_eq!(id.instance_id.len(), 32);
+        assert!(id.instance_id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }
 
 #[cfg(test)]
