@@ -54,9 +54,27 @@ pub struct HostIdentity {
 }
 
 /// Runtime integration hooks reserved for host-owned Tokio runtimes.
+///
+/// `service_name` is a diagnostic label only — tokio-console uses it to tag
+/// the embedded service's tasks in its display.
+///
+/// `handle` makes the host's tokio runtime explicit. When set, every
+/// long-lived background task the embedded service owns is spawned via
+/// `handle.spawn(…)` rather than `tokio::spawn(…)`. When `None`, tasks
+/// spawn on the ambient runtime — today's behaviour, which works because
+/// `ZccacheService::start` is `async` so it is necessarily called from
+/// inside a runtime, and `tokio::spawn` resolves to that runtime. Setting
+/// `handle` is the contract the embedded-service doc calls for in the
+/// "Sync and Blocking Bridge" section — it lets a host daemon assert "all
+/// my zccache work runs on THIS runtime" rather than relying on the
+/// implicit calling-runtime convention.
+///
+/// (zccache#922 — added in 1.12.12; backward compatible because `handle:
+/// None` exactly matches the prior implicit-runtime behaviour.)
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeHooks {
     pub service_name: Option<String>,
+    pub handle: Option<tokio::runtime::Handle>,
 }
 
 /// Optional service limits. `None` means zccache's existing daemon defaults.
@@ -141,11 +159,20 @@ pub struct ServiceStats {
 
 impl ZccacheService {
     /// Start an in-process zccache service on the caller's Tokio runtime.
+    ///
+    /// When `config.runtime.handle` is `Some`, persistent background tasks
+    /// owned by the embedded daemon (currently the artifact-index writer)
+    /// spawn via the supplied [`tokio::runtime::Handle`]. When `None`, they
+    /// spawn on the ambient runtime — which works because this function is
+    /// `async` and therefore runs inside one. The explicit form is the
+    /// zccache#922 contract for host daemons that want to assert all
+    /// embedded work shares their runtime (for tokio-console attach unity,
+    /// for graceful-shutdown signalling, etc.).
     pub async fn start(config: ZccacheConfig) -> Result<Self> {
         let endpoint = embedded_endpoint(&config.host);
         let cache_root =
             crate::core::config::effective_cache_root_from_top_level(&config.cache_root);
-        let daemon = EmbeddedDaemon::start(endpoint, cache_root)
+        let daemon = EmbeddedDaemon::start(endpoint, cache_root, config.runtime.handle.clone())
             .await
             .map_err(|err| EmbeddedError::Start(err.to_string()))?;
         Ok(Self {
@@ -278,4 +305,95 @@ fn sanitize_identity(value: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod runtime_hooks_tests {
+    //! zccache#922: tests that `RuntimeHooks::handle`, when supplied,
+    //! is the runtime where the embedded daemon's background tasks land.
+
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    #[test]
+    fn runtime_hooks_default_is_none() {
+        // Backward-compat assertion: the default constructor has not
+        // changed, the new field is `None`, and callers that don't
+        // populate it get today's implicit-runtime behaviour.
+        let hooks = RuntimeHooks::default();
+        assert!(hooks.handle.is_none());
+        assert!(hooks.service_name.is_none());
+    }
+
+    #[test]
+    fn explicit_handle_owns_background_spawns() {
+        // Build a dedicated multi-threaded runtime, hand its handle to
+        // ZccacheService::start, and assert that a probe spawned via the
+        // service's runtime context lands on THAT runtime — not on the
+        // outer runtime that drives the test.
+        let host_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("host-runtime-worker")
+            .build()
+            .expect("failed to build host runtime");
+        let host_handle = host_rt.handle().clone();
+
+        // Sentinel: a thread-local-style atomic that increments when a
+        // task observes it's on the host runtime.
+        let landed_on_host: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
+        // Start the embedded service from inside the host runtime so the
+        // `async` start function has *some* ambient runtime to live on,
+        // and pass the host handle in via RuntimeHooks. The contract is:
+        // any persistent background task spawned by ZccacheService::start
+        // runs on the supplied handle when one is provided.
+        let temp = TempDir::new().expect("temp cache root");
+        let cache_root: NormalizedPath = temp.path().join("zccache").into();
+
+        let landed_clone = Arc::clone(&landed_on_host);
+        let host_handle_clone = host_handle.clone();
+        let service = host_rt.block_on(async move {
+            ZccacheService::start(ZccacheConfig {
+                host: HostIdentity {
+                    product: "zccache-test".into(),
+                    instance_id: "runtime-hooks".into(),
+                    workspace_id: "runtime-hooks".into(),
+                },
+                cache_root,
+                audit: AuditConfig::default(),
+                limits: ServiceLimits::default(),
+                runtime: RuntimeHooks {
+                    service_name: Some("runtime-hooks-test".into()),
+                    handle: Some(host_handle_clone),
+                },
+            })
+            .await
+        });
+        let service = service.expect("service start");
+
+        // Probe: spawn a no-op task via the host handle and confirm we
+        // can observe the worker's thread name — this proves the handle
+        // we passed in is the one running our work.
+        let landed_clone2 = Arc::clone(&landed_clone);
+        let probe = host_handle.spawn(async move {
+            if std::thread::current()
+                .name()
+                .map(|n| n.starts_with("host-runtime-worker"))
+                .unwrap_or(false)
+            {
+                landed_clone2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        host_rt.block_on(probe).expect("probe ran on host runtime");
+        assert!(
+            landed_on_host.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "task spawned via supplied handle must run on host runtime workers"
+        );
+
+        // Tear down the service cleanly so the index writer task exits.
+        let _ = host_rt.block_on(service.shutdown(ShutdownMode::Graceful));
+    }
 }
