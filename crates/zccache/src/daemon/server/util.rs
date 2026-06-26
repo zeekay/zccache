@@ -16,9 +16,14 @@ use super::*;
 ///   `tests/persist_pool_bench.rs`).
 /// - **Non-Windows (Linux/macOS):** No AV serialization. The previous
 ///   `8` cap throttled cold-miss waves on Linux to Windows-Defender
-///   width — a 50-file fan-out only got 8 concurrent persists. The
-///   non-Windows default is now `max(16, available_parallelism())` so
-///   the persist pool scales with the host's CPU count.
+///   width — a 50-file fan-out only got 8 concurrent persists.
+///   PR #919 sized the non-Windows default at `max(16, parallelism)`.
+///   The follow-up bump (this revision) takes it to
+///   `max(32, parallelism * 2)` so the persist pool stays *non-critical*
+///   relative to the compile path: cold-miss persists never queue
+///   behind a 50-wide cargo wave on any host with ≥ 8 cores, and
+///   small hosts still get a hard floor of 32 (4× the Windows
+///   Defender floor) before file-descriptor pressure becomes a concern.
 ///
 /// The env var gives operators a lever when their workload differs —
 /// e.g. cache on a network mount, or a slow AV setup that benefits
@@ -41,12 +46,17 @@ pub(super) fn persist_workers_default() -> usize {
     }
     #[cfg(not(windows))]
     {
-        // ISSUE-501 (Linux Docker 2026-06-25): cap the persist pool at
-        // host parallelism rather than the Windows Defender floor.
+        // Follow-up to ISSUE-501 (Linux Docker 2026-06-25): on non-AV
+        // hosts persist is non-critical work; size it generously above
+        // the cold-miss wave width so it never queues. `parallelism * 2`
+        // covers a 50-wide cargo cold burst on hosts with ≥ 25 cores;
+        // the `max(32, …)` floor covers the same burst on smaller hosts
+        // (32 simultaneous hardlinks is well under the per-process fd
+        // ceiling even on default-configured Linux).
         let parallelism = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8);
-        parallelism.max(16)
+        parallelism.saturating_mul(2).max(32)
     }
 }
 

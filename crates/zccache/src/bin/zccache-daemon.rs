@@ -38,15 +38,25 @@ use zccache::core::NormalizedPath;
 /// A 50-wide fan-out alone exhausted the prior 16-thread budget, leaving
 /// persist + loader tasks queued behind cache lookups.
 ///
-/// We compute `max(64, available_parallelism * 4)` capped at `512`
-/// (tokio's stated default for the blocking pool). On a typical
-/// 8-core dev box this lands at 64; on a 32-core CI host at 128; and
-/// the 512 ceiling protects against pathological hosts.
+/// We compute `clamp(parallelism * 8, 128, 512)`. The `* 8` multiplier
+/// (raised from `* 4`) and the floor lift (64 → 128) come from a
+/// follow-up after PR #919 / ISSUE-502: the previous 4× / 64-floor sized
+/// the pool tight against the *critical* paths (cache-check fan-out +
+/// persist concurrency + loaders), leaving no headroom for *non-critical*
+/// blocking work (hashing under `lookup_since_async`, watcher
+/// canonicalize, per-request fs metadata calls). Doubling the multiplier
+/// and floor moves those non-critical paths out of the queue tail so a
+/// 50-wide cargo cold burst doesn't park hashing behind persist.
+///
+/// Resulting sizes:
+/// - 1–16 cores → 128 (floor)
+/// - 32 cores → 256
+/// - ≥ 64 cores → 512 (ceiling — matches tokio's stated default).
 fn daemon_max_blocking_threads() -> usize {
     let parallelism = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(8);
-    parallelism.saturating_mul(4).clamp(64, 512)
+    parallelism.saturating_mul(8).clamp(128, 512)
 }
 
 const DAEMON_PROFILE_ENV: &str = "ZCCACHE_DAEMON_PROFILE";
