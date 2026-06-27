@@ -76,17 +76,11 @@ fn init() -> Option<Mutex<std::fs::File>> {
         Ok(file) => {
             // One-line startup confirmation so hosts can verify the
             // env var was picked up by THIS process.
-            eprintln!(
-                "zccache: {ENV_VAR} active, writing to {}",
-                path.display()
-            );
+            eprintln!("zccache: {ENV_VAR} active, writing to {}", path.display());
             Some(Mutex::new(file))
         }
         Err(e) => {
-            eprintln!(
-                "zccache: {ENV_VAR}={} but open failed: {e}",
-                path.display()
-            );
+            eprintln!("zccache: {ENV_VAR}={} but open failed: {e}", path.display());
             None
         }
     }
