@@ -14,6 +14,10 @@ pub mod audit_writer;
 pub mod ci;
 pub mod cli;
 pub mod compiler;
+/// zccache#940 — per-sub-phase JSONL trace for the embedded compile
+/// path. Diagnostic-only, gated by the `ZCCACHE_INNER_TRACE` env var.
+/// See module doc for the wire format and why it exists.
+pub mod compile_trace;
 pub mod core;
 pub mod daemon;
 pub mod depgraph;

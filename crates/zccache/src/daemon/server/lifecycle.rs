@@ -9,6 +9,16 @@ use super::*;
 /// artifact and depfile directories, even within the same process.
 pub(super) static SERVER_INSTANCE: AtomicU64 = AtomicU64::new(0);
 pub(super) static ARTIFACT_PERSIST_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// zccache#940 — monotonic per-process compile counter for the inner
+/// diagnostic trace. Resets across process restarts by design (the
+/// trace file is process-scoped). Hosts that need durable ids should
+/// cross-correlate by `ts_ns` against their own audit log.
+static INNER_COMPILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_inner_compile_id() -> String {
+    let n = INNER_COMPILE_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("z{n:08x}")
+}
 
 impl DaemonServer {
     /// Create a new daemon server bound to the given endpoint, using the
@@ -368,6 +378,14 @@ impl EmbeddedDaemon {
         self.state
             .last_activity
             .store(now_secs(), Ordering::Relaxed);
+        // zccache#940: per-compile id for the diagnostic trace. The
+        // embedded daemon does not yet surface an audit id through
+        // EmbeddedCompileRequest, so we generate a monotonic per-process
+        // counter here. Hosts that already track their own per-compile
+        // id (soldr's `c<N>` scheme) get a parallel namespace; the two
+        // sides can be cross-correlated by timestamp.
+        let compile_id = next_inner_compile_id();
+        let total = std::time::Instant::now();
         let response = handle_compile_ephemeral(
             &self.state,
             std::process::id(),
@@ -379,19 +397,38 @@ impl EmbeddedDaemon {
             request.stdin,
         )
         .await;
+        crate::compile_trace::record(
+            "embedded_daemon_compile",
+            total.elapsed().as_micros() as u64,
+            &compile_id,
+        );
         match response {
             Response::CompileResult {
                 exit_code,
                 stdout,
                 stderr,
                 cached,
-            } => Ok(EmbeddedCompileResult {
-                exit_code,
-                stdout,
-                stderr,
-                cached,
-            }),
-            Response::Error { message } => Err(message),
+            } => {
+                crate::compile_trace::record(
+                    if cached {
+                        "embedded_outcome_cached"
+                    } else {
+                        "embedded_outcome_miss"
+                    },
+                    0,
+                    &compile_id,
+                );
+                Ok(EmbeddedCompileResult {
+                    exit_code,
+                    stdout,
+                    stderr,
+                    cached,
+                })
+            }
+            Response::Error { message } => {
+                crate::compile_trace::record("embedded_outcome_error", 0, &compile_id);
+                Err(message)
+            }
             other => Err(format!("unexpected embedded compile response: {other:?}")),
         }
     }
