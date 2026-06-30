@@ -107,12 +107,19 @@ wait-timeout = "0.2"
 # shared: used by test_support, download-daemon bin, etc.
 tracing-subscriber = { workspace = true }
 
+# Global allocator on every target. mimalloc is pure C with no autotools
+# step, so it cross-compiles cleanly in every direction. tikv-jemalloc
+# was the previous choice on unix but its bundled autoconf invokes a
+# hidden `$(CC) -MM` dep-tracking pass that silently drops the
+# `--sysroot` flag — broke Linux->*-apple-darwin (and would equally
+# break Windows->Linux); see tikv/jemallocator#170. Using one allocator
+# everywhere also removes a per-platform variable from perf analysis.
+mimalloc = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-tikv-jemallocator = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-mimalloc = { workspace = true }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",

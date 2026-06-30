@@ -7,13 +7,8 @@
 //! handles (exe file lock on Windows, implicit cwd handle on all OSes)
 //! via [`zccache::daemon::trampoline`] before entering [`run_server`].
 
-#[cfg(unix)]
 #[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-#[cfg(windows)]
-#[global_allocator]
-static GLOBAL_WIN: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::Parser;
 use zccache::core::NormalizedPath;
