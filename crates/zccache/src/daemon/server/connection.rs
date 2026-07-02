@@ -744,7 +744,9 @@ async fn send_response_for_wire(
     }
 }
 
-fn compile_miss_reason(
+// `pub(super)` so the embedded compile path (`lifecycle.rs`) attributes
+// miss reasons identically to the IPC path (soldr#1286).
+pub(super) fn compile_miss_reason(
     ctx: &JournalContext,
     outcome: &str,
     default_reason: Option<&'static str>,
