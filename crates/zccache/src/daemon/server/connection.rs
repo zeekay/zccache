@@ -754,7 +754,22 @@ pub(super) fn compile_miss_reason(
     if outcome != "miss" || default_reason != Some(miss_reason::UNKNOWN) {
         return default_reason;
     }
-    match crate::compiler::parse_invocation(&ctx.compiler, &ctx.args) {
+    // Issue #951: expand `@response-file` args before parsing. The
+    // compile pipeline expands them (`expand_args_cached`) and caches
+    // through them, but this attribution path used to parse the RAW
+    // argv — for fbuild-style invocations (`g++ @args.rsp`) the parser
+    // then saw no `-c`/no source and stamped every such miss
+    // `uncacheable_input`, hiding the real reason (observed: 117/117
+    // mislabeled on a dev machine while the second pass served hits).
+    // If the response file is already gone by journal time, keep the
+    // honest `unknown` default instead of guessing uncacheable.
+    let base_dir = std::path::Path::new(&ctx.cwd);
+    let expanded =
+        match crate::compiler::response_file::expand_response_files_in(&ctx.args, base_dir) {
+            Ok(expanded) => expanded,
+            Err(_) => return default_reason,
+        };
+    match crate::compiler::parse_invocation(&ctx.compiler, &expanded) {
         crate::compiler::ParsedInvocation::NonCacheable { .. } => {
             Some(miss_reason::UNCACHEABLE_INPUT)
         }
@@ -983,6 +998,55 @@ mod self_profile_tests {
     #[test]
     fn cacheable_miss_keeps_default_reason() {
         let ctx = test_journal_ctx("rustc", &["--crate-name", "demo", "src/lib.rs"]);
+        assert_eq!(
+            compile_miss_reason(&ctx, "miss", Some(miss_reason::UNKNOWN)),
+            Some(miss_reason::UNKNOWN)
+        );
+    }
+
+    // Issue #951: fbuild-style invocations pass the whole cacheable
+    // argv through `@file.rsp`. Attribution must expand the response
+    // file before parsing — parsing the raw `@arg` mislabels every
+    // such miss as `uncacheable_input`.
+    #[test]
+    fn rsp_cacheable_miss_keeps_default_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("file1.cpp");
+        std::fs::write(&src, "int f() { return 1; }\n").unwrap();
+        let rsp = dir.path().join("compile_1.rsp");
+        std::fs::write(&rsp, format!("-c\n{}\n-o\nfile1.o\n-O2\n", src.display())).unwrap();
+        let arg = format!("@{}", rsp.display());
+        let mut ctx = test_journal_ctx("/usr/bin/g++", &[arg.as_str()]);
+        ctx.cwd = dir.path().to_string_lossy().into_owned();
+        assert_eq!(
+            compile_miss_reason(&ctx, "miss", Some(miss_reason::UNKNOWN)),
+            Some(miss_reason::UNKNOWN),
+            "a cacheable compile behind @rsp must not be stamped uncacheable_input"
+        );
+    }
+
+    // Issue #951: a genuinely uncacheable invocation stays attributed
+    // even when it arrives through a response file.
+    #[test]
+    fn rsp_preprocess_only_miss_is_attributed_uncacheable() {
+        let dir = tempfile::tempdir().unwrap();
+        let rsp = dir.path().join("preprocess.rsp");
+        std::fs::write(&rsp, "-E\nfile1.cpp\n").unwrap();
+        let arg = format!("@{}", rsp.display());
+        let mut ctx = test_journal_ctx("/usr/bin/g++", &[arg.as_str()]);
+        ctx.cwd = dir.path().to_string_lossy().into_owned();
+        assert_eq!(
+            compile_miss_reason(&ctx, "miss", Some(miss_reason::UNKNOWN)),
+            Some(miss_reason::UNCACHEABLE_INPUT)
+        );
+    }
+
+    // Issue #951: fbuild deletes the rsp right after the compile; if it
+    // is already gone at journal time, keep the honest `unknown`
+    // default rather than guessing uncacheable.
+    #[test]
+    fn rsp_missing_at_journal_time_keeps_default_reason() {
+        let ctx = test_journal_ctx("/usr/bin/g++", &["@/nonexistent/gone.rsp"]);
         assert_eq!(
             compile_miss_reason(&ctx, "miss", Some(miss_reason::UNKNOWN)),
             Some(miss_reason::UNKNOWN)

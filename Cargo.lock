@@ -3934,7 +3934,7 @@ dependencies = [
 
 [[package]]
 name = "zccache"
-version = "1.12.14"
+version = "1.12.15"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -3991,7 +3991,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-cli"
-version = "1.12.14"
+version = "1.12.15"
 dependencies = [
  "pyo3",
  "pyo3-build-config",
@@ -4000,7 +4000,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-fingerprint"
-version = "1.12.14"
+version = "1.12.15"
 dependencies = [
  "pyo3",
  "pyo3-build-config",
@@ -4009,7 +4009,7 @@ dependencies = [
 
 [[package]]
 name = "zccache-watcher"
-version = "1.12.14"
+version = "1.12.15"
 dependencies = [
  "pyo3",
  "pyo3-build-config",

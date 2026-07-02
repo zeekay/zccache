@@ -33,7 +33,8 @@
 //!
 //! | event | who writes it | meaning | key fields |
 //! |---|---|---|---|
-//! | `spawn-attempt` | CLI | about to spawn a daemon (or was about to, and lost the race) | `reason`, `endpoint`, `client_pid`, `client_version`, `client_binary_path` |
+//! | `spawn-attempt` | CLI | won the single-flight spawn slot and is spawning a daemon (#952) | `reason`, `endpoint`, `client_pid`, `client_version`, `client_binary_path` |
+//! | `spawn-parked` | CLI | wanted a daemon but another client holds the spawn slot; parking on ready-wait (#952) | `reason`, `endpoint`, `client_pid`, `client_version` |
 //! | `spawn` | daemon | bound the endpoint, server up | `endpoint`, `version`, `idle_timeout`, `client_version`, `client_binary_path` |
 //! | `died-idle` | daemon | exiting after idle timeout | `reason`, `idle_secs`, `idle_timeout_secs` |
 //! | `died-shutdown` | daemon | got a `Shutdown` request | `reason`, `uptime_secs` |
@@ -75,6 +76,11 @@ use super::NormalizedPath;
 /// constants exist for the call sites we ship today.
 pub const EVENT_SPAWN: &str = "spawn";
 pub const EVENT_SPAWN_ATTEMPT: &str = "spawn-attempt";
+/// Issue #952: the client wanted a daemon but another client already
+/// holds the single-flight spawn slot; this one parks on the
+/// ready-wait instead of spawning. Pairs with exactly one
+/// `spawn-attempt` per cold start.
+pub const EVENT_SPAWN_PARKED: &str = "spawn-parked";
 pub const EVENT_DIED_IDLE: &str = "died-idle";
 pub const EVENT_DIED_SHUTDOWN: &str = "died-shutdown";
 pub const EVENT_VERSION_MISMATCH: &str = "version_mismatch";
