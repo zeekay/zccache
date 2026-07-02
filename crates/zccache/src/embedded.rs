@@ -1022,8 +1022,7 @@ mod journal_tests {
                     if let Some(found) = find_journal(&path) {
                         return Some(found);
                     }
-                } else if path.file_name().and_then(|n| n.to_str())
-                    == Some("compile_journal.jsonl")
+                } else if path.file_name().and_then(|n| n.to_str()) == Some("compile_journal.jsonl")
                 {
                     return Some(path);
                 }

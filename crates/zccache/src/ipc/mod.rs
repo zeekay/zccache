@@ -455,9 +455,13 @@ pub fn lock_file_path() -> NormalizedPath {
     #[cfg(unix)]
     {
         let endpoint = default_endpoint();
+        // Endpoint paths always live inside a directory, but the denied
+        // `expect_used` lint fires when clippy compiles this cfg(unix)
+        // arm (it was landed from a host where clippy never saw it —
+        // caught during soldr#1286 docker-linux verification).
         let dir = std::path::Path::new(&endpoint)
             .parent()
-            .expect("endpoint should have parent directory");
+            .unwrap_or_else(|| std::path::Path::new("/tmp"));
         dir.join(lock_file_name(namespace.as_deref())).into()
     }
     #[cfg(windows)]
