@@ -386,6 +386,20 @@ impl EmbeddedDaemon {
         // sides can be cross-correlated by timestamp.
         let compile_id = next_inner_compile_id();
         let total = std::time::Instant::now();
+        // soldr#1286: capture journal metadata BEFORE the handler consumes
+        // the request so embedded compiles land in compile_journal.jsonl
+        // exactly like daemon-IPC compiles do (connection.rs journal block).
+        // Without this the embedded backend — the only compile path for
+        // soldr since zccache became an embedded service — was invisible
+        // to hit/miss telemetry: `zccache analyze`, dashboards, and
+        // post-mortem scripts saw zero rustc records.
+        let journal_ctx = JournalContext {
+            compiler: request.compiler.to_string_lossy().into_owned(),
+            args: request.args.clone(),
+            cwd: request.cwd.to_string_lossy().into_owned(),
+            env: request.env.clone(),
+            session_id: None,
+        };
         let response = handle_compile_ephemeral(
             &self.state,
             std::process::id(),
@@ -402,6 +416,23 @@ impl EmbeddedDaemon {
             total.elapsed().as_micros() as u64,
             &compile_id,
         );
+        // Journal the outcome (hit/miss/error + miss_reason) on the same
+        // background-thread writer the daemon path uses. `log` never
+        // blocks, so the embedded hot path pays only the context capture
+        // above plus serde serialization — parity with the IPC path's
+        // accepted cost (issue #459).
+        if let Some((outcome, exit_code, default_reason)) = extract_outcome(&response) {
+            let miss_reason =
+                super::connection::compile_miss_reason(&journal_ctx, outcome, default_reason);
+            let entry = JournalEntry::new(
+                journal_ctx,
+                outcome,
+                exit_code,
+                total.elapsed().as_nanos(),
+                miss_reason,
+            );
+            self.state.journal.log(&entry, None);
+        }
         match response {
             Response::CompileResult {
                 exit_code,

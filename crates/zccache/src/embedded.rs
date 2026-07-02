@@ -958,3 +958,104 @@ mod runtime_hooks_tests {
         let _ = host_rt.block_on(service.shutdown(ShutdownMode::Graceful));
     }
 }
+
+#[cfg(test)]
+mod journal_tests {
+    //! soldr#1286: the embedded backend must journal every compile
+    //! outcome to `logs/compile_journal.jsonl` exactly like the daemon
+    //! IPC path. Before this test existed, embedded compiles (the only
+    //! compile path for soldr hosts) produced zero journal records, so
+    //! hit-ratio and miss-reason telemetry was blind on dev machines.
+
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn unreachable_compile_request() -> CompileRequest {
+        CompileRequest {
+            audit: AuditContext::new(
+                crate::audit::AuditId::new("journal-run").expect("non-empty"),
+                crate::audit::AuditId::new("journal-trace").expect("non-empty"),
+            ),
+            compiler: PathBuf::from("/nonexistent/compiler-that-never-runs").into(),
+            args: vec!["--version".into()],
+            cwd: std::env::current_dir().expect("cwd").into(),
+            env: Vec::new(),
+            stdin: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_compile_writes_compile_journal() {
+        let temp = TempDir::new().expect("temp cache root");
+        let mut audit = AuditConfig::default();
+        audit.mode = crate::audit::AuditMode::Off;
+        let service = ZccacheService::start(ZccacheConfig {
+            host: HostIdentity {
+                product: "zccache-test".into(),
+                instance_id: "embedded-journal".into(),
+                workspace_id: "embedded-journal".into(),
+            },
+            cache_root: temp.path().join("zccache").into(),
+            audit,
+            limits: ServiceLimits::default(),
+            runtime: RuntimeHooks::default(),
+            cancellation: None,
+        })
+        .await
+        .expect("service start");
+
+        // The fake compiler cannot spawn, which still exercises the
+        // journal write path (outcome "error", exit_code -1) without
+        // needing a real compiler on the test host.
+        let _ = service.compile(unreachable_compile_request()).await;
+
+        // `CompileJournal` writes on a background thread, and the
+        // effective cache root gains a versioned subdir — locate
+        // `logs/compile_journal.jsonl` by walking the temp tree and
+        // poll briefly for the async write.
+        fn find_journal(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+            let entries = std::fs::read_dir(dir).ok()?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(found) = find_journal(&path) {
+                        return Some(found);
+                    }
+                } else if path.file_name().and_then(|n| n.to_str()) == Some("compile_journal.jsonl")
+                {
+                    return Some(path);
+                }
+            }
+            None
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let content = loop {
+            let content = find_journal(temp.path()).and_then(|p| std::fs::read_to_string(p).ok());
+            match content {
+                Some(c) if !c.trim().is_empty() => break c,
+                _ if std::time::Instant::now() > deadline => {
+                    panic!("embedded compile produced no compile_journal.jsonl record")
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+            }
+        };
+
+        let line = content.lines().next().expect("at least one journal line");
+        let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON journal line");
+        assert_eq!(
+            v["outcome"], "error",
+            "unspawnable compiler must journal as error: {v}"
+        );
+        assert!(
+            v["compiler"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("compiler-that-never-runs"),
+            "journal must record the embedded compiler path: {v}"
+        );
+
+        let report = service.shutdown(ShutdownMode::Graceful).await;
+        assert!(report.is_ok(), "shutdown after journaled compile succeeds");
+    }
+}
