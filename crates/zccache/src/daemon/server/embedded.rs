@@ -27,6 +27,19 @@ impl EmbeddedDaemon {
         let backend_identity = crate::ipc::current_backend_identity(&endpoint)
             .map_err(|err| crate::ipc::IpcError::Endpoint(err.to_string()))?;
         let (state, index_writer_rx) = new_shared_state(&endpoint, &cache_dir, backend_identity);
+        // Arm the startup depgraph-load gate as early as possible — before
+        // this state can serve any compile. The shared `dep_graph_load_complete`
+        // flag inits `true` ("assume loaded"); the standalone daemon flips it
+        // to `false` via `mark_dep_graph_load_pending()` before offloading the
+        // `depgraph.bin` load, but the embedded service never did. So
+        // `wait_for_startup_depgraph_load` in the compile pipeline was a no-op
+        // and the first warm compiles after a `soldr load` raced the empty
+        // default graph, taking a `CacheVerdict::Cold` (miss) until the
+        // background load swapped the restored graph in. The depgraph load in
+        // `start_background_tasks` flips this back to `true` + notifies waiters.
+        state
+            .dep_graph_load_complete
+            .store(false, std::sync::atomic::Ordering::Release);
 
         let mut daemon = Self {
             state,
