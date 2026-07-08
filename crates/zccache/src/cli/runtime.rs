@@ -91,30 +91,55 @@ async fn spawn_and_wait(
     outbound_pid: Option<u32>,
 ) -> Result<(), String> {
     let daemon_bin = find_daemon_binary().ok_or("cannot find zccache-daemon binary")?;
-    // Record *why* the CLI is about to spawn a daemon. Pairs with the
-    // daemon-side "spawn" event so an operator can correlate each CLI
-    // decision with the resulting daemon PID by parsing the single
-    // `daemon-lifecycle.log`. Reasons: initial-start vs. one of the
-    // replaced-* variants. This is the diagnostic gap zccache#323
-    // identified — knowing 5 daemons spawned without knowing why
-    // makes the root cause undebuggable.
+    // Issue #952: single-flight the spawn across a client herd. A
+    // -j16 cold start used to produce 16+ spawn-attempts within
+    // milliseconds — each losing client paid a fork/exec plus lockfile
+    // contention that delayed the winner's bind by seconds. Exactly
+    // one client wins the slot and spawns; the rest park directly on
+    // the ready-wait below.
+    let spawn_slot = acquire_spawn_slot();
     let meta = crate::core::lifecycle::client_meta(crate::core::VERSION);
-    crate::core::lifecycle::write_event(
-        crate::core::lifecycle::EVENT_SPAWN_ATTEMPT,
-        serde_json::json!({
-            "reason": reason,
-            "endpoint": endpoint,
-            "daemon_namespace": crate::core::config::daemon_namespace_label(),
-            "client_pid": std::process::id(),
-            // #755 acceptance #4: distinguishes fbuild's bundled
-            // binary from a PyPI install when both share an endpoint.
-            "client_version": meta["client_version"],
-            "client_binary_path": meta["client_binary_path"],
-        }),
-    );
-    spawn_daemon(&daemon_bin, endpoint)?;
+    if spawn_slot.is_some() {
+        // Record *why* the CLI is about to spawn a daemon. Pairs with the
+        // daemon-side "spawn" event so an operator can correlate each CLI
+        // decision with the resulting daemon PID by parsing the single
+        // `daemon-lifecycle.log`. Reasons: initial-start vs. one of the
+        // replaced-* variants. This is the diagnostic gap zccache#323
+        // identified — knowing 5 daemons spawned without knowing why
+        // makes the root cause undebuggable.
+        crate::core::lifecycle::write_event(
+            crate::core::lifecycle::EVENT_SPAWN_ATTEMPT,
+            serde_json::json!({
+                "reason": reason,
+                "endpoint": endpoint,
+                "daemon_namespace": crate::core::config::daemon_namespace_label(),
+                "client_pid": std::process::id(),
+                // #755 acceptance #4: distinguishes fbuild's bundled
+                // binary from a PyPI install when both share an endpoint.
+                "client_version": meta["client_version"],
+                "client_binary_path": meta["client_binary_path"],
+            }),
+        );
+        spawn_daemon(&daemon_bin, endpoint)?;
+    } else {
+        crate::core::lifecycle::write_event(
+            crate::core::lifecycle::EVENT_SPAWN_PARKED,
+            serde_json::json!({
+                "reason": reason,
+                "endpoint": endpoint,
+                "daemon_namespace": crate::core::config::daemon_namespace_label(),
+                "client_pid": std::process::id(),
+                "client_version": meta["client_version"],
+            }),
+        );
+    }
 
-    wait_for_daemon_ready(endpoint).await?;
+    // The slot guard must survive until the daemon is READY: releasing
+    // right after spawn would let a late-arriving client win a second
+    // slot before the daemon binds its lockfile.
+    let wait_result = wait_for_daemon_ready(endpoint).await;
+    drop(spawn_slot);
+    wait_result?;
 
     // #755 acceptance #2: emit the linked daemon-died + pipe-handover
     // pair so the takeover lineage is reconstructable from a single
@@ -132,6 +157,85 @@ async fn spawn_and_wait(
         }
     }
     Ok(())
+}
+
+/// Issue #952: RAII guard for the single-flight spawn slot. Removes the
+/// slot file on drop so the next cold start can win a fresh slot.
+pub(crate) struct SpawnSlotGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for SpawnSlotGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// How long a spawn slot may exist before another client treats it as
+/// abandoned (winner crashed between slot-create and daemon bind).
+/// Generous relative to a healthy spawn (~1-5s) but short enough that a
+/// crashed winner doesn't wedge the herd for long — the parked losers'
+/// ready-wait grace is 10s, so one stale window later a new winner
+/// spawns.
+const SPAWN_SLOT_STALE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Issue #952: try to become the one client that spawns the daemon.
+///
+/// Winner: atomically creates `<daemon-lock>.spawn` (`create_new`) and
+/// gets a guard that removes it once the daemon is ready (or the spawn
+/// failed). Losers get `None` and park on the ready-wait. A slot older
+/// than [`SPAWN_SLOT_STALE`] is treated as abandoned and reclaimed.
+/// Fail-open: if the filesystem refuses the arbitration entirely
+/// (permissions, exotic tmpfs), the caller behaves as the winner —
+/// worst case is the pre-#952 thundering herd, never a lost spawn.
+pub(crate) fn acquire_spawn_slot() -> Option<SpawnSlotGuard> {
+    let lock_path = crate::ipc::lock_file_path();
+    let slot_path = std::path::PathBuf::from(format!("{}.spawn", lock_path.display()));
+    acquire_spawn_slot_at(slot_path, SPAWN_SLOT_STALE)
+}
+
+/// Path-parameterized core of [`acquire_spawn_slot`], split out so the
+/// arbitration logic is unit-testable without touching the process-
+/// global endpoint/lockfile config.
+fn acquire_spawn_slot_at(
+    slot_path: std::path::PathBuf,
+    stale_after: std::time::Duration,
+) -> Option<SpawnSlotGuard> {
+    if let Some(parent) = slot_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    for attempt in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&slot_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                let _ = writeln!(file, "{}", std::process::id());
+                return Some(SpawnSlotGuard { path: slot_path });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&slot_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > stale_after);
+                if stale && attempt == 0 {
+                    let _ = std::fs::remove_file(&slot_path);
+                    continue;
+                }
+                return None;
+            }
+            // Unexpected fs error: fail open (spawn without a guard).
+            Err(_) => {
+                return Some(SpawnSlotGuard {
+                    path: std::path::PathBuf::new(),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Tunables for [`wait_for_daemon_ready_with`]. Defaults match the contract
@@ -728,6 +832,40 @@ mod tests {
         } else {
             "/tmp/zccache-test-issue-673-dead.sock"
         }
+    }
+
+    // -- acquire_spawn_slot_at (issue #952 single-flight arbiter) ----------
+
+    #[test]
+    fn spawn_slot_first_caller_wins_second_parks() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("daemon.lock.spawn");
+        let winner = acquire_spawn_slot_at(slot.clone(), Duration::from_secs(20));
+        assert!(winner.is_some(), "first caller must win the slot");
+        assert!(
+            acquire_spawn_slot_at(slot.clone(), Duration::from_secs(20)).is_none(),
+            "second caller must park while the slot is held"
+        );
+        drop(winner);
+        assert!(
+            acquire_spawn_slot_at(slot, Duration::from_secs(20)).is_some(),
+            "slot must be reusable after the winner's guard drops"
+        );
+    }
+
+    #[test]
+    fn spawn_slot_stale_holder_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("daemon.lock.spawn");
+        std::fs::write(&slot, "12345\n").unwrap();
+        // A zero staleness window means any existing slot is abandoned;
+        // sleep a few ms so the file's mtime age is strictly positive.
+        std::thread::sleep(Duration::from_millis(20));
+        let reclaimed = acquire_spawn_slot_at(slot, Duration::from_millis(0));
+        assert!(
+            reclaimed.is_some(),
+            "an abandoned slot older than the staleness window must be reclaimed"
+        );
     }
 
     // -- classify_wait_tick (pure decision function) -----------------------

@@ -93,30 +93,51 @@ pub(crate) async fn spawn_and_wait(
 ) -> Result<(), String> {
     let daemon_bin = find_daemon_binary().ok_or("cannot find zccache-daemon binary")?;
     tracing::debug!(?daemon_bin, %endpoint, reason, "spawning daemon");
-    // Record *why* the CLI is about to spawn a daemon so an operator
-    // can correlate each CLI decision with the resulting daemon PID
-    // by parsing the single `daemon-lifecycle.log`. See zccache#323
-    // for the diagnostic gap that motivated this.
+    // Issue #952: single-flight the spawn — same arbiter as the
+    // runtime.rs spawn path. Exactly one client in a cold-start herd
+    // spawns; the rest park on the ready-wait.
+    let spawn_slot = crate::cli::runtime::acquire_spawn_slot();
     let meta = crate::core::lifecycle::client_meta(crate::core::VERSION);
-    crate::core::lifecycle::write_event(
-        crate::core::lifecycle::EVENT_SPAWN_ATTEMPT,
-        serde_json::json!({
-            "reason": reason,
-            "endpoint": endpoint,
-            "daemon_namespace": crate::core::config::daemon_namespace_label(),
-            "client_pid": std::process::id(),
-            // #755 acceptance #4: see runtime.rs for rationale.
-            "client_version": meta["client_version"],
-            "client_binary_path": meta["client_binary_path"],
-        }),
-    );
-    super::super::spawn_daemon(&daemon_bin, endpoint)?;
+    if spawn_slot.is_some() {
+        // Record *why* the CLI is about to spawn a daemon so an operator
+        // can correlate each CLI decision with the resulting daemon PID
+        // by parsing the single `daemon-lifecycle.log`. See zccache#323
+        // for the diagnostic gap that motivated this.
+        crate::core::lifecycle::write_event(
+            crate::core::lifecycle::EVENT_SPAWN_ATTEMPT,
+            serde_json::json!({
+                "reason": reason,
+                "endpoint": endpoint,
+                "daemon_namespace": crate::core::config::daemon_namespace_label(),
+                "client_pid": std::process::id(),
+                // #755 acceptance #4: see runtime.rs for rationale.
+                "client_version": meta["client_version"],
+                "client_binary_path": meta["client_binary_path"],
+            }),
+        );
+        super::super::spawn_daemon(&daemon_bin, endpoint)?;
+    } else {
+        crate::core::lifecycle::write_event(
+            crate::core::lifecycle::EVENT_SPAWN_PARKED,
+            serde_json::json!({
+                "reason": reason,
+                "endpoint": endpoint,
+                "daemon_namespace": crate::core::config::daemon_namespace_label(),
+                "client_pid": std::process::id(),
+                "client_version": meta["client_version"],
+            }),
+        );
+    }
 
     // Adaptive wait keyed on the daemon-lifecycle lockfile PID (issue #673):
     // the previous 100-iteration / 10 s loop expired under thundering-herd
     // builds while individual ERROR_PIPE_BUSY backoffs were still in flight.
     // The shared helper polls past 10 s as long as a daemon owns the lockfile.
-    super::super::wait_for_daemon_ready(endpoint).await?;
+    // The slot guard lives until READY so a late client can't win a
+    // second slot before the daemon binds (#952).
+    let wait_result = super::super::wait_for_daemon_ready(endpoint).await;
+    drop(spawn_slot);
+    wait_result?;
 
     // #755 acceptance #2: emit linked daemon-died + pipe-handover events
     // for the takeover case. Best-effort: if we can't read the new
