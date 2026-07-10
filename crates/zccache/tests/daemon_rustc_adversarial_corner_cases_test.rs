@@ -617,3 +617,76 @@ async fn rustc_multiple_cargo_env_vars() {
 
     h.shutdown().await;
 }
+
+/// Non-CARGO env vars read via `env!()` must invalidate the cache when their
+/// values change (issue #1021). A build.rs `cargo:rustc-env=STAMP=<value>`
+/// (vergen / shadow-rs / built) reaches rustc as a plain process env var that
+/// rustc records as a `# env-dep:STAMP=<value>` line in dep-info. The env
+/// filter in the context key only keeps CARGO_* vars, so without env-dep
+/// tracking a changed STAMP with identical argv/sources serves the stale
+/// artifact with the old value baked in.
+///
+/// Mimics cargo's invocation shape (`--emit=dep-info,link` + `--out-dir` +
+/// `-C metadata/extra-filename`) so the daemon can scan the dep-info file.
+#[tokio::test]
+#[ignore]
+async fn rustc_non_cargo_env_dep_change_invalidates_cache() {
+    let mut h = match TestHarness::new().await {
+        Some(h) => h,
+        None => return,
+    };
+
+    h.write_file(
+        "envdep.rs",
+        r#"pub fn stamp() -> &'static str { env!("STAMP") }"#,
+    );
+
+    let args = &[
+        "--edition",
+        "2021",
+        "--crate-type",
+        "lib",
+        "--crate-name",
+        "envdep",
+        "--emit=dep-info,link",
+        "-C",
+        "metadata=abc123",
+        "-C",
+        "extra-filename=-abc123",
+        "--out-dir",
+        ".",
+        "envdep.rs",
+    ];
+    let rlib = "libenvdep-abc123.rlib";
+
+    // Compile with STAMP=one → miss (cold).
+    let env_one: Vec<(String, String)> = vec![("STAMP".into(), "one".into())];
+    let (ec, cached) = h.compile_args(args, Some(env_one.clone())).await;
+    assert_eq!(ec, 0);
+    assert!(!cached, "first compile should be miss");
+    let obj_one = std::fs::read(h.path(rlib)).unwrap();
+
+    // Same STAMP value again → must still hit (no over-invalidation).
+    std::fs::remove_file(h.path(rlib)).unwrap();
+    let (ec, cached) = h.compile_args(args, Some(env_one)).await;
+    assert_eq!(ec, 0);
+    assert!(cached, "same-value recompile should hit");
+
+    // STAMP=two → MUST miss: the artifact must embed the new value.
+    // A false hit here serves an rlib with the stale "one" baked in.
+    let env_two: Vec<(String, String)> = vec![("STAMP".into(), "two".into())];
+    let (ec, cached) = h.compile_args(args, Some(env_two)).await;
+    assert_eq!(ec, 0);
+    assert!(
+        !cached,
+        "changed non-CARGO env-dep value MUST produce cache miss \
+         (false hit = stale env!() value baked into the artifact)"
+    );
+    let obj_two = std::fs::read(h.path(rlib)).unwrap();
+    assert_ne!(
+        obj_one, obj_two,
+        "different STAMP → different .rlib content"
+    );
+
+    h.shutdown().await;
+}

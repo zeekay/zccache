@@ -36,7 +36,8 @@ pub use persistence::{
 };
 
 /// On-disk format version. Bump when snapshot layout changes.
-pub const DEPGRAPH_VERSION: u32 = 5;
+/// v6: `ContextEntrySnapshot` gained `env_deps` + `env_dep_fp` (issue #1021).
+pub const DEPGRAPH_VERSION: u32 = 6;
 
 /// Magic bytes identifying a depgraph snapshot file ("ZCDG").
 pub const DEPGRAPH_MAGIC: [u8; 4] = [0x5A, 0x43, 0x44, 0x47];
@@ -88,6 +89,10 @@ pub struct ContextEntrySnapshot {
     pub artifact_key: Option<[u8; 32]>,
     pub last_file_hashes: Vec<(String, [u8; 32])>,
     pub rustc_externs: Vec<RustcExternSnapshot>,
+    /// Env-var names from rustc dep-info `# env-dep:` lines (issue #1021).
+    pub env_deps: Vec<String>,
+    /// Fingerprint of `env_deps` values at last stored compile.
+    pub env_dep_fp: Option<[u8; 32]>,
     /// 0=Cold, 1=Warm, 2=Stale
     pub state: u8,
 }
@@ -192,6 +197,8 @@ impl DepGraph {
                         .map(|(p, h)| (p.to_string_lossy().into_owned(), *h.as_bytes()))
                         .collect(),
                     rustc_externs,
+                    env_deps: ctx.env_deps.clone(),
+                    env_dep_fp: ctx.env_dep_fp.map(|h| *h.as_bytes()),
                     state: match ctx.state {
                         ContextState::Cold => 0,
                         ContextState::Warm => 1,
@@ -279,6 +286,8 @@ impl DepGraph {
                     .into_iter()
                     .map(|(p, h)| (NormalizedPath::from(p.as_str()), ContentHash::from_bytes(h)))
                     .collect(),
+                env_deps: c.env_deps,
+                env_dep_fp: c.env_dep_fp.map(ContentHash::from_bytes),
                 last_accessed: Instant::now(),
                 state: match c.state {
                     0 => ContextState::Cold,

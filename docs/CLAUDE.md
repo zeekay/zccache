@@ -23,6 +23,7 @@ Architecture docs are split by subsystem. Read only what's relevant to your curr
 | Generic tool exec (`zccache exec`, issue #272) | [runtime.md § Generic tool exec](architecture/runtime.md#generic-tool-exec-zccache-exec) — `handle_exec.rs` + `cli/commands/exec.rs` |
 | Platform-specific issues | [portability.md](architecture/portability.md) |
 | Compile journal record shape | [journal-schema.md](journal-schema.md) |
+| Rustc cache-key semantics (env-deps #1021, crate types, native libs) | [data-flow.md § Rustc Cache-Key Semantics](architecture/data-flow.md#rustc-cache-key-semantics) |
 | `ZCCACHE_CACHE_DIR` contract + `zccache cache-root` | [runtime.md § Cache root invariants](architecture/runtime.md#cache-root-invariants) |
 | zccache vs sccache feature matrix | [FEATURE-MATRIX.md](FEATURE-MATRIX.md) — generated from [feature-matrix.yaml](feature-matrix.yaml) by `ci/render_feature_matrix.py` |
 

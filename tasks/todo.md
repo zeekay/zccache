@@ -1,3 +1,23 @@
+# #1021 rustc cache-key soundness tail (in flight, branch fix/1021-rustc-env-dep-keying)
+
+Issue: https://github.com/zackees/zccache/issues/1021
+
+- [x] 1. RED test `rustc_non_cargo_env_dep_change_invalidates_cache` (corner_cases file) —
+      confirmed RED (false hit), then GREEN after fix.
+- [x] 2. GREEN: `# env-dep:` names parsed from dep-info (`RustcDepScan`), recorded per context
+      (`DepGraph::record_env_deps` + snapshot v6), value fingerprint gated on EVERY hit path
+      (`env_deps_match`): request fast path, context fast path, hash_verify, compat, error-cache.
+- [x] 3. `parse_rustc.rs` incremental comment corrected (sccache refuses; CGU caveat noted).
+- [x] 4. Native-lib stance documented (data-flow.md § Rustc Cache-Key Semantics + README).
+- [x] 5. Crate-type allowlist + cdylib exclusion documented (also fixed stale README claim
+      that proc-macro/bin are passed through — they cache since parse_rustc.rs allowlist grew).
+- [x] 6. fmt + clippy clean; workspace lib tests pass; rustc integration suites pass.
+      NOTE: `./test` publish-order preflight broken on MAIN (zccache-cli-core /
+      zccache-daemon-core missing from RUST_PUBLISH_ORDER) — pre-existing, separate fix.
+      NOTE: `daemon_rustc_cache_worktree_test::test_rustc_sibling_git_worktree_equivalent_cache_sharing`
+      fails identically on unmodified main (line 511 "B edits must not poison A") — pre-existing.
+- [ ] 7. Docker linux validation; PR; merge; validate on main; close #1021.
+
 # #968 wedge/timeout burn-down — near complete
 
 Meta: https://github.com/zackees/zccache/issues/968

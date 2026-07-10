@@ -30,6 +30,36 @@ fn empty_graph_roundtrip() {
     assert_eq!(stats.context_count, 0);
 }
 
+/// `env_deps` + `env_dep_fp` survive save/load (issue #1021, format v6):
+/// the env-dep gate must keep working after a daemon restart or a stale
+/// hit slips through the restored graph.
+#[test]
+fn env_deps_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let path = test_path(&dir);
+    let graph = DepGraph::new();
+
+    let key = graph.register(make_ctx("/src/envdep.rs"));
+    let names = vec!["GIT_SHA".to_string(), "STAMP".to_string()];
+    let client_env = vec![
+        ("GIT_SHA".to_string(), "abc123".to_string()),
+        ("STAMP".to_string(), "one".to_string()),
+    ];
+    let fp = super::super::super::env_deps::env_dep_fingerprint(&names, Some(&client_env));
+    assert!(fp.is_some());
+    graph.record_env_deps(&key, names, fp);
+
+    save_to_file(&graph, &path).unwrap();
+    let loaded = load_from_file(&path).unwrap();
+
+    assert!(loaded.env_deps_match(&key, Some(&client_env)));
+    let changed = vec![
+        ("GIT_SHA".to_string(), "def456".to_string()),
+        ("STAMP".to_string(), "one".to_string()),
+    ];
+    assert!(!loaded.env_deps_match(&key, Some(&changed)));
+}
+
 #[test]
 fn populated_graph_roundtrip() {
     let dir = TempDir::new().unwrap();

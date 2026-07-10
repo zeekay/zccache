@@ -11,6 +11,7 @@
 //! - `maintenance` — `trim`, `clear`, stats, accessors, `ingest_compile_commands`.
 
 mod check;
+mod env_deps;
 mod maintenance;
 mod register;
 mod update;
@@ -64,6 +65,14 @@ pub struct ContextEntry {
     pub artifact_key: Option<ArtifactKey>,
     /// File hashes from the last update() — used for drift diagnostics.
     pub last_file_hashes: Vec<(NormalizedPath, ContentHash)>,
+    /// Env-var names this context reads via `env!()` / `option_env!()`,
+    /// recorded from rustc dep-info `# env-dep:` lines (sorted, deduped).
+    /// Empty for C/C++ contexts and rustc contexts without env deps.
+    pub env_deps: Vec<String>,
+    /// Fingerprint of `env_deps` values in the client env of the last stored
+    /// compile. Hit paths compare this against the current request env — a
+    /// mismatch forces a recompile (issue #1021).
+    pub env_dep_fp: Option<ContentHash>,
     /// When this entry was last accessed (for trimming).
     pub last_accessed: Instant,
     /// Current state.

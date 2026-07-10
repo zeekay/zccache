@@ -410,6 +410,7 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
         source_path: &source_path,
         ctx: &ctx,
         rustc_extern_paths: &rustc_extern_paths,
+        client_env: client_env.as_deref(),
         snap_clock,
     }) {
         HashSourceOutcome::Ready(outcome) => outcome,
@@ -625,7 +626,18 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
                         compat_reason,
                     ),
                 );
-                if let crate::depgraph::CacheVerdict::Hit { artifact_key } = compat_verdict {
+                // Issue #1021: the compat candidate's artifact embeds the env
+                // values of the compile that stored it — gate on them before
+                // serving it under this check-style request.
+                let compat_env_ok = actual_context_key.as_ref().is_none_or(|key| {
+                    state
+                        .dep_graph
+                        .load()
+                        .env_deps_match(key, client_env.as_deref())
+                });
+                if let (crate::depgraph::CacheVerdict::Hit { artifact_key }, true) =
+                    (compat_verdict, compat_env_ok)
+                {
                     let artifact_key_hex = artifact_key.hash().to_hex();
                     pending_writes::await_pending(
                         &state.pending_cache_writes,
@@ -753,6 +765,7 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
                 &cwd_path,
                 &ctx,
                 rustc_args,
+                client_env.as_deref(),
                 &stdout,
                 &stderr,
                 exit_code,
@@ -784,6 +797,7 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
             compilation: &compilation,
             rustc_args_opt: rustc_args_opt.as_deref(),
             rustc_extern_paths: &rustc_extern_paths,
+            client_env: client_env.as_deref(),
             is_rustc,
             rust_profile_enabled,
             rust_profile_mode,

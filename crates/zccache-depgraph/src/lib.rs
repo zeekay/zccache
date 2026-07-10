@@ -8,6 +8,7 @@ pub mod args;
 pub mod compile_commands;
 pub mod context;
 pub mod depfile;
+pub mod env_deps;
 pub mod graph;
 pub mod msvc_args;
 pub mod rustc_args;
@@ -26,6 +27,7 @@ pub use context::{
     RustcCompileContext,
 };
 pub use depfile::{prepare_depfile, DepfileError, DepfileStrategy};
+pub use env_deps::{env_dep_fingerprint, VOLATILE_ENV_DEP_NAMES};
 pub use graph::{CacheVerdict, ContextState, DepGraph, DepGraphStats};
 pub use rustc_args::{parse_rustc_args, ExternCrate, RustcParsedArgs};
 pub use scanner::{IncludeDirective, IncludeKind, ScanResult};

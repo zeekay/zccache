@@ -212,10 +212,16 @@ pub(crate) fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedI
         }
     };
 
-    // Note: -C incremental is ignored for caching purposes.
-    // The incremental dir is excluded from the cache key, and we let rustc
-    // use it on a miss (doesn't affect output determinism for rlib/rmeta).
-    // sccache also allows incremental — cargo always passes it.
+    // Note: -C incremental is ignored for caching purposes (issue #1021).
+    // zccache's position: the incremental dir is excluded from the cache key,
+    // and rustc may still use it on a miss. sccache takes the OPPOSITE
+    // position — it refuses to cache incremental compiles and the standard
+    // guidance there is CARGO_INCREMENTAL=0. Caveat we accept: incremental
+    // can change CGU partitioning and therefore internal symbol names in the
+    // artifact, so two byte-different artifacts can be "the same compile";
+    // artifacts are still correct for linking, and content-addressed lookup
+    // means we only ever serve bytes produced by a real compile of the same
+    // keyed inputs.
 
     // Default crate type is bin if not specified
     if crate_types.is_empty() {

@@ -23,6 +23,9 @@ pub(super) struct StoreOutcomeRequest<'a> {
     pub(super) compilation: &'a crate::compiler::CacheableCompilation,
     pub(super) rustc_args_opt: Option<&'a crate::depgraph::RustcParsedArgs>,
     pub(super) rustc_extern_paths: &'a [NormalizedPath],
+    /// Client env of this request — env-dep values are fingerprinted from it
+    /// after the dep-info scan (issue #1021).
+    pub(super) client_env: Option<&'a [(String, String)]>,
     pub(super) is_rustc: bool,
     pub(super) rust_profile_enabled: bool,
     pub(super) rust_profile_mode: &'a str,
@@ -106,6 +109,9 @@ struct CompileScanRequest {
 
 struct CompileScanCollection {
     scan_result: crate::depgraph::ScanResult,
+    /// Env-var names from rustc dep-info `# env-dep:` lines (issue #1021).
+    /// Always empty for C/C++.
+    rustc_env_deps: Vec<String>,
     user_depfile_capture: Option<(NormalizedPath, Vec<u8>)>,
     depfile_parse_warning: Option<String>,
 }
@@ -119,6 +125,7 @@ async fn collect_compile_scan_blocking(req: CompileScanRequest) -> CompileScanCo
                 unresolved: vec![format!("compile dependency scan worker failed: {e}")],
                 has_computed: false,
             },
+            rustc_env_deps: Vec::new(),
             user_depfile_capture: None,
             depfile_parse_warning: None,
         })
@@ -136,16 +143,27 @@ fn collect_compile_scan(req: CompileScanRequest) -> CompileScanCollection {
     } = req;
 
     if is_rustc {
-        let scan_result = rustc_args.as_ref().map_or_else(
-            || crate::depgraph::ScanResult {
-                resolved: Vec::new(),
-                unresolved: vec!["missing parsed rustc args for rustc dependency scan".into()],
-                has_computed: false,
+        let (scan_result, rustc_env_deps) = rustc_args.as_ref().map_or_else(
+            || {
+                (
+                    crate::depgraph::ScanResult {
+                        resolved: Vec::new(),
+                        unresolved: vec![
+                            "missing parsed rustc args for rustc dependency scan".into()
+                        ],
+                        has_computed: false,
+                    },
+                    Vec::new(),
+                )
             },
-            |args| scan_rustc_deps(args, &source_path, &cwd_path),
+            |args| {
+                let dep_scan = scan_rustc_deps(args, &source_path, &cwd_path);
+                (dep_scan.scan, dep_scan.env_deps)
+            },
         );
         return CompileScanCollection {
             scan_result,
+            rustc_env_deps,
             user_depfile_capture: None,
             depfile_parse_warning: None,
         };
@@ -153,6 +171,7 @@ fn collect_compile_scan(req: CompileScanRequest) -> CompileScanCollection {
 
     let mut user_depfile_capture = None;
     let mut depfile_parse_warning = None;
+    let rustc_env_deps = Vec::new();
     let scan_result = match &depfile_strategy {
         DepfileStrategy::Injected { path }
         | DepfileStrategy::UserSpecified { path }
@@ -192,6 +211,7 @@ fn collect_compile_scan(req: CompileScanRequest) -> CompileScanCollection {
 
     CompileScanCollection {
         scan_result,
+        rustc_env_deps,
         user_depfile_capture,
         depfile_parse_warning,
     }
@@ -214,6 +234,7 @@ pub(super) async fn store_successful_compile(req: StoreOutcomeRequest<'_>) -> Op
         compilation,
         rustc_args_opt,
         rustc_extern_paths,
+        client_env,
         is_rustc,
         rust_profile_enabled,
         rust_profile_mode,
@@ -322,6 +343,7 @@ pub(super) async fn store_successful_compile(req: StoreOutcomeRequest<'_>) -> Op
     };
     let CompileScanCollection {
         scan_result,
+        rustc_env_deps,
         user_depfile_capture,
         ..
     } = scan_collection;
@@ -484,6 +506,18 @@ pub(super) async fn store_successful_compile(req: StoreOutcomeRequest<'_>) -> Op
             compile_start,
         })
     });
+
+    // Record env-dep names + value fingerprint AFTER the depgraph update
+    // inside `store_miss_artifact`: a concurrent reader in the window sees
+    // the old fingerprint and fails the gate toward a safe recompile rather
+    // than a stale hit (issue #1021).
+    if is_rustc {
+        let env_dep_fp = crate::depgraph::env_dep_fingerprint(&rustc_env_deps, client_env);
+        state
+            .dep_graph
+            .load()
+            .record_env_deps(context_key, rustc_env_deps, env_dep_fp);
+    }
 
     // Record miss phase profile
     let total_ns = compile_start.elapsed().as_nanos() as u64;

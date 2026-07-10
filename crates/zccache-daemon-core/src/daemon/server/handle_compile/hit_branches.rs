@@ -49,6 +49,16 @@ pub(super) fn try_request_cache_hit(probe: RequestCacheHitProbe<'_>) -> Option<R
     if !request_cache_entry_matches_root(&req_entry, request_cache_key_root.as_ref()) {
         return None;
     }
+    // Issue #1021: the request fingerprint only covers CARGO_* env, so a
+    // changed `# env-dep:` value (vergen-style rustc-env) is invisible to
+    // this zero-hash path. Gate on the context's recorded env-dep values.
+    if !state
+        .dep_graph
+        .load()
+        .env_deps_match(&req_entry.context_key, client_env)
+    {
+        return None;
+    }
     let fh_entry = state.fast_hit_cache.get(&req_entry.context_key)?;
     let artifact_key_hex = &fh_entry.artifact_key_hex;
     let source_path = req_entry
@@ -191,6 +201,15 @@ pub(super) async fn try_fast_hit(probe: FastHitProbe<'_>) -> Option<Response> {
     };
     if !cache_entry_fresh_at(compile_start, entry_cached_at, FAST_HIT_MAX_AGE)
         || !context_files_fresh(state, &context_key, source_path, entry_clock)
+    {
+        return None;
+    }
+    // Issue #1021: the context key only covers CARGO_* env, so a changed
+    // `# env-dep:` value is invisible to this zero-hash path too.
+    if !state
+        .dep_graph
+        .load()
+        .env_deps_match(&context_key, client_env)
     {
         return None;
     }

@@ -41,6 +41,7 @@ pub(super) fn maybe_store_rustc_error_artifact(
     cwd_path: &NormalizedPath,
     ctx: &CompileContext,
     rustc_args: &crate::depgraph::RustcParsedArgs,
+    client_env: Option<&[(String, String)]>,
     stdout: &Arc<Vec<u8>>,
     stderr: &Arc<Vec<u8>>,
     exit_code: i32,
@@ -50,7 +51,8 @@ pub(super) fn maybe_store_rustc_error_artifact(
         return None;
     }
 
-    let scan_result = scan_rustc_deps(rustc_args, source_path, cwd_path);
+    let dep_scan = scan_rustc_deps(rustc_args, source_path, cwd_path);
+    let scan_result = dep_scan.scan;
     let tracked_paths: Vec<NormalizedPath> = std::iter::once(source_path.clone())
         .chain(scan_result.resolved.iter().cloned())
         .chain(ctx.force_includes.iter().cloned())
@@ -73,6 +75,13 @@ pub(super) fn maybe_store_rustc_error_artifact(
         .dep_graph
         .load()
         .update(context_key, scan_result, get_hash)?;
+    // Record env-dep names AFTER update so a concurrent reader in the window
+    // sees the old fingerprint and safely recompiles (issue #1021).
+    let env_dep_fp = crate::depgraph::env_dep_fingerprint(&dep_scan.env_deps, client_env);
+    state
+        .dep_graph
+        .load()
+        .record_env_deps(context_key, dep_scan.env_deps, env_dep_fp);
     let artifact_key_hex = artifact_key.hash().to_hex();
     let meta = ArtifactIndex::new(
         Vec::new(),

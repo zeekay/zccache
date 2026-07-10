@@ -162,6 +162,8 @@ impl DepGraph {
                 has_computed_includes: false,
                 artifact_key: None,
                 last_file_hashes: Vec::new(),
+                env_deps: Vec::new(),
+                env_dep_fp: None,
                 last_accessed: Instant::now(),
                 state: ContextState::Cold,
             });

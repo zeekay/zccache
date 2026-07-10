@@ -131,3 +131,53 @@ Non-cacheable patterns detected by the CLI:
 - `-E` / `-M` / `-MM` (preprocessing / dependency generation only).
 - `-` as input (stdin source).
 - Unrecognized compiler.
+
+## Rustc Cache-Key Semantics
+
+The rustc key is a two-level construction in `zccache-depgraph`:
+
+- **Context key** (`RustcCompileContext::context_key_with_root`): compiler
+  identity hash, all cache-relevant flags (`--crate-type`, `--edition`,
+  `--emit`, `--cfg`, codegen flags, lints, `--remap-path-prefix`, …),
+  extern crate identities, and the `CARGO_*` env subset (minus
+  `CARGO_MAKEFLAGS`, `CARGO_INCREMENTAL`, and the volatile path-valued
+  `CARGO_MANIFEST_DIR` / `CARGO_MANIFEST_PATH` / `CARGO_TARGET_DIR`).
+- **Artifact key** (`compute_rustc_artifact_key_with_root`): context key +
+  content hashes of the source, every dep-info file dependency, and every
+  `--extern` rlib/rmeta.
+
+**Env-var dependencies (issue #1021).** Non-`CARGO_` env values read via
+`env!()` / `option_env!()` — e.g. build-script `cargo:rustc-env=` values from
+vergen / shadow-rs / built — are tracked through the `# env-dep:` dep-info
+lines the compiler emits. After each compile the daemon records the env-dep
+*names* on the context entry (`DepGraph::record_env_deps`) plus a blake3
+fingerprint of their values in that compile's client env. Every hit path
+(request-level fast path, context-level fast path, depgraph verify, rustc
+check/build metadata-compat) gates on `DepGraph::env_deps_match` — a changed
+value forces a recompile instead of serving an artifact with the stale value
+baked in. Volatile path-valued names (`OUT_DIR`, `CARGO_MANIFEST_DIR`,
+`CARGO_MANIFEST_PATH`, `CARGO_TARGET_DIR`) are excluded: their referenced
+*content* is hashed as ordinary file deps, and fingerprinting the path string
+would cascade misses across checkout moves. Both fields persist in the
+depgraph snapshot (format v6). Compiles that emit no dep-info (`--emit=link`
+only) record no env-dep names and keep the pre-#1021 behavior for
+non-`CARGO_` vars.
+
+**Cacheable crate types.** `lib`, `rlib`, `staticlib`, `proc-macro`, `bin`
+(`RUSTC_CACHEABLE_CRATE_TYPES` in `zccache-compiler/src/parse_rustc.rs`).
+`dylib` / `cdylib` are deliberately non-cacheable: final shared-library
+artifacts recompile every time while their rlib deps still hit.
+
+**Native-library blind spot (recorded decision, issue #1021 item 3).**
+Link-step native libraries resolved via `-L`/`-l` are *not* content-hashed
+into `bin`/`staticlib` keys — sccache shares this blind spot, and hashing
+resolved system libraries on every link costs syscalls on the hot path with
+no field reports justifying it. Revisit (flip to hashing) if a real-world
+stale-bin report lands or before promoting any shared/remote artifact tier.
+
+**Incremental compilation.** `-C incremental` is excluded from the key and
+the compiler may use the incremental dir on a miss. sccache instead refuses
+to cache incremental compiles. Caveat accepted: incremental can change CGU
+partitioning (internal symbol names), so byte-level artifact identity is not
+guaranteed across incremental states; served artifacts always come from a
+real compile of the same keyed inputs.

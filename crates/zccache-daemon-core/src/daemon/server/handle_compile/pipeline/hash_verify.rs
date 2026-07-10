@@ -28,6 +28,9 @@ pub(super) struct HashVerifyInput<'a> {
     pub(super) source_path: &'a NormalizedPath,
     pub(super) ctx: &'a CompileContext,
     pub(super) rustc_extern_paths: &'a [NormalizedPath],
+    /// Current request env — gated against the context's recorded env-dep
+    /// values before any hit verdict (issue #1021).
+    pub(super) client_env: Option<&'a [(String, String)]>,
     pub(super) snap_clock: Clock,
 }
 
@@ -45,6 +48,7 @@ pub(super) fn hash_and_verify(input: HashVerifyInput<'_>) -> HashSourceOutcome {
         source_path,
         ctx,
         rustc_extern_paths,
+        client_env,
         snap_clock,
     } = input;
 
@@ -52,6 +56,27 @@ pub(super) fn hash_and_verify(input: HashVerifyInput<'_>) -> HashSourceOutcome {
     // return Cold without examining any hashes, so the work is wasted.
     // Jump straight to compiler exec.
     let context_is_cold = state.dep_graph.load().is_cold(&context_key);
+
+    // Issue #1021: env-dep gate. When the context's recorded `# env-dep:`
+    // values (e.g. vergen's `cargo:rustc-env=GIT_SHA`) don't match the
+    // current request env, every stored artifact for this context embeds
+    // stale values — skip hashing and force a recompile, which re-records
+    // the names and fingerprint.
+    if !context_is_cold
+        && !state
+            .dep_graph
+            .load()
+            .env_deps_match(&context_key, client_env)
+    {
+        return HashSourceOutcome::Ready(HashVerifyOutcome {
+            hash_map: HashMap::new(),
+            hash_source_ns: 0,
+            hash_headers_ns: 0,
+            depgraph_check_ns: 0,
+            verdict: crate::depgraph::CacheVerdict::Cold,
+            diag_reason: "env_deps_changed".to_string(),
+        });
+    }
 
     // ── Phase: hash source ───────────────────────────────────────────
     // Issue #468: env-gated sub-phase trace. When ZCCACHE_HIT_TRACE=1, the

@@ -380,9 +380,23 @@ ZCCACHE_CACHE_DIR = { value = "/tmp/.zccache", force = false }
 ```
 
 Supports `--emit=metadata` (`cargo check`), `--emit=dep-info,metadata,link` (`cargo build`),
-extern crate content hashing, and cacheable crate types such as `lib`, `rlib`,
-and `staticlib`. Proc-macro and binary crates are passed through without caching,
-matching the usual `sccache` behavior.
+extern crate content hashing, and env-var dependency tracking: the `# env-dep:`
+names rustc records in dep-info (every `env!()` / `option_env!()` read, including
+build-script `cargo:rustc-env=` values like vergen's `GIT_SHA`) are folded into
+hit validation, so a changed value forces a recompile instead of serving a stale
+artifact.
+
+**Cacheable crate types**: `lib`, `rlib`, `staticlib`, `proc-macro`, and `bin`.
+`dylib` / `cdylib` invocations are deliberately passed through without caching —
+final shared-library artifacts (e.g. PyO3/maturin `cdylib` targets) recompile
+every time, while their rlib dependencies still hit.
+
+**Known blind spot (sccache parity)**: native libraries linked via `-L`/`-l`
+into `bin`/`staticlib` units are not content-hashed into the cache key — a
+system-upgraded `libssl.so` with an otherwise-identical invocation can serve a
+stale binary. This matches sccache's behavior; hashing `-L`-resolved libraries
+on every link was judged not worth the syscall cost. Run `zccache clear` after
+system-library upgrades if this matters to your workflow.
 
 Useful Rust workflow commands:
 

@@ -789,6 +789,8 @@ fn warm_context_with_no_artifact_returns_cold_on_check() {
             has_computed_includes: false,
             artifact_key: None,
             last_file_hashes: Vec::new(),
+            env_deps: Vec::new(),
+            env_dep_fp: None,
             last_accessed: Instant::now(),
             state: ContextState::Warm,
         },

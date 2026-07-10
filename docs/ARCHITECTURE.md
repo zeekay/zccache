@@ -21,6 +21,7 @@ This document is the index for zccache's architecture specification. Each subsys
 
 - **High-level design** → [overview.md](architecture/overview.md)
 - **"How does a cache hit work?"** → [data-flow.md](architecture/data-flow.md)
+- **Rustc cache key: env-deps, crate types, native-lib stance** → [data-flow.md § Rustc Cache-Key Semantics](architecture/data-flow.md#rustc-cache-key-semantics)
 - **CLI↔daemon communication** → [ipc.md](architecture/ipc.md)
 - **File change detection** → [metadata-cache.md](architecture/metadata-cache.md)
 - **Disk cache & eviction** → [artifact-store.md](architecture/artifact-store.md)
