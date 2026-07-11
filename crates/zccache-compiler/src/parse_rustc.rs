@@ -16,12 +16,12 @@ use super::{CacheableCompilation, CompilerFamily, ParsedInvocation};
 ///   caches the same set. The artifact key already covers source
 ///   content, deps, and compiler identity, so the safety contract
 ///   is the same as any other rustc invocation.
-/// Crate types zccache caches (zccache#1021 documents the exclusions):
-/// `dylib` and `cdylib` are deliberately NOT cacheable — dynamic
-/// libraries embed platform linker state (soname/install-name, import
-/// libs) that the artifact store does not model, so PyO3/maturin
-/// `cdylib` final artifacts recompile every time while their rlib deps
-/// still hit.
+///   Crate types zccache caches (zccache#1021 documents the exclusions):
+///   `dylib` and `cdylib` are deliberately NOT cacheable — dynamic
+///   libraries embed platform linker state (soname/install-name, import
+///   libs) that the artifact store does not model, so PyO3/maturin
+///   `cdylib` final artifacts recompile every time while their rlib deps
+///   still hit.
 const RUSTC_CACHEABLE_CRATE_TYPES: &[&str] = &["lib", "rlib", "staticlib", "proc-macro", "bin"];
 
 /// Host dynamic-library file-name pattern for proc-macros, matching
@@ -88,6 +88,8 @@ pub(crate) fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedI
     let mut crate_name: Option<String> = None;
     let mut extra_filename: Option<String> = None;
     let mut emit_types: Vec<String> = Vec::new();
+    let mut explicit_link_output: Option<String> = None;
+    let mut explicit_output: Option<String> = None;
     let mut unknown_flags: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -128,6 +130,16 @@ pub(crate) fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedI
                     // Handle --emit=dep-info=path form
                     s.split('=').next().unwrap_or(s).to_string()
                 }));
+                for part in next.split(',') {
+                    if let Some((kind, path)) = part.split_once('=') {
+                        if kind == "link" && path != "-" {
+                            explicit_link_output = Some(path.to_string());
+                        }
+                        if path != "-" && !path.is_empty() && explicit_output.is_none() {
+                            explicit_output = Some(path.to_string());
+                        }
+                    }
+                }
                 i += 2;
                 continue;
             }
@@ -136,6 +148,16 @@ pub(crate) fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedI
                 val.split(',')
                     .map(|s| s.split('=').next().unwrap_or(s).to_string()),
             );
+            for part in val.split(',') {
+                if let Some((kind, path)) = part.split_once('=') {
+                    if kind == "link" && path != "-" {
+                        explicit_link_output = Some(path.to_string());
+                    }
+                    if path != "-" && !path.is_empty() && explicit_output.is_none() {
+                        explicit_output = Some(path.to_string());
+                    }
+                }
+            }
             i += 1;
             continue;
         }
@@ -255,13 +277,49 @@ pub(crate) fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedI
     let metadata_only = !has_link_emit && emit_types.iter().any(|t| t == "metadata");
 
     // Derive output path
+    let primary_emit = if emit_types.iter().any(|kind| kind == "link") {
+        Some("link")
+    } else {
+        emit_types
+            .iter()
+            .find(|kind| {
+                matches!(
+                    kind.as_str(),
+                    "metadata"
+                        | "dep-info"
+                        | "obj"
+                        | "asm"
+                        | "llvm-ir"
+                        | "llvm-bc"
+                        | "bitcode"
+                        | "mir"
+                )
+            })
+            .map(String::as_str)
+    };
     let output = if let Some(o) = output_file {
+        o
+    } else if let Some(o) = explicit_link_output {
+        o
+    } else if let Some(o) = explicit_output {
         o
     } else if let Some(ref dir) = out_dir {
         let name = crate_name.as_deref().unwrap_or("unknown");
         let suffix = extra_filename.as_deref().unwrap_or("");
-        let filename = if metadata_only {
+        let filename = if primary_emit == Some("metadata") || metadata_only {
             format!("lib{name}{suffix}.rmeta")
+        } else if primary_emit == Some("dep-info") {
+            format!("{name}{suffix}.d")
+        } else if primary_emit == Some("obj") {
+            format!("{name}{suffix}.o")
+        } else if primary_emit == Some("asm") {
+            format!("{name}{suffix}.s")
+        } else if primary_emit == Some("llvm-ir") {
+            format!("{name}{suffix}.ll")
+        } else if matches!(primary_emit, Some("llvm-bc" | "bitcode")) {
+            format!("{name}{suffix}.bc")
+        } else if primary_emit == Some("mir") {
+            format!("{name}{suffix}.mir")
         } else if is_proc_macro {
             rustc_proc_macro_filename(name, suffix)
         } else if is_bin {
@@ -283,8 +341,20 @@ pub(crate) fn parse_rustc_invocation(compiler: &str, args: &[String]) -> ParsedI
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
         });
-        let filename = if metadata_only {
+        let filename = if primary_emit == Some("metadata") || metadata_only {
             format!("lib{name}.rmeta")
+        } else if primary_emit == Some("dep-info") {
+            format!("{name}.d")
+        } else if primary_emit == Some("obj") {
+            format!("{name}.o")
+        } else if primary_emit == Some("asm") {
+            format!("{name}.s")
+        } else if primary_emit == Some("llvm-ir") {
+            format!("{name}.ll")
+        } else if matches!(primary_emit, Some("llvm-bc" | "bitcode")) {
+            format!("{name}.bc")
+        } else if primary_emit == Some("mir") {
+            format!("{name}.mir")
         } else if is_proc_macro {
             rustc_proc_macro_filename(name, "")
         } else if is_bin {
