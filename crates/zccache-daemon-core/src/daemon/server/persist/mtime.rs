@@ -87,7 +87,7 @@ pub(in crate::daemon::server) fn floor_materialized_outputs_to_input_max<'a>(
             continue;
         };
         if current < max_mtime {
-            let _ = filetime::set_file_mtime(path, ft);
+            let _ = set_materialized_mtime(path, ft);
         }
     }
 }
@@ -105,9 +105,28 @@ fn mtime_floor_disabled() -> bool {
 pub(in crate::daemon::server) fn floor_artifact_mtime_to_sibling_max(
     path: &Path,
 ) -> std::io::Result<()> {
+    if let Some(ft) = compute_sibling_floor(path)? {
+        let _ = set_materialized_mtime(path, ft);
+    }
+    Ok(())
+}
+
+/// Compute the sibling-floor mtime for `path` without applying it. Returns
+/// `None` when the floor is disabled or would be a no-op (no sibling is
+/// newer than `path`'s current mtime). Split out from
+/// [`floor_artifact_mtime_to_sibling_max`] so same-inode call sites can
+/// check whether flooring is actually needed before deciding how to apply
+/// it (e.g. detaching a hardlinked output instead of mutating the shared
+/// blob in place).
+pub(in crate::daemon::server) fn compute_sibling_floor(
+    path: &Path,
+) -> std::io::Result<Option<filetime::FileTime>> {
+    if mtime_floor_disabled() {
+        return Ok(None);
+    }
     let parent = match path.parent() {
         Some(p) => p,
-        None => return Ok(()),
+        None => return Ok(None),
     };
     let my_mtime = std::fs::metadata(path)?.modified()?;
     let mut max_mtime = my_mtime;
@@ -139,8 +158,26 @@ pub(in crate::daemon::server) fn floor_artifact_mtime_to_sibling_max(
         }
     }
     if max_mtime > my_mtime {
-        let ft = filetime::FileTime::from_system_time(max_mtime);
-        let _ = filetime::set_file_mtime(path, ft);
+        Ok(Some(filetime::FileTime::from_system_time(max_mtime)))
+    } else {
+        Ok(None)
     }
-    Ok(())
+}
+
+pub(in crate::daemon::server) fn set_materialized_mtime(
+    path: &Path,
+    mtime: filetime::FileTime,
+) -> std::io::Result<()> {
+    let readonly = std::fs::metadata(path)?.permissions().readonly();
+    if readonly {
+        make_writable(path)?;
+    }
+    let result = filetime::set_file_mtime(path, mtime);
+    if readonly {
+        let restore = set_readonly(path, true);
+        if result.is_ok() {
+            restore?;
+        }
+    }
+    result
 }
