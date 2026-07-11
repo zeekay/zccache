@@ -165,32 +165,41 @@ fn path_has_dsym_ancestor(rel: &Path) -> bool {
 
 /// True for files cargo writes inside `.fingerprint/<crate>-<hash>/` that
 /// feed its freshness decision. soldr's `docs/THIN_TARGET_CACHE_PRUNING.md`
-/// Section 4.3 enumerates these prefixes. Everything else in the directory
-/// (notably the `*.json` debug files) is treated as output.
+/// Section 4.3 enumerates these prefixes.
+///
+/// soldr#1564: Cargo's `Fingerprint::load` reads the per-unit `<stem>.json`
+/// record (e.g. `lib-foo.json`, `bin-foo.json`,
+/// `build-script-build-foo.json`, `run-build-script-build-foo.json`)
+/// *in addition to* the opaque hash file with the same stem — the JSON is
+/// NOT a human-readable diagnostic, it's the serialized `Fingerprint`
+/// Cargo needs to even attempt a freshness comparison. Dropping it makes
+/// `cargo::core::compiler::fingerprint::load` fail with
+/// `failed to read .fingerprint/<unit>/<stem>.json`, forcing every unit
+/// Dirty regardless of whether the hash file and primary outputs survived
+/// the restore. So the `.json` suffix is stripped before matching
+/// prefixes, and a `<stem>.json` classifies identically to `<stem>`.
+/// Files whose stem does not match any load-bearing prefix (e.g. a
+/// `<pkg>-<hash>.json` file matching the fingerprint directory's own name)
+/// remain diagnostic-class output.
 fn is_fingerprint_meta_file(rel: &Path) -> bool {
     let Some(name) = rel.file_name().and_then(OsStr::to_str) else {
         return false;
     };
-    // Cargo writes human-readable diagnostics beside several hash records
-    // using the same stem plus `.json`. Reject the suffix before consulting
-    // prefixes so `bin-*.json` and build-script JSON cannot masquerade as
-    // load-bearing fingerprints.
-    if rel.extension() == Some(OsStr::new("json")) {
-        return false;
-    }
     if name == "invoked.timestamp" {
         return true;
     }
+    let stem = name.strip_suffix(".json").unwrap_or(name);
     // Cargo stores the load-bearing fingerprints for build-script compile
     // and execution units under these two prefixes. They are opaque hash
-    // records just like dep-/lib-/bin-*; adjacent JSON remains diagnostic.
-    if name.starts_with("build-script-") || name.starts_with("run-build-script-") {
+    // records just like dep-/lib-/bin-*, and their `.json` companions are
+    // load-bearing too (see doc comment above).
+    if stem.starts_with("build-script-") || stem.starts_with("run-build-script-") {
         return true;
     }
     matches!(
-        name.split('-').next(),
+        stem.split('-').next(),
         Some("dep" | "output" | "lib" | "bin")
-    ) && name.contains('-')
+    ) && stem.contains('-')
 }
 
 /// True for cargo's compiled build-script binaries. The base name is

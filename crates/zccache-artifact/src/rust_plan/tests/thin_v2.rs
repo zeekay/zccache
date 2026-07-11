@@ -144,8 +144,10 @@ fn thin_v2_save_drops_rlib_rmeta_even_when_allowed_list_lists_them() {
 #[test]
 fn thin_v2_save_keeps_fingerprint_meta_but_drops_fingerprint_outputs() {
     // Tests the split: files cargo reads to make a freshness decision
-    // (`dep-*`, `lib-*`, `bin-*`, `output-*`, `invoked.timestamp`) are
-    // kept; everything else in `.fingerprint/<crate>/` is dropped.
+    // (`dep-*`, `lib-*`, `bin-*`, `output-*`, `build-script-*`,
+    // `run-build-script-*`, `invoked.timestamp`, and their `.json`
+    // companions -- soldr#1564) are kept; everything else in
+    // `.fingerprint/<crate>/` is dropped.
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("target").join("debug");
     // Meta files (kept):
@@ -237,11 +239,28 @@ fn thin_v2_save_keeps_fingerprint_meta_but_drops_fingerprint_outputs() {
         !kept_paths
             .iter()
             .any(|p| p.ends_with(".fingerprint/serde-abc/serde-abc.json")),
-        "fingerprint output .json must be dropped; got {kept_paths:?}",
+        "fingerprint output .json (no load-bearing prefix) must be dropped; got {kept_paths:?}",
+    );
+    // soldr#1564: `.json` companions of load-bearing prefixes (`bin-*`,
+    // `build-script-*`, `run-build-script-*`, ...) are load-bearing too --
+    // Cargo's Fingerprint::load reads them to make a freshness decision --
+    // and must be RETAINED, not dropped as diagnostic output.
+    assert!(
+        kept_paths
+            .iter()
+            .any(|p| p.ends_with(".fingerprint/serde-abc/bin-serde.json")),
+        "bin-*.json is load-bearing and must be kept; got {kept_paths:?}",
     );
     assert!(
-        !kept_paths.iter().any(|p| p.ends_with(".json")),
-        "all fingerprint diagnostic JSON must be dropped; got {kept_paths:?}",
+        kept_paths
+            .iter()
+            .any(|p| p.ends_with(".fingerprint/serde-abc/build-script-build-script-build.json")),
+        "build-script-*.json is load-bearing and must be kept; got {kept_paths:?}",
+    );
+    assert!(
+        kept_paths.iter().any(|p| p
+            .ends_with(".fingerprint/serde-abc/run-build-script-build-script-build.json")),
+        "run-build-script-*.json is load-bearing and must be kept; got {kept_paths:?}",
     );
     assert!(
         kept_paths.iter().any(|p| p.ends_with("deps/serde-abc.d")),
@@ -317,6 +336,9 @@ fn thin_v2_classifier_recognizes_new_classes() {
             "{name} is a load-bearing Cargo freshness hash",
         );
     }
+    // soldr#1564: `.json` companions of load-bearing prefixes are
+    // themselves load-bearing (Cargo's Fingerprint::load reads them), so
+    // they classify as Meta, not Outputs.
     for name in [
         "build-script-build-script-build.json",
         "run-build-script-build-script-build.json",
@@ -325,8 +347,8 @@ fn thin_v2_classifier_recognizes_new_classes() {
         let path = Path::new("debug/.fingerprint/serde-abc").join(name);
         assert_eq!(
             classify_artifact(&path, RustPlanMode::Thin, true),
-            Some(RustArtifactClass::CargoFingerprintOutputs),
-            "{name} is diagnostic JSON, not a freshness hash",
+            Some(RustArtifactClass::CargoFingerprintMeta),
+            "{name} is a load-bearing Cargo freshness record despite the .json suffix",
         );
     }
     // Legacy (thin_v2 = false) keeps the umbrella class so older
