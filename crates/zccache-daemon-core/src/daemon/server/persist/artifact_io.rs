@@ -3,6 +3,54 @@
 
 use super::*;
 
+/// Keeps a pre-existing digest sidecar intact if this publish attempt fails.
+struct DigestSidecarGuard {
+    path: PathBuf,
+    previous: Option<Vec<u8>>,
+    touched: bool,
+}
+
+impl DigestSidecarGuard {
+    fn for_blob(blob_path: &Path) -> std::io::Result<Self> {
+        let name = blob_path.file_name().unwrap_or_default().to_string_lossy();
+        let path = blob_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!(
+                ".cowhash-{}",
+                blake3::hash(name.as_bytes()).to_hex()
+            ));
+        let previous = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            path,
+            previous,
+            touched: false,
+        })
+    }
+
+    fn write_for(&mut self, hash_source: &Path, named_as: &Path) -> std::io::Result<()> {
+        // A write can truncate an existing sidecar before reporting an error.
+        self.touched = true;
+        write_authoritative_blob_digest_for(hash_source, named_as)
+    }
+
+    fn restore_on_failure(&self, blob_path: &Path) {
+        if !self.touched {
+            return;
+        }
+        match &self.previous {
+            Some(bytes) => {
+                let _ = std::fs::write(&self.path, bytes);
+            }
+            None => remove_authoritative_blob_digest(blob_path),
+        }
+    }
+}
+
 pub(in crate::daemon::server) fn artifact_persist_tmp_path(cache_path: &Path) -> PathBuf {
     let counter = ARTIFACT_PERSIST_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let name = cache_path
@@ -20,15 +68,25 @@ pub(in crate::daemon::server) fn persist_artifact_output(
         std::fs::create_dir_all(parent).map_err(|e| enrich_persist_err(e, None, cache_path))?;
     }
     let tmp_path = artifact_persist_tmp_path(cache_path);
+    let mut digest = DigestSidecarGuard::for_blob(cache_path)
+        .map_err(|e| enrich_persist_err(e, None, cache_path))?;
     let result = (|| {
         std::fs::write(&tmp_path, payload)?;
         set_readonly(&tmp_path, readonly_enabled())?;
-        replace_artifact_cache_file(&tmp_path, cache_path)?;
-        write_authoritative_blob_digest(cache_path)
+        // Write the digest sidecar for cache_path's *final* name while the
+        // bytes are still private at tmp_path, so the rename that publishes
+        // the blob is the last fallible step. Writing the digest *after*
+        // the rename (the prior order) could leave a published, digest-less
+        // blob behind if this write failed — which verify_registered_blob
+        // would later evict as unverifiable even though it was never
+        // tampered with (issue #1042).
+        digest.write_for(&tmp_path, cache_path)?;
+        replace_artifact_cache_file(&tmp_path, cache_path)
     })();
     if let Err(e) = result {
         let _ = make_writable(&tmp_path);
         let _ = std::fs::remove_file(&tmp_path);
+        digest.restore_on_failure(cache_path);
         return Err(enrich_persist_err(e, None, cache_path));
     }
     Ok(())
@@ -171,33 +229,60 @@ pub(in crate::daemon::server) fn persist_artifact_file(
     }
 
     let tmp_path = artifact_persist_tmp_path(cache_path);
-    let result = (|| match reflink_copy::reflink(source_path, &tmp_path) {
-        Ok(()) => {
+    let mut digest = DigestSidecarGuard::for_blob(cache_path)
+        .map_err(|e| enrich_persist_err(e, Some(source_path), cache_path))?;
+    // Tier order: reflink (true COW, cheapest) -> hardlink (shared inode,
+    // no bytes copied) -> full copy (always works, most expensive). Commit
+    // 49dd59c replaced the pre-existing hardlink-first strategy with
+    // reflink-then-copy and dropped the hardlink attempt entirely, which
+    // regressed the STORE-direction fast path to a full byte copy on every
+    // non-reflink filesystem (most Linux ext4, most Windows NTFS without
+    // ReFS) — issue #1042.
+    let result = (|| {
+        if reflink_copy::reflink(source_path, &tmp_path).is_ok() {
             set_readonly(&tmp_path, readonly_enabled())?;
+            digest.write_for(&tmp_path, cache_path)?;
             replace_artifact_cache_file(&tmp_path, cache_path)?;
-            write_authoritative_blob_digest(cache_path)?;
-            Ok(PersistArtifactFileStats {
+            return Ok(PersistArtifactFileStats {
                 reflink_count: 1,
                 ..PersistArtifactFileStats::default()
-            })
+            });
         }
-        Err(_) => {
-            let copy_bytes = std::fs::copy(source_path, &tmp_path)?;
-            set_readonly(&tmp_path, readonly_enabled())?;
+        // A failed reflink attempt may have left a partial tmp file behind
+        // (platform-dependent); clear it defensively before the next tier,
+        // since std::fs::hard_link fails if the destination already exists.
+        let _ = std::fs::remove_file(&tmp_path);
+        if std::fs::hard_link(source_path, &tmp_path).is_ok() {
+            // The hardlink shares the compiler output's inode. Changing its
+            // read-only bit through `tmp_path` would also make the still-live
+            // source path read-only (and on Windows changes its FILE_ATTRIBUTE_READONLY),
+            // causing the next compiler/link step to fail with access denied.
+            // The hardlink registry's digest verification protects this
+            // shared store entry; permission hardening is reserved for
+            // independent reflink/copy blobs.
+            digest.write_for(&tmp_path, cache_path)?;
             replace_artifact_cache_file(&tmp_path, cache_path)?;
-            write_authoritative_blob_digest(cache_path)?;
-            Ok(PersistArtifactFileStats {
-                copy_count: 1,
-                copy_bytes,
+            return Ok(PersistArtifactFileStats {
+                hardlink_count: 1,
                 ..PersistArtifactFileStats::default()
-            })
+            });
         }
+        let copy_bytes = std::fs::copy(source_path, &tmp_path)?;
+        set_readonly(&tmp_path, readonly_enabled())?;
+        digest.write_for(&tmp_path, cache_path)?;
+        replace_artifact_cache_file(&tmp_path, cache_path)?;
+        Ok(PersistArtifactFileStats {
+            copy_count: 1,
+            copy_bytes,
+            ..PersistArtifactFileStats::default()
+        })
     })();
     match result {
         Ok(stats) => Ok(stats),
         Err(e) => {
             let _ = make_writable(&tmp_path);
             let _ = std::fs::remove_file(&tmp_path);
+            digest.restore_on_failure(cache_path);
             Err(enrich_persist_err(e, Some(source_path), cache_path))
         }
     }

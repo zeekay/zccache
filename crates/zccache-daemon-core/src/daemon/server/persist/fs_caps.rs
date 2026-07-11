@@ -2,12 +2,13 @@
 
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 pub(in crate::daemon::server) const DISABLE_REFLINK_ENV: &str = "ZCCACHE_DISABLE_REFLINK";
 pub(in crate::daemon::server) const COW_READONLY_ENV: &str = "ZCCACHE_COW_READONLY";
 const WINDOWS_HARDLINK_LIMIT: u64 = 1023;
 const UNIX_HARDLINK_LIMIT: u64 = 65_000;
+const CAPS_CACHE_LIMIT: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(in crate::daemon::server) enum FileIdWidth {
@@ -72,6 +73,7 @@ pub(in crate::daemon::server) fn apply_reflink_switch(
 struct VolumePair(u128, u128, PathBuf);
 
 static CAPS: OnceLock<dashmap::DashMap<VolumePair, VolumeCaps>> = OnceLock::new();
+static CAPS_INSERT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PROBE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn cache() -> &'static dashmap::DashMap<VolumePair, VolumeCaps> {
@@ -116,6 +118,21 @@ pub(in crate::daemon::server) fn fs_caps(src: &Path, dst: &Path) -> VolumeCaps {
         return (*caps).effective();
     }
     let caps = probe_caps(src, dst);
+    let _insert_guard = CAPS_INSERT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache().len() >= CAPS_CACHE_LIMIT {
+        // Coarse bound on unbounded growth (issue #1042): the cache key
+        // includes a destination-parent PathBuf so distinct build-output
+        // directories never collide, but a daemon servicing many thousands
+        // of distinct directories over its lifetime would otherwise grow
+        // this map without limit. A full clear is simpler than LRU
+        // bookkeeping and self-corrects — the next fs_caps() call just
+        // re-probes and re-populates, which is cheap (one create_dir_all
+        // + two tiny reflink/hardlink probe files).
+        cache().clear();
+    }
     cache().insert(key, caps);
     caps.effective()
 }

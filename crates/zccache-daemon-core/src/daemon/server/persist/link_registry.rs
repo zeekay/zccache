@@ -50,10 +50,152 @@ fn digest_path(blob_path: &Path) -> PathBuf {
         .join(sidecar_name)
 }
 
+/// Writes the digest sidecar keyed by `named_as`'s digest path, but hashes
+/// `hash_source`'s bytes. Lets a caller compute and persist the digest for a
+/// blob's *final* resting name while its bytes are still at a private tmp
+/// path, so the digest write can complete (or fail) before the rename that
+/// publishes the blob — avoiding an orphaned, digest-less blob if the
+/// digest write fails after publication (issue #1042).
+pub(in crate::daemon::server) fn write_authoritative_blob_digest_for(
+    hash_source: &Path,
+    named_as: &Path,
+) -> std::io::Result<()> {
+    write_authoritative_blob_digest_for_with_cleanup(hash_source, named_as).map(|digest| {
+        digest.commit();
+    })
+}
+
+#[cfg(test)]
 pub(in crate::daemon::server) fn write_authoritative_blob_digest(
     blob_path: &Path,
 ) -> std::io::Result<()> {
-    std::fs::write(digest_path(blob_path), hash_file(blob_path)?)
+    write_authoritative_blob_digest_for(blob_path, blob_path)
+}
+
+/// Owns the digest sidecar published by one artifact-write attempt.
+///
+/// Dropping an uncommitted guard removes only the sidecar installed by that
+/// attempt. This lets artifact_io clean up after a later blob-rename failure
+/// without deleting a sidecar that existed before the attempt started.
+pub(in crate::daemon::server) struct AuthoritativeBlobDigest {
+    path: Option<PathBuf>,
+    digest: [u8; 32],
+}
+
+impl AuthoritativeBlobDigest {
+    /// Keep the sidecar after its blob has been published successfully.
+    pub(in crate::daemon::server) fn commit(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for AuthoritativeBlobDigest {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let matches = std::fs::read(&path)
+                .map(|bytes| bytes.as_slice() == self.digest.as_slice())
+                .unwrap_or(false);
+            if matches {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// Writes and atomically publishes an authoritative digest sidecar, returning
+/// an ownership guard for cleanup if the subsequent blob publication fails.
+/// The final sidecar is never opened for writing, so a partial write cannot
+/// truncate an existing valid sidecar.
+pub(in crate::daemon::server) fn write_authoritative_blob_digest_for_with_cleanup(
+    hash_source: &Path,
+    named_as: &Path,
+) -> std::io::Result<AuthoritativeBlobDigest> {
+    use std::io::Write;
+
+    let digest = hash_file(hash_source)?;
+    let final_path = digest_path(named_as);
+
+    // `create_new` prevents two writers from sharing a temporary file. A
+    // retry also handles a stale file left by an interrupted prior attempt
+    // (including a reused process id) without falling back to the final path.
+    let (temp_path, result) = loop {
+        let counter = ARTIFACT_PERSIST_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = final_path.with_file_name(format!(
+            ".{}.tmp-{}-{}",
+            final_path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+            counter
+        ));
+        let mut temp = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(temp) => temp,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let result = (|| {
+            temp.write_all(&digest)?;
+            temp.sync_all()?;
+            drop(temp);
+            replace_digest_sidecar(&temp_path, &final_path)
+        })();
+        break (temp_path, result);
+    };
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    Ok(AuthoritativeBlobDigest {
+        path: Some(final_path),
+        digest,
+    })
+}
+
+#[cfg(not(windows))]
+fn replace_digest_sidecar(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp_path, final_path)
+}
+
+#[cfg(windows)]
+fn replace_digest_sidecar(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+
+    let temp = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let final_path = final_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: Both buffers are NUL-terminated UTF-16 strings that remain
+    // alive for the duration of the call.
+    if unsafe {
+        MoveFileExW(
+            temp.as_ptr(),
+            final_path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Best-effort cleanup of a blob's digest sidecar. Used when a publish
+/// attempt fails after the digest was already written but before (or during)
+/// the rename that would have made the blob visible — avoids leaving a
+/// stray digest sidecar with no corresponding blob.
+pub(in crate::daemon::server) fn remove_authoritative_blob_digest(blob_path: &Path) {
+    let _ = std::fs::remove_file(digest_path(blob_path));
 }
 
 fn read_authoritative_blob_digest(blob_path: &Path) -> std::io::Result<Option<[u8; 32]>> {
@@ -67,6 +209,49 @@ fn read_authoritative_blob_digest(blob_path: &Path) -> std::io::Result<Option<[u
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn is_digest_migration_excluded(path: &Path) -> bool {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    name.starts_with(".cowhash-") || name.contains(".tmp-")
+}
+
+/// Backfill digest sidecars for blobs written before durable sidecars existed.
+///
+/// This is intended as a one-time startup migration. A valid sidecar makes a
+/// blob a no-op on subsequent runs; files that disappear between enumeration
+/// and hashing or sidecar publication are ignored as stale entries.
+pub(in crate::daemon::server) fn migrate_legacy_blob_digests(
+    artifact_dir: &Path,
+) -> std::io::Result<usize> {
+    let mut migrated = 0;
+    for entry in std::fs::read_dir(artifact_dir)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if is_digest_migration_excluded(&path) {
+            continue;
+        }
+        let is_file = match entry.file_type() {
+            Ok(file_type) => file_type.is_file(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !is_file {
+            continue;
+        }
+        if read_authoritative_blob_digest(&path)?.is_some() {
+            continue;
+        }
+        match write_authoritative_blob_digest_for(&path, &path) {
+            Ok(()) => migrated += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(migrated)
 }
 
 pub(in crate::daemon::server) fn register_hardlink(
@@ -141,14 +326,37 @@ pub(in crate::daemon::server) fn commit_hardlink_registration(
             "hardlink registration disappeared before commit",
         ));
     };
-    if get_file_id(output_path) != Some(id) {
-        record.suspect = true;
-        drop(record);
-        cancel_hardlink_registration(id, output_path);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "hardlink output disappeared before registration commit",
-        ));
+    match get_file_id(output_path) {
+        Some(actual) if actual == id => {}
+        Some(_mismatched) => {
+            // The path now resolves to a *different* file identity than the
+            // hardlink we just created — genuine evidence of a race/swap.
+            // Mark the blob suspect so the next read-path verification
+            // re-hashes it before serving it.
+            record.suspect = true;
+            drop(record);
+            cancel_hardlink_registration(id, output_path);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "hardlink output identity changed before registration commit",
+            ));
+        }
+        None => {
+            // Identity could not be resolved at all (e.g. a transient
+            // stat/handle failure — an AV scanner momentarily holding the
+            // handle). This is not evidence of corruption, just an
+            // inconclusive check, so the blob must not be marked suspect
+            // here. Cancel this registration and surface a plain error;
+            // the caller (write_cached.rs) falls back to a copy on any
+            // commit failure the same way it already does for a failed
+            // std::fs::hard_link, instead of hard-failing (issue #1042).
+            drop(record);
+            cancel_hardlink_registration(id, output_path);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "hardlink output identity transiently unavailable before registration commit",
+            ));
+        }
     }
     record.outputs.insert(output_path.to_path_buf());
     drop(record);
@@ -217,6 +425,24 @@ pub(in crate::daemon::server) fn verify_registered_blob(blob_path: &Path) -> std
                 return Ok(());
             }
         }
+        // Either a digest existed and the hash didn't match (real
+        // corruption evidence), or no digest exists at all. Issue #1042
+        // considered trusting a digest-less blob when its current hardlink
+        // count is <= 1 (reasoning: no *current* alias, so no mechanism to
+        // have poisoned it). That reasoning is unsound: a since-deleted
+        // alias could have mutated the shared inode before being removed,
+        // and the blob's current bytes would already reflect that
+        // poisoning — link count only reflects the *present*, not whether
+        // a risky window existed in the past. (Confirmed by the existing
+        // failed_restart_eviction_restores_readonly_and_retries_after_alias_delete
+        // regression test, which specifically covers this sequence.) A
+        // digest-less blob is therefore always evicted here. Fix #1
+        // (issue #1042) already prevents the main real-world trigger for
+        // this — a freshly-persisted blob can no longer become visible
+        // without its digest, since the digest is now written *before*
+        // the publishing rename. The remaining cost is a one-time cache
+        // miss for blobs written by a pre-#1039 zccache version on
+        // upgrade, which is the safer trade-off.
         let link_count = hard_link_count(blob_path).unwrap_or_default();
         tracing::warn!(
             event = "cow_unregistered_blob_evicted",
@@ -378,6 +604,13 @@ pub(in crate::daemon::server) fn registered_output_count(blob_path: &Path) -> us
 #[cfg(test)]
 pub(in crate::daemon::server) fn is_file_id_registered(id: FileId) -> bool {
     registry().contains_key(&id)
+}
+
+#[cfg(test)]
+pub(in crate::daemon::server) fn is_blob_suspect_for_test(blob_path: &Path) -> bool {
+    get_file_id(blob_path)
+        .and_then(|id| registry().get(&id).map(|record| record.suspect))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
