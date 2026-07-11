@@ -83,15 +83,51 @@ pub(super) fn hash_file(
     path: &Path,
     clock: Clock,
 ) -> Result<ContentHash, String> {
-    debug_assert!(
-        !path.to_string_lossy().starts_with(r"\\?\"),
-        "path must not have \\\\?\\ prefix: {}",
-        path.display()
-    );
+    let lookup_path = path_for_cache_lookup(path);
     cache_system
-        .lookup_since(&NormalizedPath::new(path), clock)
+        .lookup_since(&NormalizedPath::new(lookup_path.as_ref()), clock)
         .map(|r| r.hash)
         .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn path_for_cache_lookup(path: &Path) -> std::borrow::Cow<'_, Path> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        if !path.as_os_str().as_encoded_bytes().starts_with(br"\\?\") {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        let encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
+
+        let ascii_eq = |value: u16, uppercase: u8| {
+            value == u16::from(uppercase) || value == u16::from(uppercase.to_ascii_lowercase())
+        };
+        let is_unc = encoded.len() >= 8
+            && ascii_eq(encoded[4], b'U')
+            && ascii_eq(encoded[5], b'N')
+            && ascii_eq(encoded[6], b'C')
+            && encoded[7] == b'\\' as u16;
+        let normalized = if is_unc {
+            let mut result = vec![b'\\' as u16, b'\\' as u16];
+            result.extend_from_slice(&encoded[8..]);
+            Some(result)
+        } else if encoded.len() >= 6
+            && encoded[4] <= 0x7f
+            && (encoded[4] as u8).is_ascii_alphabetic()
+            && encoded[5] == b':' as u16
+        {
+            Some(encoded[4..].to_vec())
+        } else {
+            None
+        };
+        if let Some(normalized) = normalized {
+            return std::borrow::Cow::Owned(PathBuf::from(std::ffi::OsString::from_wide(
+                &normalized,
+            )));
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
 }
 
 /// Check if all files in a context's dependency list are unchanged since
@@ -227,4 +263,44 @@ pub(super) fn lookup_artifact_with_disk_fallback<'a>(
         .artifacts
         .insert(key_hex.to_string(), CachedArtifact::from_index(meta));
     state.artifacts.get_mut(key_hex)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    #[test]
+    fn cache_lookup_path_strips_windows_verbatim_prefix() {
+        let input = Path::new(r"\\?\C:\workspace\clippy.toml");
+        assert_eq!(
+            path_for_cache_lookup(input).as_ref(),
+            Path::new(r"C:\workspace\clippy.toml")
+        );
+
+        let unc = Path::new(r"\\?\UNC\server\share\clippy.toml");
+        assert_eq!(
+            path_for_cache_lookup(unc).as_ref(),
+            Path::new(r"\\server\share\clippy.toml")
+        );
+
+        let encoded = [
+            b'\\' as u16,
+            b'\\' as u16,
+            b'?' as u16,
+            b'\\' as u16,
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            0xd800,
+        ];
+        let non_unicode = PathBuf::from(std::ffi::OsString::from_wide(&encoded));
+        assert_eq!(
+            path_for_cache_lookup(&non_unicode)
+                .as_os_str()
+                .encode_wide()
+                .collect::<Vec<_>>(),
+            encoded[4..]
+        );
+    }
 }
