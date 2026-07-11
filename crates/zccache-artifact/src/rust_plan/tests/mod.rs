@@ -11,6 +11,7 @@ use std::path::Path;
 mod classes_and_packages;
 mod delta;
 mod restore_errors;
+mod restore_mutation_isolation;
 mod save_restore;
 mod schema_validation;
 mod summary_tests;
