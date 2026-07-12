@@ -21,7 +21,8 @@ Rollout values are `rust` (Rust single and multi-output plans), `c-cpp`
 `-MF`/`-MD` depfiles; MSVC
 flag rewriting is supported only for explicit `/Fo` object paths), or
 `all`. Unsupported shapes—including multi-source compiler invocations, C++
-modules, linker side outputs, generic exec, and stdout output—remain on the
+modules, unrewritable or undeclared linker outputs, opaque generic exec, and
+stdout output—remain on the
 legacy path before compiler spawn. Explicit Rust `--emit=kind=path` outputs
 are parsed and included in the complete cache-hit reverse map. Inferred
 outputs for staticlibs, bins, proc macros, objects, assembly, LLVM IR/bitcode,
@@ -29,6 +30,13 @@ MIR, and dep-info use their actual rustc extensions.
 
 Pure archive invocations with one output and no linker side effects use the
 same private transaction when the lane is `all`.
+
+Linker invocations participate in the `all` lane when the parser's primary
+and declared secondary destinations can all be rewritten before spawn. The
+private directory is checked for undeclared files/bundles after the linker
+exits, and the requested output directory is checked for external side
+effects. Either condition prevents cache publication; declared outputs are
+independently salvaged to preserve a successful link.
 
 Generic tool execution also participates in the `all` lane when every
 declared output is an exact argument token. Those paths are rewritten into a
@@ -196,7 +204,8 @@ remove read-only attributes before deletion.
 `ZCCACHE_DISABLE_REFLINK=1` disables cloning and `ZCCACHE_COW_READONLY=0`
 disables read-only enforcement. Neither setting adds an IPC roundtrip.
 Unsupported shapes—including multi-source compiler invocations, C++ modules,
-linker side outputs, opaque generic exec, and stdout output—remain on the
+unrewritable/undeclared linker outputs, opaque generic exec, and stdout
+output—remain on the
 legacy path before compiler spawn. Explicit Rust `--emit=kind=path`
 destinations are included in the complete cache-hit reverse map. The staged
 lane remains opt-in for output families that do not yet have complete-set
