@@ -7,7 +7,10 @@ use std::sync::Arc;
 use zccache_core::NormalizedPath;
 
 use super::detect::{detect_family, is_source_file, MODULE_EXTENSIONS};
-use super::{parse_msvc, CacheableCompilation, CompilerFamily, ParsedInvocation, SourceMode};
+use super::{
+    parse_msvc, CacheableCompilation, CompilerFamily, MultiFileOutputLayout,
+    MultiFileSourceArgument, ParsedInvocation, SourceMode,
+};
 
 /// Map a `-x <lang>` value to the corresponding source mode.
 /// Returns `None` for unrecognized language values (no special mode).
@@ -157,6 +160,7 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     let mut output_file: Option<String> = None;
     let mut current_mode = SourceMode::Normal;
     let mut unknown_flags: Vec<String> = Vec::new();
+    let mut end_of_options = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -173,6 +177,25 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             return ParsedInvocation::NonCacheable {
                 reason: "stdin source not cacheable".to_string(),
             };
+        }
+
+        if !end_of_options && arg == "--" {
+            end_of_options = true;
+            i += 1;
+            continue;
+        }
+
+        if end_of_options {
+            let effective_mode = if current_mode != SourceMode::Normal {
+                current_mode
+            } else {
+                source_mode_from_extension(arg)
+            };
+            if is_source_file(arg) || current_mode != SourceMode::Normal {
+                source_files.push((arg.clone(), i, effective_mode));
+            }
+            i += 1;
+            continue;
         }
 
         if arg == "-c" {
@@ -257,7 +280,16 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
     // Multi-file: `-o` is invalid with `-c` and multiple sources (compiler rejects it),
     // so each source gets its default output name (stem.o).
     if source_files.len() > 1 {
+        let output_layout = output_file.map_or(MultiFileOutputLayout::PerSourceDefault, |path| {
+            MultiFileOutputLayout::InvalidSingleOutput(NormalizedPath::new(path))
+        });
         let source_indices: Vec<usize> = source_files.iter().map(|(_, idx, _)| *idx).collect();
+        let source_arguments = source_indices
+            .iter()
+            .map(|index| MultiFileSourceArgument {
+                argument_indices: vec![*index],
+            })
+            .collect();
         let shared_args: Arc<[String]> = Arc::from(args.to_vec());
         let compilations = source_files
             .iter()
@@ -279,6 +311,8 @@ pub fn parse_invocation(compiler: &str, args: &[String]) -> ParsedInvocation {
             compilations,
             original_args: shared_args,
             source_indices,
+            source_arguments,
+            output_layout,
         };
     }
 

@@ -101,6 +101,26 @@ impl CompilerFamily {
     }
 }
 
+/// How one multi-source compiler invocation selects its primary object paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiFileOutputLayout {
+    /// Every source uses the compiler's default stem-based object name.
+    PerSourceDefault,
+    /// MSVC/clang-cl default stem-based `.obj` names with slash-flag syntax.
+    MsvcPerSourceDefault,
+    /// MSVC's directory-valued `/Fo` redirects every stem-based object.
+    MsvcDirectory(NormalizedPath),
+    /// A file-valued output flag is invalid/ambiguous for multiple sources.
+    InvalidSingleOutput(NormalizedPath),
+}
+
+/// Exact argv elements that jointly name one source in a multi-file command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiFileSourceArgument {
+    /// Indices to retain/remove as one unit (for example `/Tc` plus its value).
+    pub argument_indices: Vec<usize>,
+}
+
 /// The result of parsing a compiler invocation.
 #[derive(Debug, Clone)]
 pub enum ParsedInvocation {
@@ -115,6 +135,10 @@ pub enum ParsedInvocation {
         /// Indices of source files in `original_args`, so the daemon can filter
         /// out cache-hit sources without reconstructing args.
         source_indices: Vec<usize>,
+        /// Complete argv spans for source filtering and private per-unit plans.
+        source_arguments: Vec<MultiFileSourceArgument>,
+        /// Exact primary-output naming semantics for the batch.
+        output_layout: MultiFileOutputLayout,
     },
     /// A non-cacheable invocation (linking, preprocessing, etc.).
     NonCacheable {

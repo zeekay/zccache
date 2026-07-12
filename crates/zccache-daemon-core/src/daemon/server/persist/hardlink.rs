@@ -246,6 +246,13 @@ pub(in crate::daemon::server) fn get_file_id(path: &Path) -> Option<FileId> {
     })
 }
 
+#[cfg(unix)]
+pub(in crate::daemon::server) fn get_file_change_marker(path: &Path) -> Option<i128> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()))
+}
+
 #[cfg(windows)]
 pub(in crate::daemon::server) fn same_file(a: &Path, b: &Path) -> bool {
     get_file_id(a)
@@ -309,5 +316,41 @@ pub(in crate::daemon::server) fn get_file_id(path: &Path) -> Option<FileId> {
             volume_serial: u64::from(legacy.dwVolumeSerialNumber),
             identifier,
         })
+    }
+}
+
+#[cfg(windows)]
+pub(in crate::daemon::server) fn get_file_change_marker(path: &Path) -> Option<i128> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut basic: FILE_BASIC_INFO = std::mem::zeroed();
+        let ok = GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&raw mut basic).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        );
+        let _ = CloseHandle(handle);
+        (ok != 0).then_some(i128::from(basic.ChangeTime))
     }
 }

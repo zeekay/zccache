@@ -8,7 +8,10 @@
 use super::staged_store::materialization_error_progress;
 #[cfg(test)]
 use super::staged_store::{inject_staged_fault, StagedFaultGuard, StagedFaultPoint};
-use super::staged_store::{materialization_error, staged_lane_enabled, StagedMaterializationStats};
+use super::staged_store::{
+    materialization_error, materialize_independent_with_stats, staged_lane_enabled,
+    StagedMaterializationStats,
+};
 use crate::core::path::NormalizedPath;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -135,18 +138,6 @@ pub(in crate::daemon::server) struct StagedCompilePlan {
 }
 
 impl StagedCompilePlan {
-    #[cfg(test)]
-    pub(in crate::daemon::server) fn for_test(
-        root: PathBuf,
-        outputs: Vec<StagedOutputPlan>,
-    ) -> Self {
-        Self {
-            outputs,
-            rewritten_args: Vec::new(),
-            root,
-        }
-    }
-
     /// Build a plan for the narrow Phase 3 Rust lane.  A plan is absent for
     /// unsupported invocations, preserving the proven legacy path.
     pub(in crate::daemon::server) fn rustc(
@@ -881,26 +872,17 @@ impl Drop for StagedCompilePlan {
     }
 }
 
+mod multi;
+pub(in crate::daemon::server) use multi::*;
+mod side_outputs;
+use side_outputs::cc_has_unsupported_side_outputs;
+
 fn absolute(path: &Path, cwd: &Path) -> NormalizedPath {
     if path.is_absolute() {
         path.to_path_buf().into()
     } else {
         cwd.join(path).into()
     }
-}
-
-fn cc_has_unsupported_side_outputs(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        let lower = arg.to_ascii_lowercase();
-        lower == "--serialize-diagnostics"
-            || lower == "-mj"
-            || lower.starts_with("-fmodule")
-            || lower.starts_with("-Winvalid-pch")
-            || lower.starts_with("/fd")
-            || lower.starts_with("/fp")
-            || lower.starts_with("/fa")
-            || lower.starts_with("/fi")
-    })
 }
 
 fn emit_specs(args: &[String]) -> Vec<(String, String)> {

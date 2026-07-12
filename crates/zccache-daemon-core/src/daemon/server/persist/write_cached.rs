@@ -268,6 +268,7 @@ pub(in crate::daemon::server) fn write_cached_payload_with_policy_stats(
 
 pub(in crate::daemon::server) const PAR_WRITE_THRESHOLD: usize = 4;
 
+#[cfg(test)]
 pub(in crate::daemon::server) fn write_payloads_par<P, Q>(
     targets: &[(P, Q)],
     payloads: &[CachedPayload],

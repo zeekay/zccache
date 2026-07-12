@@ -1,6 +1,6 @@
 //! Clang/GCC parsing: -c, multi-file, -x header mode, header units, sticky-mode regressions.
 
-use super::super::{parse_invocation, CompilerFamily, ParsedInvocation};
+use super::super::{parse_invocation, CompilerFamily, MultiFileOutputLayout, ParsedInvocation};
 use super::args;
 use zccache_core::NormalizedPath;
 
@@ -66,6 +66,51 @@ fn multi_file_split() {
 }
 
 #[test]
+fn multi_file_explicit_single_output_is_typed_as_invalid_batch_shape() {
+    let result = parse_invocation(
+        "clang++",
+        &args(&["-c", "a.cpp", "b.cpp", "-o", "combined.o"]),
+    );
+    match result {
+        ParsedInvocation::MultiFile {
+            compilations,
+            output_layout,
+            ..
+        } => {
+            assert_eq!(compilations[0].output_file, NormalizedPath::new("a.o"));
+            assert_eq!(compilations[1].output_file, NormalizedPath::new("b.o"));
+            assert_eq!(
+                output_layout,
+                MultiFileOutputLayout::InvalidSingleOutput(NormalizedPath::new("combined.o"))
+            );
+        }
+        other => panic!("expected MultiFile, got: {other:?}"),
+    }
+}
+
+#[test]
+fn multi_file_sources_beginning_with_dash_are_positional_after_separator() {
+    let args = args(&["-c", "--", "-left.c", "-right.cpp"]);
+    match parse_invocation("clang", &args) {
+        ParsedInvocation::MultiFile {
+            compilations,
+            source_arguments,
+            ..
+        } => {
+            assert_eq!(compilations.len(), 2);
+            assert_eq!(compilations[0].source_file, NormalizedPath::new("-left.c"));
+            assert_eq!(
+                compilations[1].source_file,
+                NormalizedPath::new("-right.cpp")
+            );
+            assert_eq!(source_arguments[0].argument_indices, vec![2]);
+            assert_eq!(source_arguments[1].argument_indices, vec![3]);
+        }
+        other => panic!("expected multi-file invocation, got {other:?}"),
+    }
+}
+
+#[test]
 fn multi_file_with_flags() {
     let result = parse_invocation(
         "g++",
@@ -76,6 +121,7 @@ fn multi_file_with_flags() {
             compilations,
             original_args,
             source_indices,
+            ..
         } => {
             assert_eq!(compilations.len(), 2);
             assert_eq!(compilations[0].source_file, NormalizedPath::new("main.cpp"));

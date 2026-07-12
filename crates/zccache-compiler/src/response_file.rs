@@ -9,6 +9,9 @@ use std::path::Path;
 
 use zccache_core::NormalizedPath;
 
+#[cfg(any(windows, test))]
+mod msvc;
+
 /// Maximum nesting depth for response files to prevent stack overflow.
 const MAX_DEPTH: usize = 10;
 
@@ -311,8 +314,10 @@ fn format_rsp_content_rustc(args: &[String]) -> Option<String> {
 /// - `CompilerFamily::Rustc` uses rustc's line-oriented format (one arg
 ///   per line, no quoting). Required because rustc does not unquote
 ///   `'..."..."...'`-style values from response files; see #634.
-/// - All other families use the GCC/Clang/MSVC-compatible single- or
-///   double-quoted format produced by `format_rsp_argument`.
+/// - `CompilerFamily::Msvc` uses Windows command-line double-quote and
+///   backslash escaping; `cl.exe` treats single quotes literally.
+/// - GCC/Clang use the single- or double-quoted format produced by
+///   `format_rsp_argument`.
 ///
 /// The returned [`TempResponseFile`] keeps the temporary file alive via RAII.
 /// Drop it after the compiler process finishes.
@@ -332,6 +337,7 @@ pub fn write_response_file_if_needed(
         NormalizedPath::new(tmp_dir.join(format!("zccache_{}_{}.rsp", std::process::id(), id)));
     let content = match family_hint {
         crate::CompilerFamily::Rustc => format_rsp_content_rustc(args),
+        crate::CompilerFamily::Msvc => msvc::format_rsp_content(args),
         _ => format_rsp_content_if_safe(args),
     };
     let Some(content) = content else {

@@ -18,10 +18,10 @@ cache hit.
 
 `ZCCACHE_STAGED_ARTIFACTS=off` restores the legacy path as an immediate kill
 switch. Narrow diagnostic values are `rust` (Rust single and multi-output
-plans), `c-cpp` (ordinary single-object and single-PCH GCC/Clang plans
-including user-owned `-MF`/`-MD` depfiles; MSVC flag rewriting is supported
-only for explicit `/Fo` object paths), or
-`all`. Unsupported shapes—including multi-source compiler invocations, C++
+plans), `c-cpp` (ordinary single-object, single-PCH, and multi-source GCC/Clang plans
+including unambiguous default depfiles; MSVC flag rewriting supports explicit
+single-source `/Fo` object paths and multi-source `/Fo` directories), or
+`all`. Unsupported shapes—including ambiguous multi-source side outputs, C++
 modules, unrewritable or undeclared linker outputs, opaque generic exec, and
 stdout output—remain on the
 legacy path before compiler spawn. Explicit Rust `--emit=kind=path` outputs
@@ -70,6 +70,20 @@ directory, outside the clearable artifact store. An advisory lock protects
 each live daemon's directory: startup cleanup reclaims only unlocked crash
 debris, while cache clear and eviction cannot delete outputs still needed for
 publication salvage or requested-path materialization.
+
+Ordinary multi-source GCC/Clang and MSVC/clang-cl compile requests are planned
+as an all-or-nothing set before any compiler starts. Each miss source is run as
+a private single-source unit with the original cwd, environment, and logical
+arguments; source order also determines stdout/stderr order. GCC/Clang default
+objects and `-MD`/`-MMD` depfiles, plus MSVC default or directory-valued `/Fo`
+objects, have unique reverse mappings to requested paths. File-valued batch
+`-o`/`/Fo`, colliding default object names, explicit shared `-MF`, serialized
+diagnostics, source-dependency JSON, listings, PDB/PCH, and module outputs fall
+back before spawn. A failed unit publishes or materializes none of the miss
+outputs. Successful units use complete v2 publication and physical hit
+restoration. Requested paths are materialized before generation, pointer, or
+index visibility, so a failed materialization cannot expose a cache hit.
+Private paths never become depfile targets or cache metadata.
 
 The v2 transaction is visible only after the complete generation and manifest
 are written and the per-key pointer is switched. Readers validate the pointer,
@@ -262,7 +276,7 @@ remove read-only attributes before deletion.
 
 `ZCCACHE_DISABLE_REFLINK=1` disables cloning and `ZCCACHE_COW_READONLY=0`
 disables read-only enforcement. Neither setting adds an IPC roundtrip.
-Unsupported shapes—including multi-source compiler invocations, C++ modules,
+Unsupported shapes—including ambiguous multi-source output sets, C++ modules,
 unrewritable/undeclared linker outputs, opaque generic exec, and stdout
 output—remain on the
 legacy path before compiler spawn. Explicit Rust `--emit=kind=path`

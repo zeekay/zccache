@@ -25,6 +25,7 @@ This document is the index for zccache's architecture specification. Each subsys
 - **File change detection** → [metadata-cache.md](architecture/metadata-cache.md)
 - **Disk cache & eviction** → [artifact-store.md](architecture/artifact-store.md)
 - **Reflink / hardlink COW safety** → [artifact-store.md](architecture/artifact-store.md#capability-driven-cow-materialization)
+- **Staged multi-source C/C++ outputs** → [artifact-store.md](architecture/artifact-store.md#immutable-staged-output-rollout)
 - **soldr target artifact contract** → [rust-artifact-plan.md](architecture/rust-artifact-plan.md)
 - **Embedded soldr/fbuild service integration** → [embedded-service.md](architecture/embedded-service.md)
 - **Legacy action target snapshots** → [target-cache.md](architecture/target-cache.md)

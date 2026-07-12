@@ -20,7 +20,10 @@
 
 use std::sync::Arc;
 
-use super::{CacheableCompilation, CompilerFamily, ParsedInvocation};
+use super::{
+    CacheableCompilation, CompilerFamily, MultiFileOutputLayout, MultiFileSourceArgument,
+    ParsedInvocation,
+};
 use zccache_core::NormalizedPath;
 
 /// Source file extensions recognised by the MSVC / clang-cl parser.
@@ -122,6 +125,11 @@ fn msvc_default_output(source: &str) -> String {
     format!("{stem}.obj")
 }
 
+fn msvc_output_directory(path: &str) -> Option<String> {
+    path.ends_with(['/', '\\'])
+        .then(|| path.trim_end_matches(['/', '\\']).replace('\\', "/"))
+}
+
 /// Parse an MSVC / clang-cl compiler invocation for cacheability.
 ///
 /// `compiler` is the executable path. `family` should be `CompilerFamily::Msvc`
@@ -136,7 +144,7 @@ pub fn parse_msvc_invocation(
 ) -> ParsedInvocation {
     let mut has_c_flag = false;
     let mut output_file: Option<String> = None;
-    let mut source_files: Vec<(String, usize)> = Vec::new();
+    let mut source_files: Vec<(String, usize, Vec<usize>)> = Vec::new();
     let mut unknown_flags: Vec<String> = Vec::new();
     // Pending source-language override from /Tc<file> / /Tp<file>.
     // Those flags both name and language-tag the file in one go.
@@ -251,28 +259,28 @@ pub fn parse_msvc_invocation(
         if let Some(rest) = strip_flag(arg, "Tc") {
             if rest.is_empty() {
                 if let Some(next) = args.get(i + 1) {
-                    source_files.push((next.clone(), i + 1));
+                    source_files.push((next.clone(), i + 1, vec![i, i + 1]));
                     i += 2;
                     continue;
                 }
                 i += 1;
                 continue;
             }
-            source_files.push((rest.to_string(), i));
+            source_files.push((rest.to_string(), i, vec![i]));
             i += 1;
             continue;
         }
         if let Some(rest) = strip_flag(arg, "Tp") {
             if rest.is_empty() {
                 if let Some(next) = args.get(i + 1) {
-                    source_files.push((next.clone(), i + 1));
+                    source_files.push((next.clone(), i + 1, vec![i, i + 1]));
                     i += 2;
                     continue;
                 }
                 i += 1;
                 continue;
             }
-            source_files.push((rest.to_string(), i));
+            source_files.push((rest.to_string(), i, vec![i]));
             i += 1;
             continue;
         }
@@ -330,7 +338,7 @@ pub fn parse_msvc_invocation(
 
         // ── Positional argument: source file candidate ───────────────────
         if is_msvc_source_file(arg) {
-            source_files.push((arg.clone(), i));
+            source_files.push((arg.clone(), i, vec![i]));
         } else {
             // Unknown positional (e.g., import library, .obj file). For
             // strict accounting, surface these via `unknown_flags` so
@@ -357,23 +365,48 @@ pub fn parse_msvc_invocation(
     // sources with `/c`, each becomes a separate `.obj`. MSVC names them by
     // stem in the cwd just like gcc.
     if source_files.len() > 1 {
-        let source_indices: Vec<usize> = source_files.iter().map(|(_, idx)| *idx).collect();
+        let output_directory = output_file.as_deref().and_then(msvc_output_directory);
+        let output_layout = match (&output_file, &output_directory) {
+            (_, Some(directory)) => {
+                MultiFileOutputLayout::MsvcDirectory(NormalizedPath::new(directory))
+            }
+            (Some(path), None) => {
+                MultiFileOutputLayout::InvalidSingleOutput(NormalizedPath::new(path))
+            }
+            (None, None) => MultiFileOutputLayout::MsvcPerSourceDefault,
+        };
+        let source_indices: Vec<usize> = source_files.iter().map(|(_, idx, _)| *idx).collect();
+        let source_arguments = source_files
+            .iter()
+            .map(|(_, _, argument_indices)| MultiFileSourceArgument {
+                argument_indices: argument_indices.clone(),
+            })
+            .collect();
         let shared_args: Arc<[String]> = Arc::from(args.to_vec());
         let compilations = source_files
             .iter()
-            .map(|(src, _)| CacheableCompilation {
-                compiler: NormalizedPath::new(compiler),
-                family,
-                source_file: NormalizedPath::new(src),
-                output_file: NormalizedPath::new(msvc_default_output(src)),
-                original_args: Arc::clone(&shared_args),
-                unknown_flags: unknown_flags.clone(),
+            .map(|(src, _, _)| {
+                let default_output = msvc_default_output(src);
+                let output_file = output_directory.as_ref().map_or_else(
+                    || NormalizedPath::new(default_output.as_str()),
+                    |directory| NormalizedPath::new(format!("{directory}/{default_output}")),
+                );
+                CacheableCompilation {
+                    compiler: NormalizedPath::new(compiler),
+                    family,
+                    source_file: NormalizedPath::new(src),
+                    output_file,
+                    original_args: Arc::clone(&shared_args),
+                    unknown_flags: unknown_flags.clone(),
+                }
             })
             .collect();
         return ParsedInvocation::MultiFile {
             compilations,
             original_args: shared_args,
             source_indices,
+            source_arguments,
+            output_layout,
         };
     }
 
@@ -381,7 +414,7 @@ pub fn parse_msvc_invocation(
         clippy::expect_used,
         reason = "source_files non-empty: structurally guaranteed by the is_empty() guard earlier in this function and the multi-file early return"
     )]
-    let (source, _) = source_files
+    let (source, _, _) = source_files
         .into_iter()
         .next()
         .expect("source_files non-empty: checked above as `if !source_files.is_empty()`");
@@ -725,6 +758,7 @@ mod tests {
             ParsedInvocation::MultiFile {
                 compilations,
                 source_indices,
+                output_layout,
                 ..
             } => {
                 assert_eq!(compilations.len(), 2);
@@ -733,6 +767,74 @@ mod tests {
                 assert_eq!(compilations[1].source_file, NormalizedPath::new("b.c"));
                 assert_eq!(compilations[1].output_file, NormalizedPath::new("b.obj"));
                 assert_eq!(source_indices, vec![1, 2]);
+                assert_eq!(output_layout, MultiFileOutputLayout::MsvcPerSourceDefault);
+            }
+            other => panic!("expected MultiFile, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_file_msvc_fo_directory_maps_every_requested_object() {
+        let result = parse_msvc_invocation(
+            "cl",
+            &args(&["/c", "/Fo:objects\\", "src/a.c", "other/b.c"]),
+            CompilerFamily::Msvc,
+        );
+        match result {
+            ParsedInvocation::MultiFile {
+                compilations,
+                output_layout,
+                ..
+            } => {
+                assert_eq!(
+                    output_layout,
+                    MultiFileOutputLayout::MsvcDirectory(NormalizedPath::new("objects"))
+                );
+                assert_eq!(
+                    compilations[0].output_file,
+                    NormalizedPath::new("objects/a.obj")
+                );
+                assert_eq!(
+                    compilations[1].output_file,
+                    NormalizedPath::new("objects/b.obj")
+                );
+            }
+            other => panic!("expected MultiFile, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_file_msvc_file_valued_fo_is_typed_as_invalid_batch_shape() {
+        let result = parse_msvc_invocation(
+            "cl",
+            &args(&["/c", "/Fo:one.obj", "a.c", "b.c"]),
+            CompilerFamily::Msvc,
+        );
+        match result {
+            ParsedInvocation::MultiFile { output_layout, .. } => assert_eq!(
+                output_layout,
+                MultiFileOutputLayout::InvalidSingleOutput(NormalizedPath::new("one.obj"))
+            ),
+            other => panic!("expected MultiFile, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_file_msvc_source_arguments_preserve_separated_flag_spans() {
+        let result = parse_msvc_invocation(
+            "cl",
+            &args(&["/c", "/Tc", "a.c", "/Tpb.cpp"]),
+            CompilerFamily::Msvc,
+        );
+        match result {
+            ParsedInvocation::MultiFile {
+                source_indices,
+                source_arguments,
+                ..
+            } => {
+                assert_eq!(source_indices, vec![2, 3]);
+                assert_eq!(source_arguments[0].argument_indices, vec![1, 2]);
+                assert_eq!(source_arguments[1].argument_indices, vec![3]);
             }
             other => panic!("expected MultiFile, got: {other:?}"),
         }

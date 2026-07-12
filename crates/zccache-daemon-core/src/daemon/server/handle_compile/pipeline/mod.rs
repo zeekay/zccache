@@ -176,7 +176,9 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
         crate::compiler::ParsedInvocation::MultiFile {
             compilations,
             original_args,
-            source_indices,
+            source_indices: _,
+            source_arguments,
+            output_layout,
         } => {
             wait_for_startup_depgraph_load(state, &sid).await;
             return handle_compile_multi(
@@ -185,7 +187,8 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
                 compiler,
                 compilations,
                 original_args,
-                source_indices,
+                source_arguments,
+                output_layout,
                 cwd.into(),
                 worktree_root.clone(),
                 system_includes,

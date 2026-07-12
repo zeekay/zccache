@@ -3,7 +3,7 @@
 use super::handle_exec::ExecStagedPlan;
 use super::*;
 
-fn record_observed_materialization(
+pub(super) fn record_observed_materialization(
     state: &SharedState,
     output_count: usize,
     salvage_reason: Option<&'static str>,
@@ -137,6 +137,30 @@ fn record_salvage_start(
     );
 }
 
+/// Record that already-materialized requested outputs survived a later
+/// publication failure. Multi-source publication deliberately happens after
+/// requested-path materialization so a failed materialization can never leave
+/// a cache-visible generation.
+pub(super) fn record_prepublication_salvage_success(
+    state: &SharedState,
+    output_count: usize,
+    reason: &'static str,
+) {
+    use crate::daemon::staged_stats::{StagedCounter, StagedTiming};
+    record_salvage_start(state, output_count, Some(reason));
+    state.profiler.staged.count(StagedCounter::SalvageSuccess);
+    state.profiler.staged.timing(StagedTiming::Salvage, 0);
+    crate::core::lifecycle::write_event(
+        "staged_salvage_complete",
+        serde_json::json!({
+            "reason": reason,
+            "output_count": output_count,
+            "copied_bytes": 0,
+            "elapsed_ns": 0,
+        }),
+    );
+}
+
 pub(super) fn materialize_link_plan_observed(
     state: &SharedState,
     plan: &StagedCompilePlan,
@@ -160,6 +184,23 @@ pub(super) fn materialize_exec_plan_observed(
     salvage_reason: Option<&'static str>,
 ) -> std::io::Result<()> {
     let output_count = plan.output_count();
+    record_salvage_start(state, output_count, salvage_reason);
+    let started = std::time::Instant::now();
+    record_observed_materialization(
+        state,
+        output_count,
+        salvage_reason,
+        started,
+        plan.materialize(),
+    )
+}
+
+pub(super) fn materialize_multi_unit_observed(
+    state: &SharedState,
+    plan: &StagedMultiUnitPlan,
+    salvage_reason: Option<&'static str>,
+) -> std::io::Result<()> {
+    let output_count = plan.outputs.len();
     record_salvage_start(state, output_count, salvage_reason);
     let started = std::time::Instant::now();
     record_observed_materialization(

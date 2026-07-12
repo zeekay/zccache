@@ -2,6 +2,19 @@
 use super::*;
 use tempfile::tempdir;
 
+impl StagedCompilePlan {
+    pub(in crate::daemon::server) fn for_test(
+        root: PathBuf,
+        outputs: Vec<StagedOutputPlan>,
+    ) -> Self {
+        Self {
+            outputs,
+            rewritten_args: Vec::new(),
+            root,
+        }
+    }
+}
+
 impl<T> StagedPlanOutcome<T> {
     fn unwrap(self) -> Option<T> {
         match self {
