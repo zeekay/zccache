@@ -50,6 +50,10 @@ pub(super) struct CachedHitMaterializeRequest<'a> {
     pub(super) downgrade_output_metadata: bool,
     pub(super) mtime_floor_paths: Vec<NormalizedPath>,
     pub(super) rustc_metadata_compat_outputs: Option<Vec<NormalizedPath>>,
+    /// `Some` identifies a parsed rustc invocation and records whether its
+    /// crate type authorizes `.rlib` delivery. `.rmeta` remains eligible for
+    /// any parsed rustc invocation; `None` keeps staged outputs independent.
+    pub(super) rustc_archive_hardlink_eligible: Option<bool>,
     pub(super) phases: CachedHitPhases,
 }
 
@@ -71,6 +75,7 @@ pub(super) fn materialize_cached_compile_hit(
         downgrade_output_metadata,
         mtime_floor_paths,
         rustc_metadata_compat_outputs,
+        rustc_archive_hardlink_eligible,
         phases,
     } = request;
 
@@ -151,7 +156,23 @@ pub(super) fn materialize_cached_compile_hit(
                 .collect();
             (targets, payloads.iter().cloned().collect())
         };
-    if !write_payloads_par_with_mtime_floor(&targets, &payloads_to_write, &mtime_floor_paths) {
+    let delivery_policies = targets
+        .iter()
+        .map(|(target, _)| {
+            rustc_archive_hardlink_eligible.map_or(
+                crate::compiler::DeliveryPolicy::IndependentOnly,
+                |archive_eligible| {
+                    crate::compiler::rustc_output_delivery(archive_eligible, target.as_path())
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    if !write_payloads_par_with_mtime_floor_and_policies(
+        &targets,
+        &payloads_to_write,
+        &mtime_floor_paths,
+        &delivery_policies,
+    ) {
         return None;
     }
     let t2 = Instant::now();
@@ -310,6 +331,7 @@ mod tests {
             downgrade_output_metadata: true,
             mtime_floor_paths: Vec::new(),
             rustc_metadata_compat_outputs: None,
+            rustc_archive_hardlink_eligible: None,
             phases: CachedHitPhases::request_cache(0, 0),
         })
         .unwrap();
@@ -418,6 +440,7 @@ mod tests {
             downgrade_output_metadata: true,
             mtime_floor_paths: Vec::new(),
             rustc_metadata_compat_outputs: None,
+            rustc_archive_hardlink_eligible: None,
             phases: CachedHitPhases::request_cache(0, 0),
         })
         .expect("materialize_cached_compile_hit must succeed");
@@ -509,6 +532,7 @@ mod tests {
             downgrade_output_metadata: false,
             mtime_floor_paths: Vec::new(),
             rustc_metadata_compat_outputs: None,
+            rustc_archive_hardlink_eligible: None,
             phases: CachedHitPhases::request_cache(0, 0),
         })
         .expect("legacy single-output hit must still succeed");
@@ -588,6 +612,7 @@ mod tests {
                 downgrade_output_metadata: false,
                 mtime_floor_paths: Vec::new(),
                 rustc_metadata_compat_outputs: None,
+                rustc_archive_hardlink_eligible: None,
                 phases: CachedHitPhases::request_cache(0, 0),
             })
             .expect("materialize_cached_compile_hit must succeed");

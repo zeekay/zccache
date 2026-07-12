@@ -11,23 +11,35 @@ pub(in crate::daemon::server) fn write_cached_output(
         remove_materialized_output(out_path)?;
         return std::fs::write(out_path, data);
     }
-    materialize_cached_file(out_path, cache_file)
+    materialize_cached_file(
+        out_path,
+        cache_file,
+        crate::compiler::DeliveryPolicy::IndependentOnly,
+    )
 }
 
 pub(in crate::daemon::server) fn write_cached_file(
     out_path: &Path,
     cache_file: &Path,
 ) -> std::io::Result<()> {
-    materialize_cached_file(out_path, cache_file)
+    materialize_cached_file(
+        out_path,
+        cache_file,
+        crate::compiler::DeliveryPolicy::IndependentOnly,
+    )
 }
 
-fn materialize_cached_file(out_path: &Path, cache_file: &Path) -> std::io::Result<()> {
+fn materialize_cached_file(
+    out_path: &Path,
+    cache_file: &Path,
+    delivery: crate::compiler::DeliveryPolicy,
+) -> std::io::Result<()> {
     let staged = is_staged_artifact_path(cache_file);
-    if !staged {
-        verify_registered_blob(cache_file)?;
-    }
+    verify_registered_blob(cache_file)?;
+    let hardlink_allowed =
+        !staged || matches!(delivery, crate::compiler::DeliveryPolicy::HardlinkEligible);
     if same_file(out_path, cache_file) {
-        if staged {
+        if !hardlink_allowed {
             let floor =
                 filetime::FileTime::from_last_modification_time(&std::fs::metadata(cache_file)?);
             detach_with_floored_mtime(out_path, cache_file, floor)?;
@@ -55,7 +67,9 @@ fn materialize_cached_file(out_path: &Path, cache_file: &Path) -> std::io::Resul
     // call sites in this module; a genuinely-too-many-links file still
     // fails the real `std::fs::hard_link` call below, which already has
     // a graceful copy fallback.
-    if !staged && hardlink_below_limit(caps, hard_link_count(cache_file).unwrap_or_default()) {
+    if hardlink_allowed
+        && hardlink_below_limit(caps, hard_link_count(cache_file).unwrap_or_default())
+    {
         // Only flip the blob read-only *after* the link actually lands.
         // Read-only exists to protect the blob once it's shared; setting
         // it beforehand serves no purpose on the attempt path and, if
@@ -215,6 +229,18 @@ pub(in crate::daemon::server) fn write_cached_payload(
     }
 }
 
+pub(in crate::daemon::server) fn write_cached_payload_with_policy(
+    out_path: &Path,
+    cache_file: &Path,
+    payload: &CachedPayload,
+    delivery: crate::compiler::DeliveryPolicy,
+) -> std::io::Result<()> {
+    match payload {
+        CachedPayload::Bytes(data) => write_cached_output(out_path, cache_file, data),
+        CachedPayload::File(path) => materialize_cached_file(out_path, path, delivery),
+    }
+}
+
 pub(in crate::daemon::server) const PAR_WRITE_THRESHOLD: usize = 4;
 
 pub(in crate::daemon::server) fn write_payloads_par<P, Q>(
@@ -245,6 +271,7 @@ where
         .all(|((out, cache), payload)| write_one(out.as_ref(), cache.as_ref(), payload))
 }
 
+#[cfg(test)]
 pub(in crate::daemon::server) fn write_payloads_par_with_mtime_floor<P, Q, R>(
     targets: &[(P, Q)],
     payloads: &[CachedPayload],
@@ -255,14 +282,58 @@ where
     Q: AsRef<Path> + Sync,
     R: AsRef<Path>,
 {
-    if !write_payloads_par(targets, payloads) {
-        return false;
+    let policies = vec![crate::compiler::DeliveryPolicy::IndependentOnly; targets.len()];
+    write_payloads_par_with_mtime_floor_and_policies(targets, payloads, floor_paths, &policies)
+}
+
+pub(in crate::daemon::server) fn write_payloads_par_with_mtime_floor_and_policies<P, Q, R>(
+    targets: &[(P, Q)],
+    payloads: &[CachedPayload],
+    floor_paths: &[R],
+    policies: &[crate::compiler::DeliveryPolicy],
+) -> bool
+where
+    P: AsRef<Path> + Sync,
+    Q: AsRef<Path> + Sync,
+    R: AsRef<Path>,
+{
+    debug_assert_eq!(targets.len(), payloads.len());
+    debug_assert_eq!(targets.len(), policies.len());
+    let write_one = |out: &Path,
+                     cache: &Path,
+                     payload: &CachedPayload,
+                     policy: crate::compiler::DeliveryPolicy|
+     -> bool {
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        write_cached_payload_with_policy(out, cache, payload, policy).is_ok()
+    };
+    let ok = if targets.len() < PAR_WRITE_THRESHOLD {
+        targets
+            .iter()
+            .zip(payloads)
+            .zip(policies)
+            .all(|(((out, cache), payload), policy)| {
+                write_one(out.as_ref(), cache.as_ref(), payload, *policy)
+            })
+    } else {
+        use rayon::prelude::*;
+        targets
+            .par_iter()
+            .zip(payloads.par_iter())
+            .zip(policies.par_iter())
+            .all(|(((out, cache), payload), policy)| {
+                write_one(out.as_ref(), cache.as_ref(), payload, *policy)
+            })
+    };
+    if ok {
+        let batch_floor = std::time::SystemTime::now();
+        floor_materialized_outputs_to_input_max(
+            targets.iter().map(|(out, _)| out.as_ref()),
+            floor_paths.iter().map(|path| path.as_ref()),
+            batch_floor,
+        );
     }
-    let batch_floor = std::time::SystemTime::now();
-    floor_materialized_outputs_to_input_max(
-        targets.iter().map(|(out, _)| out.as_ref()),
-        floor_paths.iter().map(|path| path.as_ref()),
-        batch_floor,
-    );
-    true
+    ok
 }

@@ -292,6 +292,61 @@ fn staged_generation_materializes_independently_from_the_backend() {
     );
 }
 
+#[test]
+fn staged_generation_hardlinks_only_when_semantically_authorized() {
+    let dir = tempfile::tempdir().unwrap();
+    let artifact_dir = dir.path().join("artifacts");
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    let source = dir.path().join("source.rlib");
+    let output = dir.path().join("target.rlib");
+    std::fs::write(&source, b"semantic rust archive").unwrap();
+    let key = "e".repeat(64);
+    persist_staged_artifact_paths(&artifact_dir, &key, &[source.into()]).unwrap();
+    let payloads = load_staged_artifact_paths(&artifact_dir, &key, &[21])
+        .unwrap()
+        .unwrap();
+    let payload = CachedPayload::File(payloads[0].clone());
+    write_cached_payload_with_policy(
+        &output,
+        &payloads[0],
+        &payload,
+        crate::compiler::DeliveryPolicy::HardlinkEligible,
+    )
+    .unwrap();
+    if !require_hardlink(
+        &output,
+        &payloads[0],
+        "staged_generation_hardlinks_only_when_semantically_authorized",
+    ) {
+        return;
+    }
+
+    make_writable(&output).unwrap();
+    std::fs::write(&output, b"poisoned rust archive").unwrap();
+    mark_registered_links_suspect([output.as_path()]);
+    assert!(
+        verify_registered_blob(&payloads[0]).is_err(),
+        "a hardlink contract violation must be rejected before serve"
+    );
+}
+
+#[test]
+fn staged_generation_digest_survives_registry_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let artifact_dir = dir.path().join("artifacts");
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    let source = dir.path().join("source.rmeta");
+    std::fs::write(&source, b"semantic rust metadata").unwrap();
+    let key = "d".repeat(64);
+    persist_staged_artifact_paths(&artifact_dir, &key, &[source.into()]).unwrap();
+    let payloads = load_staged_artifact_paths(&artifact_dir, &key, &[22])
+        .unwrap()
+        .unwrap();
+    forget_blob_registration_for_restart_test(&payloads[0]);
+    verify_registered_blob(&payloads[0])
+        .expect("the v2 generation digest must rebuild registry trust after restart");
+}
+
 /// Regression test for issue #1042 finding #1: fix #1 (writing the digest
 /// sidecar *before* the publishing rename, not after) is what actually
 /// closes the "valid blob evicted on restart" gap for freshly-persisted

@@ -382,6 +382,15 @@ pub(in crate::daemon::server) fn persist_staged_artifact_paths(
                     ),
                 )
             })?;
+            write_authoritative_blob_digest_for(&destination, &destination).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "staged output durable digest failed: {}: {error}",
+                        destination.display()
+                    ),
+                )
+            })?;
             outputs.push(StagedOutput {
                 index,
                 size,

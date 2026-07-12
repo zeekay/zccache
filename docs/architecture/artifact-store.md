@@ -50,10 +50,18 @@ the run. Generic tools whose output paths are embedded in opaque arguments,
 environment variables, or undeclared side effects retain the legacy path.
 
 Published v2 files are always independent copies or true reflinks of private
-compiler files. Hardlinks are not used by the staged lane. Requested output
-materialization also uses reflink/copy only; this is especially important for
-SQLite, databases, incremental state, depfiles, and unknown outputs because an
-NTFS hardlink is a shared mutable inode, not COW.
+compiler files. Hardlinks are never used between compiler staging and the
+backend. Requested-output delivery may use the hardlink-shared tier only for
+parser-authorized rustc metadata and `lib`/`rlib` archives; a `.rlib` suffix
+without the matching rustc crate type is not authorization. SQLite, databases,
+incremental state, depfiles, executables, and unknown outputs remain on
+reflink/copy because an NTFS hardlink is a shared mutable inode, not COW.
+
+Every v2 output carries the same durable COW digest sidecar used by the legacy
+hardlink registry. This lets restart verification reject a mutate-then-delete
+alias attack before the backend is served. Read-only enforcement, watcher
+suspicion, file-identity registration, link-count limits, and copy fallback
+remain mandatory for the narrow semantic allowlist.
 
 The v2 transaction is visible only after the complete generation and manifest
 are written and the per-key pointer is switched. Readers validate the pointer,

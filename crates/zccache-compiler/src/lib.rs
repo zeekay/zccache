@@ -37,7 +37,10 @@ use std::sync::Arc;
 use zccache_core::NormalizedPath;
 
 pub use detect::detect_family;
-pub use output_policy::{DeliveryPolicy, MutationContract, OutputClassification, OutputRole};
+pub use output_policy::{
+    rustc_archive_hardlink_eligible, rustc_output_delivery, DeliveryPolicy, MutationContract,
+    OutputClassification, OutputRole,
+};
 pub use parse::parse_invocation;
 
 /// Supported compiler families.

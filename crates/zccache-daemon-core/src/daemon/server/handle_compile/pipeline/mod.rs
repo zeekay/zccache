@@ -666,6 +666,12 @@ pub(super) async fn handle_compile_request(req: CompileRequest<'_>) -> Response 
                                 &ctx,
                             ),
                             rustc_metadata_compat_outputs: Some(requested_outputs),
+                            rustc_archive_hardlink_eligible: Some(
+                                rustc_args
+                                    .crate_types
+                                    .iter()
+                                    .any(|kind| matches!(kind.as_str(), "lib" | "rlib")),
+                            ),
                             phases: CachedHitPhases {
                                 parse_args_ns,
                                 build_context_ns,
