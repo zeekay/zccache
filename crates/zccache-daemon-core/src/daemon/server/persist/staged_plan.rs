@@ -391,6 +391,75 @@ impl StagedCompilePlan {
         }))
     }
 
+    /// Build a linker plan only when every declared output can be redirected
+    /// by exact path replacement. Undeclared linker side effects are checked
+    /// by the caller after the process exits; they invalidate publication.
+    pub(in crate::daemon::server) fn link(
+        artifact_dir: &Path,
+        args: &[String],
+        primary_output: &NormalizedPath,
+        secondary_outputs: &[NormalizedPath],
+        cwd: &Path,
+    ) -> io::Result<Option<Self>> {
+        if !super::staged_link_lane_enabled() {
+            return Ok(None);
+        }
+        let root = artifact_dir.join(".staged-v2").join(format!(
+            ".link-{}-{}",
+            std::process::id(),
+            PLAN_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root)?;
+        let result = (|| {
+            let mut requested_outputs = Vec::with_capacity(1 + secondary_outputs.len());
+            requested_outputs.push(absolute(primary_output, cwd));
+            requested_outputs.extend(secondary_outputs.iter().map(|output| absolute(output, cwd)));
+            let mut outputs = Vec::with_capacity(requested_outputs.len());
+            let mut rewritten_args = args.to_vec();
+            for requested in requested_outputs {
+                let filename = requested.file_name().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "link output has no filename")
+                })?;
+                let staged: NormalizedPath = root.join(filename).into();
+                if outputs.iter().any(|output: &StagedOutputPlan| {
+                    output.requested == requested || output.staged == staged
+                }) {
+                    return Ok(None);
+                }
+                let requested_text = requested.to_string_lossy();
+                let relative = requested
+                    .strip_prefix(cwd)
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned());
+                let mut replaced = false;
+                for arg in &mut rewritten_args {
+                    let candidates = [Some(requested_text.as_ref()), relative.as_deref()];
+                    match rewrite_link_output_arg(
+                        arg,
+                        candidates.into_iter().flatten(),
+                        staged.to_string_lossy().as_ref(),
+                    ) {
+                        Some(arg_replaced) => replaced |= arg_replaced,
+                        None => return Ok(None),
+                    }
+                }
+                if !replaced {
+                    return Ok(None);
+                }
+                outputs.push(StagedOutputPlan { requested, staged });
+            }
+            Ok(Some(Self {
+                outputs,
+                rewritten_args,
+                root: root.clone(),
+            }))
+        })();
+        if matches!(result, Ok(None) | Err(_)) {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        result
+    }
+
     pub(in crate::daemon::server) fn output_paths(&self) -> Vec<NormalizedPath> {
         self.outputs
             .iter()
@@ -400,6 +469,30 @@ impl StagedCompilePlan {
 
     pub(in crate::daemon::server) fn primary_staged(&self) -> &NormalizedPath {
         &self.outputs[0].staged
+    }
+
+    pub(in crate::daemon::server) fn staged_for_requested(
+        &self,
+        requested: &Path,
+    ) -> Option<NormalizedPath> {
+        self.outputs
+            .iter()
+            .find(|output| output.requested.as_path() == requested)
+            .map(|output| output.staged.clone())
+    }
+
+    pub(in crate::daemon::server) fn unexpected_staged_entries(&self) -> io::Result<Vec<PathBuf>> {
+        let declared: std::collections::HashSet<PathBuf> = self
+            .outputs
+            .iter()
+            .map(|output| output.staged.as_path().to_path_buf())
+            .collect();
+        Ok(std::fs::read_dir(&self.root)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|path| !declared.contains(path))
+            .collect())
     }
 
     pub(in crate::daemon::server) fn rewrite_depfile_strategy(
@@ -498,6 +591,43 @@ impl StagedCompilePlan {
                 Err(error)
             }
         })
+    }
+}
+
+/// Rewrite one exact or delimiter-bounded linker output path. Returning
+/// `None` means the token was ambiguous and the caller must use the legacy
+/// path before spawning the linker.
+fn rewrite_link_output_arg<'a>(
+    arg: &mut String,
+    candidates: impl Iterator<Item = &'a str>,
+    staged: &str,
+) -> Option<bool> {
+    let mut ranges = Vec::new();
+    for candidate in candidates.filter(|candidate| !candidate.is_empty()) {
+        if arg == candidate {
+            ranges.push((0, arg.len()));
+            continue;
+        }
+        for (start, _) in arg.match_indices(candidate) {
+            let end = start + candidate.len();
+            let before = arg[..start].chars().next_back();
+            let after = arg[end..].chars().next();
+            if before.is_some_and(|ch| matches!(ch, '=' | ':' | ','))
+                && after.is_none_or(|ch| ch == ',')
+            {
+                ranges.push((start, end));
+            }
+        }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    match ranges.as_slice() {
+        [] => Some(false),
+        &[(start, end)] => {
+            arg.replace_range(start..end, staged);
+            Some(true)
+        }
+        _ => None,
     }
 }
 
@@ -818,5 +948,91 @@ mod tests {
             .iter()
             .any(|arg| arg.contains(".staged-v2")));
         plan.cleanup().unwrap();
+    }
+
+    #[test]
+    fn link_plan_rewrites_primary_and_declared_secondary_outputs() {
+        if !staged_tests_enabled() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let primary: NormalizedPath = temp.path().join("app.exe").into();
+        let import: NormalizedPath = temp.path().join("app.lib").into();
+        let plan = StagedCompilePlan::link(
+            temp.path(),
+            &[
+                "-o".into(),
+                "app.exe".into(),
+                "-Wl,--out-implib,app.lib".into(),
+            ],
+            &primary,
+            std::slice::from_ref(&import),
+            temp.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.outputs.len(), 2);
+        assert!(plan
+            .rewritten_args
+            .iter()
+            .any(|arg| arg.contains(".staged-v2") && arg.contains("app.exe")));
+        assert!(plan
+            .rewritten_args
+            .iter()
+            .any(|arg| arg.contains(".staged-v2") && arg.contains("app.lib")));
+        std::fs::write(
+            plan.primary_staged().parent().unwrap().join("implicit.pdb"),
+            b"debug",
+        )
+        .unwrap();
+        assert_eq!(plan.unexpected_staged_entries().unwrap().len(), 1);
+        plan.cleanup().unwrap();
+    }
+
+    #[test]
+    fn link_plan_rewrites_absolute_output_once_and_ignores_substrings() {
+        if !staged_tests_enabled() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let primary: NormalizedPath = temp.path().join("app.exe").into();
+        let absolute = primary.to_string_lossy().into_owned();
+        let plan = StagedCompilePlan::link(
+            temp.path(),
+            &[
+                "-o".into(),
+                absolute,
+                "--trace-symbol=app.exe.helper".into(),
+            ],
+            &primary,
+            &[],
+            temp.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            plan.rewritten_args[1],
+            plan.primary_staged().to_string_lossy()
+        );
+        assert_eq!(plan.rewritten_args[2], "--trace-symbol=app.exe.helper");
+        plan.cleanup().unwrap();
+    }
+
+    #[test]
+    fn link_plan_rejects_ambiguous_output_token() {
+        if !staged_tests_enabled() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let primary: NormalizedPath = temp.path().join("app.exe").into();
+        let plan = StagedCompilePlan::link(
+            temp.path(),
+            &["-Wl,-Map,app.exe,app.exe".into()],
+            &primary,
+            &[],
+            temp.path(),
+        )
+        .unwrap();
+        assert!(plan.is_none());
     }
 }

@@ -65,6 +65,17 @@ pub(in crate::daemon::server) fn staged_lane_enabled(
     }
 }
 
+pub(in crate::daemon::server) fn staged_link_lane_enabled() -> bool {
+    std::env::var(STAGED_ARTIFACTS_ENV)
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "all" | "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
 pub(in crate::daemon::server) fn is_staged_artifact_path(path: &Path) -> bool {
     let components = path
         .components()

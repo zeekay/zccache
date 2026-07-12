@@ -313,7 +313,19 @@ pub(super) async fn handle_link_ephemeral(
             }
         }
     } else {
-        None
+        match StagedCompilePlan::link(
+            &state.artifact_dir,
+            args,
+            &output_path,
+            &parsed_tool.secondary_outputs,
+            cwd_path,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::warn!(%error, "link staging plan failed; using legacy path");
+                None
+            }
+        }
     };
     let compiler_args = staged_plan
         .as_ref()
@@ -413,6 +425,26 @@ pub(super) async fn handle_link_ephemeral(
             .unwrap_or_default()
         };
 
+        if let Some(plan) = staged_plan.as_ref() {
+            let unexpected_staged = plan.unexpected_staged_entries().unwrap_or_else(|error| {
+                tracing::warn!(%error, "failed to inspect staged linker output set");
+                vec![plan.primary_staged().as_path().to_path_buf()]
+            });
+            if !side_effects.is_empty() || !unexpected_staged.is_empty() {
+                tracing::warn!(
+                    external_count = side_effects.len(),
+                    staged_count = unexpected_staged.len(),
+                    "undeclared linker side effects invalidate staged publication"
+                );
+                if let Err(error) = plan.materialize() {
+                    return Response::Error {
+                        message: format!("failed to materialize staged link output: {error}"),
+                    };
+                }
+                return result;
+            }
+        }
+
         let mut read_targets: Vec<(String, std::path::PathBuf)> =
             Vec::with_capacity(1 + parsed_tool.secondary_outputs.len() + side_effects.len());
         read_targets.push((
@@ -433,7 +465,11 @@ pub(super) async fn handle_link_ephemeral(
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            read_targets.push((name, sec_path));
+            let read_path = staged_plan
+                .as_ref()
+                .and_then(|plan| plan.staged_for_requested(&sec_path))
+                .map_or(sec_path.clone(), |path| path.into_path_buf());
+            read_targets.push((name, read_path));
         }
         for se in &side_effects {
             read_targets.push((
@@ -467,6 +503,13 @@ pub(super) async fn handle_link_ephemeral(
                 })
                 .collect()
         };
+
+        if staged_plan.is_some() && reads.iter().any(Option::is_none) {
+            let _ = staged_plan.as_ref().map(StagedCompilePlan::cleanup);
+            return Response::Error {
+                message: "successful linker omitted a staged output".to_string(),
+            };
+        }
 
         // Primary read gates the cache populate. If it fails, the link
         // succeeded but the output file is no longer readable — skip
@@ -528,7 +571,7 @@ pub(super) async fn handle_link_ephemeral(
                     }
                     if let Err(error) = plan.materialize() {
                         return Response::Error {
-                            message: format!("failed to materialize archive output: {error}"),
+                            message: format!("failed to materialize staged link output: {error}"),
                         };
                     }
                 } else {
