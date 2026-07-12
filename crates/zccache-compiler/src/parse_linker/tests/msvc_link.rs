@@ -211,3 +211,98 @@ fn msvc_case_insensitive_dll_flag() {
         other => panic!("expected cacheable, got: {other:?}"),
     }
 }
+
+#[test]
+fn msvc_declares_explicit_debug_side_outputs() {
+    let result = parse_linker_invocation(
+        "link.exe",
+        args(&[
+            "/OUT:foo.exe",
+            "/DEBUG",
+            "/PDB:symbols/foo.pdb",
+            "/ILK:state/foo.ilk",
+            "/MAP:maps/foo.map",
+            "/PDBSTRIPPED:symbols/foo-public.pdb",
+            "main.obj",
+        ]),
+    );
+    let ParsedLinkerInvocation::Cacheable(c) = result else {
+        panic!("expected cacheable")
+    };
+    assert_eq!(
+        c.secondary_outputs,
+        vec![
+            NormalizedPath::new("maps/foo.map"),
+            NormalizedPath::new("symbols/foo.pdb"),
+            NormalizedPath::new("symbols/foo-public.pdb"),
+            NormalizedPath::new("state/foo.ilk"),
+        ]
+    );
+}
+
+#[test]
+fn msvc_declares_implicit_debug_incremental_and_map_outputs() {
+    let result = parse_linker_invocation(
+        "link.exe",
+        args(&["/DEBUG", "/MAP", "/OUT:bin/foo.exe", "main.obj"]),
+    );
+    let ParsedLinkerInvocation::Cacheable(c) = result else {
+        panic!("expected cacheable")
+    };
+    assert_eq!(
+        c.secondary_outputs,
+        vec![
+            NormalizedPath::new("bin/foo.pdb"),
+            NormalizedPath::new("bin/foo.ilk"),
+            NormalizedPath::new("bin/foo.map"),
+        ]
+    );
+}
+
+#[test]
+fn msvc_debug_incremental_no_omits_implicit_ilk() {
+    let result = parse_linker_invocation(
+        "link.exe",
+        args(&["/DEBUG", "/INCREMENTAL:NO", "/OUT:foo.exe", "main.obj"]),
+    );
+    let ParsedLinkerInvocation::Cacheable(c) = result else {
+        panic!("expected cacheable")
+    };
+    assert_eq!(c.secondary_outputs, vec![NormalizedPath::new("foo.pdb")]);
+}
+
+#[test]
+fn msvc_ignored_pdb_and_ilk_options_are_not_declared() {
+    let result = parse_linker_invocation(
+        "link.exe",
+        args(&[
+            "/OUT:foo.exe",
+            "/PDB:foo.pdb",
+            "/ILK:foo.ilk",
+            "/INCREMENTAL:NO",
+            "main.obj",
+        ]),
+    );
+    let ParsedLinkerInvocation::Cacheable(c) = result else {
+        panic!("expected cacheable")
+    };
+    assert!(c.secondary_outputs.is_empty());
+}
+
+#[test]
+fn msvc_debug_none_does_not_declare_debug_outputs() {
+    let result = parse_linker_invocation(
+        "link.exe",
+        args(&[
+            "/DEBUG:NONE",
+            "/PDB:foo.pdb",
+            "/ILK:foo.ilk",
+            "/OUT:foo.exe",
+            "main.obj",
+        ]),
+    );
+    let ParsedLinkerInvocation::Cacheable(c) = result else {
+        panic!("expected cacheable")
+    };
+    assert!(c.secondary_outputs.is_empty());
+}

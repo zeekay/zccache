@@ -253,8 +253,14 @@ pub(super) async fn handle_link_ephemeral(
             };
             let targets: Vec<(NormalizedPath, NormalizedPath)> = (0..payloads.len())
                 .map(|i| {
-                    let target: NormalizedPath = if payloads.len() == 1 {
+                    let target: NormalizedPath = if i == 0 {
                         output_path.clone()
+                    } else if let Some(secondary) = parsed_tool.secondary_outputs.get(i - 1) {
+                        if secondary.is_absolute() {
+                            secondary.clone()
+                        } else {
+                            cwd_path.join(secondary).into()
+                        }
                     } else {
                         output_path
                             .parent()

@@ -37,6 +37,11 @@ private directory is checked for undeclared files/bundles after the linker
 exits, and the requested output directory is checked for external side
 effects. Either condition prevents cache publication; declared outputs are
 independently salvaged to preserve a successful link.
+Explicit GNU/LLVM map and dependency-file paths and active MSVC PDB, ILK,
+stripped-PDB, and map paths are declared secondary outputs. Implicit names,
+GNU semantic map destinations (`%` or a directory), and conditional
+LTCG/PGO/embedded-IDL/Windows-metadata outputs remain on the legacy path
+before spawn.
 
 Generic tool execution also participates in the `all` lane when every
 declared output is an exact argument token. Those paths are rewritten into a

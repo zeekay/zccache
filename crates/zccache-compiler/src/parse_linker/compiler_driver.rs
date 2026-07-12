@@ -68,14 +68,30 @@ pub(super) fn parse_compiler_driver_link(tool: &str, args: Vec<String>) -> Parse
 
         // -Wl, pass-through to linker — check for non-determinism and secondary outputs
         if arg.starts_with("-Wl,") {
-            for part in arg.split(',') {
-                if part == "--build-id=uuid" {
+            let parts = arg.split(',').collect::<Vec<_>>();
+            for (index, part) in parts.iter().enumerate() {
+                if *part == "--build-id=uuid" {
                     has_build_id_uuid = true;
                 }
                 // GNU/LLD --out-implib produces an import library (.dll.a) as a side effect.
                 // Meson/ninja uses: -Wl,--out-implib=path/to/foo.dll.a
                 if let Some(implib) = part.strip_prefix("--out-implib=") {
                     secondary_outputs.push(NormalizedPath::new(implib));
+                }
+                if let Some(map) = part.strip_prefix("-Map=") {
+                    if map != "-" {
+                        secondary_outputs.push(NormalizedPath::new(map));
+                    }
+                }
+                if (*part == "-Map" || *part == "--dependency-file")
+                    && parts.get(index + 1).is_some_and(|value| *value != "-")
+                {
+                    secondary_outputs.push(NormalizedPath::new(parts[index + 1]));
+                }
+                if let Some(depfile) = part.strip_prefix("--dependency-file=") {
+                    if depfile != "-" {
+                        secondary_outputs.push(NormalizedPath::new(depfile));
+                    }
                 }
             }
             cache_relevant_flags.push(arg.clone());
@@ -153,6 +169,9 @@ pub(super) fn parse_compiler_driver_link(tool: &str, args: Vec<String>) -> Parse
             reason: "no input files specified".to_string(),
         };
     }
+
+    let mut seen_outputs = std::collections::HashSet::new();
+    secondary_outputs.retain(|output| seen_outputs.insert(output.clone()));
 
     ParsedLinkerInvocation::Cacheable(CacheableLink {
         tool: NormalizedPath::new(tool),
