@@ -20,6 +20,13 @@ pub(super) fn parse_msvc_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvo
     let mut cache_relevant_flags: Vec<String> = Vec::new();
     let mut has_deterministic = false;
     let mut secondary_outputs: Vec<NormalizedPath> = Vec::new();
+    let mut has_debug = false;
+    let mut incremental = None;
+    let mut implicit_map = false;
+    let mut explicit_pdb = false;
+    let mut explicit_ilk = false;
+    let mut debug_outputs = Vec::new();
+    let mut incremental_outputs = Vec::new();
 
     for arg in &args {
         let upper = arg.to_uppercase();
@@ -55,6 +62,77 @@ pub(super) fn parse_msvc_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvo
             continue;
         }
 
+        // Debug/incremental linker products. Explicit destinations are part
+        // of the declared output set. Implicit names are added after /OUT is
+        // known so the staging planner can reject the invocation before
+        // spawn unless it can redirect every product.
+        if upper == "/DEBUG:NONE" || upper == "-DEBUG:NONE" {
+            has_debug = false;
+            cache_relevant_flags.push(arg.clone());
+            continue;
+        }
+        if upper == "/DEBUG"
+            || upper == "-DEBUG"
+            || upper.starts_with("/DEBUG:")
+            || upper.starts_with("-DEBUG:")
+        {
+            has_debug = true;
+            cache_relevant_flags.push(arg.clone());
+            continue;
+        }
+        if upper == "/INCREMENTAL" || upper == "-INCREMENTAL" {
+            incremental = Some(true);
+            cache_relevant_flags.push(arg.clone());
+            continue;
+        }
+        if upper == "/INCREMENTAL:NO" || upper == "-INCREMENTAL:NO" {
+            incremental = Some(false);
+            cache_relevant_flags.push(arg.clone());
+            continue;
+        }
+        if upper == "/MAP" || upper == "-MAP" {
+            implicit_map = true;
+            cache_relevant_flags.push(arg.clone());
+            continue;
+        }
+        let explicit_output = [
+            "/PDB:",
+            "-PDB:",
+            "/PDBSTRIPPED:",
+            "-PDBSTRIPPED:",
+            "/ILK:",
+            "-ILK:",
+            "/MAP:",
+            "-MAP:",
+        ]
+        .into_iter()
+        .find(|prefix| upper.starts_with(prefix));
+        if let Some(prefix) = explicit_output {
+            let path = &arg[prefix.len()..];
+            if !path.is_empty() {
+                let output = NormalizedPath::new(path);
+                if prefix.eq_ignore_ascii_case("/PDB:")
+                    || prefix.eq_ignore_ascii_case("-PDB:")
+                    || prefix.eq_ignore_ascii_case("/PDBSTRIPPED:")
+                    || prefix.eq_ignore_ascii_case("-PDBSTRIPPED:")
+                {
+                    debug_outputs.push(output);
+                } else if prefix.eq_ignore_ascii_case("/ILK:")
+                    || prefix.eq_ignore_ascii_case("-ILK:")
+                {
+                    incremental_outputs.push(output);
+                } else {
+                    secondary_outputs.push(output);
+                }
+            }
+            explicit_pdb |=
+                prefix.eq_ignore_ascii_case("/PDB:") || prefix.eq_ignore_ascii_case("-PDB:");
+            explicit_ilk |=
+                prefix.eq_ignore_ascii_case("/ILK:") || prefix.eq_ignore_ascii_case("-ILK:");
+            cache_relevant_flags.push(arg.clone());
+            continue;
+        }
+
         // Other flags
         if arg.starts_with('/') || arg.starts_with('-') {
             cache_relevant_flags.push(arg.clone());
@@ -77,6 +155,28 @@ pub(super) fn parse_msvc_link(tool: &str, args: Vec<String>) -> ParsedLinkerInvo
         let ext = if is_dll { "dll" } else { "exe" };
         NormalizedPath::new(first.with_extension(ext))
     });
+    if has_debug {
+        secondary_outputs.extend(debug_outputs);
+    }
+    let incremental_enabled =
+        incremental == Some(true) || (has_debug && incremental != Some(false));
+    if incremental_enabled {
+        secondary_outputs.extend(incremental_outputs);
+    }
+    if has_debug && !explicit_pdb {
+        secondary_outputs.push(NormalizedPath::new(output_file.with_extension("pdb")));
+    }
+    // /DEBUG changes LINK's default to incremental linking unless explicitly
+    // disabled. Both /DEBUG's implicit case and explicit /INCREMENTAL create
+    // an ILK whose default name follows the image output.
+    if incremental_enabled && !explicit_ilk {
+        secondary_outputs.push(NormalizedPath::new(output_file.with_extension("ilk")));
+    }
+    if implicit_map {
+        secondary_outputs.push(NormalizedPath::new(output_file.with_extension("map")));
+    }
+    let mut seen_outputs = std::collections::HashSet::new();
+    secondary_outputs.retain(|output| seen_outputs.insert(output.clone()));
 
     ParsedLinkerInvocation::Cacheable(CacheableLink {
         tool: NormalizedPath::new(tool),

@@ -404,6 +404,81 @@ async fn test_link_path_remap_auto_hits_across_sibling_git_roots() {
 }
 
 #[tokio::test]
+#[ignore] // Integration test — starts a real daemon + compiler driver.
+async fn test_link_hit_restores_explicit_map_destination() {
+    let archiver = match zccache::test_support::find_on_path("ar")
+        .or_else(|| zccache::test_support::find_on_path("llvm-ar"))
+    {
+        Some(path) => path,
+        None => {
+            eprintln!("skipping test: neither ar nor llvm-ar found on PATH");
+            return;
+        }
+    };
+    let compiler = ["clang", "gcc"]
+        .into_iter()
+        .filter_map(zccache::test_support::find_on_path)
+        .find(|compiler| compiler_driver_link_is_feasible(compiler, &archiver).is_ok());
+    let Some(compiler) = compiler else {
+        eprintln!("skipping test: no usable clang/gcc compiler-driver link found");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    setup_equivalent_c_root(&compiler, &archiver, &root).unwrap();
+    std::fs::create_dir_all(root.join("reports")).unwrap();
+    let output = root.join("build").join(linked_binary_name("mapped"));
+    let map = root.join("reports/mapped.map");
+    let mut args = compiler_driver_link_args(&root, &output);
+    args.insert(2, "-Wl,-Map,reports/mapped.map".to_string());
+
+    let (endpoint, server_handle, shutdown) = start_daemon().await;
+    let mut client = zccache::ipc::connect(&endpoint).await.unwrap();
+    client.send(&Request::Clear).await.unwrap();
+    let _: Option<Response> = client.recv().await.unwrap();
+
+    for expected_cached in [false, true] {
+        client
+            .send(&Request::LinkEphemeral {
+                client_pid: std::process::id(),
+                tool: compiler.to_string_lossy().into_owned().into(),
+                args: args.clone(),
+                cwd: root.to_string_lossy().into_owned().into(),
+                env: None,
+            })
+            .await
+            .unwrap();
+        let response = client.recv().await.unwrap();
+        match response {
+            Some(Response::LinkResult {
+                exit_code, cached, ..
+            }) => {
+                assert_eq!(exit_code, 0);
+                assert_eq!(cached, expected_cached);
+            }
+            other => panic!("expected LinkResult, got: {other:?}"),
+        }
+        assert!(output.exists(), "primary output must exist");
+        assert!(
+            map.exists(),
+            "map must use its declared reports/ destination"
+        );
+        if !expected_cached {
+            std::fs::remove_file(&output).unwrap();
+            std::fs::remove_file(&map).unwrap();
+        }
+    }
+
+    assert!(
+        !root.join("build/mapped.map").exists(),
+        "hit must not relocate the map beside the primary output"
+    );
+    shutdown.notify_one();
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
 #[ignore] // Integration test — starts a real daemon. Run with `test --full`.
 async fn test_ar_cache_invalidated_on_input_change() {
     let ar_path = match zccache::test_support::find_on_path("ar") {

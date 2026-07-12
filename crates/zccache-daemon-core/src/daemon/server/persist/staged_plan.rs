@@ -404,6 +404,9 @@ impl StagedCompilePlan {
         if !super::staged_link_lane_enabled() {
             return Ok(None);
         }
+        if has_unmodeled_link_output_option(args) {
+            return Ok(None);
+        }
         let root = artifact_dir.join(".staged-v2").join(format!(
             ".link-{}-{}",
             std::process::id(),
@@ -417,6 +420,10 @@ impl StagedCompilePlan {
             let mut outputs = Vec::with_capacity(requested_outputs.len());
             let mut rewritten_args = args.to_vec();
             for requested in requested_outputs {
+                let requested_text = requested.to_string_lossy();
+                if requested_text.contains('%') || requested.as_path().is_dir() {
+                    return Ok(None);
+                }
                 let filename = requested.file_name().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "link output has no filename")
                 })?;
@@ -426,7 +433,6 @@ impl StagedCompilePlan {
                 }) {
                     return Ok(None);
                 }
-                let requested_text = requested.to_string_lossy();
                 let relative = requested
                     .strip_prefix(cwd)
                     .ok()
@@ -629,6 +635,37 @@ fn rewrite_link_output_arg<'a>(
         }
         _ => None,
     }
+}
+
+fn has_unmodeled_link_output_option(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let lower = arg.to_ascii_lowercase();
+        [
+            "/pgd:",
+            "-pgd:",
+            "/ltcgout:",
+            "-ltcgout:",
+            "/idlout:",
+            "-idlout:",
+            "/tlbout:",
+            "-tlbout:",
+            "/winmdfile:",
+            "-winmdfile:",
+            "/midl:",
+            "-midl:",
+            "--stats=",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+            || matches!(
+                lower.as_str(),
+                "/winmd" | "-winmd" | "/ltcg:incremental" | "-ltcg:incremental"
+            )
+            || matches!(
+                arg.as_str(),
+                "-map" | "-dependency_info" | "-object_path_lto" | "-save-temps"
+            )
+    })
 }
 
 impl Drop for StagedCompilePlan {
@@ -1034,5 +1071,120 @@ mod tests {
         )
         .unwrap();
         assert!(plan.is_none());
+    }
+
+    #[test]
+    fn link_plan_stages_explicit_msvc_debug_output_set() {
+        if !staged_tests_enabled() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let primary: NormalizedPath = temp.path().join("app.exe").into();
+        let pdb: NormalizedPath = temp.path().join("app.pdb").into();
+        let ilk: NormalizedPath = temp.path().join("app.ilk").into();
+        let map: NormalizedPath = temp.path().join("app.map").into();
+        let args = [
+            format!("/OUT:{}", primary.display()),
+            format!("/PDB:{}", pdb.display()),
+            format!("/ILK:{}", ilk.display()),
+            format!("/MAP:{}", map.display()),
+        ];
+        let plan =
+            StagedCompilePlan::link(temp.path(), &args, &primary, &[pdb, ilk, map], temp.path())
+                .unwrap()
+                .unwrap();
+        assert_eq!(plan.outputs.len(), 4);
+        assert!(plan
+            .rewritten_args
+            .iter()
+            .all(|arg| arg.contains(".staged-v2")));
+        plan.cleanup().unwrap();
+    }
+
+    #[test]
+    fn link_plan_rejects_implicit_msvc_side_output_before_spawn() {
+        if !staged_tests_enabled() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let primary: NormalizedPath = temp.path().join("app.exe").into();
+        let implicit_pdb: NormalizedPath = temp.path().join("app.pdb").into();
+        let plan = StagedCompilePlan::link(
+            temp.path(),
+            &["/DEBUG".into(), format!("/OUT:{}", primary.display())],
+            &primary,
+            &[implicit_pdb],
+            temp.path(),
+        )
+        .unwrap();
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn link_plan_rejects_semantic_gnu_map_destination() {
+        if !staged_tests_enabled() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let primary: NormalizedPath = temp.path().join("app").into();
+        let semantic_map: NormalizedPath = temp.path().join("%.map").into();
+        let plan = StagedCompilePlan::link(
+            temp.path(),
+            &[
+                "-o".into(),
+                primary.to_string_lossy().into_owned(),
+                format!("-Map={}", semantic_map.display()),
+            ],
+            &primary,
+            &[semantic_map],
+            temp.path(),
+        )
+        .unwrap();
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn link_plan_rejects_unmodeled_output_option_before_spawn() {
+        if !staged_tests_enabled() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let primary: NormalizedPath = temp.path().join("app.exe").into();
+        let plan = StagedCompilePlan::link(
+            temp.path(),
+            &[
+                format!("/OUT:{}", primary.display()),
+                "/LTCGOUT:state/app.iobj".into(),
+            ],
+            &primary,
+            &[],
+            temp.path(),
+        )
+        .unwrap();
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn link_plan_accepts_case_sensitive_gnu_map_option() {
+        if !staged_tests_enabled() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let primary: NormalizedPath = temp.path().join("app").into();
+        let map: NormalizedPath = temp.path().join("app.map").into();
+        let plan = StagedCompilePlan::link(
+            temp.path(),
+            &[
+                "-o".into(),
+                primary.to_string_lossy().into_owned(),
+                "-Map".into(),
+                map.to_string_lossy().into_owned(),
+            ],
+            &primary,
+            &[map],
+            temp.path(),
+        )
+        .unwrap();
+        assert!(plan.is_some());
     }
 }

@@ -469,3 +469,37 @@ fn gnu_ld_no_secondary_outputs() {
         other => panic!("expected cacheable, got: {other:?}"),
     }
 }
+
+#[test]
+fn gnu_ld_declares_map_and_dependency_outputs() {
+    let result = parse_linker_invocation(
+        "ld",
+        args(&[
+            "-o",
+            "app",
+            "-Map=reports/app.map",
+            "--dependency-file",
+            "deps/app.d",
+            "main.o",
+        ]),
+    );
+    let ParsedLinkerInvocation::Cacheable(c) = result else {
+        panic!("expected cacheable")
+    };
+    assert_eq!(
+        c.secondary_outputs,
+        vec![
+            NormalizedPath::new("reports/app.map"),
+            NormalizedPath::new("deps/app.d"),
+        ]
+    );
+}
+
+#[test]
+fn gnu_ld_stdout_map_is_not_a_file_output() {
+    let result = parse_linker_invocation("ld", args(&["-o", "app", "-Map=-", "main.o"]));
+    let ParsedLinkerInvocation::Cacheable(c) = result else {
+        panic!("expected cacheable")
+    };
+    assert!(c.secondary_outputs.is_empty());
+}

@@ -180,3 +180,26 @@ fn gcc_no_secondary_outputs() {
         other => panic!("expected cacheable, got: {other:?}"),
     }
 }
+
+#[test]
+fn gcc_driver_declares_wl_map_and_dependency_outputs() {
+    let result = parse_linker_invocation(
+        "gcc",
+        args(&[
+            "-o",
+            "app",
+            "-Wl,-Map,reports/app.map,--dependency-file=deps/app.d",
+            "main.o",
+        ]),
+    );
+    let ParsedLinkerInvocation::Cacheable(c) = result else {
+        panic!("expected cacheable")
+    };
+    assert_eq!(
+        c.secondary_outputs,
+        vec![
+            NormalizedPath::new("reports/app.map"),
+            NormalizedPath::new("deps/app.d"),
+        ]
+    );
+}
