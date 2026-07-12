@@ -111,6 +111,14 @@ pub(super) fn try_request_cache_hit(probe: RequestCacheHitProbe<'_>) -> Option<R
     };
     let rustc_requested_outputs =
         rustc_explicit_requested_outputs(effective_args, &output_path, cwd);
+    let compiler_name = compiler_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let rustc_archive_hardlink_eligible = (compiler_name.contains("rustc")
+        || compiler_name == "clippy-driver")
+        .then(|| crate::compiler::rustc_archive_hardlink_eligible(effective_args));
     materialize_cached_compile_hit(CachedHitMaterializeRequest {
         state,
         sid,
@@ -126,6 +134,7 @@ pub(super) fn try_request_cache_hit(probe: RequestCacheHitProbe<'_>) -> Option<R
         downgrade_output_metadata: false,
         mtime_floor_paths,
         rustc_metadata_compat_outputs: rustc_requested_outputs,
+        rustc_archive_hardlink_eligible,
         phases: CachedHitPhases::request_cache(request_cache_lookup_ns, cross_root_validate_ns),
     })
 }
@@ -250,6 +259,8 @@ pub(super) async fn try_fast_hit(probe: FastHitProbe<'_>) -> Option<Response> {
         downgrade_output_metadata: true,
         mtime_floor_paths: input_paths.clone(),
         rustc_metadata_compat_outputs: rustc_requested_outputs,
+        rustc_archive_hardlink_eligible: is_rustc
+            .then(|| crate::compiler::rustc_archive_hardlink_eligible(effective_args)),
         phases: CachedHitPhases {
             parse_args_ns,
             build_context_ns,
@@ -386,6 +397,8 @@ pub(super) async fn try_depgraph_cached_hit(probe: DepgraphHitProbe<'_>) -> Opti
         downgrade_output_metadata: true,
         mtime_floor_paths: input_paths.clone(),
         rustc_metadata_compat_outputs: rustc_requested_outputs,
+        rustc_archive_hardlink_eligible: is_rustc
+            .then(|| crate::compiler::rustc_archive_hardlink_eligible(effective_args)),
         phases: CachedHitPhases {
             parse_args_ns,
             build_context_ns,

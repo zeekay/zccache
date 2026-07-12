@@ -122,6 +122,52 @@ impl OutputClassification {
     }
 }
 
+/// Return the semantic delivery policy for a rustc output. The `.rlib`
+/// allowlist is gated by parsed crate type, so `--crate-type bin -o fake.rlib`
+/// remains independent. Rust metadata is a read-only compiler interface for
+/// every cacheable crate type.
+#[must_use]
+pub fn rustc_output_delivery(
+    archive_hardlink_eligible: bool,
+    output: &std::path::Path,
+) -> DeliveryPolicy {
+    let extension = output.extension().and_then(|ext| ext.to_str());
+    if extension == Some("rmeta") {
+        return DeliveryPolicy::HardlinkEligible;
+    }
+    if extension != Some("rlib") {
+        return DeliveryPolicy::IndependentOnly;
+    }
+    if archive_hardlink_eligible {
+        DeliveryPolicy::HardlinkEligible
+    } else {
+        DeliveryPolicy::IndependentOnly
+    }
+}
+
+/// Parse rustc crate-type flags for the archive hardlink allowlist.
+#[must_use]
+pub fn rustc_archive_hardlink_eligible(args: &[String]) -> bool {
+    let mut crate_types = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--crate-type" {
+            if let Some(value) = args.get(i + 1) {
+                crate_types.extend(value.split(','));
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(value) = args[i].strip_prefix("--crate-type=") {
+            crate_types.extend(value.split(','));
+        }
+        i += 1;
+    }
+    crate_types
+        .into_iter()
+        .any(|crate_type| matches!(crate_type, "lib" | "rlib"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +202,27 @@ mod tests {
             OutputClassification::for_compiler(CompilerFamily::Gcc, "custom.output").delivery,
             DeliveryPolicy::IndependentOnly
         );
+    }
+
+    #[test]
+    fn rust_archive_policy_requires_semantic_crate_type() {
+        assert_eq!(
+            rustc_output_delivery(true, std::path::Path::new("x.rlib")),
+            DeliveryPolicy::HardlinkEligible
+        );
+        assert_eq!(
+            rustc_output_delivery(false, std::path::Path::new("x.rlib")),
+            DeliveryPolicy::IndependentOnly
+        );
+        assert_eq!(
+            rustc_output_delivery(false, std::path::Path::new("x.rmeta")),
+            DeliveryPolicy::HardlinkEligible
+        );
+        assert!(rustc_archive_hardlink_eligible(&[
+            "--crate-type=rlib".into()
+        ]));
+        assert!(!rustc_archive_hardlink_eligible(&[
+            "--crate-type=bin".into()
+        ]));
     }
 }
