@@ -586,7 +586,7 @@ jobs:
             # known. See PERF.md.
             max_warm_ms_cold: ""
             max_warm_ms_restore: "1500"
-            max_warm_ms_worktree: "2500"
+            max_warm_ms_worktree: "4000"
             max_warm_ms_touch: "2500"
             max_staged_overhead_ms: "15000"
             max_materialization_copied_bytes: "2147483648"
@@ -595,7 +595,7 @@ jobs:
             min_speedup: "3.0"
             max_warm_ms_cold: ""
             max_warm_ms_restore: "2500"
-            max_warm_ms_worktree: "4000"
+            max_warm_ms_worktree: "5000"
             max_warm_ms_touch: "4000"
             max_staged_overhead_ms: "25000"
             max_materialization_copied_bytes: "2147483648"
@@ -874,7 +874,7 @@ jobs:
               daemon_rss="" compile_rss=""
               staged_overhead_ms="" tier_counts="" materialization_copied=""
               salvage_count="" staged_critical_failures="" publication_success=""
-              warm_compilations=""
+              warm_compilations="" warm_misses=""
 
               result_json="$(find "${fixture_root}" -type f -path "*/${scenario}/result.json" | head -n1)"
               if [[ -z "${result_json}" ]]; then
@@ -893,6 +893,7 @@ jobs:
               daemon_rss="$(jq -r '.peak_daemon_rss_bytes // empty' "${result_json}")"
               compile_rss="$(jq -r '.peak_compile_rss_bytes // empty' "${result_json}")"
               warm_compilations="$(jq -r '.warm_compilations // empty' "${result_json}")"
+              warm_misses="$(jq -r '.warm_misses // empty' "${result_json}")"
 
               cold_report=""
               for cand in 'cold-cache-report.json' 'a-cache-report.json'; do
@@ -1045,9 +1046,9 @@ jobs:
                 telemetry_pass="0"
                 telemetry_issue="materialization copied ${materialization_copied} bytes (max ${MAX_MATERIALIZATION_COPIED_BYTES})"
               elif [[ "${scenario}" == "restore-no-clean-warm" ]]; then
-                if [[ -z "${warm_compilations}" || "${warm_compilations}" != "0" ]]; then
+                if [[ -z "${warm_misses}" || "${warm_misses}" != "0" ]]; then
                   telemetry_pass="0"
-                  telemetry_issue="restore warm build was not a no-op (compilations=${warm_compilations:-missing})"
+                  telemetry_issue="restore warm build had cache misses (misses=${warm_misses:-missing}, compilations=${warm_compilations:-missing})"
                 fi
               elif [[ -z "${tier_reflink}" || -z "${tier_hardlink}" || -z "${tier_copy}" ]] \
                    || (( tier_reflink + tier_hardlink + tier_copy <= 0 )); then

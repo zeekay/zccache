@@ -96,7 +96,8 @@ def test_perf_cluster_gates_staged_metrics_and_restore_noop() -> None:
         "salvage_attempt",
         "materialize_failure",
         "warm_compilations",
-        "restore warm build was not a no-op",
+        "warm_misses",
+        "restore warm build had cache misses",
     ):
         assert required in workflow
 

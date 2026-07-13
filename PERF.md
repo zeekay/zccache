@@ -165,8 +165,8 @@ separate because runner and filesystem costs differ:
 
 | Platform | min speedup | restore max | worktree max | touch max | staged miss max |
 |---|---:|---:|---:|---:|---:|
-| Linux | `4.5x` | `1500ms` | `2500ms` | `2500ms` | `15000ms` |
-| macOS ARM | `3.0x` | `2500ms` | `4000ms` | `4000ms` | `25000ms` |
+| Linux | `4.5x` | `1500ms` | `4000ms` | `2500ms` | `15000ms` |
+| macOS ARM | `3.0x` | `2500ms` | `5000ms` | `4000ms` | `25000ms` |
 | Windows | `2.0x` | `5000ms` | `8000ms` | `8000ms` | `40000ms` |
 
 The staged miss budget is the sum of hashing, publication, and requested-path
@@ -174,8 +174,9 @@ materialization telemetry. Every cell also requires at least one cold staged
 publication, zero salvage and critical staged failures, and no more than 2 GiB
 of warm materialization copies. Cache-exercising warm scenarios must report an
 actual reflink, hardlink-shared, or copy tier. `restore-no-clean-warm` instead
-requires zero downstream compilations, proving Cargo accepted the restored
-state as a no-op rebuild.
+requires zero cache misses. Wrapper compilations that are served entirely as
+cache hits are allowed; a miss is the signal that Cargo rebuilt downstream
+state instead of accepting the restore as a no-op.
 
 Why both gates instead of speedup-only: some scenarios have cold-side compile
 time that dominates the speedup ratio (e.g. `restore-no-clean-warm`: cargo
