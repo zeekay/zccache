@@ -30,7 +30,11 @@ The workflow fires on:
 2. **`push`** to `main`, `perf/**`, or `evaluate/**`. The branch name is parsed into an effective `(platforms, fixtures, scenarios)` scope (see below). The dispatch inputs are not consulted.
 3. **Manual `gh workflow run` CLI** — same as the dispatch button.
 
-The full matrix is always loaded; cells that fall outside the resolved scope skip themselves at the gate step. **`main` defaults to the `medium` fixture only** to keep per-push cycle time short; push to `perf/all` (or `perf/all-sqlite-*`) when you want `sqlite-link` measured too — its bundled `libsqlite3` adds ~3-5 min of `cc-rs` build per cell.
+The full matrix is always loaded; cells that fall outside the resolved scope
+skip themselves at the gate step. `main`, `perf/all`, and dispatch defaults run
+the sanctioned full matrix: Linux, Windows, and macOS ARM; `medium` and
+`sqlite-link`; and all four scenarios. Canonical `perf/<plat>-<fix>-<scen>`
+branches remain the iteration path for a narrower cell.
 
 ## Branch-name convention
 
@@ -57,13 +61,15 @@ Short tokens keep the branch name unambiguous (the real names contain hyphens th
 
 ### Full scope table
 
-48 hierarchical patterns plus two opt-in-full aliases. Anything not in this table (e.g., a developer iteration branch like `perf/cluster-hierarchical-skip`) falls back to the **default scope (`medium` fixture, all scenarios)** and emits a `::notice::` so the run is still useful. Use `perf/all` if you want the full fixture sweep included.
+48 hierarchical patterns plus two full aliases. Anything not in this table
+(e.g., a developer iteration branch like `perf/cluster-hierarchical-skip`)
+falls back to the full default scope and emits a `::notice::`.
 
 #### Aliases — full ride
 
 | Branch | Scope |
 |---|---|
-| `main` | every platform × `medium` fixture × every scenario (use `perf/all` for full sweep) |
+| `main` | full sweep |
 | `perf/all` | same as `perf/all-all-all` |
 
 #### Platform = `all` (12)
@@ -134,15 +140,19 @@ Short tokens keep the branch name unambiguous (the real names contain hyphens th
 | `perf/mac-sqlite-worktree` | **single cell**: mac × sqlite-link × worktree |
 | `perf/mac-sqlite-touch` | **single cell**: mac × sqlite-link × touch |
 
-> Today, only `linux` has a matrix row in `build-binaries` / `bench`. `win` and `mac` branches resolve correctly via setup but their cells gate out until cross-platform runner rows land. The branch names stay stable.
+Linux runs on Ubuntu 24.04, Windows runs on Windows 2025, and `mac-arm` runs
+on the Apple Silicon `macos-14` image. Each platform builds its own soldr and
+zccache binaries before benchmarking.
 
 ## Picking a branch for the work you're doing
 
 - **Iterating on cache hit-rate fixes that only affect sqlite builds** → `perf/linux-sqlite-cold` (fastest signal: one cell, the hard gate scenario).
 - **Tuning archive fidelity** → `perf/all-all-cold` (sweep cold-tar-untar-warm across everything; fixture variation matters).
 - **Worktree path-remap change** → `perf/linux-all-worktree` (every fixture on linux, worktree scenario only).
-- **Just experimenting / unsure** → `perf/all` for the full sweep, or push to `main` for the default scope (medium fixture, all scenarios) — fastest cycle that still covers all three scenarios.
-- **Personal feature branch like `perf/wip/foo`** → falls through to the default scope (medium, all scenarios) with a `::notice::`. Fine for one-off runs; rename to a canonical pattern when you know what axis you're working on.
+- **Just experimenting / unsure** → use one canonical narrow branch first;
+  `perf/all` and `main` intentionally run the full release gate.
+- **Personal feature branch like `perf/wip/foo`** → falls through to the full
+  scope with a `::notice::`. Rename to a canonical pattern for a narrow loop.
 
 ## Gate semantics
 
@@ -150,14 +160,22 @@ Every scenario gates on **`speedup >= min_speedup` AND (optionally) `warm_ms
 <= max_warm_ms_<scen>`** — both must hold for PASS. The warm-ms ceiling is
 opt-in per scenario; scenarios with no ceiling gate on speedup alone.
 
-Linux thresholds today:
+Every scenario is a hard gate. Platform timing budgets are deliberately
+separate because runner and filesystem costs differ:
 
-| Scenario | min_speedup | max_warm_ms | Mode |
-|---|---:|---:|---|
-| `cold-tar-untar-warm` | `4.5x` | — | **hard** (fails workflow) |
-| `restore-no-clean-warm` | `4.5x` | `1500ms` | **hard** (fails workflow) |
-| `worktree-share` | `4.5x` | — | soft (`::warning::`) |
-| `touch-no-change` | `4.5x` | — | soft (`::warning::`) |
+| Platform | min speedup | restore max | worktree max | touch max | staged miss max |
+|---|---:|---:|---:|---:|---:|
+| Linux | `4.5x` | `1500ms` | `2500ms` | `2500ms` | `15000ms` |
+| macOS ARM | `3.0x` | `2500ms` | `4000ms` | `4000ms` | `25000ms` |
+| Windows | `2.0x` | `5000ms` | `8000ms` | `8000ms` | `40000ms` |
+
+The staged miss budget is the sum of hashing, publication, and requested-path
+materialization telemetry. Every cell also requires at least one cold staged
+publication, zero salvage and critical staged failures, and no more than 2 GiB
+of warm materialization copies. Cache-exercising warm scenarios must report an
+actual reflink, hardlink-shared, or copy tier. `restore-no-clean-warm` instead
+requires zero downstream compilations, proving Cargo accepted the restored
+state as a no-op rebuild.
 
 Why both gates instead of speedup-only: some scenarios have cold-side compile
 time that dominates the speedup ratio (e.g. `restore-no-clean-warm`: cargo
@@ -168,14 +186,11 @@ that hide behind a high ratio. Other scenarios (`cold-tar-untar-warm`) want
 speedup as the signal of cache contribution and don't currently set a warm-ms
 ceiling.
 
-Thresholds live on the `evaluate` matrix row (`min_speedup`,
-`max_warm_ms_<scen>`). Each platform row carries its own values; the workflow
-has only `linux` today, so the numbers above are linux-tuned. mac-arm / win
-rows will need their own thresholds because per-OS variance on the noise floor
-is significant. To add a warm-ms ceiling to a scenario that doesn't have one,
-set the corresponding `max_warm_ms_<scen>` field in the matrix include to a
-non-empty value (e.g. `"2000"`); the gate code picks it up via
-`max_warm_ms_for`.
+Thresholds live on each `evaluate` matrix row (`min_speedup`,
+`max_warm_ms_<scen>`, `max_staged_overhead_ms`, and
+`max_materialization_copied_bytes`). Change them only with a linked sanctioned
+run showing the before/after distribution; ad-hoc local timings are diagnostic,
+not release-gate evidence.
 
 ## Reading the run
 
@@ -183,7 +198,9 @@ Every cell appends to `$GITHUB_STEP_SUMMARY`. From the run page:
 
 1. **Scope** table at the top (`setup` job) — confirms the resolved `(platforms, fixtures, scenarios)` and the source (`branch:<ref>`, `alias:main`, `dispatch`, `unknown-perf:<ref>`, etc.).
 2. **bench** cells emit a per-fixture table with `cold/A ms | warm/B ms | speedup | hits/misses | hit rate | peak daemon RSS`.
-3. **Evaluate** cell emits a single per-platform table covering every (fixture, scenario) it could find, with `cold | warm | speedup | threshold | mode | result`.
+3. **Evaluate** emits a per-platform table covering every fixture/scenario,
+   including cold/warm timing, staged miss overhead, materialization tier
+   counts, copied bytes, salvage count, cache counts, and RSS.
 4. Failed runs annotate the failing rows with `::error::` lines (visible in the "Annotations" sidebar).
 
 Raw `result.json`, `*-shutdown.json`, and `rss-*.csv` are uploaded as `perf-results-<platform>-<fixture>` artifacts (14-day retention).

@@ -40,6 +40,8 @@ cold_start_ms="$(measure::now_ms)"
 cold_elapsed_ms="$(measure::elapsed_ms "${cold_start_ms}")"
 
 SOLDR_CACHE_DIR="${CACHE}" soldr cache flush --json >/dev/null 2>&1 || true
+SOLDR_CACHE_DIR="${CACHE}" soldr cache report --json \
+    > "${WORKDIR}/cold-cache-report.json" 2>/dev/null || true
 
 # --- Touch every source file without changing content --------------
 
@@ -65,6 +67,9 @@ warm_stats="$(SOLDR_CACHE_DIR="${CACHE}" measure::session_end_json)"
 warm_hits="$(echo "${warm_stats}" | jq -r '.stats.hits // 0')"
 warm_misses="$(echo "${warm_stats}" | jq -r '.stats.misses // 0')"
 warm_hit_rate="$(echo "${warm_stats}" | jq -r '.stats.hit_rate // 0')"
+
+SOLDR_CACHE_DIR="${CACHE}" soldr cache report --json \
+    > "${WORKDIR}/warm-cache-report.json" 2>/dev/null || true
 
 SOLDR_CACHE_DIR="${CACHE}" soldr cache shutdown \
     --shutdown-timeout-seconds 30 --json >"${WORKDIR}/touch-shutdown.json" || true

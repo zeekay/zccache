@@ -1,5 +1,32 @@
 //! Transaction, race, migration, cleanup, and deterministic fault tests.
 use super::*;
+
+#[test]
+fn staged_rollout_defaults_on_and_preserves_compatibility_switches() {
+    use crate::compiler::CompilerFamily::{Clang, Rustc};
+
+    assert!(staged_artifacts_enabled_for(None));
+    assert!(staged_lane_enabled_for(None, Rustc));
+    assert!(staged_lane_enabled_for(None, Clang));
+    assert!(!staged_link_lane_enabled_for(None));
+    assert!(!staged_exec_lane_enabled_for(None));
+
+    for disabled in ["", "0", "false", "off", "no", " OFF "] {
+        assert!(!staged_artifacts_enabled_for(Some(disabled)));
+        assert!(!staged_lane_enabled_for(Some(disabled), Rustc));
+        assert!(!staged_lane_enabled_for(Some(disabled), Clang));
+        assert!(!staged_link_lane_enabled_for(Some(disabled)));
+        assert!(!staged_exec_lane_enabled_for(Some(disabled)));
+    }
+
+    assert!(staged_lane_enabled_for(Some("rust"), Rustc));
+    assert!(!staged_lane_enabled_for(Some("rust"), Clang));
+    assert!(!staged_lane_enabled_for(Some("c-cpp"), Rustc));
+    assert!(staged_lane_enabled_for(Some("c-cpp"), Clang));
+    assert!(staged_link_lane_enabled_for(Some("all")));
+    assert!(staged_exec_lane_enabled_for(Some("all")));
+    assert!(staged_exec_lane_enabled_for(Some("exec")));
+}
 use std::fs;
 
 fn source_files(dir: &Path) -> Vec<NormalizedPath> {

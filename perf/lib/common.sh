@@ -16,29 +16,54 @@
 
 # measure::start_rss_poller <csv-path>
 #
-# Backgrounds a 1Hz `ps` loop that appends `epoch,pid,rss,vsz,comm`
+# Backgrounds a 1Hz process loop that appends `epoch,pid,rss,vsz,comm`
 # rows for every running zccache-daemon / rustc / cargo process. The
 # poller PID is stashed so `measure::stop_rss_poller` can kill it.
 measure::start_rss_poller() {
     local csv="$1"
     _MEASURE_RSS_CSV="${csv}"
     echo "epoch,pid,rss_kb,vsz_kb,comm" > "${csv}"
-    (
-        while true; do
-            # `ps -A -o pid,rss,vsz,comm --no-headers` is GNU-flavoured;
-            # ubuntu runners have it. macOS workers (v2+) will need a
-            # different code path.
-            local now
-            now="$(date +%s)"
-            ps -A -o pid=,rss=,vsz=,comm= 2>/dev/null \
-                | awk -v t="${now}" '
-                    $4 ~ /^(zccache-daemon|zccache|rustc|cargo|soldr)$/ {
-                        printf "%s,%s,%s,%s,%s\n", t, $1, $2, $3, $4
-                    }' \
-                >> "${csv}" || true
-            sleep 1
-        done
-    ) &
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            _MEASURE_RSS_PS1="${csv}.poll.ps1"
+            cat > "${_MEASURE_RSS_PS1}" <<'POWERSHELL'
+$now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+Get-Process | Where-Object {
+    $_.ProcessName -match '^(zccache-daemon|zccache|rustc|cargo|soldr)(\.|$)'
+} | ForEach-Object {
+    $name = $_.ProcessName -replace '\..*$', ''
+    '{0},{1},{2},{3},{4}' -f $now, $_.Id,
+        [math]::Floor($_.WorkingSet64 / 1KB),
+        [math]::Floor($_.VirtualMemorySize64 / 1KB), $name
+}
+POWERSHELL
+            local ps1_windows
+            ps1_windows="$(cygpath -w "${_MEASURE_RSS_PS1}")"
+            (
+                while true; do
+                    powershell.exe -NoLogo -NoProfile -NonInteractive \
+                        -ExecutionPolicy Bypass -File "${ps1_windows}" \
+                        >> "${csv}" 2>/dev/null || true
+                    sleep 1
+                done
+            ) &
+            ;;
+        *)
+            (
+                while true; do
+                    local now
+                    now="$(date +%s)"
+                    ps -A -o pid=,rss=,vsz=,comm= 2>/dev/null \
+                        | awk -v t="${now}" '
+                            $4 ~ /^(zccache-daemon|zccache|rustc|cargo|soldr)$/ {
+                                printf "%s,%s,%s,%s,%s\n", t, $1, $2, $3, $4
+                            }' \
+                        >> "${csv}" || true
+                    sleep 1
+                done
+            ) &
+            ;;
+    esac
     _MEASURE_RSS_PID="$!"
     # Detach so the poller survives `set -e` traps in the parent.
     disown "${_MEASURE_RSS_PID}" 2>/dev/null || true
@@ -53,6 +78,10 @@ measure::stop_rss_poller() {
         kill "${_MEASURE_RSS_PID}" 2>/dev/null || true
         wait "${_MEASURE_RSS_PID}" 2>/dev/null || true
         _MEASURE_RSS_PID=""
+    fi
+    if [[ -n "${_MEASURE_RSS_PS1:-}" ]]; then
+        rm -f "${_MEASURE_RSS_PS1}"
+        _MEASURE_RSS_PS1=""
     fi
 }
 
@@ -98,7 +127,7 @@ measure::cache_bytes() {
     local cache_root="$1"
     local zccache_dir="${cache_root}/cache/zccache"
     if [[ -d "${zccache_dir}" ]]; then
-        du -sb "${zccache_dir}" | awk '{print $1}'
+        du -sk "${zccache_dir}" | awk '{print $1 * 1024}'
     else
         echo 0
     fi
@@ -129,7 +158,18 @@ measure::session_end_json() {
 
 # measure::now_ms
 measure::now_ms() {
-    date +%s%3N
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            powershell.exe -NoLogo -NoProfile -NonInteractive -Command \
+                '[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()' | tr -d '\r'
+            ;;
+        Darwin)
+            perl -MTime::HiRes=time -e 'printf "%.0f\n", time() * 1000'
+            ;;
+        *)
+            date +%s%3N
+            ;;
+    esac
 }
 
 # measure::elapsed_ms <start-ms>

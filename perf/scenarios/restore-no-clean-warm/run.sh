@@ -134,12 +134,14 @@ cp -R "${CACHE_WARM}/cache/zccache/logs" "${WORKDIR}/warm-zccache-logs" 2>/dev/n
 # as 0/0.
 WARM_STATS_FILE="${CACHE_WARM}/cache/zccache/logs/last-session-stats.json"
 if [[ -s "${WARM_STATS_FILE}" ]]; then
+    warm_compilations="$(jq -r '.stats.compilations // .compilations // 0' "${WARM_STATS_FILE}")"
     warm_hits="$(jq -r '.stats.hits // .hits // 0' "${WARM_STATS_FILE}")"
     warm_misses="$(jq -r '.stats.misses // .misses // 0' "${WARM_STATS_FILE}")"
     warm_hit_rate="$(jq -r '.stats.hit_rate // .hit_rate // 0' "${WARM_STATS_FILE}")"
     warm_stats_source="file"
 else
     warm_stats="$(SOLDR_CACHE_DIR="${CACHE_WARM}" measure::session_end_json)"
+    warm_compilations="$(echo "${warm_stats}" | jq -r '.stats.compilations // .compilations // 0')"
     warm_hits="$(echo "${warm_stats}" | jq -r '.stats.hits // 0')"
     warm_misses="$(echo "${warm_stats}" | jq -r '.stats.misses // 0')"
     warm_hit_rate="$(echo "${warm_stats}" | jq -r '.stats.hit_rate // 0')"
@@ -176,6 +178,7 @@ measure::emit_summary_json "${SCENARIO}" \
     "cold_ms=${cold_elapsed_ms}" \
     "warm_ms=${warm_elapsed_ms}" \
     "speedup=${speedup}" \
+    "warm_compilations=${warm_compilations}" \
     "warm_hits=${warm_hits}" \
     "warm_misses=${warm_misses}" \
     "warm_hit_rate=${warm_hit_rate}" \

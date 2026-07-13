@@ -22,22 +22,18 @@ on:
         description: Platform subset
         type: choice
         required: true
-        default: linux
+        default: all
         options:
           - all
           - linux
           - mac-arm
           - win
       fixtures:
-        # sqlite-link is intentionally NOT the default: it adds ~3-5
-        # minutes of cargo build per cell (cc-rs + bundled libsqlite3)
-        # and the medium fixture is the primary signal today. Pick
-        # `all` or `sqlite-link` explicitly when you specifically want
-        # the C-bundled crate exercised.
+        # Both fixtures are part of the sanctioned rollout gate.
         description: Fixture subset
         type: choice
         required: true
-        default: medium
+        default: all
         options:
           - all
           - medium
@@ -79,6 +75,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   # Never cancel a perf run in flight — every measurement is a data
   # point we want to keep, even if a follow-up push lands before this
@@ -118,29 +118,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Defaults are intentionally narrow. `FIX="medium"` keeps
-          # the per-push cycle short (sqlite-link adds 3-5 min/cell).
-          # Branches that want the full sweep ask for it explicitly via
-          # `perf/all-all-all` or the `perf/all` alias.
-          PLAT="all"; FIX="medium"; SCEN="all"; SOURCE="default"
+          # Main, dispatch, and unknown perf branches default to the
+          # complete sanctioned rollout matrix. Canonical branch tokens
+          # remain available for narrow iteration.
+          PLAT="all"; FIX="all"; SCEN="all"; SOURCE="default"
 
           if [[ "${EVENT}" == "workflow_dispatch" ]]; then
-            PLAT="${IN_PLAT:-linux}"
-            FIX="${IN_FIX:-medium}"
+            PLAT="${IN_PLAT:-all}"
+            FIX="${IN_FIX:-all}"
             SCEN="${IN_SCEN:-all}"
             SOURCE="dispatch"
           else
             case "${REF_NAME}" in
               main)
-                # Main pushes default to medium-only so a routine
-                # merge doesn't pay for the sqlite-link build. Use
-                # `perf/all` to opt into the full sweep when you
-                # actually want sqlite-link measured.
                 SOURCE="alias:main"
                 ;;
               perf/all)
-                # The explicit "give me everything" alias.
-                FIX="all"
                 SOURCE="alias:perf/all"
                 ;;
               perf/*)
@@ -171,7 +164,7 @@ jobs:
                   *)        bad=1 ;;
                 esac
                 if [[ -n "${rest}" || "${bad}" == "1" ]]; then
-                  echo "::notice::Branch '${REF_NAME}' does not match perf/<plat>-<fix>-<scen>; falling back to defaults (medium fixture, all scenarios). See PERF.md."
+                  echo "::notice::Branch '${REF_NAME}' does not match perf/<plat>-<fix>-<scen>; falling back to the full matrix. See PERF.md."
                   SOURCE="unknown-perf:${REF_NAME}"
                 else
                   PLAT="${plat}"; FIX="${fix}"; SCEN="${scen}"
@@ -180,9 +173,7 @@ jobs:
                 ;;
               *)
                 # evaluate/** and anything else covered by the push
-                # filter that isn't main/perf — use defaults (medium
-                # fixture, all scenarios). Push to `perf/all` if you
-                # want sqlite-link included.
+                # filter that isn't main/perf uses full defaults.
                 SOURCE="non-perf:${REF_NAME}"
                 ;;
             esac
@@ -218,13 +209,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Currently ships linux only; win / mac-arm / mac-x86 rows
-        # drop in here once perf/lib/common.sh has cross-platform
-        # RSS pollers. The dispatch input still accepts those names
-        # so the surface stays stable.
         include:
           - platform: linux
             runs_on: ubuntu-24.04
+            exe: ""
+            rustflags: -C link-arg=-fuse-ld=mold
+          - platform: mac-arm
+            runs_on: macos-14
+            exe: ""
+            rustflags: ""
+          - platform: win
+            runs_on: windows-2025
+            exe: .exe
+            rustflags: ""
     runs-on: ${{ matrix.runs_on }}
     steps:
       # Platform gate is a step (not job-level `if:`) because GHA
@@ -323,7 +320,7 @@ jobs:
       - name: Build zccache trio (release)
         if: steps.gate.outputs.selected == 'true' && steps.cache_zccache.outputs.cache-hit != 'true'
         env:
-          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           cargo build --release --features zccache-bin,daemon-bin,fingerprint-bin --bin zccache --bin zccache-daemon --bin zccache-fp
 
@@ -331,8 +328,10 @@ jobs:
         if: steps.gate.outputs.selected == 'true' && steps.cache_zccache.outputs.cache-hit != 'true'
         run: |
           mkdir -p staged/zccache
-          cp target/release/zccache target/release/zccache-daemon target/release/zccache-fp staged/zccache/
-          chmod +x staged/zccache/zccache staged/zccache/zccache-daemon staged/zccache/zccache-fp
+          for binary in zccache zccache-daemon zccache-fp; do
+            cp "target/release/${binary}${{ matrix.exe }}" "staged/zccache/${binary}${{ matrix.exe }}"
+            chmod +x "staged/zccache/${binary}${{ matrix.exe }}"
+          done
 
       - name: Restore prebuilt soldr binary
         if: steps.gate.outputs.selected == 'true'
@@ -352,7 +351,7 @@ jobs:
       - name: Build soldr (release)
         if: steps.gate.outputs.selected == 'true' && steps.cache_soldr.outputs.cache-hit != 'true'
         env:
-          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+          RUSTFLAGS: ${{ matrix.rustflags }}
         working-directory: soldr-src
         run: |
           cargo build --release -p soldr-cli
@@ -361,14 +360,15 @@ jobs:
         if: steps.gate.outputs.selected == 'true' && steps.cache_soldr.outputs.cache-hit != 'true'
         run: |
           mkdir -p staged/soldr
-          cp soldr-src/target/release/soldr staged/soldr/
-          chmod +x staged/soldr/soldr
+          cp "soldr-src/target/release/soldr${{ matrix.exe }}" "staged/soldr/soldr${{ matrix.exe }}"
+          chmod +x "staged/soldr/soldr${{ matrix.exe }}"
 
       - name: Verify staged binaries
         if: steps.gate.outputs.selected == 'true'
         run: |
-          find staged -maxdepth 4 -type f -printf '%p\t%s bytes\n'
+          find staged -maxdepth 4 -type f -exec ls -l {} \;
           for needed in staged/soldr/soldr staged/zccache/zccache staged/zccache/zccache-daemon staged/zccache/zccache-fp; do
+            needed="${needed}${{ matrix.exe }}"
             if [[ ! -f "${needed}" ]]; then
               echo "::error::Missing required binary ${needed} after source build"
               exit 1
@@ -389,11 +389,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [linux]
+        platform: [linux, mac-arm, win]
         fixture: [medium, sqlite-link]
         include:
           - platform: linux
             runs_on: ubuntu-24.04
+            exe: ""
+          - platform: mac-arm
+            runs_on: macos-14
+            exe: ""
+          - platform: win
+            runs_on: windows-2025
+            exe: .exe
     runs-on: ${{ matrix.runs_on }}
     steps:
       - name: Gate cell against resolved scope
@@ -447,7 +454,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install stable --profile minimal --no-self-update
 
       - name: Install fixture native deps
-        if: steps.gate.outputs.selected == 'true' && matrix.fixture == 'sqlite-link'
+        if: steps.gate.outputs.selected == 'true' && matrix.fixture == 'sqlite-link' && matrix.platform == 'linux'
         run: |
           # rusqlite's `bundled` feature compiles libsqlite3 from C
           # via cc-rs. ubuntu-24.04 ships gcc already, but be
@@ -465,9 +472,9 @@ jobs:
       - name: Stage soldr on PATH
         if: steps.gate.outputs.selected == 'true'
         run: |
-          chmod +x staged/soldr/soldr
+          chmod +x "staged/soldr/soldr${{ matrix.exe }}"
           mkdir -p "$HOME/.local/bin"
-          cp staged/soldr/soldr "$HOME/.local/bin/soldr"
+          cp "staged/soldr/soldr${{ matrix.exe }}" "$HOME/.local/bin/soldr${{ matrix.exe }}"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Verify soldr is the source build
@@ -535,20 +542,15 @@ jobs:
             ${{ steps.run.outputs.out_root }}/*/rss-*.csv
             ${{ steps.run.outputs.out_root }}/*/warm-cache-report.json
             ${{ steps.run.outputs.out_root }}/*/cold-cache-report.json
+            ${{ steps.run.outputs.out_root }}/*/*-cache-report.json
             ${{ steps.run.outputs.out_root }}/*/warm-zccache-logs/**
             ${{ steps.run.outputs.out_root }}/*/cold-zccache-logs/**
           if-no-files-found: warn
           retention-days: 14
 
   evaluate:
-    # Per-platform gate: pull every fixture's artifact for this
-    # platform via `pattern: perf-results-<platform>-*` and iterate
-    # (fixture x scenario) internally. One Evaluate check per
-    # platform (max 3 when win and mac-arm matrix rows land alongside
-    # linux). cold-tar-untar-warm is the hard gate (fails the
-    # workflow); worktree-share and touch-no-change are soft today
-    # (::warning::) — they'll be promoted to hard once their
-    # baselines are trusted.
+    # Pull every fixture artifact for one platform and hard-gate all
+    # four rollout scenarios plus their staged telemetry.
     name: Evaluate ${{ matrix.platform }}
     needs: [setup, bench]
     strategy:
@@ -571,8 +573,28 @@ jobs:
             # known. See PERF.md.
             max_warm_ms_cold: ""
             max_warm_ms_restore: "1500"
-            max_warm_ms_worktree: ""
-            max_warm_ms_touch: ""
+            max_warm_ms_worktree: "2500"
+            max_warm_ms_touch: "2500"
+            max_staged_overhead_ms: "15000"
+            max_materialization_copied_bytes: "2147483648"
+          - platform: mac-arm
+            runs_on: macos-14
+            min_speedup: "3.0"
+            max_warm_ms_cold: ""
+            max_warm_ms_restore: "2500"
+            max_warm_ms_worktree: "4000"
+            max_warm_ms_touch: "4000"
+            max_staged_overhead_ms: "25000"
+            max_materialization_copied_bytes: "2147483648"
+          - platform: win
+            runs_on: windows-2025
+            min_speedup: "2.0"
+            max_warm_ms_cold: ""
+            max_warm_ms_restore: "5000"
+            max_warm_ms_worktree: "8000"
+            max_warm_ms_touch: "8000"
+            max_staged_overhead_ms: "40000"
+            max_materialization_copied_bytes: "2147483648"
     runs-on: ${{ matrix.runs_on }}
     steps:
       - name: Gate cell against resolved scope
@@ -617,6 +639,8 @@ jobs:
           MAX_WARM_MS_RESTORE:  ${{ matrix.max_warm_ms_restore }}
           MAX_WARM_MS_WORKTREE: ${{ matrix.max_warm_ms_worktree }}
           MAX_WARM_MS_TOUCH:    ${{ matrix.max_warm_ms_touch }}
+          MAX_STAGED_OVERHEAD_MS: ${{ matrix.max_staged_overhead_ms }}
+          MAX_MATERIALIZATION_COPIED_BYTES: ${{ matrix.max_materialization_copied_bytes }}
           REQ_FIXTURES:         ${{ needs.setup.outputs.fixtures }}
           REQ_SCENARIOS:        ${{ needs.setup.outputs.scenarios }}
           M_PLATFORM:           ${{ matrix.platform }}
@@ -630,13 +654,10 @@ jobs:
             return 1
           }
 
-          # scenario -> "fail" or "warn". cold-tar-untar-warm is the
-          # only gate today; the others are soft until their baselines
-          # stabilize (see workflow header).
+          # Every known rollout scenario is a hard gate.
           mode_for() {
             case "$1" in
-              cold-tar-untar-warm|restore-no-clean-warm) echo "fail" ;;
-              worktree-share|touch-no-change) echo "warn" ;;
+              cold-tar-untar-warm|restore-no-clean-warm|worktree-share|touch-no-change) echo "fail" ;;
               *) echo "warn" ;;
             esac
           }
@@ -762,8 +783,8 @@ jobs:
           {
             echo "## Evaluate ${M_PLATFORM}"
             echo
-            echo "| Fixture | Scenario | Verdict | Speedup | Need | Cold | Warm | Compiles | Hits | Misses | Ignored | Errors | Unique Srcs | Bytes W | Time Saved | Daemon RSS | Compile RSS |"
-            echo "| --- | --- | :---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+            echo "| Fixture | Scenario | Verdict | Speedup | Need | Cold | Warm | Staged miss | Tiers R/H/C | Copied | Salvage | Compiles | Hits | Misses | Ignored | Errors | Unique Srcs | Bytes W | Time Saved | Daemon RSS | Compile RSS |"
+            echo "| --- | --- | :---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           # Verdict cell: bold-marked so PASS/FAIL/WARN jumps out at a
@@ -791,10 +812,12 @@ jobs:
           emit_row() {
             local verdict="$1"
             local need="${2:-—}"
-            printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+            printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
               "${fixture}" "${scenario}" \
               "$(fmt_verdict "${verdict}")" "${speedup:-—}x" "${need}" \
               "$(fmt_ms "${cold_ms}")" "$(fmt_ms "${warm_ms}")" \
+              "$(fmt_ms "${staged_overhead_ms}")" "${tier_counts:-n/a}" \
+              "$(fmt_bytes "${materialization_copied}")" "${salvage_count:-n/a}" \
               "${compiles:-—}" \
               "$(fmt_count_pct "${hits}" "${compiles}")" \
               "$(fmt_count_pct "${misses}" "${compiles}")" \
@@ -836,6 +859,9 @@ jobs:
               compiles="" hits="" misses="" non_cache="" errs="" hit_rate=""
               bytes_w="" bytes_r="" time_saved="" unique_srcs=""
               daemon_rss="" compile_rss=""
+              staged_overhead_ms="" tier_counts="" materialization_copied=""
+              salvage_count="" staged_critical_failures="" publication_success=""
+              warm_compilations=""
 
               result_json="$(find "${fixture_root}" -type f -path "*/${scenario}/result.json" | head -n1)"
               if [[ -z "${result_json}" ]]; then
@@ -853,6 +879,13 @@ jobs:
               warm_ms="$(jq -r --arg k "${warm_key}" '.[$k] // empty' "${result_json}")"
               daemon_rss="$(jq -r '.peak_daemon_rss_bytes // empty' "${result_json}")"
               compile_rss="$(jq -r '.peak_compile_rss_bytes // empty' "${result_json}")"
+              warm_compilations="$(jq -r '.warm_compilations // empty' "${result_json}")"
+
+              cold_report=""
+              for cand in 'cold-cache-report.json' 'a-cache-report.json'; do
+                f="$(find "${fixture_root}" -type f -path "*/${scenario}/${cand}" | head -n1)"
+                if [[ -n "${f}" ]]; then cold_report="${f}"; break; fi
+              done
 
               # Pull warm-side per-session counters from the cache
               # report. Naming varies by scenario:
@@ -879,6 +912,52 @@ jobs:
                 bytes_r="$(jq -r '.last_session.bytes_read // empty' "${warm_report}")"
                 time_saved="$(jq -r '.last_session.time_saved_ms // empty' "${warm_report}")"
                 unique_srcs="$(jq -r '.last_session.unique_sources // empty' "${warm_report}")"
+              fi
+
+              if [[ -n "${cold_report}" ]]; then
+                staged_overhead_ns="$(jq -r '
+                  (.last_session.phase_profile.staged.timings_ns.hashing // 0) +
+                  (.last_session.phase_profile.staged.timings_ns.publication // 0) +
+                  (.last_session.phase_profile.staged.timings_ns.miss_materialization // 0)
+                ' "${cold_report}")"
+                staged_overhead_ms="$(( (staged_overhead_ns + 999999) / 1000000 ))"
+                publication_success="$(jq -r '.last_session.phase_profile.staged.counters.publication_success // empty' "${cold_report}")"
+                cold_salvage="$(jq -r '.last_session.phase_profile.staged.counters.salvage_attempt // 0' "${cold_report}")"
+                cold_critical="$(jq -r '
+                  (.last_session.phase_profile.staged.counters.publication_failure // 0) +
+                  (.last_session.phase_profile.staged.counters.publication_conflict // 0) +
+                  (.last_session.phase_profile.staged.counters.materialize_failure // 0)
+                ' "${cold_report}")"
+              else
+                cold_salvage=""
+                cold_critical=""
+              fi
+
+              if [[ -n "${warm_report}" ]]; then
+                tier_reflink="$(jq -r '.last_session.phase_profile.staged.counters.materialize_reflink // 0' "${warm_report}")"
+                tier_hardlink="$(jq -r '.last_session.phase_profile.staged.counters.materialize_hardlink_shared // 0' "${warm_report}")"
+                tier_copy="$(jq -r '.last_session.phase_profile.staged.counters.materialize_copy // 0' "${warm_report}")"
+                materialization_copied="$(jq -r '.last_session.phase_profile.staged.bytes.materialization_copied // 0' "${warm_report}")"
+                warm_salvage="$(jq -r '.last_session.phase_profile.staged.counters.salvage_attempt // 0' "${warm_report}")"
+                warm_critical="$(jq -r '
+                  (.last_session.phase_profile.staged.counters.publication_failure // 0) +
+                  (.last_session.phase_profile.staged.counters.publication_conflict // 0) +
+                  (.last_session.phase_profile.staged.counters.materialize_failure // 0)
+                ' "${warm_report}")"
+                tier_counts="${tier_reflink}/${tier_hardlink}/${tier_copy}"
+              else
+                tier_reflink="" tier_hardlink="" tier_copy=""
+                warm_salvage="" warm_critical=""
+              fi
+
+              if [[ -n "${cold_salvage}" && -n "${warm_salvage}" ]]; then
+                salvage_count="$(( cold_salvage + warm_salvage ))"
+                staged_critical_failures="$(( cold_critical + warm_critical ))"
+              elif [[ "${scenario}" == "restore-no-clean-warm" && -n "${cold_salvage}" ]]; then
+                salvage_count="${cold_salvage}"
+                staged_critical_failures="${cold_critical}"
+                tier_counts="0/0/0"
+                materialization_copied="0"
               fi
 
               if [[ -z "${cold_ms}" || -z "${warm_ms}" ]]; then
@@ -929,13 +1008,51 @@ jobs:
               fi
               need=">=${MIN_SPEEDUP}x${warm_clause}"
 
-              if [[ "${speedup_pass}" == "1" && "${warm_pass}" == "1" ]]; then
+              telemetry_pass="1"
+              telemetry_issue=""
+              if [[ -z "${staged_overhead_ms}" || -z "${publication_success}" ]]; then
+                telemetry_pass="0"
+                telemetry_issue="missing cold staged telemetry"
+              elif (( publication_success <= 0 )); then
+                telemetry_pass="0"
+                telemetry_issue="cold path published no staged generations"
+              elif (( staged_overhead_ms > MAX_STAGED_OVERHEAD_MS )); then
+                telemetry_pass="0"
+                telemetry_issue="staged miss overhead ${staged_overhead_ms}ms exceeds ${MAX_STAGED_OVERHEAD_MS}ms"
+              elif [[ -z "${salvage_count}" || -z "${staged_critical_failures}" ]]; then
+                telemetry_pass="0"
+                telemetry_issue="missing staged failure telemetry"
+              elif (( salvage_count != 0 || staged_critical_failures != 0 )); then
+                telemetry_pass="0"
+                telemetry_issue="salvage=${salvage_count} critical_failures=${staged_critical_failures}"
+              elif [[ -z "${materialization_copied}" ]]; then
+                telemetry_pass="0"
+                telemetry_issue="missing materialization byte telemetry"
+              elif (( materialization_copied > MAX_MATERIALIZATION_COPIED_BYTES )); then
+                telemetry_pass="0"
+                telemetry_issue="materialization copied ${materialization_copied} bytes (max ${MAX_MATERIALIZATION_COPIED_BYTES})"
+              elif [[ "${scenario}" == "restore-no-clean-warm" ]]; then
+                if [[ -z "${warm_compilations}" || "${warm_compilations}" != "0" ]]; then
+                  telemetry_pass="0"
+                  telemetry_issue="restore warm build was not a no-op (compilations=${warm_compilations:-missing})"
+                fi
+              elif [[ -z "${tier_reflink}" || -z "${tier_hardlink}" || -z "${tier_copy}" ]] \
+                   || (( tier_reflink + tier_hardlink + tier_copy <= 0 )); then
+                telemetry_pass="0"
+                telemetry_issue="warm build reported no materialization tier"
+              fi
+              need="${need}; staged<=${MAX_STAGED_OVERHEAD_MS}ms; copied<=${MAX_MATERIALIZATION_COPIED_BYTES}B; salvage=0"
+
+              if [[ "${speedup_pass}" == "1" && "${warm_pass}" == "1" && "${telemetry_pass}" == "1" ]]; then
                 emit_row "PASS" "${need}"
                 echo "PASS  ${fixture}/${scenario}: speedup=${speedup}x warm=$(fmt_ms "${warm_ms}") (need ${need}), cold=$(fmt_ms "${cold_ms}"), hits=${hits:-?}/${compiles:-?} ($(fmt_pct "${hit_rate}"))"
               else
                 if [[ "${mode}" == "fail" ]]; then
                   emit_row "FAIL" "${need}"
                   echo "::error::$(fmt_annotation "${need}")"
+                  if [[ -n "${telemetry_issue}" ]]; then
+                    echo "::error::${fixture}/${scenario}: ${telemetry_issue}; tiers=${tier_counts:-missing}; copied=${materialization_copied:-missing}; salvage=${salvage_count:-missing}"
+                  fi
                   status=1
                 else
                   emit_row "WARN" "${need}"

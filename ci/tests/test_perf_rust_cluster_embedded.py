@@ -67,3 +67,35 @@ def test_perf_cluster_pins_cache_action_to_an_immutable_commit() -> None:
     ]
 
     assert cache_refs == [expected_sha, expected_sha]
+
+
+def test_perf_cluster_final_rollout_matrix_and_defaults_are_required() -> None:
+    workflow = workflow_text()
+
+    assert workflow.count("default: all") >= 3
+    assert "platform: [linux, mac-arm, win]" in workflow
+    for runner in ("ubuntu-24.04", "macos-14", "windows-2025"):
+        assert workflow.count(f"runs_on: {runner}") >= 3
+    assert "fixture: [medium, sqlite-link]" in workflow
+    assert (
+        "cold-tar-untar-warm|restore-no-clean-warm|worktree-share|touch-no-change) "
+        'echo "fail"'
+    ) in workflow
+
+
+def test_perf_cluster_gates_staged_metrics_and_restore_noop() -> None:
+    workflow = workflow_text()
+
+    for required in (
+        "MAX_STAGED_OVERHEAD_MS",
+        "MAX_MATERIALIZATION_COPIED_BYTES",
+        "publication_success",
+        "materialize_reflink",
+        "materialize_hardlink_shared",
+        "materialize_copy",
+        "salvage_attempt",
+        "materialize_failure",
+        "warm_compilations",
+        "restore warm build was not a no-op",
+    ):
+        assert required in workflow

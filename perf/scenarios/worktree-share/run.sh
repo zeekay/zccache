@@ -54,6 +54,8 @@ a_start_ms="$(measure::now_ms)"
 a_elapsed_ms="$(measure::elapsed_ms "${a_start_ms}")"
 
 SOLDR_CACHE_DIR="${CACHE}" soldr cache flush --json >/dev/null 2>&1 || true
+SOLDR_CACHE_DIR="${CACHE}" soldr cache report --json \
+    > "${WORKDIR}/a-cache-report.json" 2>/dev/null || true
 
 cache_after_a_bytes="$(measure::cache_bytes "${CACHE}")"
 
@@ -70,6 +72,9 @@ b_stats="$(SOLDR_CACHE_DIR="${CACHE}" measure::session_end_json)"
 b_hits="$(echo "${b_stats}" | jq -r '.stats.hits // 0')"
 b_misses="$(echo "${b_stats}" | jq -r '.stats.misses // 0')"
 b_hit_rate="$(echo "${b_stats}" | jq -r '.stats.hit_rate // 0')"
+
+SOLDR_CACHE_DIR="${CACHE}" soldr cache report --json \
+    > "${WORKDIR}/b-cache-report.json" 2>/dev/null || true
 
 SOLDR_CACHE_DIR="${CACHE}" soldr cache shutdown \
     --shutdown-timeout-seconds 30 --json >"${WORKDIR}/worktree-shutdown.json" || true
