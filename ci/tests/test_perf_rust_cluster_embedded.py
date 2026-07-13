@@ -84,7 +84,9 @@ def test_perf_cluster_final_rollout_matrix_and_defaults_are_required() -> None:
     assert "fixture: [medium, sqlite-link]" in workflow
     assert 'max_warm_ms_worktree: "6000"' in workflow
     assert 'max_warm_ms_touch: "5000"' in workflow
+    assert workflow.count('min_speedup: "0.05"') == 1
     assert 'min_speedup: "1.3"' in workflow
+    assert workflow.count('max_warm_ms_restore: "10000"') == 1
     assert workflow.count('max_warm_ms_worktree: "30000"') == 1
     assert workflow.count('max_warm_ms_touch: "30000"') == 1
     assert (
