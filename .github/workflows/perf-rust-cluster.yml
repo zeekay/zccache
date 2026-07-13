@@ -494,9 +494,22 @@ jobs:
         run: |
           set -o pipefail
 
-          out_root="${RUNNER_TEMP}/perf-${M_PLATFORM}-${M_FIXTURE}"
+          runner_temp="${RUNNER_TEMP}"
+          if [[ "${M_PLATFORM}" == "win" ]]; then
+            # Git Bash exposes RUNNER_TEMP in native D:\\... form. GNU tar
+            # treats the colon as a remote archive separator, so all shell
+            # tools must receive the MSYS /d/... spelling instead.
+            runner_temp="$(cygpath -u "${RUNNER_TEMP}")"
+          fi
+          out_root="${runner_temp}/perf-${M_PLATFORM}-${M_FIXTURE}"
           mkdir -p "${out_root}"
-          echo "out_root=${out_root}" >> "$GITHUB_OUTPUT"
+          artifact_root="${out_root}"
+          if [[ "${M_PLATFORM}" == "win" ]]; then
+            # upload-artifact is a Node action, not an MSYS process, and
+            # therefore needs the native Windows spelling.
+            artifact_root="$(cygpath -w "${out_root}")"
+          fi
+          echo "out_root=${artifact_root}" >> "$GITHUB_OUTPUT"
 
           # One header for the cell; each scenario appends a row via
           # measure::append_summary_md.

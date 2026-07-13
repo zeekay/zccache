@@ -99,3 +99,15 @@ def test_perf_cluster_gates_staged_metrics_and_restore_noop() -> None:
         "restore warm build was not a no-op",
     ):
         assert required in workflow
+
+
+def test_perf_cluster_normalizes_windows_temp_for_git_bash_tools() -> None:
+    workflow = workflow_text()
+    run_step = workflow.split("- name: Run selected scenarios", 1)[1].split(
+        "\n      - name:", 1
+    )[0]
+
+    assert 'runner_temp="$(cygpath -u "${RUNNER_TEMP}")"' in run_step
+    assert 'out_root="${runner_temp}/perf-${M_PLATFORM}-${M_FIXTURE}"' in run_step
+    assert 'artifact_root="$(cygpath -w "${out_root}")"' in run_step
+    assert 'echo "out_root=${artifact_root}" >> "$GITHUB_OUTPUT"' in run_step
