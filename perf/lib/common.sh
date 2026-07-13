@@ -219,6 +219,60 @@ measure::append_summary_md() {
     fi
 }
 
+# measure::quiesce_cache_for_snapshot <cache-root> <shutdown-report>
+#
+# Flush embedded zccache state and stop the owning soldr-daemon before
+# archiving a cache tree.  A flush alone is insufficient on Windows: the
+# still-live broker retains NTFS byte-range locks on SQLite files, causing
+# `soldr save` to fail (or, worse, making an external copier race a writer).
+measure::quiesce_cache_for_snapshot() {
+    local cache_root="$1"
+    local shutdown_report="$2"
+    local status_json pid="" deadline
+
+    SOLDR_CACHE_DIR="${cache_root}" soldr cache flush --json >/dev/null
+    SOLDR_CACHE_DIR="${cache_root}" soldr cache shutdown \
+        --shutdown-timeout-seconds 30 --json >"${shutdown_report}"
+    if ! jq -e '.daemon_stopped == true' "${shutdown_report}" >/dev/null; then
+        echo "cache snapshot refused: embedded zccache flush was not confirmed" >&2
+        return 1
+    fi
+
+    status_json="$(SOLDR_CACHE_DIR="${cache_root}" soldr daemon status --json)"
+    if jq -e '.running == true' >/dev/null <<<"${status_json}"; then
+        pid="$(jq -r '.pid' <<<"${status_json}")"
+    fi
+    SOLDR_CACHE_DIR="${cache_root}" soldr daemon stop >/dev/null
+
+    deadline=$(( SECONDS + 30 ))
+    while (( SECONDS < deadline )); do
+        status_json="$(SOLDR_CACHE_DIR="${cache_root}" soldr daemon status --json 2>/dev/null || true)"
+        if jq -e '.running == false' >/dev/null 2>&1 <<<"${status_json}"; then
+            if [[ -z "${pid}" ]] || ! measure::_pid_is_alive "${pid}"; then
+                return 0
+            fi
+        fi
+        sleep 0.2
+    done
+
+    echo "cache snapshot refused: soldr-daemon did not exit within 30 seconds" >&2
+    return 1
+}
+
+measure::_pid_is_alive() {
+    local pid="$1"
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            powershell.exe -NoProfile -NonInteractive -Command \
+                "if (Get-Process -Id ${pid} -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }" \
+                >/dev/null 2>&1
+            ;;
+        *)
+            kill -0 "${pid}" >/dev/null 2>&1
+            ;;
+    esac
+}
+
 # measure::reset_cache_dir <cache-root>
 #
 # Wipe a soldr cache root so the next build starts cold. Stops the

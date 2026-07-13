@@ -8,6 +8,11 @@ WORKFLOW = ROOT / ".github" / "workflows" / "perf-rust-cluster.yml"
 LOCAL_ENTRYPOINT = ROOT / "ci" / "docker" / "perf_entrypoint.sh"
 LOCAL_RUNNER = ROOT / "ci" / "docker" / "runner.Dockerfile"
 LOCAL_ORCHESTRATOR = ROOT / "ci" / "perf_local.py"
+COMMON_SH = ROOT / "perf" / "lib" / "common.sh"
+SNAPSHOT_SCENARIOS = (
+    ROOT / "perf" / "scenarios" / "cold-tar-untar-warm" / "run.sh",
+    ROOT / "perf" / "scenarios" / "restore-no-clean-warm" / "run.sh",
+)
 
 
 def workflow_text() -> str:
@@ -112,3 +117,22 @@ def test_perf_cluster_normalizes_windows_temp_for_git_bash_tools() -> None:
     assert 'out_root="${runner_temp}/perf-${M_PLATFORM}-${M_FIXTURE}"' in run_step
     assert 'artifact_root="$(cygpath -w "${out_root}")"' in run_step
     assert 'echo "out_root=${artifact_root}" >> "$GITHUB_OUTPUT"' in run_step
+
+
+def test_snapshot_scenarios_stop_the_sqlite_owner_before_save() -> None:
+    common = COMMON_SH.read_text(encoding="utf-8")
+
+    assert "measure::quiesce_cache_for_snapshot()" in common
+    assert "soldr cache flush --json" in common
+    assert "soldr cache shutdown" in common
+    assert "soldr daemon stop" in common
+    assert "measure::_pid_is_alive" in common
+    assert "Get-Process -Id" in common
+    assert "kill -0" in common
+    assert "soldr-daemon did not exit" in common
+
+    for scenario in SNAPSHOT_SCENARIOS:
+        script = scenario.read_text(encoding="utf-8")
+        before_save = script.split("\nsoldr save \\\n", 1)[0]
+        assert "measure::quiesce_cache_for_snapshot" in before_save
+        assert "soldr cache flush --json >/dev/null 2>&1 || true" not in script

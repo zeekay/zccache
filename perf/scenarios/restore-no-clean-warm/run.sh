@@ -54,10 +54,10 @@ cold_elapsed_ms="$(measure::elapsed_ms "${cold_start_ms}")"
 SOLDR_CACHE_DIR="${CACHE_COLD}" soldr cache report --json \
     > "${WORKDIR}/cold-cache-report.json" 2>/dev/null || true
 
-# Flush + shutdown so the depgraph snapshot is durable before tar.
-SOLDR_CACHE_DIR="${CACHE_COLD}" soldr cache flush --json >/dev/null 2>&1 || true
-SOLDR_CACHE_DIR="${CACHE_COLD}" soldr cache shutdown \
-    --shutdown-timeout-seconds 30 --json >"${WORKDIR}/cold-shutdown.json" || true
+# Flush and stop the owning broker so the depgraph is durable and no live
+# SQLite handle can race (or block) the snapshot on NTFS.
+measure::quiesce_cache_for_snapshot \
+    "${CACHE_COLD}" "${WORKDIR}/cold-shutdown.json"
 
 # Copy zccache's per-session logs out of the cache tree (daemon is
 # now gone) so the upload-artifact glob picks them up.
