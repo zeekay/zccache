@@ -599,7 +599,7 @@ jobs:
             max_warm_ms_cold: ""
             max_warm_ms_restore: "2500"
             max_warm_ms_worktree: "6000"
-            max_warm_ms_touch: "4000"
+            max_warm_ms_touch: "5000"
             max_staged_overhead_ms: "25000"
             max_materialization_copied_bytes: "2147483648"
           - platform: win

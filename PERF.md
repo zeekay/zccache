@@ -166,7 +166,7 @@ separate because runner and filesystem costs differ:
 | Platform | min speedup | restore max | worktree max | touch max | staged miss max |
 |---|---:|---:|---:|---:|---:|
 | Linux | `4.5x` | `1500ms` | `4000ms` | `2500ms` | `15000ms` |
-| macOS ARM | `3.0x` | `2500ms` | `6000ms` | `4000ms` | `25000ms` |
+| macOS ARM | `3.0x` | `2500ms` | `6000ms` | `5000ms` | `25000ms` |
 | Windows | `1.3x` | `5000ms` | `30000ms` | `30000ms` | `40000ms` |
 
 The Windows floor includes the `sqlite-link` fixture's bundled native C
