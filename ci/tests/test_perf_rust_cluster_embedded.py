@@ -82,6 +82,7 @@ def test_perf_cluster_final_rollout_matrix_and_defaults_are_required() -> None:
     for runner in ("ubuntu-24.04", "macos-14", "windows-2025"):
         assert workflow.count(f"runs_on: {runner}") >= 3
     assert "fixture: [medium, sqlite-link]" in workflow
+    assert 'max_warm_ms_worktree: "6000"' in workflow
     assert (
         "cold-tar-untar-warm|restore-no-clean-warm|worktree-share|touch-no-change) "
         'echo "fail"'

@@ -87,6 +87,31 @@ fn staged_generation_is_independent_and_hash_addressed() {
     assert!(is_staged_artifact_path(&payloads[0]));
 }
 
+#[cfg(windows)]
+#[test]
+fn staged_generation_publishes_beyond_legacy_max_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut artifact_dir = dir.path().join("artifacts");
+    while artifact_dir.as_os_str().len() < 220 {
+        artifact_dir = artifact_dir.join("long-staged-cache-segment");
+    }
+    fs::create_dir_all(&artifact_dir).unwrap();
+    let source = dir.path().join("source.rlib");
+    fs::write(&source, b"long-path immutable payload").unwrap();
+    let key = "b".repeat(64);
+    assert!(pointer_path(&artifact_dir, &key).as_os_str().len() > 260);
+
+    persist_staged_artifact_paths(&artifact_dir, &key, &[source.into()])
+        .expect("staged digest publication must support Win32 paths beyond MAX_PATH");
+    let payloads = load_staged_artifact_paths(&artifact_dir, &key, &[27])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fs::read(&payloads[0]).unwrap(),
+        b"long-path immutable payload"
+    );
+}
+
 #[test]
 fn staged_publication_rejects_nondeterministic_same_key_output() {
     let dir = tempfile::tempdir().unwrap();

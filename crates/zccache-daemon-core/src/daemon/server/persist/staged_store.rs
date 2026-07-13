@@ -350,8 +350,12 @@ fn replace_staged_path(source: &Path, destination: &Path) -> io::Result<()> {
             MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
         };
 
-        let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-        let destination_wide: Vec<u16> = destination
+        let source_wide: Vec<u16> = windows_verbatim_file_path(source)?
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let destination_wide: Vec<u16> = windows_verbatim_file_path(destination)?
             .as_os_str()
             .encode_wide()
             .chain(Some(0))
