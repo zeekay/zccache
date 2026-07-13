@@ -117,6 +117,7 @@ def test_perf_cluster_normalizes_windows_temp_for_git_bash_tools() -> None:
     assert 'out_root="${runner_temp}/perf-${M_PLATFORM}-${M_FIXTURE}"' in run_step
     assert 'artifact_root="$(cygpath -w "${out_root}")"' in run_step
     assert 'echo "out_root=${artifact_root}" >> "$GITHUB_OUTPUT"' in run_step
+    assert 'SOLDR_CARGO_WAIT_TIMEOUT_SECS: "300"' in run_step
 
 
 def test_snapshot_scenarios_stop_the_sqlite_owner_before_save() -> None:
@@ -134,5 +135,8 @@ def test_snapshot_scenarios_stop_the_sqlite_owner_before_save() -> None:
     for scenario in SNAPSHOT_SCENARIOS:
         script = scenario.read_text(encoding="utf-8")
         before_save = script.split("\nsoldr save \\\n", 1)[0]
+        save_command = script.split("\nsoldr save \\\n", 1)[1].split("\ntar_bytes=", 1)[0]
         assert "measure::quiesce_cache_for_snapshot" in before_save
+        assert "    --ci \\\n" in save_command
+        assert '"archive_mode=soldr-save-load-ci"' in script
         assert "soldr cache flush --json >/dev/null 2>&1 || true" not in script

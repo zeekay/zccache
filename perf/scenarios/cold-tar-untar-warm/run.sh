@@ -72,6 +72,7 @@ cold_cache_bytes="$(measure::cache_bytes "${CACHE_COLD}")"
 # side sees ${CACHE_WARM}/cache/... after load, matching what
 # SOLDR_CACHE_DIR=${CACHE_WARM} expects.
 soldr save \
+    --ci \
     --cache-dir "${CACHE_COLD}/cache" \
     --workspace "${FIXTURE_DIR}" \
     --out "${SNAPSHOT}" \
@@ -165,7 +166,7 @@ measure::emit_summary_json "${SCENARIO}" \
     "cold_cache_bytes=${cold_cache_bytes}" \
     "warm_cache_bytes=${warm_cache_bytes}" \
     "tarball_bytes=${tar_bytes}" \
-    "archive_mode=soldr-save-load" \
+    "archive_mode=soldr-save-load-ci" \
     "peak_daemon_rss_bytes=${peak_daemon_rss}" \
     "peak_compile_rss_bytes=${peak_compile_rss}"
 

@@ -488,6 +488,9 @@ jobs:
         id: run
         env:
           SOLDR_DEBUG: ${{ inputs.debug == true && '1' || '' }}
+          # A wedged compiler/daemon must fail this perf cell promptly so
+          # the remaining matrix evidence and raw diagnostics are retained.
+          SOLDR_CARGO_WAIT_TIMEOUT_SECS: "300"
           SELECTED_SCENARIOS: ${{ steps.gate.outputs.scenarios }}
           M_PLATFORM: ${{ matrix.platform }}
           M_FIXTURE: ${{ matrix.fixture }}
