@@ -25,8 +25,14 @@ measure::start_rss_poller() {
     echo "epoch,pid,rss_kb,vsz_kb,comm" > "${csv}"
     case "$(uname -s)" in
         MINGW*|MSYS*|CYGWIN*)
-            _MEASURE_RSS_PS1="${csv}.poll.ps1"
-            cat > "${_MEASURE_RSS_PS1}" <<'POWERSHELL'
+            (
+                while true; do
+                    # Feed the one-shot sample over stdin. A temporary .ps1
+                    # can remain locked by powershell.exe after the Bash
+                    # poller exits, making cleanup fail on Windows.
+                    powershell.exe -NoLogo -NoProfile -NonInteractive \
+                        -ExecutionPolicy Bypass -Command - \
+                        >> "${csv}" 2>/dev/null <<'POWERSHELL' || true
 $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 Get-Process | Where-Object {
     $_.ProcessName -match '^(zccache-daemon|zccache|rustc|cargo|soldr)(\.|$)'
@@ -37,13 +43,6 @@ Get-Process | Where-Object {
         [math]::Floor($_.VirtualMemorySize64 / 1KB), $name
 }
 POWERSHELL
-            local ps1_windows
-            ps1_windows="$(cygpath -w "${_MEASURE_RSS_PS1}")"
-            (
-                while true; do
-                    powershell.exe -NoLogo -NoProfile -NonInteractive \
-                        -ExecutionPolicy Bypass -File "${ps1_windows}" \
-                        >> "${csv}" 2>/dev/null || true
                     sleep 1
                 done
             ) &
@@ -78,10 +77,6 @@ measure::stop_rss_poller() {
         kill "${_MEASURE_RSS_PID}" 2>/dev/null || true
         wait "${_MEASURE_RSS_PID}" 2>/dev/null || true
         _MEASURE_RSS_PID=""
-    fi
-    if [[ -n "${_MEASURE_RSS_PS1:-}" ]]; then
-        rm -f "${_MEASURE_RSS_PS1}"
-        _MEASURE_RSS_PS1=""
     fi
 }
 

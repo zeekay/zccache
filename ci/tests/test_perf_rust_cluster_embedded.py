@@ -124,6 +124,18 @@ def test_perf_cluster_normalizes_windows_temp_for_git_bash_tools() -> None:
     assert 'SOLDR_CARGO_WAIT_TIMEOUT_SECS: "300"' in run_step
 
 
+def test_windows_rss_poller_does_not_create_a_lockable_script() -> None:
+    common = COMMON_SH.read_text(encoding="utf-8")
+    windows_poller = common.split("MINGW*|MSYS*|CYGWIN*)", 1)[1].split(
+        "        *)", 1
+    )[0]
+
+    assert "powershell.exe" in windows_poller
+    assert "-Command -" in windows_poller
+    assert ".poll.ps1" not in windows_poller
+    assert "_MEASURE_RSS_PS1" not in common
+
+
 def test_snapshot_scenarios_stop_the_sqlite_owner_before_save() -> None:
     common = COMMON_SH.read_text(encoding="utf-8")
 
