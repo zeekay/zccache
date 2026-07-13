@@ -167,7 +167,12 @@ separate because runner and filesystem costs differ:
 |---|---:|---:|---:|---:|---:|
 | Linux | `4.5x` | `1500ms` | `4000ms` | `2500ms` | `15000ms` |
 | macOS ARM | `3.0x` | `2500ms` | `6000ms` | `4000ms` | `25000ms` |
-| Windows | `2.0x` | `5000ms` | `8000ms` | `8000ms` | `40000ms` |
+| Windows | `1.3x` | `5000ms` | `30000ms` | `30000ms` | `40000ms` |
+
+The Windows floor includes the `sqlite-link` fixture's bundled native C
+compile, which is outside rustc artifact reuse. Staged telemetry remains a
+hard gate, so a direct-fallback regression still fails even when wall-clock
+speedup exceeds `1.3x`.
 
 The staged miss budget is the sum of hashing, publication, and requested-path
 materialization telemetry. Every cell also requires at least one cold staged

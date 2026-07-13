@@ -604,11 +604,11 @@ jobs:
             max_materialization_copied_bytes: "2147483648"
           - platform: win
             runs_on: windows-2025
-            min_speedup: "2.0"
+            min_speedup: "1.3"
             max_warm_ms_cold: ""
             max_warm_ms_restore: "5000"
-            max_warm_ms_worktree: "8000"
-            max_warm_ms_touch: "8000"
+            max_warm_ms_worktree: "30000"
+            max_warm_ms_touch: "30000"
             max_staged_overhead_ms: "40000"
             max_materialization_copied_bytes: "2147483648"
     runs-on: ${{ matrix.runs_on }}
