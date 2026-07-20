@@ -247,6 +247,13 @@ impl FingerprintManager {
 
                         // A change recorded by `on_batch` (or another verifying
                         // check) while we hashed off-lock must not be masked.
+                        // `w.dirty` is the primary, load-bearing guard; the
+                        // `generation` term is defense-in-depth — every
+                        // `generation += 1` pairs with `dirty = true`, so it is
+                        // analytically redundant. Keep both: the redundancy is
+                        // the point, so neither can be "simplified" away without
+                        // re-proving the never-report-skip-on-a-live-change
+                        // invariant.
                         let advanced = w.dirty || w.generation != gen_at_snapshot;
                         if changed.is_empty() && !advanced {
                             tracing::debug!("fingerprint check: skip (verified, not dirty)");
@@ -1113,33 +1120,123 @@ mod tests {
             (start.elapsed(), res.decision)
         });
 
-        // Hammer a full-shard sweep until the verify finishes, tracking the
-        // longest single call — the time a sweep was blocked by the shard lock.
+        // Hammer a full-shard sweep until the verify finishes. The wedge shows
+        // up as loss of THROUGHPUT, not a single slow call: when the verify
+        // holds the shard lock across the re-hash, every `mark_success` sweep
+        // (`iter_mut` over all shards) blocks until the verify ends, so the
+        // sweeper completes only a handful of all-slow round-trips. With the
+        // lock released it stays responsive and completes hundreds. Counting
+        // completed sweeps is robust on a loaded shared box, where any single
+        // call can be slow for scheduling reasons unrelated to the lock — the
+        // gap the assertion keys on is ~1 (buggy) vs 1000+ (fixed).
         let nonexistent = cache_dir.path().join("no-such-watch.json");
-        let mut max_sweep = std::time::Duration::ZERO;
         let mut sweeps = 0u64;
+        let mut slow_sweeps = 0u64;
         while !done.load(Ordering::Acquire) {
             let t = std::time::Instant::now();
             mgr.mark_success(&nonexistent);
-            max_sweep = max_sweep.max(t.elapsed());
+            if t.elapsed() > std::time::Duration::from_millis(10) {
+                slow_sweeps += 1;
+            }
             sweeps += 1;
         }
 
         let (verify_dur, decision) = verifier.join().unwrap();
         assert_eq!(decision, "run", "changed content must be detected");
-        assert!(sweeps > 0, "sweep loop must have run at least once");
         // The verify must have taken real time for the test to be meaningful
         // (600 re-hashes). If this trips, the fixture is too small.
         assert!(
             verify_dur >= std::time::Duration::from_millis(3),
             "verify was too fast ({verify_dur:?}) to exercise lock contention"
         );
-        // The point: a full-shard sweep is never blocked for the re-hash.
-        // Buggy (lock held across I/O): max_sweep ≈ verify_dur. Fixed: ~0.
+        // Throughput floor: buggy blocks the sweeper for the whole verify (~1
+        // completed round-trip); fixed keeps it responsive (hundreds). The 50
+        // floor sits far below fixed and far above buggy, so it discriminates
+        // without flaking under load.
         assert!(
-            max_sweep * 4 < verify_dur,
-            "a full-shard sweep blocked for {max_sweep:?} during a {verify_dur:?} verify — \
-             check() is holding the DashMap shard lock across re-hash I/O (issue #724)"
+            sweeps >= 50,
+            "sweeper completed only {sweeps} round-trips during the {verify_dur:?} verify — \
+             check() is wedging concurrent fingerprint ops behind the re-hash (issue #724)"
+        );
+        // And the vast majority stay fast (tolerate a small scheduling tail).
+        assert!(
+            slow_sweeps * 20 <= sweeps,
+            "{slow_sweeps}/{sweeps} sweep round-trips stalled (>10ms) during the verify — \
+             concurrent fingerprint ops are blocking behind the re-hash (issue #724)"
+        );
+    }
+
+    #[test]
+    fn on_batch_during_offlock_verify_is_never_reported_skip() {
+        // Race-coverage for issue #724. The load-bearing invariant: a change
+        // recorded via `on_batch` DURING the verifier's off-lock hash window
+        // must never come back "skip". This isolates the generation/dirty
+        // recheck (`advanced = w.dirty || ...`) — the verifier's OWN re-hash
+        // finds nothing (every tracked file is smart-touched: same content, new
+        // mtime → all `Touched`, so the verifier's `changed` set is empty), so
+        // ONLY the recheck can flip the verdict from skip to run.
+        //
+        // Neuter the recheck (force `advanced = false`) and this FAILS (returns
+        // skip → stale cache); with the fix it PASSES.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Wide off-lock window so the racer's on_batch lands inside it.
+        const FILES: usize = 800;
+        let src = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let content = vec![b'x'; 16 * 1024];
+        for i in 0..FILES {
+            std::fs::write(src.path().join(format!("f{i}.c")), &content).unwrap();
+        }
+
+        let cache_file = cache_dir.path().join("fp.json");
+        let mgr = Arc::new(FingerprintManager::new());
+
+        // Prime + mark clean so the next check takes the verify branch.
+        mgr.check(&cache_file, "two-layer", src.path(), &[], &[], &[]);
+        mgr.mark_success(&cache_file);
+
+        // Smart-touch every tracked file: SAME content, NEW mtime. The verify
+        // re-hashes all of them (all `Touched`, `changed` empty) — a wide window
+        // during which it holds no shard lock.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        for i in 0..FILES {
+            std::fs::write(src.path().join(format!("f{i}.c")), &content).unwrap();
+        }
+
+        // Racer: once the verifier is inside its off-lock hashing, deliver a
+        // brand-new file via on_batch — a genuine change the verifier's snapshot
+        // never saw and its own re-hash can never find.
+        let started = Arc::new(AtomicBool::new(false));
+        let racer_mgr = Arc::clone(&mgr);
+        let racer_started = Arc::clone(&started);
+        let racer_src = src.path().to_path_buf();
+        let racer = std::thread::spawn(move || {
+            while !racer_started.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            // Past check()'s initial (dirty == false) fast-path read and into the
+            // off-lock window, but long before it re-acquires to apply.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let new_path = racer_src.join("fNEW.c");
+            std::fs::write(&new_path, b"brand new file").unwrap();
+            racer_mgr.on_batch(&[new_path.into()], &[]);
+        });
+
+        started.store(true, Ordering::Release);
+        let result = mgr.check(&cache_file, "two-layer", src.path(), &[], &[], &[]);
+        racer.join().unwrap();
+
+        assert_eq!(
+            result.decision, "run",
+            "a change delivered via on_batch during the off-lock verify window must be \
+             reported as run, never skip (issue #724 recheck guard)"
+        );
+        assert!(
+            result.changed_files.iter().any(|f| f.contains("fNEW")),
+            "the raced on_batch change (fNEW.c) must appear in changed_files, got {:?}",
+            result.changed_files
         );
     }
 }
