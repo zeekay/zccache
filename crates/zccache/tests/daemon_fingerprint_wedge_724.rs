@@ -45,7 +45,11 @@ async fn start_daemon() -> (
     (endpoint, handle, shutdown)
 }
 
-async fn fingerprint_check(endpoint: &str, cache_file: &std::path::Path, root: &std::path::Path) -> String {
+async fn fingerprint_check(
+    endpoint: &str,
+    cache_file: &std::path::Path,
+    root: &std::path::Path,
+) -> String {
     let mut client = zccache::ipc::connect(endpoint).await.unwrap();
     client
         .send(&Request::FingerprintCheck {
@@ -74,12 +78,14 @@ async fn mark_success(client: &mut zccache::ipc::IpcConnection, cache_file: &std
     assert_eq!(client.recv().await.unwrap(), Some(Response::FingerprintAck));
 }
 
-// 16 workers so a single blocking `check()` cannot starve the sweep — the real
-// daemon defaults to one worker per core (32 on the dev boxes). With workers to
-// spare, the ONLY thing that can stall the concurrent sweep is the fingerprint
-// shard lock, which is exactly what the fix stops holding across the re-hash.
+// 16 workers mirrors the real daemon (one worker per core, 32 on the dev boxes).
+// OS-thread preemption — not free worker slots — is what keeps the concurrent
+// sweep scheduled while the verify's synchronous re-hash runs, so the ONLY thing
+// that can stall the sweep is the fingerprint shard lock, which is exactly what
+// the fix stops holding across the re-hash. Not #[ignore]d: it runs in the
+// serial (`--test-threads=1`) integration job; the in-process daemon is
+// self-contained and bounded by `test_timeout` (30 s).
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-#[ignore] // load repro: starts a real daemon, writes a large tree
 async fn fingerprint_check_verify_does_not_wedge_concurrent_requests() {
     zccache::test_support::test_timeout(async {
         const FILES: usize = 800;
